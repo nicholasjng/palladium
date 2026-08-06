@@ -117,3 +117,46 @@ def test_carry_permutation(rng):
     want_a, want_b = f.interpret(x, y)
     np.testing.assert_array_equal(got_a, np.asarray(want_a))
     np.testing.assert_array_equal(got_b, np.asarray(want_b))
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Real bug, not yet fixed: a carry read directly by a fresh "
+        "computation and separately aliased into a different carry's "
+        "output comes out wrong from the 2nd loop iteration on. Not an "
+        "emitter logic error (hand-simulating the emitted C matches the "
+        "interpret oracle); a Metal compiler code-generation issue with "
+        "several per-element sub-loops over same-sized arrays inside a "
+        "repeated outer loop."
+    ),
+    strict=True,
+)
+def test_carry_read_and_alias_conflict(rng):
+    """Found by test_fuzz_loops, shrunk by hand. 3 carries, length=2:
+    c0 and c2 swap (c0's new value is old c2, c2's new value is old c0),
+    c1 becomes tanh(c0). c0 is both the fresh computation's input and one
+    half of the swap. Passes at length=1, fails at length>=2."""
+
+    def kernel(x0_ref, x1_ref, x2_ref, o0_ref, o1_ref, o2_ref):
+        def step(_, carry):
+            c0, _c1, c2 = carry
+            return c2, jnp.tanh(c0 + 0.0 * c0), c0
+
+        f0, f1, f2 = jax.lax.fori_loop(
+            0, 2, step, (x0_ref[...], x1_ref[...], x2_ref[...])
+        )
+        o0_ref[...] = f0
+        o1_ref[...] = f1
+        o2_ref[...] = f2
+
+    f = palladium.metal_call(
+        kernel,
+        out_shape=tuple(jax.ShapeDtypeStruct((16,), jnp.float32) for _ in range(3)),
+    )
+    x0 = np.zeros(16, dtype=np.float32)
+    x1 = np.zeros(16, dtype=np.float32)
+    x2 = np.ones(16, dtype=np.float32)
+    got = f(x0, x1, x2)
+    want = f.interpret(x0, x1, x2)
+    for g, w in zip(got, want, strict=True):
+        np.testing.assert_allclose(g, np.asarray(w))

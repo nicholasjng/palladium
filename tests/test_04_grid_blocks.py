@@ -91,8 +91,10 @@ def test_2d_grid_with_index_map_arithmetic(rng):
 
 def test_noncontiguous_block_is_rejected(rng):
     """(4, 8) blocks of a (32, 128) array are strided in memory. The driver
-    refuses them up front: loudly wrong beats silently wrong. Lifting this
-    (strided copy loops in get/swap) is the ROADMAP's stretch exercise 6."""
+    refuses them up front: loudly wrong beats silently wrong.
+    Indexed ref access does not lift this: that's about a Ref's own BlockSpec
+    binding, not accesses within the kernel body.
+    Strided BlockSpec blocks remain unimplemented."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...]
