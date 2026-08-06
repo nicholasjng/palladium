@@ -1,8 +1,9 @@
-"""Core emitter machinery shared by both execution models.
+"""Core emitter machinery.
 
-CVal and EmitState, the rule registries, jaxpr walking, ref views, and
-MSL assembly. Per-primitive lowering rules live in `rules` (one thread
-per program instance) and `coop` (one SIMD-group per program instance).
+CVal, Cursor (MSL text position) and Environment (jaxpr Var bindings),
+the rule registries, jaxpr walking, ref views, and MSL assembly.
+Per-primitive lowering rules live in `rules` (one thread per program
+instance).
 """
 
 from __future__ import annotations
@@ -13,18 +14,26 @@ import itertools
 import math
 import string
 from collections.abc import Callable, Iterator
-from typing import TYPE_CHECKING, Protocol
+from typing import cast
 
-from jax.core import ShapedArray
+import jax.experimental.pallas as pl
+
+# Pinned private import: NDIndexer sits in the same module as pl.Slice
+# (jax._src.state.indexing) but, unlike Slice/ds/dslice, isn't re-exported
+# through jax.experimental.pallas -- an apparent oversight, since it's the
+# actual type `eqn.params["tree"].unflatten(...)` hands back for a get/swap
+# indexer, not a new kind of API surface. PR filed upstream to close the
+# gap (jax/experimental/pallas/__init__.py, alongside the existing `from
+# jax._src.state.indexing import Slice as Slice` line); drop this import
+# for `from jax.experimental.pallas import NDIndexer` once it lands.
+from jax._src.state.indexing import NDIndexer
+from jax.core import Atom, ShapedArray
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
+from palladium.errors import EmitError, UnsupportedPrimitiveError
 from palladium.trace import BlockInfo, KernelSpec
 
-if TYPE_CHECKING:
-    from typing_extensions import TypeIs
-
-# eqn.invars entries are Vars or inline Literals; eqn.outvars are always Vars.
-Atom = Var | Literal
+__all__ = ["EmitError"]  # re-export; the class lives in palladium.errors
 
 
 # limit compute primitive arity to a maximum of 6.
@@ -69,18 +78,7 @@ CTYPES = {
     "bool": "bool",
 }
 
-# One SIMD-group's thread count on Apple GPUs; the cooperative model's
-# lane count and dispatch.BoundKernel's launch geometry must agree on it.
-SIMDGROUP_WIDTH = 32
-
 _PID = ("_pid.x", "_pid.y", "_pid.z")
-
-
-class EmitError(Exception):
-    """The emitter cannot lower this kernel (unsupported or invalid input).
-
-    Distinct from NotImplementedError, which marks a missing rule.
-    """
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,11 +116,6 @@ class CVal:
         path needing N-element loads requires `align % N == 0`. Composed
         through views as the gcd of the base alignment and every offset
         term's provable multiple.
-    layout : str
-        Value distribution in the simdgroup-cooperative model: "rep",
-        "rowvec", or "shard" (see the `coop` module). Always "rep"
-        outside the cooperative emitter; device views are distinguished
-        by `space`, not layout.
     """
 
     expr: str
@@ -132,7 +125,6 @@ class CVal:
     readonly: bool = False
     transposed: bool = False
     align: int = 0
-    layout: str = "rep"
 
     @property
     def size(self) -> int:
@@ -145,57 +137,19 @@ class CVal:
         return self.expr if not self.shape else f"{self.expr}[{index}]"
 
 
-class EmitState:
-    """Emission state for one kernel.
+class Cursor:
+    """The write position into one kernel's growing MSL text.
 
-    Attributes
-    ----------
-    lines : list of str
-        Emitted MSL body lines, indented.
-    env : dict
-        Maps jaxpr Vars to their CVals.
-    indent : int
-        Current indentation depth, managed by `block`.
-    pid_exprs : tuple of str
-        Per-grid-axis C exprs for the program instance index; the
-        cooperative emitter swaps in threadgroup coordinates.
-    consumers, producers : dict
-        Var -> consuming eqns (None marks a jaxpr outvar) and
-        Var -> defining eqn, for rules that need lookahead.
-    prologue : list of str
-        Lines spliced ahead of the kernel body by emit_msl, for
-        function-scope declarations requested inside nested blocks.
-    coop_rows : int
-        Query rows per instance in the cooperative model; 1 otherwise.
+    Owns the emitted lines, current indentation, and the unique-name
+    counter; knows nothing about jaxpr Vars or bindings. Reusable on its
+    own wherever a rule needs to emit text without touching the
+    environment (e.g. `copy`, a pure element-loop codegen helper).
     """
 
     def __init__(self) -> None:
         self.lines: list[str] = []
-        self.env: dict[Var, CVal] = {}
-        self._names = itertools.count()
         self.indent = 1
-        # Per-grid-axis C exprs for the program instance index. The
-        # default maps one thread to one instance; the cooperative
-        # emitter swaps in threadgroup coordinates (one 32-thread
-        # threadgroup per instance) before emitting anything.
-        self.pid_exprs: tuple[str, str, str] = _PID
-        # Var -> its consuming equations at that var's own jaxpr level
-        # (None marks "is a jaxpr outvar", i.e. escapes the level).
-        # Populated by emit_jaxpr before walking each (sub-)jaxpr; Vars
-        # are unique objects per jaxpr, so levels never collide.
-        self.consumers: dict[Var, list[JaxprEqn | None]] = {}
-        # Var -> the equation that defines it (cooperative emitter only;
-        # lets a rule inspect a not-yet-emitted producer, e.g. "will this
-        # dot rhs be a fused transpose?").
-        self.producers: dict[Var, JaxprEqn] = {}
-        # Lines spliced ahead of the kernel body by emit_msl. For
-        # declarations that must be function-scope (threadgroup arrays)
-        # but are requested by rules emitting inside nested blocks.
-        self.prologue: list[str] = []
-        # Query rows per program instance in the cooperative model (R in
-        # the layout taxonomy in the coop module). 1 for
-        # the original one-row model; set by emit_msl before emission.
-        self.coop_rows: int = 1
+        self._names = itertools.count()
 
     def emit(self, line: str) -> None:
         """Append one MSL line at the current indentation."""
@@ -205,42 +159,9 @@ class EmitState:
         """Return a new unique C identifier; deterministic per process order."""
         return f"{prefix}{next(self._names)}"
 
-    def val(self, atom: Atom) -> CVal:
-        """Resolve a jaxpr atom: Vars from the environment, Literals
-        formatted in place."""
-        if isinstance(atom, Literal):
-            ctype = CTYPES[str(_shaped(atom.aval).dtype)]
-            v = atom.val
-            if math.isinf(v):
-                expr = "-INFINITY" if v < 0 else "INFINITY"
-            elif math.isnan(v):
-                expr = "NAN"
-            else:
-                expr = f"{float(v)!r}f" if ctype in ("float", "half") else str(int(v))
-            return CVal(expr=expr, shape=(), ctype=ctype)
-        return self.env[atom]
-
-    def declare(self, var: Var) -> CVal:
-        """Emit thread-local storage for `var` and bind it. Use for a
-        rule producing a new value; use `bind` for aliasing."""
-        aval = _shaped(var.aval)
-        ctype = CTYPES[str(aval.dtype)]
-        shape = tuple(int(d) for d in aval.shape)
-        name = self.fresh()
-        size = math.prod(shape)
-        self.emit(f"{ctype} {name}[{size}];" if shape else f"{ctype} {name};")
-        cval = CVal(expr=name, shape=shape, ctype=ctype)
-        self.env[var] = cval
-        return cval
-
-    def bind(self, var: Var, cval: CVal) -> CVal:
-        """Bind `var` to an existing CVal: aliasing, no declaration."""
-        self.env[var] = cval
-        return cval
-
     @contextlib.contextmanager
     def block(self, header: str) -> Iterator[None]:
-        """Emit a braced, indented block: `with state.block("for (...)"):`."""
+        """Emit a braced, indented block: `with cursor.block("for (...)"):`."""
         self.emit(header + " {")
         self.indent += 1
         yield
@@ -254,7 +175,72 @@ class EmitState:
             self.emit(f"{dst.at(i)} = {src.at(i)};")
 
 
-RuleFn = Callable[[EmitState, JaxprEqn], None]
+class Environment:
+    """The symbol table for one kernel: jaxpr Var bindings and def-use info.
+
+    Owns no MSL text; knows nothing about indentation or emission order.
+
+    Attributes
+    ----------
+    bindings : dict
+        Maps jaxpr Vars to their lowered CVals.
+    consumers, producers : dict
+        Var -> consuming eqns (None marks a jaxpr outvar) and
+        Var -> defining eqn, for rules that need lookahead.
+    """
+
+    def __init__(self) -> None:
+        self.bindings: dict[Var, CVal] = {}
+        # Var -> its consuming equations at that var's own jaxpr level
+        # (None marks "is a jaxpr outvar", i.e. escapes the level).
+        # Populated by emit_jaxpr before walking each (sub-)jaxpr; Vars
+        # are unique objects per jaxpr, so levels never collide.
+        self.consumers: dict[Var, list[JaxprEqn | None]] = {}
+        # Var -> the equation that defines it, for rules that need to
+        # inspect a not-yet-emitted producer.
+        self.producers: dict[Var, JaxprEqn] = {}
+
+    def val(self, atom: Atom) -> CVal:
+        """Resolve a jaxpr atom: Vars from bindings, Literals formatted
+        in place."""
+        if isinstance(atom, Literal):
+            ctype = CTYPES[str(_shaped(atom.aval).dtype)]
+            v = atom.val
+            if math.isinf(v):
+                expr = "-INFINITY" if v < 0 else "INFINITY"
+            elif math.isnan(v):
+                expr = "NAN"
+            else:
+                expr = f"{float(v)!r}f" if ctype in ("float", "half") else str(int(v))
+            return CVal(expr=expr, shape=(), ctype=ctype)
+        return self.bindings[atom]
+
+    def bind(self, var: Var, cval: CVal) -> CVal:
+        """Bind `var` to an existing CVal: aliasing, no declaration."""
+        self.bindings[var] = cval
+        return cval
+
+
+def declare(env: Environment, cursor: Cursor, var: Var) -> CVal:
+    """Emit thread-local storage for `var` and bind it in `env`. Use for
+    a rule producing a new value; use `env.bind` for aliasing.
+
+    The one operation that genuinely needs both a Cursor (it emits the
+    declaration) and an Environment (it binds the result) — everything
+    else a rule does is purely one or the other.
+    """
+    aval = _shaped(var.aval)
+    ctype = CTYPES[str(aval.dtype)]
+    shape = tuple(int(d) for d in aval.shape)
+    name = cursor.fresh()
+    size = math.prod(shape)
+    cursor.emit(f"{ctype} {name}[{size}];" if shape else f"{ctype} {name};")
+    cval = CVal(expr=name, shape=shape, ctype=ctype)
+    env.bind(var, cval)
+    return cval
+
+
+RuleFn = Callable[[Environment, Cursor, JaxprEqn], None]
 
 RULES: dict[str, RuleFn] = {}
 
@@ -271,7 +257,8 @@ def rule(*names: str) -> Callable[[RuleFn], RuleFn]:
 
 
 def _emit_with_rules(
-    state: EmitState,
+    env: Environment,
+    cursor: Cursor,
     jaxpr: Jaxpr,
     in_vals: list[CVal],
     rules: dict[str, RuleFn],
@@ -295,31 +282,35 @@ def _emit_with_rules(
             "scalars only, or pass arrays as kernel operands"
         )
     for var, cval in zip(jaxpr.invars, in_vals, strict=True):
-        state.env[var] = cval
+        env.bind(var, cval)
     for eqn in jaxpr.eqns:
         for iv in eqn.invars:
             if isinstance(iv, Var):
-                state.consumers.setdefault(iv, []).append(eqn)
+                env.consumers.setdefault(iv, []).append(eqn)
         for ov in eqn.outvars:
-            state.producers[ov] = eqn
+            env.producers[ov] = eqn
     for ov in jaxpr.outvars:
         if isinstance(ov, Var):
-            state.consumers.setdefault(ov, []).append(None)
+            env.consumers.setdefault(ov, []).append(None)
     for eqn in jaxpr.eqns:
         impl = rules.get(eqn.primitive.name)
         if impl is None:
             raise missing(eqn.primitive.name)
-        impl(state, eqn)
-    return [state.val(v) for v in jaxpr.outvars]
+        impl(env, cursor, eqn)
+    return [env.val(v) for v in jaxpr.outvars]
 
 
-def emit_jaxpr(state: EmitState, jaxpr: Jaxpr, in_vals: list[CVal]) -> list[CVal]:
+def emit_jaxpr(
+    env: Environment, cursor: Cursor, jaxpr: Jaxpr, in_vals: list[CVal]
+) -> list[CVal]:
     """Walk a jaxpr with the one-thread-per-instance rules (RULES).
 
     Parameters
     ----------
-    state : EmitState
-        Emission state; lines are appended in place.
+    env : Environment
+        Var bindings and def-use info; updated in place.
+    cursor : Cursor
+        MSL text position; lines are appended in place.
     jaxpr : Jaxpr
         The (sub-)jaxpr to lower.
     in_vals : list of CVal
@@ -331,11 +322,12 @@ def emit_jaxpr(state: EmitState, jaxpr: Jaxpr, in_vals: list[CVal]) -> list[CVal
         The values of `jaxpr.outvars`.
     """
     return _emit_with_rules(
-        state,
+        env,
+        cursor,
         jaxpr,
         in_vals,
         RULES,
-        lambda name: NotImplementedError(
+        lambda name: UnsupportedPrimitiveError(
             f"no MSL rule for primitive '{name}'; add one with @rule(...)"
         ),
     )
@@ -388,17 +380,13 @@ def _full_block_shape(info: BlockInfo) -> tuple[int, ...]:
     return (1,) * missing + info.block_shape
 
 
-def emit_msl(
-    spec: KernelSpec, kernel_name: str | None = None, cooperative: bool | None = None
-) -> str:
+def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
     """Assemble the full MSL source for a KernelSpec.
 
     Signature convention (relied on by `dispatch.bind`): operands in
-    jaxpr order (inputs then outputs) bound to `[[buffer(k)]]`, then the
-    thread-indexing parameters: `uint3 _pid [[thread_position_in_grid]]`
-    for the default one-thread-per-instance model, or `uint3 _tgid
-    [[threadgroup_position_in_grid]]` plus `ushort _lane
-    [[thread_index_in_simdgroup]]` for the simdgroup-cooperative model.
+    jaxpr order (inputs then outputs) bound to `[[buffer(k)]]`, then
+    `uint3 _pid [[thread_position_in_grid]]`, one thread per program
+    instance.
 
     Parameters
     ----------
@@ -406,11 +394,6 @@ def emit_msl(
         Traced kernel, from `palladium.trace`.
     kernel_name : str, optional
         Overrides `spec.name` as the MSL function name.
-    cooperative : bool, optional
-        Force the simdgroup-cooperative execution model on or off; None
-        (default) decides via `is_simdgroup_cooperative(spec)`. Must
-        match what `dispatch.bind` is told, since the two models need
-        different launch geometry.
 
     Returns
     -------
@@ -421,19 +404,12 @@ def emit_msl(
     ------
     EmitError
         For grids over rank 3, non-contiguous blocks, or scratch operands.
-    NotImplementedError
+    UnsupportedPrimitiveError
         If the kernel stages a primitive with no registered rule.
     """
     name = kernel_name or spec.name
     if len(spec.grid) > 3:
         raise EmitError(f"grid {spec.grid} has rank > 3; Metal grids are 3D")
-    from palladium.emit.coop import coop_rows, emit_jaxpr_coop
-
-    rows = coop_rows(spec) if cooperative is not False else None
-    if cooperative is None:
-        cooperative = rows is not None
-    elif cooperative and rows is None:
-        raise EmitError("cooperative=True but the kernel has no cooperative lowering")
 
     operands = list(spec.inputs) + list(spec.outputs)
     n_in = len(spec.inputs)
@@ -443,24 +419,18 @@ def emit_msl(
         qual = "device" if k >= n_in else "const device"
         ctype = CTYPES[info.dtype.name]
         params.append(f"{qual} {ctype}* arg{k}_base [[buffer({k})]]")
-    if cooperative:
-        params.append("uint3 _tgid [[threadgroup_position_in_grid]]")
-        params.append("ushort _lane [[thread_index_in_simdgroup]]")
-    else:
-        params.append("uint3 _pid [[thread_position_in_grid]]")
+    params.append("uint3 _pid [[thread_position_in_grid]]")
 
-    state = EmitState()
-    if cooperative:
-        state.pid_exprs = ("_tgid.x", "_tgid.y", "_tgid.z")
-        state.coop_rows = rows or 1
+    env = Environment()
+    cursor = Cursor()
     ref_vals: list[CVal] = []
     for k, info in enumerate(operands):
         qual = "device" if k >= n_in else "const device"
         ctype = CTYPES[info.dtype.name]
         offset = _constant_offset(info)
         if offset is None:
-            offset = _block_offset(state, spec, info)
-        state.emit(f"{qual} {ctype}* arg{k} = arg{k}_base + {offset};")
+            offset = _block_offset(env, cursor, spec, info)
+        cursor.emit(f"{qual} {ctype}* arg{k} = arg{k}_base + {offset};")
 
         # access scalar refs (shape == ()) as axis-1 arrays, since all refs are pointers.
         ref_vals.append(
@@ -480,13 +450,7 @@ def emit_msl(
             f"kernel has {len(spec.jaxpr.invars)} refs but spec carries "
             f"{n_refs} operands; scratch_shapes are not supported yet"
         )
-    body_mark = len(state.lines)
-    if cooperative:
-        emit_jaxpr_coop(state, spec.jaxpr, ref_vals)
-    else:
-        emit_jaxpr(state, spec.jaxpr, ref_vals)
-    if state.prologue:
-        state.lines[body_mark:body_mark] = ["    " + line for line in state.prologue]
+    emit_jaxpr(env, cursor, spec.jaxpr, ref_vals)
 
     head = f"kernel void {name}(\n    " + ",\n    ".join(params) + ")\n{"
     return "\n".join(
@@ -495,42 +459,14 @@ def emit_msl(
             "using namespace metal;",
             "",
             head,
-            *state.lines,
+            *cursor.lines,
             "}",
             "",
         ]
     )
 
 
-class _Slice(Protocol):
-    """Structural stand-in for `jax._src.indexing.Slice`: a private class,
-    not imported, same reasoning as `trace.py`'s `type(dim).__name__ ==
-    "Squeezed"` check. `start` is a plain Python int when static, an atom
-    (Var, possibly Literal) when dynamic (`pl.dslice`); `size`/`stride`
-    are always static, verified against real jaxprs.
-    """
-
-    start: int | Atom
-    size: int
-    stride: int
-
-
-class _NDIndexer(Protocol):
-    """Structural stand-in for `jax._src.state.indexing.NDIndexer`, same
-    reasoning as `_Slice`. One entry in `indices` per ref dimension."""
-
-    shape: tuple[int, ...]
-    indices: tuple[Atom | _Slice, ...]
-
-
-def _is_slice(idx: Atom | _Slice) -> TypeIs[_Slice]:
-    """Structural check, not `isinstance`: `_Slice` is a `Protocol` over a
-    private class, and checking by class name (not import) is this file's
-    established way of staying version-tolerant of JAX internals."""
-    return type(idx).__name__ == "Slice"
-
-
-def _ref_view(state: EmitState, ref: CVal, indexer: _NDIndexer) -> CVal:
+def _ref_view(env: Environment, ref: CVal, indexer: NDIndexer) -> CVal:
     """Resolve an NDIndexer against a Ref's CVal: pointer offset + kept shape.
 
     A Slice index keeps that dim (contributes to the result's logical
@@ -551,16 +487,30 @@ def _ref_view(state: EmitState, ref: CVal, indexer: _NDIndexer) -> CVal:
     kept: list[tuple[int, int]] = []
     align = ref.align
     for d, (idx, stride) in enumerate(zip(indexer.indices, strides, strict=True)):
-        if _is_slice(idx):
+        if isinstance(idx, pl.Slice):
             if idx.stride != 1:
                 raise EmitError(
                     f"ref access dim {d}: stride {idx.stride} != 1 is unimplemented"
                 )
-            kept.append((d, idx.size))
+            # pl.Slice.size/.start are typed `int | Array` upstream (a
+            # Slice can be user-constructed with a dynamic size), but a
+            # kernel jaxpr equation never carries one: size is always
+            # static (verified against real jaxprs) and a dynamic start
+            # is always a jaxpr atom (Var/Literal), never a live Array.
+            kept.append((d, cast(int, idx.size)))
             start = idx.start
-            expr = str(start) if isinstance(start, int) else state.val(start).expr
+            expr = (
+                str(start)
+                if isinstance(start, int)
+                else env.val(cast(Atom, start)).expr
+            )
         else:
-            expr = state.val(idx).expr
+            # NDIndexer.indices is typed to also admit fancy/advanced
+            # (gather-style) integer-array indexers upstream, but a
+            # kernel jaxpr's get/swap params never carry one: this
+            # emitter's supported subset has no such rule, and a
+            # non-Slice index here is always a jaxpr atom.
+            expr = env.val(cast(Atom, idx)).expr
         if expr != "0":
             terms.append(f"{expr} * {stride}")
             # A dynamic index contributes its stride as the provable
@@ -651,7 +601,9 @@ ELEMENTWISE: dict[str, str] = {
 }
 
 
-def _block_offset(state: EmitState, spec: KernelSpec, info: BlockInfo) -> str:
+def _block_offset(
+    env: Environment, cursor: Cursor, spec: KernelSpec, info: BlockInfo
+) -> str:
     """Element offset of this program instance's block, as a C expression.
 
     The index map is a jaxpr over grid indices (bound to _pid components),
@@ -662,10 +614,8 @@ def _block_offset(state: EmitState, spec: KernelSpec, info: BlockInfo) -> str:
 
     Zero-literal terms are elided; falls back to "0" for an all-zero map.
     """
-    pid_vals = [
-        CVal(f"(int){state.pid_exprs[k]}", (), "int") for k in range(len(spec.grid))
-    ]
-    out_vals = emit_jaxpr(state, info.index_map_jaxpr.jaxpr, pid_vals)
+    pid_vals = [CVal(f"(int){_PID[k]}", (), "int") for k in range(len(spec.grid))]
+    out_vals = emit_jaxpr(env, cursor, info.index_map_jaxpr.jaxpr, pid_vals)
     block_shape = _full_block_shape(info)
     strides = _element_strides(info.array_shape)
 
