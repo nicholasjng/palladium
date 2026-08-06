@@ -3,7 +3,7 @@
 The oracle tests prove kernels compute the right values; these prove the
 emitter produces the *same text* it did when the snapshot was blessed.
 Unintended codegen drift (a qualifier change, a lost offset factor, an
-extra copy) shows up as a reviewable diff instead of silence. Ctx's name
+extra copy) shows up as a reviewable diff instead of silence. EmitState's name
 counter is deterministic, so snapshots are stable across runs.
 
 Regenerate after an *intended* emitter change:

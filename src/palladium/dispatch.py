@@ -1,11 +1,9 @@
-"""Step 3 of the pipeline: hand emitted MSL to metal-runtime and run it.
+"""Step 3 of the pipeline: compile emitted MSL via metal-runtime and run it.
 
-Deliberately nothing but glue around Kernel/Buffer/run, plus the
-debugging hooks: `PALLADIUM_DUMP_MSL=1` prints every kernel's source
-before it compiles (a directory path writes `<name>_<hash>.metal` files
-instead; the `MOSAIC_GPU_DUMP_PTX` idiom one layer up), and a Metal
-compile failure re-raises with the line-numbered source attached so
-`program_source:LINE:COL` diagnostics resolve by eye.
+Glue around Kernel/Buffer/run, plus debugging hooks. `PALLADIUM_DUMP_MSL=1`
+prints each kernel's source before compiling; a directory path instead
+writes `<name>_<hash>.metal` files. Metal compile failures re-raise with
+the line-numbered source attached.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ import numpy as np
 
 from palladium.trace import KernelSpec
 
-__all__ = ["BoundKernel", "bind"]
+__all__ = ["BoundKernel", "PendingResult", "bind"]
 
 
 def _dump_msl(name: str, msl_source: str) -> None:
@@ -43,6 +41,30 @@ def _numbered(msl_source: str) -> str:
     )
 
 
+@dataclasses.dataclass
+class PendingResult:
+    """A launched kernel whose command buffer may still be executing.
+
+    Returned by `BoundKernel.launch`, committed but not waited on.
+
+    Attributes
+    ----------
+    batch : metal_runtime.Batch
+        Already committed; `wait()` blocks on it if unfinished.
+    out_bufs : list of metal_runtime.Buffer
+        This launch's outputs, read back on `wait()`.
+    """
+
+    batch: mr.Batch
+    out_bufs: list[mr.Buffer]
+
+    def wait(self) -> np.ndarray | tuple[np.ndarray, ...]:
+        """Block until the GPU is done, then return the outputs."""
+        self.batch.wait()
+        outs = tuple(b.to_numpy() for b in self.out_bufs)
+        return outs[0] if len(outs) == 1 else outs
+
+
 @dataclasses.dataclass(frozen=True)
 class BoundKernel:
     """A compiled Metal kernel behind a NumPy-in/NumPy-out call.
@@ -54,8 +76,7 @@ class BoundKernel:
     kernel : metal_runtime.Kernel
         The compiled pipeline.
     msl_source : str
-        The exact source that compiled; kept because reading the emitted
-        text beats re-deriving it when a kernel misbehaves.
+        Exact source that compiled.
     threadgroup : int or tuple of int, optional
         Explicit threadgroup size; None lets the runtime choose.
     """
@@ -70,27 +91,36 @@ class BoundKernel:
     _in_bufs: list[mr.Buffer] = dataclasses.field(
         default_factory=list, compare=False, repr=False
     )
+    # copy_from() into a reused _in_bufs entry races an in-flight GPU read of
+    # that same shared-storage buffer unless the prior launch is known done;
+    # waited on (a no-op if the caller already did) before the next reuse.
+    _last_pending: PendingResult | None = dataclasses.field(
+        default=None, compare=False, repr=False
+    )
 
-    def __call__(self, *arrays: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
-        """Dispatch over `spec.grid` threads and return the outputs.
+    def launch(self, *arrays: np.ndarray) -> PendingResult:
+        """Encode and commit one dispatch without blocking on the result.
+
+        `__call__` is `launch` followed by `wait()`.
 
         Parameters
         ----------
         *arrays : numpy.ndarray
             One array per kernel input, matching `spec.inputs` shapes;
-            copied into fresh device buffers each call.
+            copied into fresh or reused device buffers (see `_in_bufs`).
 
         Returns
         -------
-        numpy.ndarray or tuple of numpy.ndarray
-            One array per kernel output; a bare array for single-output
-            kernels.
+        PendingResult
+            Committed, not yet waited on.
         """
         spec = self.spec
         if len(arrays) != len(spec.inputs):
             raise TypeError(
                 f"kernel takes {len(spec.inputs)} arrays, got {len(arrays)}"
             )
+        if self._last_pending is not None:
+            self._last_pending.batch.wait()  # no-op if the caller already waited
         first_call = len(self._in_bufs) < len(spec.inputs)
         in_bufs = []
         for i, (a, info) in enumerate(zip(arrays, spec.inputs, strict=True)):
@@ -103,20 +133,41 @@ class BoundKernel:
                 self._in_bufs[i].copy_from(arr)
             in_bufs.append(self._in_bufs[i])
         # Fresh per call, unlike inputs: to_numpy() is a live view, so reusing
-        # this buffer would mutate an array already returned to the caller.
+        # this buffer would mutate an array a caller might still be holding
+        # from an earlier, not-yet-waited-on PendingResult.
         out_bufs = [
             mr.Buffer.empty(list(info.array_shape), dtype=info.dtype.name)
             for info in spec.outputs
         ]
         grid = tuple(int(g) for g in spec.grid)
-        mr.run(
+        batch = mr.Batch()
+        batch.add(
             self.kernel,
             grid=grid if len(grid) > 1 else grid[0],
             threadgroup=self.threadgroup,
             buffers=[*in_bufs, *out_bufs],
         )
-        outs = tuple(b.to_numpy() for b in out_bufs)
-        return outs[0] if len(outs) == 1 else outs
+        batch.commit()
+        pending = PendingResult(batch, out_bufs)
+        object.__setattr__(self, "_last_pending", pending)
+        return pending
+
+    def __call__(self, *arrays: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
+        """Dispatch over `spec.grid` threads and return the outputs.
+
+        Parameters
+        ----------
+        *arrays : numpy.ndarray
+            One array per kernel input, matching `spec.inputs` shapes;
+            copied into fresh or reused device buffers (see `_in_bufs`).
+
+        Returns
+        -------
+        numpy.ndarray or tuple of numpy.ndarray
+            One array per kernel output; a bare array for single-output
+            kernels.
+        """
+        return self.launch(*arrays).wait()
 
 
 def bind(
@@ -136,9 +187,8 @@ def bind(
     msl_source : str
         MSL text from `emit_msl`.
     math_mode : metal_runtime.MathMode, optional
-        FAST by default. Use SAFE for kernels using the df32 prelude:
-        FAST deletes compensated arithmetic (measured, see metal-runtime
-        notes/float32x2.md).
+        FAST by default. Use SAFE for df32-prelude kernels; FAST drops
+        compensated arithmetic.
     threadgroup : int or tuple of int, optional
         Explicit threadgroup size; None lets the runtime choose.
 

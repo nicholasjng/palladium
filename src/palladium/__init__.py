@@ -39,15 +39,13 @@ CacheKey = tuple[tuple[tuple[int, ...], str], ...]
 class MetalCallable:
     """The palladium pipeline behind a `pl.pallas_call`-shaped call.
 
-    Retraces per input shape/dtype because block layouts and loop bounds
-    are baked into the emitted MSL; identical shapes hit `cache`, and
+    Retraces per input shape/dtype; identical shapes hit `cache`,
     identical source hits metal-runtime's library cache below that.
 
     Attributes
     ----------
     interpret : callable
-        The same pallas_call with `interpret=True`: the CPU oracle every
-        correctness check diffs against.
+        The same pallas_call with `interpret=True`: the CPU oracle.
     cache : dict
         Maps input-shape signatures to compiled `BoundKernel`s;
         `cache[key].msl_source` is the emitted text for that shape.
@@ -88,9 +86,8 @@ class MetalCallable:
 def debug_msl(kernel: Callable, *example_args, **pallas_kwargs) -> str:
     """Trace `kernel` through pallas_call and return the emitted MSL.
 
-    The one-call version of the debugging loop. The per-operand pointer
-    lines at the top of the body carry the BlockSpec offsets; the rest is
-    the kernel jaxpr, statement by statement.
+    Per-operand pointer lines at the top of the body carry the BlockSpec
+    offsets; the rest is the kernel jaxpr, statement by statement.
 
     Parameters
     ----------

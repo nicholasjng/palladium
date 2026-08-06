@@ -1,14 +1,10 @@
-"""Step 1 of the pipeline: get the kernel jaxpr out of Pallas.
+"""Step 1 of the pipeline: extract the kernel jaxpr from Pallas.
 
-`pl.pallas_call` does not run the kernel; it stages it into a single
-`pallas_call` equation whose params carry the kernel body (a stateful
-jaxpr over Refs) and the grid/block structure. Tracing the wrapped call
-with `jax.make_jaxpr` and repackaging that equation is everything this
-module does.
+Traces the wrapped `pl.pallas_call` with `jax.make_jaxpr` and repackages
+the resulting `pallas_call` equation into a KernelSpec.
 
-Verified against JAX 0.11; the version-sensitive surface is the
-`grid_mapping` / `block_mapping` dataclass fields (see `_block_infos`),
-which is why the jax dependency is pinned to one minor.
+Pinned to JAX 0.11: `grid_mapping`/`block_mapping` dataclass fields are
+version-sensitive (see `_block_infos`).
 """
 
 from __future__ import annotations
@@ -33,11 +29,11 @@ class BlockInfo:
     block_shape : tuple of int
         Kernel-visible block shape, squeezed dims removed.
     array_shape : tuple of int
-        Shape of the full underlying array.
+        Full array shape.
     dtype : numpy.dtype
         Element type, shared by block and array.
     index_map_jaxpr : ClosedJaxpr
-        The staged BlockSpec index map: grid indices to block index, in
+        Staged BlockSpec index map: grid indices to block index, in
         units of blocks.
     """
 
@@ -62,9 +58,7 @@ class KernelSpec:
     inputs, outputs : tuple of BlockInfo
         Operand descriptions in jaxpr order.
     raw_params : dict
-        The full, unprocessed pallas_call params. Future features (scratch
-        shapes, dimension semantics) reach in here rather than growing
-        this dataclass speculatively.
+        Full, unprocessed pallas_call params.
     """
 
     name: str
