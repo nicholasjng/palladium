@@ -1,53 +1,77 @@
 # palladium
 
-Pallas kernels on Apple GPU: trace a `pl.pallas_call`, emit Metal Shading Language,
-dispatch through [metal-runtime](https://github.com/nicholasjng/metal-runtime).
-The result is hand-written kernels running faster than Diffrax on ODE integration, measured in `examples/`.
+Hand-authored ODE/SDE integrator kernels on Apple GPU: trace a
+`pl.pallas_call`, emit Metal Shading Language, dispatch through
+[metal-runtime](https://github.com/nicholasjng/metal-runtime). You
+write an ordinary [Pallas](https://docs.jax.dev/en/latest/pallas/index.html)
+kernel — control flow via `fori_loop`/`scan`/`while_loop` over one
+thread per program instance — and palladium turns it into a compiled
+Metal kernel behind a NumPy-in/NumPy-out callable, or a jax.ffi
+primitive that composes inside `jax.jit`.
+
+```python
+import jax, jax.numpy as jnp
+import palladium
+
+def rk4_step(y_ref, dt_ref, o_ref):
+    ...  # ordinary Pallas: refs, BlockSpecs, jnp ops, fori_loop/scan/while
+
+call = palladium.metal_call(rk4_step, grid=..., in_specs=..., out_shape=...)
+out = call(y0, dt)                       # eager, NumPy in/out
+oracle = call.interpret(y0, dt)          # the same kernel on the CPU interpreter
+print(call.explain(y0, dt))              # launch geometry, emitted MSL size
+```
+
+The bundled Lotka-Volterra RK4 ensemble example runs tens of times
+faster than `jax.jit(vmap(diffeqsolve))` on CPU at N=100,000 (M1 Pro);
+see `docs/performance.md` for the measurement discipline behind
+comparisons like this.
+
+Note: an earlier iteration of this project also grew a cooperative
+SIMD-group/MMA GEMM lowering (matmuls, flash attention, MLP training).
+That capability outgrew being a side feature and was split out into its
+own sibling project, `mgemm`; palladium stays scoped to hand-authored
+control-flow kernels.
 
 ## Setup
 
-```sh
-uv sync
-uv run pytest -m "not exercise"   # baseline sanity check: must be green
-```
-
-`uv sync` also compiles `native/ffi/palladium_ffi.cpp` (scikit-build-core,
-root `CMakeLists.txt`); needs CMake and Ninja on `PATH` (`brew install
-cmake ninja`), same as metal-runtime.
-
-metal-runtime is a git dependency (`pyproject.toml`), no sibling checkout needed.
-Developing metal-runtime itself: point `[tool.uv.sources]` at a local `path` instead of a git revision.
-
-## Status
-
-Exercises 1-5 (block load/store, elementwise, grids, loops, the RK4 capstone) and stretches 6-10
-(indexed ref access, per-thread adaptive stepping, counter-based RNG, df32 precision, jax.ffi
-integration) are done:
+Requires macOS on Apple silicon, Python 3.12+, CMake and Ninja
+(`brew install cmake ninja`). metal-runtime is currently consumed as a
+sibling path dependency (`[tool.uv.sources]` in `pyproject.toml`), so
+check both repos out next to each other:
 
 ```sh
-uv run pytest tests/                              # everything green
-uv run python examples/02_adaptive_lockstep.py     # the headline result
+git clone https://github.com/nicholasjng/metal-runtime
+git clone <this repo> palladium && cd palladium
+uv sync          # builds metal-runtime and the native FFI handler
+uv run pytest -q # must be green on a Metal-capable Mac
 ```
 
-`02_adaptive_lockstep.py` runs a Van der Pol ensemble through Diffrax's
-`vmap`-synchronized adaptive solve and palladium's per-thread adaptive
-kernel (Bogacki-Shampine 3(2), FSAL, PI controller), and prints
-wall-clock and step-count comparisons for both.
+## Documentation
+
+- [Getting started](docs/getting-started.md): first kernel, the
+  interpret-oracle workflow, `explain()`, debugging hooks, the error
+  taxonomy.
+- [Supported subset](docs/supported-subset.md): the contract. Which
+  primitives, dtypes, and kernel structures are supported.
+- [Performance guide](docs/performance.md): execution models, the
+  dispatch floor, `pin()`, FFI overhead, math modes, and how to measure
+  on thermally sensitive hardware.
+- [Extending](docs/extending.md): registering lowering rules for new
+  primitives with `palladium.rule`.
+
+Versioning: pre-1.0 semver (minor may break the public API, patch may
+not); the public API is `palladium.__all__`. jax is pinned to a tested
+range (`>=0.11,<0.12`) and a weekly CI canary tests jax head before the
+pin widens. History in [CHANGELOG.md](CHANGELOG.md).
 
 ## Integrating with JAX
 
-`metal_call(...)` is NumPy-in, NumPy-out: it traces a kernel once,
-compiles it, and runs it eagerly. `MetalCallable.__call__` calls
-`np.asarray` on its arguments, which fails the moment one is a tracer,
-so a `metal_call` result cannot sit inside a jitted computation.
-
-`metal_call_jit(...)` (`src/palladium/ffi.py`) is the fix: same
-`pl.pallas_call`-shaped entry point, but dispatch happens through
-`jax.ffi.ffi_call` against a registered FFI target instead of eagerly.
-CPU stays the JAX-visible platform (`register_ffi_target(...,
-platform="cpu")`); Metal is reached through the FFI escape hatch, no new
-PJRT client needed. The result is an ordinary JAX primitive: traceable,
-jittable, composable with surrounding `jax.numpy` code.
+`metal_call` is eager and NumPy-based, so its result cannot sit inside
+a jitted computation. `metal_call_jit` registers the kernel as a
+jax.ffi target instead: CPU stays the JAX-visible platform, Metal is
+reached through the FFI escape hatch, and the call is an ordinary JAX
+primitive, traceable and composable with surrounding `jax.numpy` code.
 
 ```python
 call = palladium.metal_call_jit(kernel, out_shape=jax.ShapeDtypeStruct((8, 8), jnp.float32))
@@ -58,82 +82,47 @@ def composed(x, y):
 ```
 
 One generic native handler (`native/ffi/palladium_ffi.cpp`) backs every
-palladium kernel: MSL source, entry point name, grid, and math mode
-travel as FFI attributes (baked into the HLO at trace time), and
-`RemainingArgs`/`RemainingRets` cover any input/output count. Nothing to
-build separately: the repo root's `CMakeLists.txt` (scikit-build-core)
-compiles it and ships `libpalladium_ffi.dylib` inside the `palladium`
-package as part of `uv sync`/`pip install`, the same way metal-runtime
-ships `libmetal_runtime_c.dylib`. `metal_call_jit` finds it via
-`importlib.resources`; `PALLADIUM_FFI_LIBRARY` overrides the path for an
-out-of-tree build. Not differentiable: `ffi_call` has no JVP/transpose
-rule by default.
-
-## How the emitter was built
-
-Test-driven, one primitive group at a time. The stubs live in
-`src/palladium/emit.py`; each names its test file, each test file names
-its stub, and every docstring carries the hints.
-
-1. `test_02_emit_copy.py`: block load/store
-2. `test_03_emit_elementwise.py`: the elementwise table
-3. `test_04_grid_blocks.py`: grids, program_id, BlockSpec offsets
-4. `test_05_loops.py`: fori_loop -> C for-loop (the one that matters)
-5. `test_06_capstone_rk4.py`: batched RK4 Lotka-Volterra, no new rules
-6. `test_07_preflight.py` / `test_08_adaptive.py`: comparisons and
-   select_n, then the adaptive controller kernel built on top of them
-7. `test_09_indexed_refs.py`: indexed ref access, `x_ref[i, j]`
-8. `test_10_random_bits.py`: counter-based RNG, `jax.random` inside a kernel
-
-`uv run pytest tests/ -x` finds the first red test when a new stretch is scaffolded.
-
-Debugging: the emitter's output is just text, read it.
-`print(palladium.debug_msl(kernel, *args, **pallas_kwargs))` is the
-one-call version; `PALLADIUM_DUMP_MSL=1` (or `=<dir>`) dumps every
-kernel's source at compile time, and Metal compile errors arrive with the
-line-numbered source attached. The CPU oracle for any kernel is
-`metal_call(...).interpret`.
-
-## Machinery
-
-- `tests/golden/` pins the emitted MSL for three canonical kernels;
-  regenerate after intended emitter changes with
-  `PALLADIUM_REGEN_GOLDEN=1 uv run pytest tests/test_msl_snapshots.py`
-  and review the diff.
-- `uv run mew run` benchmarks the ensemble solve (palladium vs Diffrax),
-  filter with `--tag palladium|diffrax`.
-- `uv run pytest -m fuzz` differential-fuzzes the emitter: Hypothesis
-  generates random kernels (expression trees, loops with permuted
-  carries) and diffs Metal against the interpret oracle under SAFE math.
-  Excluded from default runs; scale with `PALLADIUM_FUZZ_EXAMPLES`. On a
-  failure, Hypothesis shrinks to a minimal kernel, turn it into a named
-  regression test. Doesn't generate indexed-ref kernels yet: stretch 6
-  landed without generated coverage, still worth adding.
+kernel: MSL source, entry point, launch geometry, and math mode travel
+as FFI attributes. It is built by `uv sync` via the root
+`CMakeLists.txt`; `PALLADIUM_FFI_LIBRARY` overrides the path for an
+out-of-tree build. `jax.grad` works by pairing a backward kernel via
+`jax.custom_vjp` (`metal_call_jit` kernels have no JVP/transpose rule of
+their own); `jax.vmap` works with `vmap_method="sequential"` (one
+dispatch per batch element; a batch dim in the Pallas grid is the fast
+path).
 
 ## Examples
 
 - `01_ode_ensembles.py`: batched RK4 Lotka-Volterra, palladium vs
-  jit(vmap(diffeqsolve)).
-- `02_adaptive_lockstep.py`: the lockstep tax. Diffrax vs palladium's
-  per-thread adaptive controller on a Van der Pol ensemble.
-- `03_sde_montecarlo.py`: GBM Monte Carlo, hand-written MSL (pcg_hash)
-  next to a Pallas-authored version (`jax.random`, Threefry-2x32-20) for
-  comparison, both validated against Black-Scholes.
-- `04_reaction_diffusion.py`: Gray-Scott stencil, one thread per grid
-  point, halo reads via indexed ref access. Beats the CPU baseline.
-- `05_df32_precision.py`: does compensated arithmetic (df32) buy real
-  accuracy on the RK4 capstone. FAST vs SAFE vs df32, all measured
-  against a true float64 reference, not against each other.
-- `06_flash_attention.py`: single-head scaled-dot-product attention,
-  online-softmax with streaming K/V (one thread per query, no cross-
-  thread reduction needed, unlike training a shared model). Verified
-  against an independent NumPy implementation of the recurrence, not
-  just assembled and hoped. Streaming avoids the per-thread stack limit
-  a full-materialization approach would hit at any real sequence
-  length; honest result: still ~15-20x slower than a plain `jax.jit`
-  reference, and that's `dot_general` being a naive scalar loop, not a
-  parallelism problem this time. Full story in ROADMAP's stretch 17.
+  `jit(vmap(diffeqsolve))`.
+- `02_adaptive_lockstep.py`: the vmap lockstep tax. Diffrax vs a
+  per-thread adaptive controller (Bogacki-Shampine 3(2), PI control)
+  with divergent per-thread step counts.
+- `03_sde_montecarlo.py`: GBM Monte Carlo with in-kernel counter-based
+  RNG, validated against Black-Scholes.
+- `04_reaction_diffusion.py`: Gray-Scott stencil via indexed ref
+  access.
+- `05_df32_precision.py`: compensated (df32) arithmetic under
+  `math_mode=SAFE`, measured against a float64 reference.
 
 ```sh
-uv run python examples/02_adaptive_lockstep.py
+uv run python examples/01_ode_ensembles.py
 ```
+
+## Development machinery
+
+- Every kernel-lowering test diffs the GPU result against
+  `interpret=True`, the CPU oracle; rules are verified by sabotage
+  (break the rule, watch the test fail), not by passing.
+- `tests/golden/` pins emitted MSL for canonical kernels; regenerate
+  after intended emitter changes with `PALLADIUM_REGEN_GOLDEN=1
+  uv run pytest tests/test_msl_snapshots.py` and review the diff.
+- `uv run pytest -m fuzz` differential-fuzzes the emitter with
+  Hypothesis-generated kernels (expression trees, loops with permuted
+  carries, control flow) against the oracle under SAFE math; scale with
+  `PALLADIUM_FUZZ_EXAMPLES`. It has caught real bugs, including a Metal
+  compiler miscompile (`docs/notes/emitter-simplifications.md`).
+- `uv run mew run` benchmarks the ensemble solve, filter with
+  `--tag palladium|diffrax`.
+- `docs/notes/` is the development lab notebook (design explorations,
+  measurement records); `ROADMAP.md` the longer arc.
