@@ -1,6 +1,6 @@
 """Exercise 5, the capstone: a batched RK4 Lotka-Volterra integrator.
 
-No new emitter rules — if exercises 1-4 are green, this composes them.
+No new emitter rules: if exercises 1-4 are green, this composes them.
 One Metal thread integrates one (prey, predator) system over `STEPS` RK4
 steps with its own parameters; the grid is the ensemble. This is the
 kernel that examples/01_ode_ensembles.py benchmarks against Diffrax.

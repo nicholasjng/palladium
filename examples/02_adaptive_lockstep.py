@@ -1,4 +1,4 @@
-"""Example 2: the lockstep tax — why per-thread adaptivity is the prize.
+"""Example 2: the lockstep tax, or why per-thread adaptivity is the prize.
 
 `vmap` over an adaptive Diffrax solve forces the whole batch into lockstep:
 every trajectory takes (and rejects) the steps its worst neighbour needs.
@@ -6,9 +6,9 @@ This script MEASURES that tax on the CPU backend by salting a mild Van der
 Pol ensemble with a few stiff members and timing the same batch with and
 without them.
 
-It runs today, with no palladium code: it is the motivation. The payoff —
+It runs today, with no palladium code: it is the motivation. The payoff,
 each Metal thread running its own PI-controlled adaptive loop, immune to
-its neighbours — is ROADMAP exercise 7, and this script is where it will
+its neighbours, is ROADMAP exercise 7, and this script is where it will
 plug in.
 """
 
@@ -80,7 +80,7 @@ def main():
     print()
     print("Every lane pays for the stiff lanes' steps: vmap synchronizes the")
     print("step-size controller across the batch. A per-thread adaptive loop")
-    print("in a Metal kernel pays only where stiffness actually is —")
+    print("in a Metal kernel pays only where stiffness actually is:")
     print("ROADMAP exercise 7 builds it on top of the exercise-4 loop rule.")
 
 

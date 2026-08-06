@@ -1,9 +1,9 @@
-"""Example 3: SDE Monte Carlo on the GPU — hand-written MSL, runs today.
+"""Example 3: SDE Monte Carlo on the GPU. Hand-written MSL, runs today.
 
 Prices a European call under geometric Brownian motion: N paths x M
 Euler-Maruyama steps, one Metal thread per path, RNG generated in-kernel
 (counter-based hash + Box-Muller), validated against the Black-Scholes
-closed form. No palladium codegen involved — this is the runtime showcase
+closed form. No palladium codegen involved: this is the runtime showcase
 and the performance bar the Pallas-authored path should meet.
 
 RNG note: pcg_hash is fine for a pricing demo (each (path, step) pair gets
@@ -103,7 +103,7 @@ def main():
     print()
     print("Diffrax comparison: solving the same SDE with diffrax on CPU is")
     print("dominated by Brownian-path bookkeeping; try it with Euler +")
-    print("UnsafeBrownianPath at N=10_000 and extrapolate — then write the")
+    print("UnsafeBrownianPath at N=10_000 and extrapolate, then write the")
     print("Pallas version once in-kernel RNG lands (ROADMAP exercise 8).")
 
 

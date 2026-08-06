@@ -52,7 +52,7 @@ def test_program_id_lands_in_the_right_block():
 
 
 def test_row_blocks_2d(rng):
-    """Blocks are rows of a 2D array: (1, 128) of (64, 128) — contiguous."""
+    """Blocks are rows of a 2D array: (1, 128) of (64, 128), contiguous."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] + 1.0
@@ -91,7 +91,7 @@ def test_2d_grid_with_index_map_arithmetic(rng):
 
 def test_noncontiguous_block_is_rejected(rng):
     """(4, 8) blocks of a (32, 128) array are strided in memory. The driver
-    refuses them up front — loudly wrong beats silently wrong. Lifting this
+    refuses them up front: loudly wrong beats silently wrong. Lifting this
     (strided copy loops in get/swap) is the ROADMAP's stretch exercise 6."""
 
     def kernel(x_ref, o_ref):

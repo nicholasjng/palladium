@@ -26,7 +26,7 @@ def test_emitted_source_is_plausible_msl(rng):
     msl = palladium.emit_msl(spec)
     assert "kernel void" in msl
     assert "[[buffer(0)]]" in msl and "[[buffer(1)]]" in msl
-    # It must actually compile — Metal's frontend is the real judge.
+    # It must actually compile: Metal's frontend is the real judge.
     import metal_runtime as mr
 
     mr.Kernel(msl, spec.name)

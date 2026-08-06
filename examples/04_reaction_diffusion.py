@@ -1,9 +1,9 @@
-"""Example 4: method-of-lines PDE — the large-state contrast.
+"""Example 4: method-of-lines PDE, the large-state contrast.
 
 Gray-Scott reaction-diffusion on a 128x128 grid, integrated with explicit
 Euler. The baseline (runs today) is jax.jit + lax.scan on CPU. The Metal
 version is a stencil kernel: one thread per grid point, halo reads from
-neighbours, threadgroup-memory tiling for the reads — which needs *indexed*
+neighbours, threadgroup-memory tiling for the reads, which needs *indexed*
 ref access (`x_ref[i, j]`), the ROADMAP's stretch exercise 6. Until then
 this script prints the baseline and stops.
 """
@@ -66,7 +66,7 @@ def main():
     )
     print()
     print("Metal stencil version: pending indexed ref access (x_ref[i, j]),")
-    print("ROADMAP stretch exercise 6 — one thread per cell, halo reads,")
+    print("ROADMAP stretch exercise 6: one thread per cell, halo reads,")
     print("threadgroup-memory tiling via run(..., threadgroup_memory=[...]).")
 
 

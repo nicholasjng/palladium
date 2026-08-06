@@ -1,6 +1,6 @@
 """Provided, green from day one: tracing Pallas into KernelSpecs.
 
-Also your map of the territory: run with -s and read the printed jaxprs —
+Also your map of the territory: run with -s and read the printed jaxprs;
 every exercise rule consumes exactly these structures.
 """
 
@@ -66,7 +66,7 @@ def test_gridded_spec_and_loop_staging(rng):
 
 
 def test_interpret_mode_is_the_oracle(rng):
-    """interpret=True runs the kernel on CPU — the reference for every
+    """interpret=True runs the kernel on CPU, the reference for every
     exercise. (Without it, pallas_call refuses to run on CPU at all.)"""
     f = pl.pallas_call(
         _mad_kernel,

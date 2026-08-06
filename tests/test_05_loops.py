@@ -1,4 +1,4 @@
-"""Exercise 4: `_rule_scan` in emit.py — fori_loop becomes a C for-loop.
+"""Exercise 4: `_rule_scan` in emit.py. fori_loop becomes a C for-loop.
 
 This is the exercise that makes the whole project worthwhile: once the
 time-stepping loop lives *inside* the kernel, one dispatch does the whole
@@ -19,7 +19,7 @@ pytestmark = pytest.mark.exercise
 def test_euler_logistic(rng):
     """dy/dt = r*y(1 - y), 100 explicit Euler steps, entirely in-kernel.
 
-    The rate r is read from a Ref *before* the loop and used inside it —
+    The rate r is read from a Ref *before* the loop and used inside it;
     that is how scan consts arise (see the exercise-4 docstring), and every
     real ODE kernel has them (its parameters). Meet them here, not in the
     capstone."""
@@ -89,9 +89,10 @@ def test_nested_loops(rng):
     y = rng.uniform(0.5, 1.5, 128).astype(np.float32)
     np.testing.assert_allclose(f(y), np.asarray(f.interpret(y)), rtol=1e-4)
 
+
 def test_carry_permutation(rng):
     """A body that returns its carries reordered: `return b, a` stages
-    outvars that ARE the carry vars, so a sequential copy-back clobbers —
+    outvars that ARE the carry vars, so a sequential copy-back clobbers;
     scan semantics require all carries to update simultaneously."""
 
     def kernel(x_ref, y_ref, xo_ref, yo_ref):

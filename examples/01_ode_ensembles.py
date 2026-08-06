@@ -1,8 +1,8 @@
-"""Example 1: massive ensembles of small ODEs — palladium vs Diffrax.
+"""Example 1: massive ensembles of small ODEs, palladium vs Diffrax.
 
 One Metal thread integrates one Lotka-Volterra system (RK4, fixed step)
 with its own parameters; the grid is the ensemble. The Diffrax baseline is
-the same ensemble under jit(vmap(diffeqsolve)) on the CPU backend — on
+the same ensemble under jit(vmap(diffeqsolve)) on the CPU backend; on
 macOS that IS the practical Diffrax deployment (jax-metal is stale and
 cannot run it; see ROADMAP).
 
@@ -128,7 +128,7 @@ def main():
             "(fixed- vs adaptive-step, f32; not a bug at ~1e-3)"
         )
     except NotImplementedError as e:
-        print(f"palladium path pending — {e}")
+        print(f"palladium path pending: {e}")
         print("finish the exercises: uv run pytest tests/ -m exercise")
 
 
