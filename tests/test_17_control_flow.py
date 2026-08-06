@@ -71,7 +71,7 @@ def test_switch_three_branches_and_index_clamping(rng):
 def test_while_loop_trip_count_diverges_per_thread(rng):
     def kernel(x_ref, o_ref):
         def cond(carry):
-            y, n = carry
+            y, _ = carry
             return y >= 1.0
 
         def body(carry):
@@ -94,7 +94,7 @@ def test_while_swapped_carries_need_the_snapshot(rng):
 
     def kernel(a_ref, o_ref):
         def cond(carry):
-            a, b, n = carry
+            *_, n = carry
             return n < 5
 
         def body(carry):
@@ -102,7 +102,7 @@ def test_while_swapped_carries_need_the_snapshot(rng):
             return b, a + b, n + 1
 
         a0 = a_ref[0, 0]
-        a, b, n = jax.lax.while_loop(cond, body, (a0, a0 + 1.0, jnp.int32(0)))
+        a, b, _ = jax.lax.while_loop(cond, body, (a0, a0 + 1.0, jnp.int32(0)))
         o_ref[0, 0] = a + b
 
     a = rng.standard_normal((128, 1)).astype(np.float32)

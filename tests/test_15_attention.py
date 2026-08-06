@@ -43,7 +43,7 @@ def _attention_kernel(seq_len: int, head_dim: int, block_kv: int):
         m0 = jnp.full((1, 1), -jnp.inf, jnp.float32)
         l0 = jnp.zeros((1, 1), jnp.float32)
         o0 = jnp.zeros((1, head_dim), jnp.float32)
-        m, l, o = jax.lax.fori_loop(0, seq_len // block_kv, step, (m0, l0, o0))
+        _, l, o = jax.lax.fori_loop(0, seq_len // block_kv, step, (m0, l0, o0))
         o_ref[...] = o / l
 
     return palladium.metal_call(

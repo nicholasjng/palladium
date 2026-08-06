@@ -171,7 +171,7 @@ def test_cooperative_kernel_dispatches_through_ffi(rng):
         m0 = jnp.full((bq, 1), -jnp.inf, jnp.float32)
         l0 = jnp.zeros((bq, 1), jnp.float32)
         o0 = jnp.zeros((bq, hd), jnp.float32)
-        m, l, o = jax.lax.fori_loop(0, seq // bkv, step, (m0, l0, o0))
+        _, l, o = jax.lax.fori_loop(0, seq // bkv, step, (m0, l0, o0))
         o_ref[...] = o / l
 
     f = palladium.metal_call_jit(
