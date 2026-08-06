@@ -1,9 +1,10 @@
 """Example 4: method-of-lines PDE, the large-state contrast.
 
+Docs: indexed ref access, docs/supported-subset.md (ref indexing).
 Gray-Scott reaction-diffusion on a 128x128 grid, integrated with explicit
 Euler. The baseline is jax.jit + lax.scan on CPU. The Metal version is a
 stencil kernel: one thread per grid point, halo reads from neighbours via
-indexed ref access (`x_ref[i, j]`, stretch 6, `test_09_indexed_refs.py`).
+indexed ref access (`x_ref[i, j]`, `test_09_indexed_refs.py`).
 
 A PDE step depends on every thread's neighbours finishing the previous
 step first, which a single dispatch cannot guarantee across threadgroups

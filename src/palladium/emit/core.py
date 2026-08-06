@@ -18,7 +18,10 @@ from typing import TYPE_CHECKING, Protocol
 from jax.core import ShapedArray
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
+from palladium.errors import EmitError, UnsupportedPrimitiveError
 from palladium.trace import BlockInfo, KernelSpec
+
+__all__ = ["EmitError"]  # re-export; the class lives in palladium.errors
 
 if TYPE_CHECKING:
     from typing_extensions import TypeIs
@@ -73,14 +76,12 @@ CTYPES = {
 # lane count and dispatch.BoundKernel's launch geometry must agree on it.
 SIMDGROUP_WIDTH = 32
 
+# Threadgroup memory per threadgroup on Apple GPUs. Checked at emission
+# so an over-budget kernel fails with the numbers instead of an opaque
+# Metal pipeline error.
+TG_MEMORY_LIMIT = 32768
+
 _PID = ("_pid.x", "_pid.y", "_pid.z")
-
-
-class EmitError(Exception):
-    """The emitter cannot lower this kernel (unsupported or invalid input).
-
-    Distinct from NotImplementedError, which marks a missing rule.
-    """
 
 
 @dataclasses.dataclass(frozen=True)
@@ -192,6 +193,9 @@ class EmitState:
         # declarations that must be function-scope (threadgroup arrays)
         # but are requested by rules emitting inside nested blocks.
         self.prologue: list[str] = []
+        # Total threadgroup memory declared through the prologue, in
+        # bytes; emit_msl rejects kernels over TG_MEMORY_LIMIT.
+        self.tg_bytes: int = 0
         # Query rows per program instance in the cooperative model (R in
         # the layout taxonomy in the coop module). 1 for
         # the original one-row model; set by emit_msl before emission.
@@ -335,7 +339,7 @@ def emit_jaxpr(state: EmitState, jaxpr: Jaxpr, in_vals: list[CVal]) -> list[CVal
         jaxpr,
         in_vals,
         RULES,
-        lambda name: NotImplementedError(
+        lambda name: UnsupportedPrimitiveError(
             f"no MSL rule for primitive '{name}'; add one with @rule(...)"
         ),
     )
@@ -421,19 +425,24 @@ def emit_msl(
     ------
     EmitError
         For grids over rank 3, non-contiguous blocks, or scratch operands.
-    NotImplementedError
+    UnsupportedPrimitiveError
         If the kernel stages a primitive with no registered rule.
     """
     name = kernel_name or spec.name
     if len(spec.grid) > 3:
         raise EmitError(f"grid {spec.grid} has rank > 3; Metal grids are 3D")
     from palladium.emit.coop import coop_rows, emit_jaxpr_coop
+    from palladium.emit.gemm import emit_gemm, gemm_desc
 
     rows = coop_rows(spec) if cooperative is not False else None
     if cooperative is None:
         cooperative = rows is not None
     elif cooperative and rows is None:
         raise EmitError("cooperative=True but the kernel has no cooperative lowering")
+    # The specialized GEMM lowering launches several SIMD-groups (one
+    # instance each) per threadgroup; dispatch.bind and the FFI path read
+    # the same gemm_groups() to size the threadgroup accordingly.
+    desc = gemm_desc(spec) if cooperative else None
 
     operands = list(spec.inputs) + list(spec.outputs)
     n_in = len(spec.inputs)
@@ -446,12 +455,21 @@ def emit_msl(
     if cooperative:
         params.append("uint3 _tgid [[threadgroup_position_in_grid]]")
         params.append("ushort _lane [[thread_index_in_simdgroup]]")
+        if desc is not None:
+            params.append("ushort _sg [[simdgroup_index_in_threadgroup]]")
     else:
         params.append("uint3 _pid [[thread_position_in_grid]]")
 
     state = EmitState()
     if cooperative:
-        state.pid_exprs = ("_tgid.x", "_tgid.y", "_tgid.z")
+        if desc is not None:
+            state.pid_exprs = (
+                f"(_tgid.x * {desc.groups}u + (uint)_sg)",
+                "_tgid.y",
+                "_tgid.z",
+            )
+        else:
+            state.pid_exprs = ("_tgid.x", "_tgid.y", "_tgid.z")
         state.coop_rows = rows or 1
     ref_vals: list[CVal] = []
     for k, info in enumerate(operands):
@@ -481,12 +499,20 @@ def emit_msl(
             f"{n_refs} operands; scratch_shapes are not supported yet"
         )
     body_mark = len(state.lines)
-    if cooperative:
+    if desc is not None:
+        emit_gemm(state, ref_vals, desc)
+    elif cooperative:
         emit_jaxpr_coop(state, spec.jaxpr, ref_vals)
     else:
         emit_jaxpr(state, spec.jaxpr, ref_vals)
     if state.prologue:
         state.lines[body_mark:body_mark] = ["    " + line for line in state.prologue]
+    if state.tg_bytes > TG_MEMORY_LIMIT:
+        raise EmitError(
+            f"kernel declares {state.tg_bytes} bytes of threadgroup memory; "
+            f"Apple GPUs cap it at {TG_MEMORY_LIMIT} per threadgroup. Fewer "
+            "or smaller dot_generals per kernel stay under the budget."
+        )
 
     head = f"kernel void {name}(\n    " + ",\n    ".join(params) + ")\n{"
     return "\n".join(

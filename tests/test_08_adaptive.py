@@ -1,8 +1,8 @@
-"""Stretch 7: the per-thread adaptive controller kernel.
+"""The per-thread adaptive controller kernel.
 
 Composition on top of test_07_preflight.py's primitives (comparisons,
 select_n/where, inf/nan literals, fori_loop accumulation), the same way
-the capstone composed exercises 1-4. No new emitter rules. Van der Pol
+the RK4 capstone composes the base rules. No new emitter rules. Van der Pol
 ensemble, matching examples/02_adaptive_lockstep.py's mu distribution.
 
 Bogacki-Shampine 3(2): a smaller embedded pair than RK45 (roughly half
@@ -18,8 +18,6 @@ import pytest
 from jax.experimental import pallas as pl
 
 import palladium
-
-pytestmark = pytest.mark.exercise
 
 F32 = jnp.float32
 

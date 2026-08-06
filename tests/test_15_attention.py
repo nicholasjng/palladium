@@ -1,4 +1,4 @@
-"""Stretch 17: single-head attention, matching examples/06_flash_attention.py.
+"""Single-head attention, matching examples/06_flash_attention.py.
 
 Online-softmax, streaming K/V in fixed-size blocks via dynamic ref
 slicing inside a fori_loop, carrying a (running max, running sum,
@@ -6,19 +6,15 @@ running output) accumulator. Verified against an independent NumPy
 implementation of the online-softmax recurrence (not just the interpret
 oracle, which shares the kernel's own jaxpr) before writing any
 MSL-generating code; see `examples/06_flash_attention.py`'s module
-docstring for the full story, including why this replaced the deleted
-MLP training kernel example.
+docstring for the full story.
 """
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from jax.experimental import pallas as pl
 
 import palladium
-
-pytestmark = pytest.mark.exercise
 
 
 def _attention_kernel(seq_len: int, head_dim: int, block_kv: int):

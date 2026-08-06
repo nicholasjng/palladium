@@ -1,5 +1,6 @@
 """Example 3: SDE Monte Carlo on the GPU.
 
+Docs: in-kernel RNG, docs/supported-subset.md (RNG).
 Prices a European call under geometric Brownian motion: N paths x M
 Euler-Maruyama steps, one Metal thread per path, RNG generated in-kernel,
 validated against the Black-Scholes closed form.
@@ -7,7 +8,7 @@ validated against the Black-Scholes closed form.
 Two versions. `GBM_MSL` is hand-written MSL with a cheap pcg_hash RNG:
 the runtime showcase and the performance bar. `pallas_gbm_kernel` is the
 same model authored in Pallas, using `jax.random` directly inside the
-kernel (Threefry-2x32-20, stretch 8, `test_10_random_bits.py`) instead of
+kernel (Threefry-2x32-20, `test_10_random_bits.py`) instead of
 hand-rolled MSL: `random_fold_in` derives an independent key per (path,
 step) pair, the same shape `pcg_hash`'s counter does. Threefry is ~20
 rounds of add-rotate-xor per draw versus pcg_hash's one; expect the

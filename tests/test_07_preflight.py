@@ -1,4 +1,4 @@
-"""Stretch-7 pre-flight: comparisons, select_n, and inf/nan literals.
+"""Pre-flight for the adaptive controller: comparisons, select_n, inf/nan literals.
 
 These are the emitter features an adaptive step controller stages; each
 test isolates one, and the last composes them into a controller-shaped

@@ -13,9 +13,9 @@ and a real wheel install (dylib inside the installed package).
 from __future__ import annotations
 
 import ctypes
-import functools
 import importlib.resources
 import os
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -23,8 +23,10 @@ from typing import Any
 import jax
 import numpy as np
 
+from palladium.diagnostics import KernelDiagnostics, explain_spec, log_compile
 from palladium.emit import emit_msl, is_simdgroup_cooperative
 from palladium.emit.core import SIMDGROUP_WIDTH
+from palladium.emit.gemm import gemm_groups
 from palladium.trace import KernelSpec, trace
 
 __all__ = ["FfiCallable", "metal_call_jit"]
@@ -57,12 +59,34 @@ def _library_path() -> Path:
     return Path(str(candidate))
 
 
-@functools.cache
+_REGISTER_LOCK = threading.Lock()
+_registered = False
+
+
 def _register() -> None:
-    """Loads the native handler and registers it, once per process."""
-    handle = ctypes.CDLL(str(_library_path()))
-    capsule = jax.ffi.pycapsule(handle.palladium_dispatch)
-    jax.ffi.register_ffi_target(_TARGET_NAME, capsule, platform="cpu")
+    """Loads the native handler and registers it, once per process.
+
+    Locked, not `functools.cache`: concurrent first calls must not both
+    run the registration body.
+    """
+    global _registered
+    if _registered:
+        return
+    with _REGISTER_LOCK:
+        if _registered:
+            return
+        handle = ctypes.CDLL(str(_library_path()))
+        capsule = jax.ffi.pycapsule(handle.palladium_dispatch)
+        jax.ffi.register_ffi_target(_TARGET_NAME, capsule, platform="cpu")
+        _registered = True
+
+
+# jax.ffi.ffi_call's batching methods that re-invoke the target once per
+# batch element, which is the only shape palladium can honor: the grid
+# and MSL source are baked as FFI attributes for the unbatched shape, so
+# the whole-batch methods (expand_dims, broadcast_all) would dispatch
+# that grid over batched buffers and return wrong results silently.
+_SAFE_VMAP_METHODS = (None, "sequential", "sequential_unrolled")
 
 
 class FfiCallable:
@@ -74,8 +98,9 @@ class FfiCallable:
     Tracing and MSL emission are cached per input shape/dtype, same as
     `MetalCallable` caches `BoundKernel`s.
 
-    Not differentiable: `ffi_call` has no JVP/transpose rule by default
-    (a `custom_vjp` wrapper is the path if ever needed).
+    Not differentiable by itself: `ffi_call` has no JVP/transpose rule.
+    Pair a forward and a backward kernel through `jax.custom_vjp`; see
+    `examples/07_custom_vjp.py` for the worked recipe.
 
     Attributes
     ----------
@@ -84,45 +109,87 @@ class FfiCallable:
     """
 
     def __init__(
-        self, kernel: Callable, pallas_kwargs: dict[str, Any], math_mode: Any
+        self,
+        kernel: Callable,
+        pallas_kwargs: dict[str, Any],
+        math_mode: Any,
+        vmap_method: str | None = None,
     ) -> None:
         import jax.experimental.pallas as pl
 
+        if vmap_method not in _SAFE_VMAP_METHODS:
+            raise ValueError(
+                f"vmap_method {vmap_method!r} is not supported: the launch "
+                "grid is baked per unbatched shape, so whole-batch methods "
+                "would dispatch it over batched buffers. Use 'sequential' "
+                "or 'sequential_unrolled' (one dispatch per batch element), "
+                "or put the batch dimension in the Pallas grid instead."
+            )
         self._staged = pl.pallas_call(kernel, **pallas_kwargs)
         self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
         value = math_mode.value if hasattr(math_mode, "value") else math_mode
         self._math_mode = _MATH_MODE_ORDINALS[value]
-        self._cache: dict[tuple, tuple[KernelSpec, str, bool]] = {}
+        self._vmap_method = vmap_method
+        self._cache: dict[tuple, tuple[KernelSpec, str, bool, int]] = {}
+        # Guards trace/emit on a cache miss, mirroring MetalCallable.
+        self._lock = threading.Lock()
 
-    def _spec_and_msl(self, args: tuple) -> tuple[KernelSpec, str, bool]:
+    def explain(self, *args) -> KernelDiagnostics:
+        """Report how the kernel executes for these inputs, mirroring
+        `MetalCallable.explain`. Emits MSL; compiles and dispatches
+        nothing.
+
+        Parameters
+        ----------
+        *args
+            Arrays or `jax.ShapeDtypeStruct`s fixing input shapes; no
+            data is read.
+        """
+        shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
+        return explain_spec(trace(self._staged, *shapes))
+
+    def _spec_and_msl(self, args: tuple) -> tuple[KernelSpec, str, bool, int]:
         key = tuple((a.shape, np.dtype(a.dtype).str) for a in args)
         entry = self._cache.get(key)
         if entry is None:
-            shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
-            spec = trace(self._staged, *shapes)
-            cooperative = is_simdgroup_cooperative(spec)
-            entry = (spec, emit_msl(spec, cooperative=cooperative), cooperative)
-            self._cache[key] = entry
+            with self._lock:
+                entry = self._cache.get(key)
+                if entry is None:
+                    shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
+                    spec = trace(self._staged, *shapes)
+                    cooperative = is_simdgroup_cooperative(spec)
+                    groups = gemm_groups(spec) if cooperative else 1
+                    log_compile(spec)
+                    entry = (
+                        spec,
+                        emit_msl(spec, cooperative=cooperative),
+                        cooperative,
+                        groups,
+                    )
+                    self._cache[key] = entry
         return entry
 
     def __call__(self, *args):
         """Dispatch via jax.ffi; traceable and jittable."""
         _register()
-        spec, msl_source, cooperative = self._spec_and_msl(args)
+        spec, msl_source, cooperative, groups = self._spec_and_msl(args)
         # MRLaunchDesc always wants 3 grid dims; palladium grids are 1-3D.
         grid = tuple(spec.grid) + (1, 1, 1)
         if cooperative:
-            # One SIMD-group (one threadgroup) per instance; must match
-            # emit_msl's instance indexing, same as dispatch.BoundKernel.
+            # One SIMD-group per instance (several per threadgroup when
+            # the GEMM lowering applies); must match emit_msl's instance
+            # indexing, same as dispatch.BoundKernel.
             grid = (grid[0] * SIMDGROUP_WIDTH, *grid[1:])
-            threadgroup = (SIMDGROUP_WIDTH, 1, 1)
+            threadgroup = (SIMDGROUP_WIDTH * groups, 1, 1)
         else:
             threadgroup = (0, 0, 0)  # runtime chooses
         out_structs = [
             jax.ShapeDtypeStruct(info.array_shape, info.dtype) for info in spec.outputs
         ]
         result_shapes = out_structs[0] if len(out_structs) == 1 else out_structs
-        return jax.ffi.ffi_call(_TARGET_NAME, result_shapes)(
+        return jax.ffi.ffi_call(
+            _TARGET_NAME, result_shapes, vmap_method=self._vmap_method
+        )(
             *args,
             msl_source=msl_source,
             function_name=spec.name,
@@ -146,7 +213,12 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
     **pallas_kwargs
         The usual `pl.pallas_call` keywords (out_shape, grid, in_specs,
         out_specs, ...), plus `math_mode` (`metal_runtime.MathMode`,
-        FAST by default; SAFE for df32-prelude kernels).
+        FAST by default; SAFE for df32-prelude kernels) and
+        `vmap_method` ('sequential' or 'sequential_unrolled'; None, the
+        default, rejects `jax.vmap`). The sequential methods dispatch
+        once per batch element, each paying the fixed dispatch floor, so
+        a batch dimension in the Pallas grid is the fast path; vmap is
+        the convenience.
 
     Returns
     -------
@@ -161,4 +233,5 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
     from metal_runtime import MathMode
 
     math_mode = pallas_kwargs.pop("math_mode", MathMode.FAST)
-    return FfiCallable(kernel, pallas_kwargs, math_mode)
+    vmap_method = pallas_kwargs.pop("vmap_method", None)
+    return FfiCallable(kernel, pallas_kwargs, math_mode, vmap_method)

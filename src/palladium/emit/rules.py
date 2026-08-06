@@ -9,6 +9,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable
+from typing import Any
 
 from jax.extend.core import Jaxpr, JaxprEqn
 
@@ -166,7 +167,7 @@ def _rule_random_bits(state: EmitState, eqn: JaxprEqn) -> None:
     any shape under 2**32 elements, which is every real kernel output.
     """
     if eqn.params["bit_width"] != 32:
-        raise NotImplementedError("random_bits: only bit_width=32 is implemented")
+        raise EmitError("random_bits: only bit_width=32 is implemented")
 
     key = state.val(eqn.invars[0])
     dst = state.declare(eqn.outvars[0])
@@ -202,14 +203,12 @@ def _rule_reshape(state: EmitState, eqn: JaxprEqn) -> None:
 
     Raises
     ------
-    NotImplementedError
+    EmitError
         If `dimensions` (an axis permutation applied before reshaping)
         is set; that needs a real copy, not just a shape reinterpretation.
     """
     if eqn.params["dimensions"] is not None:
-        raise NotImplementedError(
-            "reshape with a dimensions permutation is unimplemented"
-        )
+        raise EmitError("reshape with a dimensions permutation is unimplemented")
     src = state.val(eqn.invars[0])
     state.bind(eqn.outvars[0], dataclasses.replace(src, shape=eqn.params["new_sizes"]))
 
@@ -402,12 +401,19 @@ def _rule_broadcast_in_dim(state: EmitState, eqn: JaxprEqn) -> None:
 
 @rule("dot_general")
 def _rule_dot_general(state: EmitState, eqn: JaxprEqn) -> None:
-    """`a @ b` for rank-2, non-batched operands.
+    """`a @ b` for non-batched operands up to rank 2.
 
     Scalar triple-nested loop for the plain matmul contraction (lhs dim
     1 with rhs dim 0); the vectorized paths below take over when operand
-    layout and alignment allow. Batch dims, higher rank, and other
+    layout, dtype, and alignment allow. Rank-1 operands canonicalize to
+    `(1, k)` lhs / `(k, 1)` rhs over the same flat storage, covering
+    matvec, vecmat, and vecvec. Batch dims, higher rank, and other
     contraction axes are unimplemented.
+
+    `preferred_element_type` is honored through the output aval (JAX
+    computes the output dtype from it): accumulation runs in the output
+    ctype, and mixed-precision products are cast to it before the
+    multiply. The vectorized paths require f32 end to end.
 
     The scalar path keeps `i, j` outer with `k` innermost on purpose: an
     `i, k, j` reorder turns the single per-`(i, j)` write into `k`
@@ -419,25 +425,31 @@ def _rule_dot_general(state: EmitState, eqn: JaxprEqn) -> None:
     ]
     if lhs_batch or rhs_batch:
         raise EmitError("dot_general: batch dims are unimplemented")
+
+    lhs = state.val(eqn.invars[0])
+    rhs = state.val(eqn.invars[1])
+    if len(lhs.shape) == 1 and tuple(lhs_contract) == (0,):
+        lhs = dataclasses.replace(lhs, shape=(1, lhs.shape[0]))
+        lhs_contract = (1,)
+    if len(rhs.shape) == 1 and tuple(rhs_contract) == (0,):
+        rhs = dataclasses.replace(rhs, shape=(rhs.shape[0], 1))
     if tuple(lhs_contract) != (1,) or tuple(rhs_contract) != (0,):
         raise EmitError(
             "dot_general: only the standard matmul contraction (lhs dim 1 "
             "with rhs dim 0) is implemented"
         )
-
-    lhs = state.val(eqn.invars[0])
-    rhs = state.val(eqn.invars[1])
     if len(lhs.shape) != 2 or len(rhs.shape) != 2:
-        raise EmitError("dot_general: only rank-2 operands are implemented")
+        raise EmitError("dot_general: only rank-1/rank-2 operands are implemented")
     m, k = lhs.shape
     k2, n = rhs.shape
     if k != k2:
         raise EmitError(f"dot_general: inner dims disagree ({k} vs {k2})")
 
     dst = state.declare(eqn.outvars[0])
+    all_f32 = dst.ctype == lhs.ctype == rhs.ctype == "float"
 
     if (
-        dst.ctype == "float"
+        all_f32
         and rhs.transposed
         and k % 4 == 0
         and lhs.align % 4 == 0
@@ -450,7 +462,7 @@ def _rule_dot_general(state: EmitState, eqn: JaxprEqn) -> None:
         m == 1
         and n % 4 == 0
         and n <= _M1_VECTORIZE_MAX_N
-        and dst.ctype == "float"
+        and all_f32
         and not rhs.transposed
         and rhs.align % 4 == 0
     ):
@@ -471,7 +483,13 @@ def _rule_dot_general(state: EmitState, eqn: JaxprEqn) -> None:
         with state.block(f"for (uint {kk} = 0; {kk} < {k}; ++{kk})"):
             lhs_idx = f"{i} * {k} + {kk}"
             rhs_idx = f"{j} * {k} + {kk}" if rhs.transposed else f"{kk} * {n} + {j}"
-            state.emit(f"{acc} += {lhs.at(lhs_idx)} * {rhs.at(rhs_idx)};")
+            a_elem = lhs.at(lhs_idx)
+            if lhs.ctype != dst.ctype:
+                # Mixed precision (preferred_element_type wider than the
+                # operands): promote before the multiply so the product
+                # accumulates in the output ctype.
+                a_elem = f"(({dst.ctype}){a_elem})"
+            state.emit(f"{acc} += {a_elem} * {rhs.at(rhs_idx)};")
         state.emit(f"{dst.at(f'{i} * {n} + {j}')} = {acc};")
 
 
@@ -658,13 +676,12 @@ def _rule_scan(state: EmitState, eqn: JaxprEqn) -> None:
     so phase 1 snapshots reads that alias other carries into temps
     (skipping self-forward no-ops), then phase 2 overwrites the carries.
     """
-    num_carry = len(eqn.outvars)
-    num_consts = len(eqn.invars) - num_carry
     length: int = eqn.params["length"]
     body: Jaxpr = eqn.params["jaxpr"]
+    num_carry = len(eqn.outvars)
+    num_consts = len(eqn.invars) - num_carry
 
-    if len(body.outvars) != num_carry:
-        raise EmitError("lax.scan with stacked ys not supported, use lax.fori_loop")
+    _check_pure_carry_scan(eqn, body)
 
     reverse: bool = eqn.params.get("reverse", False)
     if reverse:
@@ -684,37 +701,98 @@ def _rule_scan(state: EmitState, eqn: JaxprEqn) -> None:
         _copy_back_carries(state, outs, carries)
 
 
+def _check_pure_carry_scan(eqn: JaxprEqn, body: Jaxpr) -> None:
+    """Reject scans with stacked ys or scanned xs.
+
+    Detected structurally, not from params (the param layout is JAX
+    version-sensitive): a carry's eqn aval matches its body aval, while
+    ys/xs carry an extra stacked length dim, so any rank mismatch in the
+    pairwise zip means the scan is not pure-carry.
+    """
+
+    def rank(atom: Any) -> int:
+        # Consts may be Refs, whose aval is not a ShapedArray but still
+        # exposes .shape.
+        return len(getattr(atom.aval, "shape", ()))
+
+    if len(body.outvars) != len(eqn.outvars) or any(
+        rank(ov) != rank(bv) for ov, bv in zip(eqn.outvars, body.outvars, strict=True)
+    ):
+        raise EmitError("lax.scan with stacked ys not supported, use lax.fori_loop")
+    if any(
+        rank(iv) != rank(bv) for iv, bv in zip(eqn.invars, body.invars, strict=True)
+    ):
+        raise EmitError("lax.scan with scanned xs not supported, use lax.fori_loop")
+
+
 def _copy_back_carries(state: EmitState, outs: list[CVal], carries: list[CVal]) -> None:
     """Write loop-body outputs back into their carry storage.
 
-    Two phases, because all carries update simultaneously: phase 1
-    snapshots outputs that alias a *different* carry into temps (skipping
-    self-forward no-ops), phase 2 overwrites the carries. Shared by the
-    scan and while lowerings.
-    """
-    carry_exprs = {c.expr for c in carries}
-    sources = []
-    for out, carry in zip(outs, carries, strict=True):
-        if out.expr == carry.expr:
-            # Self-forward: the value is already in place.
-            sources.append(None)
-        elif out.expr in carry_exprs:
-            # Aliases a different carry: snapshot before any overwrite.
-            tmp = CVal(state.fresh(), out.shape, out.ctype)
-            state.emit(
-                f"{tmp.ctype} {tmp.expr}[{tmp.size}];"
-                if tmp.shape
-                else f"{tmp.ctype} {tmp.expr};"
-            )
-            state.copy(tmp, out, out.size)
-            sources.append(tmp)
-        else:
-            # Fresh SSA name: no carry write can clobber it.
-            sources.append(out)
+    All carries update simultaneously, so every source element is read
+    into a scalar before any carry element is written: one fused loop
+    per element count (grouping by size is safe because an output that
+    aliases a carry has that carry's aval, so aliasing never crosses
+    sizes). Self-forwards are skipped. Shared by the scan and while
+    lowerings.
 
-    for src, carry in zip(sources, carries, strict=True):
-        if src is not None:
-            state.copy(carry, src, carry.size)
+    Carry permutations (an output that IS another carry) additionally
+    read and write through volatile pointers. This is a workaround for
+    a Metal compiler bug: with three or more thread-local array
+    temporaries live in the loop, the optimizer forwards a permuted
+    carry's read across the write it must precede, producing wrong
+    results on M-series GPUs (found by the emitter fuzzer; regression
+    test and minimized MSL in tests/test_05_loops.py). Snapshot arrays,
+    fused loops, and hoisted declarations all still miscompile; volatile
+    on the hazard endpoints is the narrowest fix that survives, and it
+    costs nothing on the common permutation-free path, which stays
+    non-volatile.
+    """
+    updates = [
+        (out, carry)
+        for out, carry in zip(outs, carries, strict=True)
+        if out.expr != carry.expr
+    ]
+    carry_exprs = {c.expr for c in carries}
+
+    def stage(group: list[tuple[CVal, CVal]], index: str) -> None:
+        hazard = any(out.expr in carry_exprs for out, _ in group)
+
+        def read(out: CVal, carry: CVal) -> str:
+            # Only carry storage is read volatile; fresh SSA values and
+            # literals are not part of the hazard (and a literal has no
+            # address to cast).
+            if not (hazard and out.expr in carry_exprs):
+                return out.at(index)
+            if carry.shape:
+                return f"((volatile thread {carry.ctype}*){out.expr})[{index}]"
+            return f"(*(volatile thread {carry.ctype}*)&{out.expr})"
+
+        def write(carry: CVal, t: str) -> str:
+            if not hazard:
+                return f"{carry.at(index)} = {t};"
+            if carry.shape:
+                return f"((volatile thread {carry.ctype}*){carry.expr})[{index}] = {t};"
+            return f"(*(volatile thread {carry.ctype}*)&{carry.expr}) = {t};"
+
+        temps = []
+        for out, carry in group:
+            t = state.fresh("_cb")
+            state.emit(f"{carry.ctype} {t} = {read(out, carry)};")
+            temps.append(t)
+        for (_, carry), t in zip(group, temps, strict=True):
+            state.emit(write(carry, t))
+
+    scalars = [(o, c) for o, c in updates if not c.shape]
+    if scalars:
+        stage(scalars, "0")
+    by_size: dict[int, list[tuple[CVal, CVal]]] = {}
+    for o, c in updates:
+        if c.shape:
+            by_size.setdefault(c.size, []).append((o, c))
+    for size, group in by_size.items():
+        i = state.fresh("_i")
+        with state.block(f"for (uint {i} = 0; {i} < {size}; ++{i})"):
+            stage(group, i)
 
 
 @rule("while")

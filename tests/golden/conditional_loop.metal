@@ -36,10 +36,11 @@ kernel void palladium_kernel(
             t11[_i12] = t9[_i12] ? t7[_i12] : t4[_i12];
         }
         for (uint _i13 = 0; _i13 < 64; ++_i13) {
-            t4[_i13] = t11[_i13];
+            float _cb14 = t11[_i13];
+            t4[_i13] = _cb14;
         }
     }
-    for (uint _i14 = 0; _i14 < 64; ++_i14) {
-        arg2[_i14] = t4[_i14];
+    for (uint _i15 = 0; _i15 < 64; ++_i15) {
+        arg2[_i15] = t4[_i15];
     }
 }

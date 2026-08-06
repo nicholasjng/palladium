@@ -1,5 +1,6 @@
 """Example 2: the lockstep tax, or why per-thread adaptivity is the prize.
 
+Docs: divergent while-loops, docs/supported-subset.md (control flow).
 vmap over an adaptive Diffrax solve forces the whole batch into lockstep:
 every trajectory takes (and rejects) the steps its worst neighbour needs.
 Measures that tax on the CPU by salting a mild Van der Pol ensemble with

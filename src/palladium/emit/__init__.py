@@ -8,6 +8,7 @@ rules (`coop`), selected per kernel by `is_simdgroup_cooperative`.
 from palladium.emit import rules as _rules  # noqa: F401  (registers RULES)
 from palladium.emit.coop import (
     COOP_RULES,
+    coop_probe,
     coop_rows,
     coop_rule,
     emit_jaxpr_coop,
@@ -29,6 +30,7 @@ __all__ = [
     "CVal",
     "EmitError",
     "EmitState",
+    "coop_probe",
     "coop_rows",
     "coop_rule",
     "emit_jaxpr",

@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "palladium"
-version = "0.1.0"
+version = "0.2.0"
 description = "Pallas kernels on Apple GPU: trace Pallas, emit MSL, dispatch via metal-runtime"
 readme = "README.md"
 license = "Apache-2.0"
@@ -48,7 +48,6 @@ benchpaths = ["benchmarks"]
 
 [tool.pytest.ini_options]
 markers = [
-    "exercise: test-driven exercise, red until you implement the emitter rule it covers",
     "fuzz: differential fuzzing against the interpret oracle; GPU-bound and slow, run explicitly with -m fuzz",
 ]
 addopts = '-m "not fuzz"'

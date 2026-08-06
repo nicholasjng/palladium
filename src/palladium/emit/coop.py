@@ -30,7 +30,11 @@ from palladium.emit.core import (
     _transpose_is_dot_rhs_only,
     _unwrapped,
 )
-from palladium.emit.rules import _rule_program_id, _rule_reshape
+from palladium.emit.rules import (
+    _check_pure_carry_scan,
+    _rule_program_id,
+    _rule_reshape,
+)
 from palladium.trace import KernelSpec
 
 # ===========================================================================
@@ -90,6 +94,16 @@ _COOP_LANES = SIMDGROUP_WIDTH
 # (simdgroup_float8x8). Module-level so an interleaved A/B can toggle it
 # per build.
 _COOP_MMA_DOT = True
+
+# Accumulator fragments live at once in the MMA dot. Wide outputs are
+# column-tiled so this bound, not the output width, sets register
+# pressure; 8 measured best on the attention shapes (16 measured worse).
+_MMA_FRAGMENT_CAP = 8
+
+# Threadgroup bytes one MMA dot's result tile may claim (the full output
+# width is staged). Two such dots plus elementwise staging tiles still
+# fit the 32KB hardware budget checked at emission.
+_MMA_TG_TILE_LIMIT = 16384
 
 
 def _coop_pl(size: int) -> int:
@@ -153,37 +167,54 @@ def is_simdgroup_cooperative(spec: KernelSpec) -> bool:
     """Whether `emit_msl` will (by default) lower this kernel with the
     simdgroup-cooperative execution model.
 
-    True iff the kernel jaxpr contains at least one `m == 1` standard
+    True iff the kernel jaxpr contains at least one `m == R` standard
     `dot_general` whose rhs is a (possibly lazily-transposed) view of an
     input ref, and every staged primitive has a cooperative lowering.
     `dispatch.bind` uses the same predicate to pick the launch geometry
     (one 32-thread threadgroup per program instance), so the decision
     must be a pure function of the spec.
     """
-    if spec.jaxpr is None or not spec.grid or len(spec.grid) > 3:
-        # Hand-built specs (tests, raw-MSL bind users) may carry no
-        # jaxpr; they can only mean the classic model.
-        return False
-    n_in = len(spec.inputs)
-    ro_refs = set(spec.jaxpr.invars[:n_in])
-    try:
-        return _coop_rows_checked(spec, ro_refs) is not None
-    except _CoopUnsupported:
-        return False
+    return coop_probe(spec)[0] is not None
 
 
 def coop_rows(spec: KernelSpec) -> int | None:
     """Rows per program instance (R) if this kernel lowers cooperatively,
     else None. `is_simdgroup_cooperative(spec)` is `coop_rows(spec) is not
     None`; `emit_msl` uses the value itself."""
-    if spec.jaxpr is None or not spec.grid or len(spec.grid) > 3:
-        return None
+    return coop_probe(spec)[0]
+
+
+def coop_probe(spec: KernelSpec) -> tuple[int | None, str | None]:
+    """(rows, reason) for the cooperative-model decision.
+
+    `rows` is R when the kernel lowers cooperatively (reason None);
+    otherwise rows is None and `reason` names the first thing that kept
+    the kernel on the classic model. The classic model is a correct but
+    much slower lowering for dot-heavy kernels, so the reason is worth
+    surfacing; `explain()` and PALLADIUM_EXPLAIN do.
+    """
+    if spec.jaxpr is None:
+        # Hand-built specs (tests, raw-MSL bind users) may carry no
+        # jaxpr; they can only mean the classic model.
+        return None, "spec carries no jaxpr"
+    if not spec.grid or len(spec.grid) > 3:
+        return None, f"grid {spec.grid} is empty or rank > 3"
+    from palladium.emit.gemm import _ROWS, gemm_desc
+
+    if gemm_desc(spec) is not None:
+        # The specialized GEMM lowering needs no per-instance result
+        # tile or accumulator array, so the walker's width caps below
+        # do not apply to it.
+        return _ROWS, None
     n_in = len(spec.inputs)
     ro_refs = set(spec.jaxpr.invars[:n_in])
     try:
-        return _coop_rows_checked(spec, ro_refs)
-    except _CoopUnsupported:
-        return None
+        rows = _coop_rows_checked(spec, ro_refs)
+    except _CoopUnsupported as e:
+        return None, str(e)
+    if rows is None:
+        return None, "no qualifying dot_general in the kernel"
+    return rows, None
 
 
 def _coop_rows_checked(spec: KernelSpec, ro_refs: set[Var]) -> int | None:
@@ -195,12 +226,14 @@ def _coop_rows_checked(spec: KernelSpec, ro_refs: set[Var]) -> int | None:
     _coop_collect_dot_rows(spec.jaxpr, ms)
     if not ms:
         return None
+    if -1 in ms:
+        raise _CoopUnsupported("dot_general lhs is not rank-2")
     if len(ms) != 1:
         raise _CoopUnsupported(f"dot_generals disagree on m: {sorted(ms)}")
     rows = ms.pop()
     if rows < 1 or rows > _COOP_LANES or _COOP_LANES % rows != 0:
         raise _CoopUnsupported(f"m={rows} does not divide the SIMD-group evenly")
-    if not _coop_walk(spec.jaxpr, ro_refs, set(), rows):
+    if not _coop_walk(spec.jaxpr, ro_refs, set(), set(), rows):
         return None
     return rows
 
@@ -215,7 +248,11 @@ def _coop_collect_dot_rows(jaxpr: Jaxpr, out: set[int]) -> None:
 
 
 def _coop_walk(
-    jaxpr: Jaxpr, ro_refs: set[Var], device_vars: set[Var], rows: int
+    jaxpr: Jaxpr,
+    ro_refs: set[Var],
+    device_vars: set[Var],
+    transposed_vars: set[Var],
+    rows: int,
 ) -> bool:
     """Detection pass mirroring the COOP_RULES' own preconditions; raises
     _CoopUnsupported on the first primitive the cooperative emitter can't
@@ -259,6 +296,7 @@ def _coop_walk(
             if not _transpose_is_dot_rhs_only(consumers, eqn):
                 raise _CoopUnsupported("transpose not fusable into dot_general")
             device_vars.add(eqn.outvars[0])
+            transposed_vars.add(eqn.outvars[0])
         elif name == "reshape":
             if eqn.params["dimensions"] is not None:
                 raise _CoopUnsupported("reshape with permutation")
@@ -277,11 +315,31 @@ def _coop_walk(
                 raise _CoopUnsupported("dot_general lhs aliases rhs")
             if eqn.invars[0] not in device_vars:
                 classify(eqn.invars[0])  # sharded lhs must fit the taxonomy
-            classify(eqn.outvars[0])
-            # The dot emits its accumulators as individually-named
-            # registers (python-side unroll, see the rule); cap the count.
             _, _, ppn = classify(eqn.outvars[0])
-            if rows * ppn > 64:
+            out_shape = shape_of(eqn.outvars[0])
+            n_dim = int(out_shape[1]) if len(out_shape) == 2 else 1
+
+            def _f32(atom: Atom) -> bool:
+                return str(_shaped(atom.aval).dtype) == "float32"
+
+            # Mirrors the rule's MMA eligibility: the MMA path column-tiles
+            # wide outputs at fixed register pressure, so its width is
+            # bounded by the threadgroup result tile, not the accumulator
+            # count. Every other path python-unrolls rows*ppn accumulator
+            # registers, so it keeps the hard cap.
+            mma_ok = (
+                _COOP_MMA_DOT
+                and eqn.invars[0] in device_vars
+                and eqn.invars[0] not in transposed_vars
+                and _f32(eqn.invars[0])
+                and _f32(eqn.invars[1])
+                and _f32(eqn.outvars[0])
+                and rows % 8 == 0
+                and int(lshape[1]) % 8 == 0
+                and n_dim % 8 == 0
+                and rows * n_dim * 4 <= _MMA_TG_TILE_LIMIT
+            )
+            if not mma_ok and rows * ppn > 64:
                 raise _CoopUnsupported("dot_general accumulator set too large")
             found_dot = True
         elif name in ("reduce_sum", "reduce_max"):
@@ -319,8 +377,12 @@ def _coop_walk(
             num_carry = len(eqn.outvars)
             num_consts = len(eqn.invars) - num_carry
             body: Jaxpr = eqn.params["jaxpr"]
-            if len(body.outvars) != num_carry or eqn.params.get("reverse", False):
-                raise _CoopUnsupported("scan with stacked ys or reverse")
+            try:
+                _check_pure_carry_scan(eqn, body)
+            except EmitError as e:
+                raise _CoopUnsupported(str(e)) from None
+            if eqn.params.get("reverse", False):
+                raise _CoopUnsupported("reverse-mode scan")
             inner_ro = {
                 bv
                 for bv, ov in zip(body.invars[:num_consts], eqn.invars[:num_consts])
@@ -331,10 +393,15 @@ def _coop_walk(
                 for bv, ov in zip(body.invars[:num_consts], eqn.invars[:num_consts])
                 if isinstance(ov, Var) and ov in device_vars
             }
+            inner_trans = {
+                bv
+                for bv, ov in zip(body.invars[:num_consts], eqn.invars[:num_consts])
+                if isinstance(ov, Var) and ov in transposed_vars
+            }
             for invar in eqn.invars[num_consts:]:
                 if isinstance(invar, Var):
                     classify(invar)
-            found_dot |= _coop_walk(body, inner_ro, inner_dev, rows)
+            found_dot |= _coop_walk(body, inner_ro, inner_dev, inner_trans, rows)
         elif name == "program_id":
             pass
         elif name in _COOP_ELEMENTWISE:
@@ -576,6 +643,7 @@ def _coop_elementwise_tg_dst(state: EmitState, eqn: JaxprEqn) -> CVal | None:
         return None
     tg = state.fresh("_tg")
     state.prologue.append(f"threadgroup float {tg}[{rows * w}];")
+    state.tg_bytes += 4 * rows * w
     return CVal(expr=tg, shape=shape, ctype="float", space="threadgroup")
 
 
@@ -873,63 +941,72 @@ def _coop_emit_dot_mma(
 
     Loads 8x8 tiles of both operands straight from device memory,
     accumulates with `simdgroup_multiply_accumulate`, and stores the
-    result tiles to a threadgroup scratch tile. Fragment storage is
-    opaque (lanes cannot index it), so the scratch tile is what
-    downstream rules read: the bound CVal is a threadgroup-space view,
-    which consumers treat like a device view. Barriers bracket the store
-    phase so one loop iteration's stores cannot race the previous
-    iteration's reads. The full threadgroup_barrier is required even for
-    a single-SIMD-group threadgroup: simdgroup_barrier does not reliably
-    order per-lane threadgroup stores against cooperative simdgroup_load
-    reads. A transposed rhs uses the hardware transpose load on the
-    untransposed (n, k) storage.
+    result tiles to a threadgroup scratch tile covering the full output
+    width. Wide outputs are computed in column tiles of at most
+    _MMA_FRAGMENT_CAP accumulator fragments each, so register pressure
+    is fixed by the cap, not the width; each column tile re-runs the k
+    loop (the lhs fragments are re-loaded per tile, lane-uniform reads
+    the cache serves). Fragment storage is opaque (lanes cannot index
+    it), so the scratch tile is what downstream rules read: the bound
+    CVal is a threadgroup-space view, which consumers treat like a
+    device view. Barriers bracket the store phase so one loop
+    iteration's stores cannot race the previous iteration's reads. The
+    full threadgroup_barrier is required even for a single-SIMD-group
+    threadgroup: simdgroup_barrier does not reliably order per-lane
+    threadgroup stores against cooperative simdgroup_load reads. A
+    transposed rhs uses the hardware transpose load on the untransposed
+    (n, k) storage.
     """
     tg = state.fresh("_mma")
     state.prologue.append(f"threadgroup float {tg}[{rows * n}];")
+    state.tg_bytes += 4 * rows * n
     rt_n, ct_n, kt_n = rows // 8, n // 8, k // 8
+    cw = max(1, _MMA_FRAGMENT_CAP // rt_n)
     state.emit("threadgroup_barrier(mem_flags::mem_threadgroup);")
-    accs: dict[tuple[int, int], str] = {}
-    for rt in range(rt_n):
-        for ct in range(ct_n):
-            c = state.fresh(f"_c{rt}_{ct}")
-            state.emit(f"simdgroup_float8x8 {c} = simdgroup_float8x8(0.0f);")
-            accs[(rt, ct)] = c
-    a_frags = [state.fresh(f"_ma{rt}") for rt in range(rt_n)]
-    b_frags = [state.fresh(f"_mb{ct}") for ct in range(ct_n)]
-    kt = state.fresh("_kt")
-    with state.block(f"for (uint {kt} = 0; {kt} < {kt_n}u; ++{kt})"):
+    for ct_lo in range(0, ct_n, cw):
+        cts = range(ct_lo, min(ct_lo + cw, ct_n))
+        accs: dict[tuple[int, int], str] = {}
         for rt in range(rt_n):
-            state.emit(f"simdgroup_float8x8 {a_frags[rt]};")
-            state.emit(
-                f"simdgroup_load({a_frags[rt]}, "
-                f"{lhs.expr} + {rt * 8 * k}u + {kt} * 8u, {k}u);"
-            )
-        for ct in range(ct_n):
-            state.emit(f"simdgroup_float8x8 {b_frags[ct]};")
-            if rhs.transposed:
+            for ct in cts:
+                c = state.fresh(f"_c{rt}_{ct}")
+                state.emit(f"simdgroup_float8x8 {c} = simdgroup_float8x8(0.0f);")
+                accs[(rt, ct)] = c
+        a_frags = [state.fresh(f"_ma{rt}") for rt in range(rt_n)]
+        b_frags = {ct: state.fresh(f"_mb{ct}") for ct in cts}
+        kt = state.fresh("_kt")
+        with state.block(f"for (uint {kt} = 0; {kt} < {kt_n}u; ++{kt})"):
+            for rt in range(rt_n):
+                state.emit(f"simdgroup_float8x8 {a_frags[rt]};")
                 state.emit(
-                    f"simdgroup_load({b_frags[ct]}, "
-                    f"{rhs.expr} + {ct * 8 * k}u + {kt} * 8u, {k}u, "
-                    f"ulong2(0, 0), true);"
+                    f"simdgroup_load({a_frags[rt]}, "
+                    f"{lhs.expr} + {rt * 8 * k}u + {kt} * 8u, {k}u);"
                 )
-            else:
-                state.emit(
-                    f"simdgroup_load({b_frags[ct]}, "
-                    f"{rhs.expr} + {kt} * {8 * n}u + {ct * 8}u, {n}u);"
-                )
+            for ct in cts:
+                state.emit(f"simdgroup_float8x8 {b_frags[ct]};")
+                if rhs.transposed:
+                    state.emit(
+                        f"simdgroup_load({b_frags[ct]}, "
+                        f"{rhs.expr} + {ct * 8 * k}u + {kt} * 8u, {k}u, "
+                        f"ulong2(0, 0), true);"
+                    )
+                else:
+                    state.emit(
+                        f"simdgroup_load({b_frags[ct]}, "
+                        f"{rhs.expr} + {kt} * {8 * n}u + {ct * 8}u, {n}u);"
+                    )
+            for rt in range(rt_n):
+                for ct in cts:
+                    c = accs[(rt, ct)]
+                    state.emit(
+                        f"simdgroup_multiply_accumulate("
+                        f"{c}, {a_frags[rt]}, {b_frags[ct]}, {c});"
+                    )
         for rt in range(rt_n):
-            for ct in range(ct_n):
-                c = accs[(rt, ct)]
+            for ct in cts:
                 state.emit(
-                    f"simdgroup_multiply_accumulate("
-                    f"{c}, {a_frags[rt]}, {b_frags[ct]}, {c});"
+                    f"simdgroup_store({accs[(rt, ct)]}, "
+                    f"{tg} + {rt * 8 * n + ct * 8}u, {n}u);"
                 )
-    for rt in range(rt_n):
-        for ct in range(ct_n):
-            state.emit(
-                f"simdgroup_store({accs[(rt, ct)]}, "
-                f"{tg} + {rt * 8 * n + ct * 8}u, {n}u);"
-            )
     state.emit("threadgroup_barrier(mem_flags::mem_threadgroup);")
     state.bind(
         outvar,
@@ -970,6 +1047,11 @@ def _coop_rule_dot_general(state: EmitState, eqn: JaxprEqn) -> None:
         )
     lhs = state.val(eqn.invars[0])
     rhs = state.val(eqn.invars[1])
+    if len(rhs.shape) == 1:
+        # Matvec: a rank-1 rhs acts as (k, 1) over the same flat storage,
+        # same canonicalization as the classic rule. Rank-1 lhs never
+        # reaches this rule (the detection walker keeps it classic).
+        rhs = dataclasses.replace(rhs, shape=(rhs.shape[0], 1))
     if len(lhs.shape) != 2 or len(rhs.shape) != 2:
         raise EmitError("dot_general: only rank-2 operands are implemented")
     m, k = lhs.shape
@@ -988,12 +1070,13 @@ def _coop_rule_dot_general(state: EmitState, eqn: JaxprEqn) -> None:
         and lhs.space in ("device", "threadgroup")
         and rhs.space == "device"
         and not lhs.transposed
+        and lhs.ctype == "float"
+        and rhs.ctype == "float"
         and CTYPES[str(_shaped(eqn.outvars[0].aval).dtype)] == "float"
         and rows % 8 == 0
         and k % 8 == 0
         and n % 8 == 0
-        and rows * n * 4 <= 4096
-        and (rows // 8) * (n // 8) <= 8
+        and rows * n * 4 <= _MMA_TG_TILE_LIMIT
     ):
         _coop_emit_dot_mma(state, eqn.outvars[0], lhs, rhs, rows, k, n)
         return
@@ -1071,7 +1154,7 @@ def _coop_rule_dot_general(state: EmitState, eqn: JaxprEqn) -> None:
         return f"{lhs.expr}[{r * k}u + {kk}]" if rows > 1 else f"{lhs.expr}[{kk}]"
 
     vectorized = (
-        dst.ctype == "float"
+        dst.ctype == lhs.ctype == rhs.ctype == "float"
         and k % 4 == 0
         and lkind == "device"
         and lhs.align % 4 == 0
@@ -1149,13 +1232,12 @@ def _coop_rule_scan(state: EmitState, eqn: JaxprEqn) -> None:
     (uniform trip count, two-phase carry copy-back), with layout-aware
     carry storage and copies. The loop itself is uniform across lanes, so
     SIMD-group functions inside the body remain valid."""
-    num_carry = len(eqn.outvars)
-    num_consts = len(eqn.invars) - num_carry
     length: int = eqn.params["length"]
     body: Jaxpr = eqn.params["jaxpr"]
+    num_carry = len(eqn.outvars)
+    num_consts = len(eqn.invars) - num_carry
 
-    if len(body.outvars) != num_carry:
-        raise EmitError("lax.scan with stacked ys not supported, use lax.fori_loop")
+    _check_pure_carry_scan(eqn, body)
     if eqn.params.get("reverse", False):
         raise EmitError("no reverse-mode scan support, use lax.fori_loop")
 

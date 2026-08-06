@@ -77,7 +77,7 @@ with per-instance state small enough for registers.
   `square`, shifts. One line plus a Metal intrinsic each; add on first
   demand by a ported example.
 - Rank-1 `dot_general` canonicalization (matvec as `(1, k)`), already
-  noted in `docs/emitter-simplifications.md`.
+  noted in `docs/notes/emitter-simplifications.md`.
 - Value-level `slice`/`dynamic_slice`, `concatenate`, `iota`, `rev`,
   simple `pad`: flat-loop rules in the classic model, same shape
   discipline as `broadcast_in_dim`.
@@ -178,7 +178,7 @@ the cooperative model before it was built.
 ### T2.5 Remaining plumbing (~500-800)
 
 - Threefry/`jit`-inline rules ported to the cooperative table (already
-  noted in `docs/emitter-simplifications.md`; needed the moment dropout
+  noted in `docs/notes/emitter-simplifications.md`; needed the moment dropout
   fuses next to a dot).
 - Dtype promotion edge cases; `stop_gradient` (identity);
   `custom_jvp/vjp` residues (inlined by the time `grad` has run, but

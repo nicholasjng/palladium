@@ -220,7 +220,7 @@ until re-measured this way.
 The execution-model fork landed in `emit.py` (see the "simdgroup-
 cooperative execution model" section there) and took flash attention
 (`examples/06`) from 0.06x to 0.88-0.92x of `jax.jit` CPU on a rested
-M1 Pro (`docs/reward-spec-matmul-emitter.md` has the full calibration
+M1 Pro (`docs/notes/reward-spec-matmul-emitter.md` has the full calibration
 history). Three of this doc's four "what has to change" items shipped,
 with one deliberate substitution:
 
@@ -252,7 +252,7 @@ enters the benchmark set (ROADMAP stretch 12's own gating condition).
 
 **Update (2026-08-14):** the m == 1 restriction noted above is gone — the
 cooperative model now lowers `m == R` dot_generals (columns-per-lane
-layout, `docs/query-blocking-scratch.md` has the motivating measurement,
+layout, `docs/notes/query-blocking-scratch.md` has the motivating measurement,
 reward spec v0.2.0 the resulting calibration: saturated at 1.42x over
 jax.jit with block_q=8). Stretch 12's gating condition — an MMA-friendly
 kernel in the benchmark set — is now genuinely met: the blocked kernel's

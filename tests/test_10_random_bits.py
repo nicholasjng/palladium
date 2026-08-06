@@ -1,4 +1,4 @@
-"""Stretch 8: counter-based RNG (`jax.random` inside a kernel).
+"""Counter-based RNG (`jax.random` inside a kernel).
 
 `jax.random.uniform(key, shape)` inside a kernel stages as `random_wrap`
 (pure type wrap of a uint32[2] array, no MSL), `random_bits` (the real
@@ -16,12 +16,9 @@ substituting a different hash validated only statistically.
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from jax.experimental import pallas as pl
 
 import palladium
-
-pytestmark = pytest.mark.exercise
 
 U32 = jnp.uint32
 F32 = jnp.float32

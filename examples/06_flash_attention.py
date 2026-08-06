@@ -1,6 +1,8 @@
 """Example 6: single-head scaled-dot-product attention, palladium
 (online-softmax, streaming K/V) vs plain jax.jit (the idiomatic JAX way).
 
+Docs: companion to docs/performance.md (the cooperative/MMA path).
+
 Splash Attention's whole reason for the online-softmax reformulation
 (https://patricktoulme.substack.com/p/when-xla-isnt-enough-from-pallas)
 is bandwidth: avoid materializing the full seq_len x seq_len score
@@ -28,7 +30,7 @@ those in is a straightforward grid extension (no dot_general widening
 needed, everything stays rank-2 per thread), not done here.
 
 Honest result: correct, and — after the emitter work this example drove
-(see `docs/reward-spec-matmul-emitter.md` for the scoring methodology
+(see `docs/notes/reward-spec-matmul-emitter.md` for the scoring methodology
 and history) — **faster than `jax.jit` CPU at every measured shape**:
 2.8x at seq 1024 (0.49ms vs 1.36ms wall) and 3.8x at seq 4096 (3.8ms vs
 14.2ms), block_kv=32, measured heat-soaked. The GPU advantage grows with
@@ -51,7 +53,7 @@ three seeds:
 4. The cooperative model generalized from one query row per instance to
    R rows (`block_q` below; columns-per-lane layout), so each K/V
    element loaded from device serves R rows — the query-blocking lever
-   `docs/query-blocking-scratch.md` measured at 2x on hand-written
+   `docs/notes/query-blocking-scratch.md` measured at 2x on hand-written
    stand-ins, transferring to this generated kernel within ~11%.
 5. Both cooperative dots lower to the SIMD-group matrix units
    (`simdgroup_float8x8`) when tile-divisible, with the softmax
@@ -59,7 +61,7 @@ three seeds:
    time at the worst shape (0.468ms -> 0.242ms at seq 1024).
 
 Thermal caveat, measured: the GPU down-clocks up to ~3x under sustained
-dispatch load (the effect `docs/simdgroup-matmul-design.md` documented)
+dispatch load (the effect `docs/notes/simdgroup-matmul-design.md` documented)
 while the CPU side barely moves. The current ~1.4x margin absorbs most
 of it; deep heat-soak can still push individual readings below parity
 without any code change.
@@ -113,7 +115,7 @@ def palladium_attention(seq_len: int, head_dim: int, block_kv: int, block_q: int
     `block_q` is the R of the emitter's cooperative model: with one
     32-lane SIMD-group per instance, every K/V element loaded from device
     serves `block_q` rows instead of one. 8 measured fastest here, the
-    same knee `docs/query-blocking-scratch.md` found on hand-written
+    same knee `docs/notes/query-blocking-scratch.md` found on hand-written
     stand-ins (reuse and SIMD-group count trade off inversely; 8 is a
     property of seq_len=1024, not a constant of the algorithm).
     `block_q=1` reproduces the previous one-row-per-instance kernel.

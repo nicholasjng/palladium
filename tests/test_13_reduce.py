@@ -1,4 +1,4 @@
-"""Stretch 15: `reduce_sum`/`reduce_max` -> nested loops, one per kept dim.
+"""`reduce_sum`/`reduce_max` -> nested loops, one per kept dim.
 
 `axes` may be any subset of dims (verified against a real jaxpr before
 implementing): full reduction to a scalar, and partial reduction along
@@ -6,17 +6,14 @@ one axis of a 2D array, are both real cases, not just the scalar one.
 `jnp.mean` is `reduce_sum` plus a plain `div`, already emittable, so no
 separate rule needed for it. `reduce_max` shares `_emit_reduce`'s loop
 shape with `reduce_sum`, added for softmax numerical stability
-(flash attention, ROADMAP stretch 17).
+(flash attention).
 """
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 import palladium
-
-pytestmark = pytest.mark.exercise
 
 
 def test_sum_to_scalar_matches_numpy(rng):

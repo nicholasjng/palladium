@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import os
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -19,6 +20,8 @@ import numpy as np
 
 from palladium.emit import is_simdgroup_cooperative
 from palladium.emit.core import SIMDGROUP_WIDTH
+from palladium.emit.gemm import gemm_groups
+from palladium.errors import DispatchError, EmitError
 from palladium.trace import KernelSpec
 
 __all__ = ["BoundKernel", "PendingResult", "bind"]
@@ -44,6 +47,24 @@ def _numbered(msl_source: str) -> str:
     )
 
 
+# NumPy refuses to export ml_dtypes extension dtypes over DLPack, so a
+# bfloat16 array cannot cross into mr.Buffer as-is. The same bytes ship
+# as uint16 and the buffer is relabeled; a pure reinterpretation, so the
+# round trip is lossless and costs one O(1) view.
+def _to_native(arr: np.ndarray) -> tuple[np.ndarray, str | None]:
+    if arr.dtype.name == "bfloat16":
+        return arr.view(np.uint16), "bfloat16"
+    return arr, None
+
+
+def _read_buffer(buf: mr.Buffer) -> np.ndarray:
+    if buf.dtype == "bfloat16":
+        import ml_dtypes
+
+        return buf.to_numpy(dtype="uint16").view(ml_dtypes.bfloat16)
+    return buf.to_numpy()
+
+
 @dataclasses.dataclass
 class PendingResult:
     """A launched kernel whose command buffer may still be executing.
@@ -64,7 +85,7 @@ class PendingResult:
     def wait(self) -> np.ndarray | tuple[np.ndarray, ...]:
         """Block until the GPU is done, then return the outputs."""
         self.batch.wait()
-        outs = tuple(b.to_numpy() for b in self.out_bufs)
+        outs = tuple(_read_buffer(b) for b in self.out_bufs)
         return outs[0] if len(outs) == 1 else outs
 
 
@@ -94,6 +115,10 @@ class BoundKernel:
     # grid's x threads, threadgroup (32, 1, 1). Must match what emit_msl
     # was told when the source was generated.
     cooperative: bool = False
+    # SIMD-groups per threadgroup (the specialized GEMM lowering packs
+    # several one-instance SIMD-groups into a threadgroup to share
+    # staged tiles); must match what emit_msl generated.
+    coop_groups: int = 1
     # Safe to reuse across calls: a BoundKernel is cached per input
     # shape/dtype, so shape never changes call-to-call. Excluded from
     # compare/repr since it's cache state, not part of a BoundKernel's identity.
@@ -106,11 +131,19 @@ class BoundKernel:
     _last_pending: PendingResult | None = dataclasses.field(
         default=None, compare=False, repr=False
     )
+    # Serializes the upload-and-commit phase: concurrent launches share
+    # _in_bufs, and each launch waits out the previous batch before
+    # overwriting them, so under the lock every in-flight batch has
+    # already read its inputs. Waiting on results stays unlocked.
+    _launch_lock: threading.Lock = dataclasses.field(
+        default_factory=threading.Lock, compare=False, repr=False
+    )
 
     def launch(self, *arrays: np.ndarray) -> PendingResult:
         """Encode and commit one dispatch without blocking on the result.
 
-        `__call__` is `launch` followed by `wait()`.
+        `__call__` is `launch` followed by `wait()`. Thread-safe: uploads
+        are serialized on a per-kernel lock, waits are not.
 
         Parameters
         ----------
@@ -122,33 +155,56 @@ class BoundKernel:
         -------
         PendingResult
             Committed, not yet waited on.
+
+        Raises
+        ------
+        DispatchError
+            On an argument count, shape, or dtype mismatch against the
+            traced spec. Dtypes are checked strictly, never cast: a
+            silent f64 -> f32 cast would hide a jax_enable_x64 mixup.
         """
         spec = self.spec
         if len(arrays) != len(spec.inputs):
-            raise TypeError(
+            raise DispatchError(
                 f"kernel takes {len(spec.inputs)} arrays, got {len(arrays)}"
             )
-        if self._last_pending is not None:
-            self._last_pending.batch.wait()  # no-op if the caller already waited
-        first_call = len(self._in_bufs) < len(spec.inputs)
-        in_bufs = []
-        for i, (a, info) in enumerate(zip(arrays, spec.inputs, strict=True)):
-            arr = np.ascontiguousarray(np.asarray(a, dtype=info.dtype))
-            if arr.shape != info.array_shape:
-                raise TypeError(f"expected shape {info.array_shape}, got {arr.shape}")
-            if first_call:
-                self._in_bufs.append(mr.Buffer(arr))
-            else:
-                self._in_bufs[i].copy_from(arr)
-            in_bufs.append(self._in_bufs[i])
-        # Fresh per call, unlike inputs: to_numpy() is a live view, so reusing
-        # this buffer would mutate an array a caller might still be holding
-        # from an earlier, not-yet-waited-on PendingResult.
-        out_bufs = [
-            mr.Buffer.empty(list(info.array_shape), dtype=info.dtype.name)
-            for info in spec.outputs
-        ]
-        return self._dispatch(in_bufs, out_bufs)
+        with self._launch_lock:
+            if self._last_pending is not None:
+                # No-op if the caller already waited; guarantees the GPU
+                # is done reading _in_bufs before they are overwritten.
+                self._last_pending.batch.wait()
+            first_call = len(self._in_bufs) < len(spec.inputs)
+            in_bufs = []
+            for i, (a, info) in enumerate(zip(arrays, spec.inputs, strict=True)):
+                arr = np.asarray(a)
+                if arr.dtype != info.dtype:
+                    raise DispatchError(
+                        f"argument {i}: dtype {arr.dtype} does not match the "
+                        f"traced {info.dtype}; cast explicitly"
+                    )
+                if arr.shape != info.array_shape:
+                    raise DispatchError(
+                        f"argument {i}: expected shape {info.array_shape}, "
+                        f"got {arr.shape}"
+                    )
+                # Non-contiguous inputs are copied, not rejected: upload
+                # copies into the device buffer anyway. Contiguity must
+                # come first: _to_native's view needs a contiguous array.
+                arr = np.ascontiguousarray(arr)
+                native, relabel = _to_native(arr)
+                if first_call:
+                    self._in_bufs.append(mr.Buffer(native, dtype=relabel))
+                else:
+                    self._in_bufs[i].copy_from(native, dtype=relabel)
+                in_bufs.append(self._in_bufs[i])
+            # Fresh per call, unlike inputs: to_numpy() is a live view, so
+            # reusing this buffer would mutate an array a caller might still
+            # be holding from an earlier, not-yet-waited-on PendingResult.
+            out_bufs = [
+                mr.Buffer.empty(list(info.array_shape), dtype=info.dtype.name)
+                for info in spec.outputs
+            ]
+            return self._dispatch(in_bufs, out_bufs)
 
     def __call__(self, *arrays: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
         """Dispatch over `spec.grid` threads and return the outputs.
@@ -173,9 +229,14 @@ class BoundKernel:
         """Encode, commit, and track one dispatch on prepared buffers."""
         grid = tuple(int(g) for g in self.spec.grid)
         if self.cooperative:
-            # One SIMD-group (one threadgroup) per instance.
+            # One SIMD-group per instance; coop_groups instances share a
+            # threadgroup when the GEMM lowering applies.
             grid = (grid[0] * SIMDGROUP_WIDTH, *grid[1:])
-            threadgroup: int | tuple[int, ...] | None = (SIMDGROUP_WIDTH, 1, 1)
+            threadgroup: int | tuple[int, ...] | None = (
+                SIMDGROUP_WIDTH * self.coop_groups,
+                1,
+                1,
+            )
         else:
             threadgroup = self.threadgroup
         batch = mr.Batch()
@@ -205,13 +266,15 @@ class BoundKernel:
         pending.wait()
 
         def call() -> np.ndarray | tuple[np.ndarray, ...]:
-            if self._last_pending is not None:
-                self._last_pending.batch.wait()
-            out_bufs = [
-                mr.Buffer.empty(list(info.array_shape), dtype=info.dtype.name)
-                for info in self.spec.outputs
-            ]
-            return self._dispatch(self._in_bufs, out_bufs).wait()
+            with self._launch_lock:
+                if self._last_pending is not None:
+                    self._last_pending.batch.wait()
+                out_bufs = [
+                    mr.Buffer.empty(list(info.array_shape), dtype=info.dtype.name)
+                    for info in self.spec.outputs
+                ]
+                pending = self._dispatch(self._in_bufs, out_bufs)
+            return pending.wait()
 
         return call
 
@@ -259,6 +322,7 @@ def bind(
     """
     if cooperative is None:
         cooperative = threadgroup is None and is_simdgroup_cooperative(spec)
+    groups = gemm_groups(spec) if cooperative else 1
     _dump_msl(spec.name, msl_source)
     try:
         kernel = mr.Kernel(msl_source, spec.name, math_mode=math_mode)
@@ -266,10 +330,24 @@ def bind(
         raise mr.CompileError(
             f"{e}\n\npalladium-emitted source:\n{_numbered(msl_source)}"
         ) from None
+    except RuntimeError as e:
+        if "stack space" in str(e):
+            # Metal's pipeline creation rejects kernels whose thread-local
+            # arrays overflow the per-thread stack; translate the opaque
+            # message into the actual fix.
+            raise EmitError(
+                f"{e}\n\nEvery loaded block and intermediate value lives in "
+                "thread-local memory, and this kernel's per-instance blocks "
+                "are too large for the per-thread stack. Shrink them by "
+                "adding or refining the grid and BlockSpecs so each program "
+                "instance touches a smaller block."
+            ) from None
+        raise
     return BoundKernel(
         spec=spec,
         kernel=kernel,
         msl_source=msl_source,
         threadgroup=threadgroup,
         cooperative=cooperative,
+        coop_groups=groups,
     )

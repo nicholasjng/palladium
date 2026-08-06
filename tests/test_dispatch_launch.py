@@ -1,4 +1,4 @@
-"""BoundKernel.launch()/PendingResult: provided plumbing, not an exercise.
+"""BoundKernel.launch()/PendingResult: the non-blocking dispatch path.
 
 Builds a KernelSpec by hand (no jax tracing needed -- launch()/__call__ only
 read spec.grid/inputs/outputs) so this runs independently of the emitter.

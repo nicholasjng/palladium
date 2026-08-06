@@ -1,4 +1,4 @@
-"""Stretch 10: jax.ffi integration (`native/ffi/palladium_ffi.cpp`).
+"""jax.ffi integration (`native/ffi/palladium_ffi.cpp`).
 
 `metal_call_jit` emits MSL the same way `metal_call` does, but dispatches
 through a registered jax.ffi target, so the result composes inside
@@ -202,3 +202,85 @@ def test_cooperative_kernel_dispatches_through_ffi(rng):
     np.testing.assert_allclose(
         float(jitted(q, k, v)), float(np.tanh(want).sum()), rtol=1e-4
     )
+
+
+def test_vmap_sequential_matches_per_element(rng):
+    def kernel(x_ref, o_ref):
+        o_ref[...] = jnp.tanh(x_ref[...]) * 2.0
+
+    f = palladium.metal_call_jit(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((16,), jnp.float32),
+        vmap_method="sequential",
+    )
+    xs = rng.standard_normal((4, 16)).astype(np.float32)
+    got = np.asarray(jax.vmap(f)(xs))
+    want = np.stack([np.asarray(f(x)) for x in xs])
+    np.testing.assert_allclose(got, want, rtol=1e-6)
+    # and under jit
+    got_jit = np.asarray(jax.jit(jax.vmap(f))(xs))
+    np.testing.assert_allclose(got_jit, want, rtol=1e-6)
+
+
+def test_whole_batch_vmap_methods_rejected():
+    # expand_dims/broadcast_all re-invoke the target once with batched
+    # buffers, but the launch grid is baked per unbatched shape; accepting
+    # them would return wrong results silently.
+    def kernel(x_ref, o_ref):
+        o_ref[...] = x_ref[...]
+
+    with pytest.raises(ValueError, match="sequential"):
+        palladium.metal_call_jit(
+            kernel,
+            out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
+            vmap_method="expand_dims",
+        )
+
+
+def test_custom_vjp_pairs_forward_and_backward_kernels(rng):
+    """The examples/07_custom_vjp.py recipe: y = tanh(x @ W) forward and
+    a fused backward kernel, paired with jax.custom_vjp; gradients must
+    match jax.grad of the plain jnp expression."""
+    m, k, n = 8, 16, 8
+
+    def fwd_kernel(x_ref, w_ref, y_ref):
+        y_ref[...] = jnp.tanh(jnp.dot(x_ref[...], w_ref[...]))
+
+    def bwd_kernel(x_ref, w_ref, y_ref, g_ref, dx_ref, dw_ref):
+        t = g_ref[...] * (1.0 - y_ref[...] * y_ref[...])
+        dx_ref[...] = jnp.dot(t, w_ref[...].T)
+        dw_ref[...] = jnp.dot(x_ref[...].T, t)
+
+    fwd = palladium.metal_call_jit(
+        fwd_kernel, out_shape=jax.ShapeDtypeStruct((m, n), jnp.float32)
+    )
+    bwd = palladium.metal_call_jit(
+        bwd_kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct((m, k), jnp.float32),
+            jax.ShapeDtypeStruct((k, n), jnp.float32),
+        ),
+    )
+
+    @jax.custom_vjp
+    def dense(x, w):
+        return fwd(x, w)
+
+    def dense_fwd(x, w):
+        y = fwd(x, w)
+        return y, (x, w, y)
+
+    def dense_bwd(res, g):
+        x, w, y = res
+        return bwd(x, w, y, g)
+
+    dense.defvjp(dense_fwd, dense_bwd)
+
+    x = jnp.asarray(rng.standard_normal((m, k)), dtype=jnp.float32)
+    w = jnp.asarray(rng.standard_normal((k, n)) / np.sqrt(k), dtype=jnp.float32)
+    grads = jax.jit(jax.grad(lambda x, w: jnp.sum(dense(x, w) ** 2), argnums=(0, 1)))
+    ref = jax.jit(jax.grad(lambda x, w: jnp.sum(jnp.tanh(x @ w) ** 2), argnums=(0, 1)))
+    dx, dw = grads(x, w)
+    dx_ref, dw_ref = ref(x, w)
+    np.testing.assert_allclose(np.asarray(dx), np.asarray(dx_ref), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(np.asarray(dw), np.asarray(dw_ref), rtol=1e-4, atol=1e-4)

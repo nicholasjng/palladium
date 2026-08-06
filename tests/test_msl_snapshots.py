@@ -94,7 +94,7 @@ def _rk4_lotka_volterra():
 
 
 def _conditional_loop():
-    # Pins the stretch-7 vocabulary in one kernel: a comparison, select_n
+    # Pins the adaptive-controller vocabulary in one kernel: a comparison, select_n
     # reached through jnp.where's jit wrapper (inlined by _inline_jit),
     # and both inside a scan with a const. The jit staging is a JAX
     # implementation detail; if an upgrade changes it, this golden turns

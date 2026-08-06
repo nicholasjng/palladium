@@ -17,6 +17,8 @@ import jax
 import numpy as np
 from jax.extend.core import ClosedJaxpr, Jaxpr
 
+from palladium.errors import TraceError
+
 __all__ = ["BlockInfo", "KernelSpec", "trace"]
 
 
@@ -78,15 +80,23 @@ class KernelSpec:
 
 
 def _block_dim(dim: Any) -> int | None:
-    # JAX 0.11 stages BlockSpec shapes as Blocked/Element/Squeezed objects
-    # rather than plain ints; squeezed dims vanish from the visible block.
+    # JAX 0.11 stages BlockSpec shapes as BlockDim objects rather than
+    # plain ints; squeezed dims vanish from the visible block. Matched by
+    # class name, not attribute: Element, Indirect, and BoundedSlice dims
+    # also carry `block_size` but mean different indexing semantics, and
+    # accepting them here would lower wrong offsets silently.
     if isinstance(dim, (int, np.integer)):
         return int(dim)
-    if hasattr(dim, "block_size"):
-        return int(dim.block_size)
-    if type(dim).__name__ == "Squeezed":
+    kind = type(dim).__name__
+    if kind == "Squeezed":
         return None
-    raise NotImplementedError(f"unhandled block dim type: {dim!r}")
+    if kind == "Blocked":
+        return int(dim.block_size)
+    raise TraceError(
+        f"unsupported block dim type {kind}: only int, pl.Blocked, and "
+        "pl.Squeezed dims are lowered (pl.Element, pl.Indirect, and "
+        "pl.BoundedSlice indexing is unimplemented)"
+    )
 
 
 def _block_infos(block_mappings: list[Any]) -> tuple[BlockInfo, ...]:
@@ -122,20 +132,19 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
 
     Raises
     ------
-    ValueError
-        If tracing finds zero or more than one pallas_call equation.
-    NotImplementedError
-        For PrefetchScalarGridSpec kernels.
+    TraceError
+        If tracing finds zero or more than one pallas_call equation, or
+        for PrefetchScalarGridSpec kernels.
     """
     closed = jax.make_jaxpr(pallas_fn)(*example_args)
     eqns = [e for e in closed.jaxpr.eqns if e.primitive.name == "pallas_call"]
     if not eqns:
-        raise ValueError(
+        raise TraceError(
             "no pallas_call equation found; pass the callable returned by "
             "pl.pallas_call, or a function that invokes one"
         )
     if len(eqns) > 1:
-        raise ValueError(
+        raise TraceError(
             f"found {len(eqns)} pallas_call equations; palladium handles one "
             "kernel at a time, trace them separately"
         )
@@ -149,7 +158,7 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
         kernel_jaxpr = kernel_jaxpr.jaxpr
 
     if grid_mapping.num_index_operands:
-        raise NotImplementedError("PrefetchScalarGridSpec is not supported")
+        raise TraceError("PrefetchScalarGridSpec is not supported")
 
     n_in, n_out = grid_mapping.num_inputs, grid_mapping.num_outputs
     mappings = list(grid_mapping.block_mappings)
