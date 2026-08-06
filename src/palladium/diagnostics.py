@@ -46,18 +46,30 @@ class KernelDiagnostics:
         return " ".join(parts)
 
 
+def normalize_threadgroup(
+    threadgroup: int | tuple[int, ...] | None,
+) -> tuple[int, ...] | None:
+    """The one place `threadgroup=` is turned into a tuple of ints.
+
+    The knob is `int | tuple[int, ...] | None` at every entry point
+    (`metal_call`, `metal_call_jit`, `bind`, `explain`), and None means
+    "let the runtime choose". Shared so the eager and jax.ffi paths
+    cannot normalize it differently.
+    """
+    if threadgroup is None:
+        return None
+    if isinstance(threadgroup, int):
+        return (int(threadgroup),)
+    return tuple(int(t) for t in threadgroup)
+
+
 def explain_spec(
     spec: KernelSpec, threadgroup: int | tuple[int, ...] | None = None
 ) -> KernelDiagnostics:
     """Diagnostics for a traced spec: emits MSL, compiles nothing."""
     msl = emit_msl(spec)
     grid = tuple(int(g) for g in spec.grid)
-    if threadgroup is None:
-        tg = None
-    elif isinstance(threadgroup, int):
-        tg = (threadgroup,)
-    else:
-        tg = tuple(int(t) for t in threadgroup)
+    tg = normalize_threadgroup(threadgroup)
     return KernelDiagnostics(
         name=spec.name,
         grid=grid,

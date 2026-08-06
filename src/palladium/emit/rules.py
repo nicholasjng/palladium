@@ -14,6 +14,8 @@ from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.emit.core import (
     _PID,
+    _TID,
+    _TPT,
     CTYPES,
     ELEMENTWISE,
     PRIMITIVE_INVARS,
@@ -669,6 +671,42 @@ def _rule_program_id(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """
     axis: int = eqn.params["axis"]
     env.bind(eqn.outvars[0], CVal(f"(int){_PID[axis]}", (), "int"))
+
+
+@rule("palladium_barrier")
+def _rule_barrier(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """`palladium.barrier()` -> `threadgroup_barrier(mem_flags::mem_threadgroup)`.
+
+    Emitted verbatim wherever the author placed it; palladium never
+    infers barrier placement from a hazard analysis. Zero outputs, so
+    nothing to bind -- the primitive carries a JAX effect purely to
+    survive DCE on the way here.
+    """
+    cursor.emit("threadgroup_barrier(mem_flags::mem_threadgroup);")
+
+
+@rule("palladium_thread_index")
+def _rule_thread_index(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """`palladium.thread_index()` -> `_tid.x`, as a rank-0 int.
+
+    Pure aliasing, same as `program_id`. The (int) cast keeps index
+    arithmetic signed.
+    """
+    env.bind(eqn.outvars[0], CVal(f"(int){_TID}", (), "int"))
+
+
+@rule("palladium_threads_per_threadgroup")
+def _rule_threads_per_threadgroup(
+    env: Environment, cursor: Cursor, eqn: JaxprEqn
+) -> None:
+    """`palladium.threads_per_threadgroup()` -> `_tpt.x`, as a rank-0 int.
+
+    Reports the *actual* size of this threadgroup, which for the final
+    group of a non-uniform dispatch is smaller than the requested size.
+    That is the whole reason cooperative loops bound themselves with this
+    instead of a compile-time constant.
+    """
+    env.bind(eqn.outvars[0], CVal(f"(int){_TPT}", (), "int"))
 
 
 @rule("scan")

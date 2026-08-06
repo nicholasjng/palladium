@@ -26,7 +26,13 @@ from palladium.errors import (
     UnsupportedPrimitiveError,
 )
 from palladium.ffi import FfiCallable, metal_call_jit
-from palladium.trace import BlockInfo, KernelSpec, trace
+from palladium.threadgroup import (
+    barrier,
+    thread_index,
+    threadgroup_memory,
+    threads_per_threadgroup,
+)
+from palladium.trace import BlockInfo, KernelSpec, ScratchInfo, trace
 
 __all__ = [
     "BlockInfo",
@@ -38,8 +44,10 @@ __all__ = [
     "KernelSpec",
     "MetalCallable",
     "PalladiumError",
+    "ScratchInfo",
     "TraceError",
     "UnsupportedPrimitiveError",
+    "barrier",
     "bind",
     "debug_msl",
     "emit_jaxpr",
@@ -47,6 +55,9 @@ __all__ = [
     "metal_call",
     "metal_call_jit",
     "rule",
+    "thread_index",
+    "threadgroup_memory",
+    "threads_per_threadgroup",
     "trace",
 ]
 

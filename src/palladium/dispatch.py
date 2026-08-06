@@ -380,6 +380,15 @@ def bind(
     """
     if pipeline_depth < 1:
         raise ValueError(f"pipeline_depth must be >= 1, got {pipeline_depth}")
+    if spec.uses_threadgroup and threadgroup is None:
+        raise EmitError(
+            f"kernel {spec.name!r} declares threadgroup_memory scratch, so it "
+            "must be dispatched with an explicit threadgroup= size. Leaving it "
+            "None lets the runtime pick a size (commonly far larger than the "
+            "declared extent), and a thread_index() past that extent writes "
+            "out of bounds with no error. Pass threadgroup=N with N no larger "
+            "than the leading extent of every threadgroup_memory request."
+        )
     _dump_msl(spec.name, msl_source)
     try:
         kernel = mr.Kernel(msl_source, spec.name, math_mode=math_mode)

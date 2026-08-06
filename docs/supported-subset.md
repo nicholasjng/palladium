@@ -13,7 +13,7 @@ error taxonomy in `docs/getting-started.md`.
 | Index maps | Any jaxpr over grid indices (they are lowered, not pattern-matched) |
 | Ref indexing | `x_ref[...]`, integer and `pl.dslice` indices, slices with unit stride; a partial slice only on the first kept dim |
 | Multiple outputs | Yes |
-| `scratch_shapes` | Rejected |
+| `scratch_shapes` | Yes. `pl.MemorySpace.*` requests are `thread`-space (private to one program instance); `palladium.threadgroup_memory(shape, dtype)` requests `threadgroup`-space storage shared across the group |
 | `PrefetchScalarGridSpec` | Rejected |
 | Captured arrays (jaxpr constvars) | Rejected; close over Python scalars or pass arrays as operands |
 | Multiple `pallas_call`s per traced function | Rejected; trace them separately |
@@ -50,6 +50,16 @@ the output dtype.
 
 Reductions: `reduce_sum`, `reduce_max` over any axis subset.
 
+Cooperative: `palladium.barrier()` (lowers to
+`threadgroup_barrier(mem_flags::mem_threadgroup)`, placed by the author,
+never inferred), `palladium.thread_index()`, and
+`palladium.threads_per_threadgroup()`. Kernels using
+`threadgroup_memory` must be dispatched with an explicit `threadgroup=`
+size no larger than the declared extent. Both `metal_call` and
+`metal_call_jit` accept it; leaving it unset is a loud error on either
+path, since a runtime-chosen size is commonly larger than the declared
+extent and indexing past it corrupts silently.
+
 Control flow: `lax.fori_loop` and full `lax.scan` (scanned xs, stacked
 ys, and `reverse=True`), `lax.while_loop` (data-dependent, divergent
 trip counts are fine), `lax.cond`/`lax.switch` (clamped index
@@ -71,6 +81,16 @@ One Metal thread per program instance, always. Parallelism comes from
 the Pallas grid; a divergent trip count in `while_loop`/`cond` inside
 one instance costs nothing correctness-wise, since threads are
 independent.
+
+Threads stop being independent once a kernel uses `threadgroup_memory`:
+those instances communicate within a threadgroup, and ordering is the
+author's responsibility via `barrier()`. There is no device-wide
+barrier, so cross-*threadgroup* communication still needs two dispatches
+(see `examples/04_reaction_diffusion.py`). `interpret=True` cannot model
+any of this -- it runs instances sequentially and reports
+`thread_index() == 0`, `threads_per_threadgroup() == 1`, so a
+cooperative kernel must be validated against a reference implementation
+rather than the interpret oracle.
 
 ## Hard limits
 

@@ -169,8 +169,9 @@ xla::ffi::Error PalladiumDispatch(std::string_view msl_source,
   desc.grid_x = (size_t)grid_x;
   desc.grid_y = (size_t)grid_y;
   desc.grid_z = (size_t)grid_z;
-  // threadgroup_x == 0 lets the runtime choose (c_api.cpp); the
-  // cooperative execution model requires an explicit (32, 1, 1).
+  // threadgroup_x == 0 lets the runtime choose (c_api.cpp). Kernels
+  // using palladium.threadgroup_memory must pass an explicit size;
+  // ffi.py rejects them otherwise, mirroring palladium.bind.
   desc.threadgroup_x = (size_t)threadgroup_x;
   desc.threadgroup_y = (size_t)threadgroup_y;
   desc.threadgroup_z = (size_t)threadgroup_z;

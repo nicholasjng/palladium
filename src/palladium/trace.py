@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Literal as TLiteral
 
 import jax
 import jax.experimental.pallas as pl
@@ -21,7 +21,31 @@ from jax.extend.core import ClosedJaxpr, Jaxpr, Literal, Var
 from palladium import effects
 from palladium.errors import TraceError
 
-__all__ = ["BlockInfo", "KernelSpec", "trace"]
+__all__ = ["BlockInfo", "KernelSpec", "ScratchInfo", "trace"]
+
+
+@dataclasses.dataclass(frozen=True)
+class ScratchInfo:
+    """An extra scratch buffer in a kernel without a backing caller array.
+
+    Attributes
+    ----------
+    shape: tuple of int
+        Buffer shape.
+    dtype: numpy.dtype
+        Buffer element type.
+    space: str
+        Metal address space: `"thread"` (private to one program
+        instance, the `pl.MemorySpace` default) or `"threadgroup"`
+        (shared across the threadgroup, requested via
+        `palladium.threadgroup_memory`). Decides the qualifier
+        `emit_msl` declares the storage with, and nothing else -- both
+        are compile-time-sized local arrays.
+    """
+
+    shape: tuple[int, ...]
+    dtype: np.dtype
+    space: TLiteral["thread", "threadgroup"] = "thread"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,6 +85,8 @@ class KernelSpec:
         Pallas grid; `(1,)` for gridless calls.
     inputs, outputs : tuple of BlockInfo
         Operand descriptions in jaxpr order.
+    scratch: tuple of ScratchInfo
+        Scratch buffer descriptions, in jaxpr order after the operands.
     raw_params : dict
         Full, unprocessed pallas_call params.
     aliases : tuple of (int, int)
@@ -73,8 +99,19 @@ class KernelSpec:
     grid: tuple[int, ...]
     inputs: tuple[BlockInfo, ...]
     outputs: tuple[BlockInfo, ...]
+    scratch: tuple[ScratchInfo, ...]
     raw_params: dict[str, Any]
     aliases: tuple[tuple[int, int], ...] = ()
+
+    @property
+    def uses_threadgroup(self) -> bool:
+        """Whether any scratch entry lives in `threadgroup` space.
+
+        True means the kernel communicates across threads, so the
+        dispatch threadgroup size stops being a free tuning knob and
+        becomes part of the kernel's contract (`palladium.bind`).
+        """
+        return any(info.space == "threadgroup" for info in self.scratch)
 
     @property
     def num_programs(self) -> int:
@@ -227,6 +264,29 @@ def _validate_parallel_writes(
                     )
 
 
+def _scratch_infos(scratch_avals: Any) -> list[ScratchInfo]:
+    # `memory_space` is typed `Any` upstream, so palladium's THREADGROUP
+    # sentinel rides through Pallas tracing on it untouched. Anything
+    # else (the pl.MemorySpace members) is thread-private storage.
+    from palladium.threadgroup import THREADGROUP
+
+    infos = []
+    for aval in scratch_avals:
+        space: TLiteral["thread", "threadgroup"] = (
+            "threadgroup"
+            if getattr(aval, "memory_space", None) is THREADGROUP
+            else "thread"
+        )
+        infos.append(
+            ScratchInfo(
+                shape=tuple(int(d) for d in aval.shape),
+                dtype=np.dtype(aval.dtype),
+                space=space,
+            )
+        )
+    return infos
+
+
 def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
     """Extract a KernelSpec from a function that calls `pl.pallas_call`.
 
@@ -285,6 +345,7 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
         raise TraceError("PrefetchScalarGridSpec is not supported")
 
     n_in, n_out = grid_mapping.num_inputs, grid_mapping.num_outputs
+    scratch_bufs = grid_mapping.scratch_avals
     mappings = list(grid_mapping.block_mappings)
 
     grid = tuple(int(g) for g in grid_mapping.grid)
@@ -307,6 +368,7 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
         grid=grid,
         inputs=inputs,
         outputs=outputs,
+        scratch=tuple(_scratch_infos(scratch_bufs)),
         raw_params=params,
         aliases=aliases,
     )

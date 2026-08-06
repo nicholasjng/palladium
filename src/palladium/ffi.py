@@ -21,8 +21,14 @@ if TYPE_CHECKING:
 import jax
 import numpy as np
 
-from palladium.diagnostics import KernelDiagnostics, explain_spec, log_compile
+from palladium.diagnostics import (
+    KernelDiagnostics,
+    explain_spec,
+    log_compile,
+    normalize_threadgroup,
+)
 from palladium.emit import emit_msl
+from palladium.errors import EmitError
 from palladium.trace import KernelSpec, trace
 
 __all__ = ["FfiCallable", "metal_call_jit"]
@@ -112,6 +118,7 @@ class FfiCallable:
         pallas_kwargs: dict[str, Any],
         math_mode: MathMode | str,
         vmap_method: str | None = None,
+        threadgroup: int | tuple[int, ...] | None = None,
     ) -> None:
         import jax.experimental.pallas as pl
 
@@ -128,6 +135,7 @@ class FfiCallable:
         # MathMode is a StrEnum, so members index the dict as their value.
         self._math_mode = _MATH_MODE_ORDINALS[math_mode]
         self._vmap_method = vmap_method
+        self._threadgroup = normalize_threadgroup(threadgroup)
         self._cache: dict[tuple, tuple[KernelSpec, str]] = {}
         # Guards trace/emit on a cache miss, mirroring MetalCallable.
         self._lock = threading.Lock()
@@ -147,7 +155,7 @@ class FfiCallable:
             data is read.
         """
         shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
-        return explain_spec(trace(self._staged, *shapes))
+        return explain_spec(trace(self._staged, *shapes), self._threadgroup)
 
     def _spec_and_msl(self, args: tuple[Any, ...]) -> tuple[KernelSpec, str]:
         key = tuple((a.shape, np.dtype(a.dtype).str) for a in args)
@@ -159,6 +167,17 @@ class FfiCallable:
                     shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
                     spec = trace(self._staged, *shapes)
                     log_compile(spec)
+                    if spec.uses_threadgroup and self._threadgroup is None:
+                        raise EmitError(
+                            f"kernel {spec.name!r} declares threadgroup_memory "
+                            "scratch, so it must be dispatched with an explicit "
+                            "threadgroup= size; metal_call_jit otherwise launches "
+                            "with a runtime-chosen one (commonly far larger than "
+                            "the declared extent), and a thread_index() past that "
+                            "extent writes out of bounds with no error. Pass "
+                            "metal_call_jit(..., threadgroup=N). Mirrors the same "
+                            "check in palladium.bind for the eager path."
+                        )
                     entry = (spec, emit_msl(spec))
                     self._cache[key] = entry
         return entry
@@ -209,7 +228,10 @@ class FfiCallable:
         spec, msl_source = self._spec_and_msl(tuple(unbatched))
         # MRLaunchDesc always wants 3 grid dims; palladium grids are 1-3D.
         grid = tuple(spec.grid) + (1, 1, 1)
-        threadgroup = (0, 0, 0)  # runtime chooses
+        # (0, 0, 0) lets the runtime choose (c_api.cpp); a cooperative
+        # kernel never reaches here with None, per the check above.
+        tg = self._threadgroup or (0,)
+        threadgroup = (tuple(tg) + (1, 1, 1))[:3] if tg != (0,) else (0, 0, 0)
         in_strides = [
             np.dtype(u.dtype).itemsize * math.prod(u.shape) if b else 0
             for u, b in zip(unbatched, batched, strict=True)
@@ -262,7 +284,9 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
         None, the default, rejects `jax.vmap`).
         'pipelined' handles the whole batch in one FFI call and is the
         fastest vmap path; a batch dimension in the Pallas grid still
-        beats it (one dispatch total).
+        beats it (one dispatch total). `threadgroup` (int or tuple; None
+        lets the runtime choose) is required for kernels using
+        `palladium.threadgroup_memory`.
 
     Returns
     -------
@@ -278,4 +302,5 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
 
     math_mode = pallas_kwargs.pop("math_mode", MathMode.FAST)
     vmap_method = pallas_kwargs.pop("vmap_method", None)
-    return FfiCallable(kernel, pallas_kwargs, math_mode, vmap_method)
+    threadgroup = pallas_kwargs.pop("threadgroup", None)
+    return FfiCallable(kernel, pallas_kwargs, math_mode, vmap_method, threadgroup)

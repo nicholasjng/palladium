@@ -13,7 +13,7 @@ import itertools
 import math
 import string
 from collections.abc import Callable, Iterator
-from typing import cast
+from typing import Literal as TLiteral, cast
 
 import jax.experimental.pallas as pl
 from jax._src.state.indexing import NDIndexer
@@ -64,6 +64,8 @@ CTYPES = {
 }
 
 _PID = ("_pid.x", "_pid.y", "_pid.z")
+_TID = "_tid.x"
+_TPT = "_tpt.x"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,9 +82,9 @@ class CVal:
         C type name, always a value of CTYPES (`"float"`, not `"float32"`).
     space : str
         Metal address space of the storage behind `expr`: `"thread"` for
-        emitter-declared locals, `"device"` for kernel operand refs and
-        views of them. Pointer casts must be qualified with this; a
-        mis-qualified cast is invalid MSL.
+        emitter-declared locals, `"threadgroup"` for per-threadgroup locals,
+        `"device"` for kernel operand refs and views of them.
+        Pointer casts must be qualified with this; a mis-qualified cast is invalid MSL.
     readonly : bool
         True for `const device` input refs and views of them. Only
         readonly device storage may be aliased instead of copied by
@@ -106,7 +108,7 @@ class CVal:
     expr: str
     shape: tuple[int, ...]
     ctype: str
-    space: str = "thread"
+    space: TLiteral["thread", "threadgroup", "device"] = "thread"
     readonly: bool = False
     transposed: bool = False
     align: int = 0
@@ -450,7 +452,7 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
     Raises
     ------
     EmitError
-        For grids over rank 3, non-contiguous blocks, or scratch operands.
+        For grids over rank 3, or non-contiguous blocks.
     UnsupportedPrimitiveError
         If the kernel stages a primitive with no registered rule.
     """
@@ -467,6 +469,9 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
         ctype = CTYPES[info.dtype.name]
         params.append(f"{qual} {ctype}* arg{k}_base [[buffer({k})]]")
     params.append("uint3 _pid [[thread_position_in_grid]]")
+    if any(info.space == "threadgroup" for info in spec.scratch):
+        params.append("uint3 _tid [[thread_position_in_threadgroup]]")
+        params.append("uint3 _tpt [[threads_per_threadgroup]]")
 
     env = Environment(
         no_stream_refs=frozenset(
@@ -499,11 +504,31 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
             )
         )
 
-    n_refs = len(operands)
+    for k, info in enumerate(spec.scratch):
+        ctype = CTYPES[info.dtype.name]
+        shape = info.shape
+        size = math.prod(info.shape)
+        # Both spaces are compile-time-sized local arrays; only the
+        # qualifier differs. MSL requires threadgroup variables at kernel
+        # scope, which is where these already land.
+        scratch_op = f"{info.space} {ctype} scratch{k}"
+        scratch_op += f"[{size}];" if shape else ";"
+        cursor.emit(scratch_op)
+        ref_vals.append(
+            CVal(
+                expr=f"scratch{k}",
+                shape=shape,
+                ctype=ctype,
+                space=info.space,
+                readonly=False,
+                align=0,
+            )
+        )
+
+    n_refs = len(operands) + len(spec.scratch)
     if len(spec.jaxpr.invars) != n_refs:
         raise EmitError(
-            f"kernel has {len(spec.jaxpr.invars)} refs but spec carries "
-            f"{n_refs} operands; scratch_shapes are not supported yet"
+            f"kernel has {len(spec.jaxpr.invars)} refs but spec carries {n_refs} operands"
         )
     emit_jaxpr(env, cursor, spec.jaxpr, ref_vals)
 
