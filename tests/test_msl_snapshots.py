@@ -93,10 +93,31 @@ def _rk4_lotka_volterra():
     return palladium.trace(f, *args)
 
 
+def _conditional_loop():
+    # Pins the stretch-7 vocabulary in one kernel: a comparison, select_n
+    # reached through jnp.where's jit wrapper (inlined by _inline_jit),
+    # and both inside a scan with a const. The jit staging is a JAX
+    # implementation detail; if an upgrade changes it, this golden turns
+    # the canary red before any GPU sees the difference.
+    def kernel(y0_ref, r_ref, o_ref):
+        r = r_ref[...]
+
+        def step(_, y):
+            grown = y + r
+            return jnp.where(grown <= 1.0, grown, y)
+
+        o_ref[...] = jax.lax.fori_loop(0, 20, step, y0_ref[...])
+
+    f = pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct((64,), jnp.float32))
+    x = np.zeros(64, np.float32)
+    return palladium.trace(f, x, x)
+
+
 SNAPSHOTS = {
     "copy_2d": _copy_2d,
     "blocked_saxpy": _blocked_saxpy,
     "rk4_lotka_volterra": _rk4_lotka_volterra,
+    "conditional_loop": _conditional_loop,
 }
 
 
