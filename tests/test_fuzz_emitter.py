@@ -62,6 +62,17 @@ BINARY = {
     "min": jnp.minimum,
     "max": jnp.maximum,
 }
+# Comparisons appear only inside where-nodes, and only over *leaves*: raw
+# inputs and literals are bit-identical on both backends, so the predicate
+# cannot flip on ulp noise between Metal and CPU libm. Computed comparison
+# operands would turn last-ulp differences into branch divergence, a false
+# positive no tolerance absorbs.
+COMPARE = {
+    "lt": lambda a, b: a < b,
+    "le": lambda a, b: a <= b,
+    "gt": lambda a, b: a > b,
+    "ge": lambda a, b: a >= b,
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -79,6 +90,10 @@ class Node:
 def eval_tree(tree, vals):
     if isinstance(tree, Leaf):
         return vals[tree.ref] if tree.ref is not None else tree.lit
+    if tree.op.startswith("where_"):
+        lhs, rhs, on_true, on_false = (eval_tree(a, vals) for a in tree.args)
+        pred = COMPARE[tree.op.removeprefix("where_")](lhs, rhs)
+        return jnp.where(pred, on_true, on_false)
     fn = UNARY.get(tree.op) or BINARY[tree.op]
     return fn(*(eval_tree(a, vals) for a in tree.args))
 
@@ -88,14 +103,20 @@ def trees(n_inputs: int):
         lambda v: Leaf(ref=None, lit=round(float(v), 3))
     )
     refs = st.integers(0, n_inputs - 1).map(lambda i: Leaf(ref=i, lit=None))
+    leaves = st.one_of(refs, literals)
     return st.recursive(
-        st.one_of(refs, literals),
+        leaves,
         lambda kids: st.one_of(
             st.tuples(st.sampled_from(sorted(UNARY)), kids).map(
                 lambda t: Node(t[0], (t[1],))
             ),
             st.tuples(st.sampled_from(sorted(BINARY)), kids, kids).map(
                 lambda t: Node(t[0], (t[1], t[2]))
+            ),
+            # Conditionals: leaf-only comparison (see COMPARE), general
+            # branches. Every instance crosses jit-inlining + select_n.
+            st.tuples(st.sampled_from(sorted(COMPARE)), leaves, leaves, kids, kids).map(
+                lambda t: Node(f"where_{t[0]}", (t[1], t[2], t[3], t[4]))
             ),
         ),
         max_leaves=8,
