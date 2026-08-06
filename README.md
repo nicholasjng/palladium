@@ -124,6 +124,15 @@ line-numbered source attached. The CPU oracle for any kernel is
 - `05_df32_precision.py`: does compensated arithmetic (df32) buy real
   accuracy on the RK4 capstone. FAST vs SAFE vs df32, all measured
   against a true float64 reference, not against each other.
+- `06_flash_attention.py`: single-head scaled-dot-product attention,
+  online-softmax with streaming K/V (one thread per query, no cross-
+  thread reduction needed, unlike training a shared model). Verified
+  against an independent NumPy implementation of the recurrence, not
+  just assembled and hoped. Streaming avoids the per-thread stack limit
+  a full-materialization approach would hit at any real sequence
+  length; honest result: still ~15-20x slower than a plain `jax.jit`
+  reference, and that's `dot_general` being a naive scalar loop, not a
+  parallelism problem this time. Full story in ROADMAP's stretch 17.
 
 ```sh
 uv run python examples/02_adaptive_lockstep.py

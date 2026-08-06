@@ -33,8 +33,7 @@ import jax.numpy as jnp
 import metal_runtime as mr
 import numpy as np
 import pytest
-from hypothesis import given, settings
-from hypothesis import strategies as st
+from hypothesis import given, settings, strategies as st
 from hypothesis.extra.numpy import arrays
 from jax.experimental import pallas as pl
 

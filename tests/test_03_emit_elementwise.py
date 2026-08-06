@@ -107,7 +107,9 @@ def test_row_vector_broadcasts_against_matrix_matches_numpy(rng):
     x = rng.standard_normal((4, 1), dtype=np.float32)
     w = rng.standard_normal((1, 32), dtype=np.float32)
     b = rng.standard_normal((32,), dtype=np.float32)
-    f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((4, 32), jnp.float32))
+    f = palladium.metal_call(
+        kernel, out_shape=jax.ShapeDtypeStruct((4, 32), jnp.float32)
+    )
     got = f(x, w, b)
     np.testing.assert_allclose(got, x @ w + b, rtol=1e-4, atol=1e-4)
 
@@ -120,6 +122,8 @@ def test_column_vector_broadcasts_against_matrix_matches_numpy(rng):
 
     x = rng.standard_normal((4, 32), dtype=np.float32)
     col = rng.standard_normal((4, 1), dtype=np.float32)
-    f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((4, 32), jnp.float32))
+    f = palladium.metal_call(
+        kernel, out_shape=jax.ShapeDtypeStruct((4, 32), jnp.float32)
+    )
     got = f(x, col)
     np.testing.assert_allclose(got, x + col, rtol=1e-5, atol=1e-6)

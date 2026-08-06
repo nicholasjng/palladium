@@ -16,6 +16,7 @@ import numpy as np
 from palladium.dispatch import BoundKernel, bind
 from palladium.emit import emit_jaxpr, emit_msl, rule
 from palladium.ffi import FfiCallable, metal_call_jit
+from palladium.simdgroup_matmul import SimdgroupMatmul, simdgroup_matmul
 from palladium.trace import BlockInfo, KernelSpec, trace
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "FfiCallable",
     "KernelSpec",
     "MetalCallable",
+    "SimdgroupMatmul",
     "bind",
     "debug_msl",
     "emit_jaxpr",
@@ -31,6 +33,7 @@ __all__ = [
     "metal_call",
     "metal_call_jit",
     "rule",
+    "simdgroup_matmul",
     "trace",
 ]
 

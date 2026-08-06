@@ -345,7 +345,11 @@ def _element_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
 def _flat_index(terms: list[tuple[str, int]]) -> str:
     """C expression for `sum(var * stride for var, stride in terms)`,
     omitting the `* 1` for a unit stride and any zero-stride term."""
-    parts = [var if stride == 1 else f"{var} * {stride}" for var, stride in terms if stride != 0]
+    parts = [
+        var if stride == 1 else f"{var} * {stride}"
+        for var, stride in terms
+        if stride != 0
+    ]
     return " + ".join(parts) or "0"
 
 
@@ -675,6 +679,46 @@ def _rule_reshape(state: EmitState, eqn: JaxprEqn) -> None:
     state.bind(eqn.outvars[0], dataclasses.replace(src, shape=eqn.params["new_sizes"]))
 
 
+@rule("transpose")
+def _rule_transpose(state: EmitState, eqn: JaxprEqn) -> None:
+    """`x.T` / `jnp.transpose(x, perm)` -> a materialized, permuted copy.
+
+    A real copy, not a view like reshape: transposed storage is
+    different bytes in the emitter's row-major flat-array model.
+
+    Verified against a real jaxpr before implementing: `a.T` inside a
+    dot product stages as a standalone `transpose` equation ahead of
+    `dot_general`, which always sees the standard (lhs dim 1, rhs dim 0)
+    contraction afterward, never a transpose folded into
+    dimension_numbers. So this, not a dot_general widening, is what a
+    dense layer's backward pass (`x.T @ dy`, `dy @ W.T`) actually needs.
+    """
+    perm: tuple[int, ...] = eqn.params["permutation"]
+    src = state.val(eqn.invars[0])
+    dst = state.declare(eqn.outvars[0])
+    src_strides = _element_strides(src.shape)
+    dst_strides = _element_strides(dst.shape)
+    rank = len(src.shape)
+    idx_vars = [state.fresh(f"_t{d}") for d in range(rank)]
+
+    def emit_loops(d: int) -> None:
+        if d == rank:
+            src_idx = _flat_index(
+                [(idx_vars[dd], src_strides[perm[dd]]) for dd in range(rank)]
+            )
+            dst_idx = _flat_index(
+                [(idx_vars[dd], dst_strides[dd]) for dd in range(rank)]
+            )
+            state.emit(f"{dst.at(dst_idx)} = {src.at(src_idx)};")
+            return
+        with state.block(
+            f"for (uint {idx_vars[d]} = 0; {idx_vars[d]} < {dst.shape[d]}; ++{idx_vars[d]})"
+        ):
+            emit_loops(d + 1)
+
+    emit_loops(0)
+
+
 # MSL templates for pure elementwise primitives; {a}/{b} are element expressions.
 # The arity check in _rule_elementwise validates every template against its equation.
 # fmin/fmax are float-only; integer min/max needs a ctype dispatch, unimplemented.
@@ -719,8 +763,15 @@ def _rule_elementwise(state: EmitState, eqn: JaxprEqn) -> None:
 
     Three templates are derived rather than looked up: integer_pow expands
     to repeated multiplication (reciprocal for negative y); convert_element_type
-    casts to the output's ctype; broadcast_in_dim is "{a}" (the element
-    loop already broadcasts scalars).
+    casts to the output's ctype; bitcast_convert_type uses as_type<T>.
+
+    Operands broadcast against `dst`'s shape numpy-style (right-aligned,
+    size-1 dims replicate): verified against a real jaxpr before
+    implementing that a bias add like `x @ w + b` stages `b`'s
+    broadcast_in_dim to the same rank as the sum but not the same size
+    on every dim (e.g. (32,) -> (1,32) against a (4,32) sum), so `add`
+    itself, not just broadcast_in_dim, has to handle differently-shaped
+    operands, not assume every operand matches `dst`'s shape exactly.
 
     The arity check requires every template field to be filled and every
     operand consumed.
@@ -740,10 +791,6 @@ def _rule_elementwise(state: EmitState, eqn: JaxprEqn) -> None:
         # Reinterprets bits without a numeric conversion (unlike
         # convert_element_type's cast); Metal's equivalent is as_type<T>.
         template = f"as_type<{dst.ctype}>({{a}})"
-    elif opname == "broadcast_in_dim":
-        if dst.shape and any(op.shape for op in ops):
-            raise EmitError("array-to-array broadcasts are unimplemented")
-        template = "{a}"
     elif opname == "select_n":
         if (pred_type := ops[0].ctype) != "bool":
             raise EmitError(
@@ -758,16 +805,42 @@ def _rule_elementwise(state: EmitState, eqn: JaxprEqn) -> None:
     if fields != expected:
         raise EmitError(f"{opname} requires {len(fields)} operands, got {len(ops)}")
 
-    def assign(idx: str) -> str:
-        inputs = {name: op.at(idx) for name, op in zip(PRIMITIVE_INVARS, ops)}
-        return f"{dst.at(idx)} = {_unwrapped(template.format(**inputs))};"
+    rank = len(dst.shape)
+    dst_strides = _element_strides(dst.shape)
 
-    if dst.shape:
-        idx = state.fresh("_i")
-        with state.block(f"for (uint {idx} = 0; {idx} < {dst.size}; ++{idx})"):
-            state.emit(assign(idx))
-    else:
-        state.emit(assign("0"))
+    def op_index(op: CVal, idx_vars: list[str]) -> str:
+        # numpy right-alignment: an operand's dim d lines up with dst's
+        # dim d + (rank - len(op.shape)); size-1 dims always read index 0.
+        rank_diff = rank - len(op.shape)
+        op_strides = _element_strides(op.shape)
+        return _flat_index(
+            [
+                (idx_vars[d + rank_diff], op_strides[d])
+                for d, size in enumerate(op.shape)
+                if size != 1
+            ]
+        )
+
+    def assign(idx_vars: list[str]) -> str:
+        dst_idx = _flat_index(list(zip(idx_vars, dst_strides)))
+        inputs = {
+            name: op.at(op_index(op, idx_vars))
+            for name, op in zip(PRIMITIVE_INVARS, ops)
+        }
+        return f"{dst.at(dst_idx)} = {_unwrapped(template.format(**inputs))};"
+
+    idx_vars = [state.fresh("_i") for _ in range(rank)]
+
+    def emit_loops(d: int) -> None:
+        if d == rank:
+            state.emit(assign(idx_vars))
+            return
+        with state.block(
+            f"for (uint {idx_vars[d]} = 0; {idx_vars[d]} < {dst.shape[d]}; ++{idx_vars[d]})"
+        ):
+            emit_loops(d + 1)
+
+    emit_loops(0)
 
 
 for _name in [
@@ -775,9 +848,181 @@ for _name in [
     "integer_pow",
     "convert_element_type",
     "bitcast_convert_type",
-    "broadcast_in_dim",
 ]:
     RULES[_name] = _rule_elementwise
+
+
+@rule("broadcast_in_dim")
+def _rule_broadcast_in_dim(state: EmitState, eqn: JaxprEqn) -> None:
+    """`jnp.broadcast_to`/rank-matching before an elementwise op ->
+    a materialized copy, replicating size-1 (or absent) input dims.
+
+    Verified against a real jaxpr before implementing (see
+    `_rule_elementwise`'s docstring): this only inserts new dims / marks
+    existing size-1 dims as broadcastable, it does not itself expand a
+    size-1 dim to a larger size; the elementwise op consuming the result
+    does that (`op_index` there). Degenerates correctly for a scalar
+    source (no broadcast_dimensions entries, every output position reads
+    index 0, `CVal.at` already treats that as "ignore the index" for a
+    true scalar).
+    """
+    src = state.val(eqn.invars[0])
+    dst = state.declare(eqn.outvars[0])
+    bcast_dims: tuple[int, ...] = eqn.params["broadcast_dimensions"]
+    src_strides = _element_strides(src.shape)
+    dst_strides = _element_strides(dst.shape)
+    rank = len(dst.shape)
+    idx_vars = [state.fresh(f"_b{d}") for d in range(rank)]
+
+    def emit_loops(d: int) -> None:
+        if d == rank:
+            src_idx = _flat_index(
+                [
+                    (idx_vars[od], src_strides[sd])
+                    for sd, od in enumerate(bcast_dims)
+                    if src.shape[sd] != 1
+                ]
+            )
+            dst_idx = _flat_index(list(zip(idx_vars, dst_strides)))
+            state.emit(f"{dst.at(dst_idx)} = {src.at(src_idx)};")
+            return
+        with state.block(
+            f"for (uint {idx_vars[d]} = 0; {idx_vars[d]} < {dst.shape[d]}; ++{idx_vars[d]})"
+        ):
+            emit_loops(d + 1)
+
+    emit_loops(0)
+
+
+@rule("dot_general")
+def _rule_dot_general(state: EmitState, eqn: JaxprEqn) -> None:
+    """`a @ b` for rank-2, non-batched operands -> a triple-nested C loop.
+
+    Naive O(M*N*K), no threadgroup-memory tiling (ROADMAP stretch 12 is
+    where a tiled/MMA version would go). Scoped to exactly the plain
+    matmul contraction (lhs dim 1 with rhs dim 0, no batch dims);
+    verified against a real jaxpr before implementing (`jnp.dot(a, b)`
+    stages `dimension_numbers=(([1], [0]), ([], []))`). Batch dims,
+    higher rank, or any other contraction axis are unimplemented.
+
+    `i, j` outer with `k` innermost, accumulating into a scalar register,
+    on purpose: an `i, k, j` reorder looks more cache-friendly (`rhs` and
+    `dst` become unit-stride in the innermost loop instead of `rhs`
+    striding by `n`), but measured ~4x *slower* at M=4096 on a real
+    generated kernel, because it turns the single per-`(i,j)` write this
+    version does into `k` read-modify-writes of the `dst` array per `j` -
+    more memory traffic than the strided reads it was meant to avoid, and
+    it gets worse as thread count grows and that traffic starts competing
+    for bandwidth. Keeping the reduction in a scalar (register-resident,
+    not array-indexed) accumulator mattered more than the access pattern.
+    """
+    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = eqn.params[
+        "dimension_numbers"
+    ]
+    if lhs_batch or rhs_batch:
+        raise EmitError("dot_general: batch dims are unimplemented")
+    if tuple(lhs_contract) != (1,) or tuple(rhs_contract) != (0,):
+        raise EmitError(
+            "dot_general: only the standard matmul contraction (lhs dim 1 "
+            "with rhs dim 0) is implemented"
+        )
+
+    lhs = state.val(eqn.invars[0])
+    rhs = state.val(eqn.invars[1])
+    if len(lhs.shape) != 2 or len(rhs.shape) != 2:
+        raise EmitError("dot_general: only rank-2 operands are implemented")
+    m, k = lhs.shape
+    k2, n = rhs.shape
+    if k != k2:
+        raise EmitError(f"dot_general: inner dims disagree ({k} vs {k2})")
+
+    dst = state.declare(eqn.outvars[0])
+    i, j, kk, acc = (
+        state.fresh("_mi"),
+        state.fresh("_ni"),
+        state.fresh("_ki"),
+        state.fresh("_acc"),
+    )
+    with (
+        state.block(f"for (uint {i} = 0; {i} < {m}; ++{i})"),
+        state.block(f"for (uint {j} = 0; {j} < {n}; ++{j})"),
+    ):
+        state.emit(f"{dst.ctype} {acc} = 0;")
+        with state.block(f"for (uint {kk} = 0; {kk} < {k}; ++{kk})"):
+            lhs_idx = f"{i} * {k} + {kk}"
+            rhs_idx = f"{kk} * {n} + {j}"
+            state.emit(f"{acc} += {lhs.at(lhs_idx)} * {rhs.at(rhs_idx)};")
+        state.emit(f"{dst.at(f'{i} * {n} + {j}')} = {acc};")
+
+
+def _emit_reduce(
+    state: EmitState, eqn: JaxprEqn, init: str, combine: Callable[[str, str], str]
+) -> None:
+    """Shared shape for `reduce_sum`/`reduce_max`: nested loops, one per
+    kept dim, each accumulating over the reduced dims via `combine`
+    starting from `init`. `axes` may be any subset of dims, not just
+    "reduce to a scalar"."""
+    axes = set(eqn.params["axes"])
+    src = state.val(eqn.invars[0])
+    rank = len(src.shape)
+    kept_dims = [d for d in range(rank) if d not in axes]
+    reduced_dims = [d for d in range(rank) if d in axes]
+
+    dst = state.declare(eqn.outvars[0])
+    src_strides = _element_strides(src.shape)
+    dst_strides = _element_strides(dst.shape)
+    idx_vars: dict[int, str] = {}
+
+    def emit_loops(dims: list[int], body: Callable[[], None]) -> None:
+        if not dims:
+            body()
+            return
+        d, rest = dims[0], dims[1:]
+        idx_vars[d] = state.fresh(f"_d{d}")
+        with state.block(
+            f"for (uint {idx_vars[d]} = 0; {idx_vars[d]} < {src.shape[d]}; ++{idx_vars[d]})"
+        ):
+            emit_loops(rest, body)
+
+    def accumulate() -> None:
+        acc = state.fresh("_acc")
+        state.emit(f"{dst.ctype} {acc} = {init};")
+
+        def inner_body() -> None:
+            src_idx = _flat_index([(idx_vars[d], src_strides[d]) for d in range(rank)])
+            state.emit(f"{acc} = {combine(acc, src.at(src_idx))};")
+
+        emit_loops(reduced_dims, inner_body)
+        dst_idx = _flat_index(
+            [(idx_vars[d], dst_strides[i]) for i, d in enumerate(kept_dims)]
+        )
+        state.emit(f"{dst.at(dst_idx)} = {acc};")
+
+    emit_loops(kept_dims, accumulate)
+
+
+@rule("reduce_sum")
+def _rule_reduce_sum(state: EmitState, eqn: JaxprEqn) -> None:
+    """`jnp.sum(x, axis=...)` -> nested loops, one per kept dim, each
+    accumulating over the reduced dims.
+
+    Verified against a real jaxpr before implementing: `jnp.sum` and
+    `jnp.mean` both stage as `reduce_sum[axes=...]` (mean adds a plain
+    `div` after, already emittable via ELEMENTWISE).
+    """
+    _emit_reduce(state, eqn, "0", lambda acc, x: f"{acc} + {x}")
+
+
+@rule("reduce_max")
+def _rule_reduce_max(state: EmitState, eqn: JaxprEqn) -> None:
+    """`jnp.max(x, axis=...)` -> the same nested-loop shape as
+    `reduce_sum`, `fmax`-combining from `-INFINITY` instead of summing
+    from 0. Verified against a real jaxpr before implementing:
+    `jnp.max` stages as `reduce_max[axes=...]`, exactly parallel to
+    `reduce_sum`. Needed for softmax numerical stability (subtract the
+    row max before `exp`), the actual motivating case.
+    """
+    _emit_reduce(state, eqn, "-INFINITY", lambda acc, x: f"fmax({acc}, {x})")
 
 
 @rule("program_id")

@@ -53,3 +53,10 @@ markers = [
 ]
 addopts = '-m "not fuzz"'
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
