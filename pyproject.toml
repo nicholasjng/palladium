@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "palladium"
+version = "0.1.0"
+description = "Pallas kernels on Apple GPU: trace Pallas, emit MSL, dispatch via metal-runtime"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Nicholas Junge", email = "nicho.junge@gmail.com" }]
+requires-python = ">=3.11"
+dependencies = [
+    "jax>=0.6",
+    "numpy>=1.26",
+    "metal-runtime",
+]
+
+[tool.uv.sources]
+metal-runtime = { path = "../metal-runtime" }
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+examples = [
+    "diffrax>=0.6",
+]
+typing = [
+    "ty>=0.0.66",
+]
+
+[tool.uv]
+default-groups = ["dev", "examples", "typing"]
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/palladium"]
+
+[tool.pytest.ini_options]
+markers = [
+    "exercise: test-driven exercise, red until you implement the emitter rule it covers",
+]
+testpaths = ["tests"]
