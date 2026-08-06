@@ -14,9 +14,8 @@ from typing import Any
 import numpy as np
 
 from palladium.dispatch import BoundKernel, bind
-from palladium.emit import emit_jaxpr, emit_msl, rule
+from palladium.emit import emit_jaxpr, emit_msl, is_simdgroup_cooperative, rule
 from palladium.ffi import FfiCallable, metal_call_jit
-from palladium.simdgroup_matmul import SimdgroupMatmul, simdgroup_matmul
 from palladium.trace import BlockInfo, KernelSpec, trace
 
 __all__ = [
@@ -25,7 +24,6 @@ __all__ = [
     "FfiCallable",
     "KernelSpec",
     "MetalCallable",
-    "SimdgroupMatmul",
     "bind",
     "debug_msl",
     "emit_jaxpr",
@@ -33,7 +31,6 @@ __all__ = [
     "metal_call",
     "metal_call_jit",
     "rule",
-    "simdgroup_matmul",
     "trace",
 ]
 
@@ -72,6 +69,16 @@ class MetalCallable:
         self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
         self.cache: dict[CacheKey, BoundKernel] = {}
 
+    def pin(self, *args) -> Callable[[], np.ndarray | tuple[np.ndarray, ...]]:
+        """Upload the inputs once; return a zero-argument callable that
+        re-dispatches on the pinned device buffers (see
+        `BoundKernel.pinned`). Use for repeated calls on unchanging
+        inputs. Later mutation of the passed arrays is not observed."""
+        arrays = [np.asarray(a) for a in args]
+        self(*arrays)  # populate the shape cache (trace/emit/compile)
+        key: CacheKey = tuple((a.shape, a.dtype.str) for a in arrays)
+        return self.cache[key].pinned(*arrays)
+
     def __call__(self, *args) -> np.ndarray | tuple[np.ndarray, ...]:
         """Run the kernel on the GPU; NumPy in, NumPy out."""
         arrays = [np.asarray(a) for a in args]
@@ -79,11 +86,16 @@ class MetalCallable:
         bound = self.cache.get(key)
         if bound is None:
             spec = trace(self._staged, *arrays)
+            # An explicit threadgroup opts out of the cooperative model
+            # (its launch geometry is fixed); codegen and launch geometry
+            # must be decided together.
+            cooperative = self._threadgroup is None and is_simdgroup_cooperative(spec)
             bound = bind(
                 spec,
-                emit_msl(spec),
+                emit_msl(spec, cooperative=cooperative),
                 math_mode=self._math_mode,
                 threadgroup=self._threadgroup,
+                cooperative=cooperative,
             )
             self.cache[key] = bound
         return bound(*arrays)
