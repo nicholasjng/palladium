@@ -9,9 +9,9 @@ description = "Pallas kernels on Apple GPU: trace Pallas, emit MSL, dispatch via
 readme = "README.md"
 license = "Apache-2.0"
 authors = [{ name = "Nicholas Junge", email = "nicho.junge@gmail.com" }]
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
-    "jax>=0.6",
+    "jax>=0.11,<0.12",
     "numpy>=1.26",
     "metal-runtime",
 ]
@@ -21,25 +21,34 @@ metal-runtime = { path = "../metal-runtime" }
 
 [dependency-groups]
 dev = [
+    "hypothesis>=6.100",
     "pytest>=8",
     "ruff>=0.6",
 ]
 examples = [
     "diffrax>=0.6",
 ]
+bench = [
+    "mew-bench",
+]
 typing = [
     "ty>=0.0.66",
 ]
 
 [tool.uv]
-default-groups = ["dev", "examples", "typing"]
+default-groups = ["bench", "dev", "examples", "typing"]
 
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/palladium"]
 
+[tool.mew]
+benchpaths = ["benchmarks"]
+
 [tool.pytest.ini_options]
 markers = [
     "exercise: test-driven exercise, red until you implement the emitter rule it covers",
+    "fuzz: differential fuzzing against the interpret oracle; GPU-bound and slow, run explicitly with -m fuzz",
 ]
+addopts = '-m "not fuzz"'
 testpaths = ["tests"]
