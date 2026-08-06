@@ -1,40 +1,28 @@
-"""jaxpr -> MSL: palladium's core, laid out as test-driven exercises.
+"""jaxpr -> MSL: palladium's core emitter.
 
-## Emission model: scalarized SSA over thread-local arrays
+Emission model: scalarized SSA over thread-local arrays. One Metal thread
+runs one Pallas program instance; `program_id(k)` maps to a component of
+`thread_position_in_grid`. Every jaxpr variable of shape S becomes a
+thread-local C array of prod(S) elements (a bare scalar for rank 0), and
+every rule emits plain element loops. Nothing is vectorized: the Metal
+compiler cleans up after us, and for ensemble workloads (a block is one
+small ODE state) one-thread-per-program is the right mapping. Triton maps
+a program to a threadgroup and Mosaic GPU to a warpgroup; this tier is
+deliberately the bottom rung of that scope ladder, and survives unchanged
+if the plmetal dialect (ROADMAP, backend endgame) ever lands.
 
-- One Metal thread per Pallas program instance. `dispatch.bind` launches
-  `prod(grid)` threads as an up-to-3D grid; `program_id(k)` maps to a
-  component of `thread_position_in_grid`. (Triton maps a program to a whole
-  threadgroup, Mosaic GPU to a warpgroup; one-thread-per-program is the
-  simplest mapping that preserves Pallas semantics, and it is the right one
-  for ensemble workloads where a block is one small ODE state. Revisit for
-  stencils.) This is also, deliberately, the bottom rung of a scope ladder:
-  if the plmetal dialect (ROADMAP, backend endgame) ever lands, a Pallas
-  thread becomes a simdgroup or an `execution_simdgroups<N>` scope, and the
-  rules in this file become its thread-scope tier unchanged.
-- Every jaxpr variable of shape S becomes a thread-local C array of prod(S)
-  elements (a bare scalar for rank 0), named t0, t1, ...
-- Every primitive rule emits a plain element loop. Nothing is vectorized;
-  the Metal compiler cleans up after us.
-- Blocks must be *contiguous* in the underlying array: the block shape must
-  equal the array shape on every dim but the leading one. `emit_msl` checks
-  this. (Lifting it means strided copy loops in get/swap — a stretch
-  exercise, see ROADMAP.)
+Blocks must be contiguous in the underlying array: the block shape must
+equal the array shape on every dim but the leading one. Lifting this means
+strided copy loops in get/swap (ROADMAP stretch 6).
 
-## The exercises
+Per-primitive rules live in RULES, keyed by `eqn.primitive.name` and
+registered with @rule(...). The file grew rule-by-rule through the
+test-driven exercise arc in ROADMAP.md; tests/test_02..06 pin each rule,
+and known gaps are tracked there (indexed ref access, select_n, inf/nan
+literals, integer min/max, integer_pow y=0).
 
-The driver (`emit_msl`, `emit_jaxpr`) and the plumbing (`Ctx`, `CVal`, the
-rule registry) are provided and covered by tests/test_01. The per-primitive
-rules are yours, in test order — each stub's docstring has the hints:
-
-    exercise 1  _rule_get / _rule_swap           tests/test_02_emit_copy.py
-    exercise 2  ELEMENTWISE + _rule_elementwise  tests/test_03_emit_elementwise.py
-    exercise 3  _rule_program_id / _block_offset tests/test_04_grid_blocks.py
-    exercise 4  _rule_scan                       tests/test_05_loops.py
-    exercise 5  composition only, no new rules   tests/test_06_capstone_rk4.py
-
-Run one exercise:  uv run pytest tests/test_02_emit_copy.py -x
-Check your MSL:    print(emit_msl(spec)) — it is just text; read it.
+Debugging: the output is text, read it. `palladium.debug_msl` is the
+one-call version; `metal_call(...).interpret` is the CPU oracle.
 """
 
 from __future__ import annotations
@@ -51,12 +39,10 @@ from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.trace import BlockInfo, KernelSpec
 
-__all__ = ["CVal", "Ctx", "EmitError", "emit_jaxpr", "emit_msl", "rule"]
+__all__ = ["RULES", "CVal", "Ctx", "EmitError", "emit_jaxpr", "emit_msl", "rule"]
 
-# A jaxpr operand: eqn.invars entries are Vars (named intermediates) or
-# Literals (inline constants); eqn.outvars are always Vars.
+# eqn.invars entries are Vars or inline Literals; eqn.outvars are always Vars.
 Atom = Var | Literal
-
 
 
 def _template_fields(template: str) -> set[str]:
@@ -64,13 +50,11 @@ def _template_fields(template: str) -> set[str]:
 
 
 def _shaped(aval: object) -> ShapedArray:
-    """Narrow an abstract value to ShapedArray (shape + dtype).
-
-    Every non-Ref value in a Pallas kernel jaxpr is shaped; Refs never pass
-    through declare()/val(), so this assert states an invariant, not a hope.
-    """
+    # Invariant, not a hope: every non-Ref value in a Pallas kernel jaxpr
+    # is shaped, and Refs never pass through declare()/val().
     assert isinstance(aval, ShapedArray), aval
     return aval
+
 
 CTYPES = {
     "float32": "float",
@@ -85,12 +69,27 @@ _PID = ("_pid.x", "_pid.y", "_pid.z")
 
 
 class EmitError(Exception):
-    pass
+    """The emitter cannot lower this kernel (unsupported or invalid input).
+
+    Distinct from NotImplementedError, which marks a missing rule: an
+    EmitError means the construct is recognized and rejected.
+    """
 
 
 @dataclasses.dataclass(frozen=True)
 class CVal:
-    """A jaxpr atom lowered to C: an identifier (or literal) plus its type."""
+    """A jaxpr atom lowered to C.
+
+    Attributes
+    ----------
+    expr : str
+        C identifier, literal, or expression. Any valid rvalue works;
+        `program_id` binds a bare `(int)_pid.x`, for example.
+    shape : tuple of int
+        Logical shape; `()` for scalars.
+    ctype : str
+        C type name, always a value of CTYPES (`"float"`, not `"float32"`).
+    """
 
     expr: str
     shape: tuple[int, ...]
@@ -98,20 +97,42 @@ class CVal:
 
     @property
     def size(self) -> int:
+        """Element count; 1 for scalars (`math.prod(()) == 1`)."""
         return math.prod(self.shape)
 
     def at(self, index: str) -> str:
         """Element access that absorbs rank-0/rank-N mixing.
 
-        Scalars ignore the index, arrays apply it — so a rule can emit
+        Scalars ignore the index and arrays apply it, so rules can emit
         `dst.at(i) = a.at(i) * b.at(i)` without caring which operands are
         scalars. This is all the broadcasting the emitter does.
+
+        Parameters
+        ----------
+        index : str
+            C expression for the element index; ignored for scalars.
+
+        Returns
+        -------
+        str
+            `expr` for scalars, `expr[index]` for arrays.
         """
         return self.expr if not self.shape else f"{self.expr}[{index}]"
 
 
 class Ctx:
-    """Accumulates MSL lines and the jaxpr-var -> CVal environment."""
+    """Emission state: MSL lines and the jaxpr-var -> CVal environment.
+
+    Attributes
+    ----------
+    lines : list of str
+        Emitted MSL body lines, indented.
+    env : dict
+        Maps jaxpr Vars to their CVals. SSA order guarantees lookups
+        succeed: every Var was an earlier equation's output or an input.
+    indent : int
+        Current indentation depth, managed by `block`.
+    """
 
     def __init__(self) -> None:
         self.lines: list[str] = []
@@ -120,13 +141,32 @@ class Ctx:
         self.indent = 1
 
     def emit(self, line: str) -> None:
+        """Append one MSL line at the current indentation."""
         self.lines.append("    " * self.indent + line)
 
     def fresh(self, prefix: str = "t") -> str:
+        """Return a new unique C identifier.
+
+        The counter is process-order deterministic, which keeps golden-MSL
+        snapshots stable.
+        """
         return f"{prefix}{next(self._names)}"
 
     def val(self, atom: Atom) -> CVal:
-        """Look up a Var, or format a Literal in place."""
+        """Resolve a jaxpr atom to its CVal.
+
+        The only bridge from jaxpr land to C land: Vars are looked up in
+        the environment, Literals are formatted in place.
+
+        Parameters
+        ----------
+        atom : Var or Literal
+            An equation operand.
+
+        Returns
+        -------
+        CVal
+        """
         if isinstance(atom, Literal):
             ctype = CTYPES[str(_shaped(atom.aval).dtype)]
             v = atom.val
@@ -135,7 +175,21 @@ class Ctx:
         return self.env[atom]
 
     def declare(self, var: Var) -> CVal:
-        """Emit a thread-local declaration for a jaxpr output var."""
+        """Emit thread-local storage for `var` and bind it.
+
+        Use when a rule produces a new value; use `bind` when it aliases
+        an existing one.
+
+        Parameters
+        ----------
+        var : Var
+            A jaxpr output variable; its aval fixes shape and ctype.
+
+        Returns
+        -------
+        CVal
+            The declared storage, already bound in `env`.
+        """
         aval = _shaped(var.aval)
         ctype = CTYPES[str(aval.dtype)]
         shape = tuple(int(d) for d in aval.shape)
@@ -147,13 +201,23 @@ class Ctx:
         return cval
 
     def bind(self, var: Var, cval: CVal) -> CVal:
-          """Bind a jaxpr var to an existing CVal, aliasing, no declaration."""
-          self.env[var] = cval
-          return cval
+        """Bind `var` to an existing CVal: aliasing, no declaration.
+
+        No duplicate-binding assert on purpose: a body jaxpr shared by two
+        equations legitimately rebinds its invars, and SSA order makes
+        rebinding harmless.
+
+        Returns
+        -------
+        CVal
+            `cval`, unchanged, for chaining.
+        """
+        self.env[var] = cval
+        return cval
 
     @contextlib.contextmanager
     def block(self, header: str) -> Iterator[None]:
-        """`with ctx.block("for (...)"):` emits a braced, indented block."""
+        """Emit a braced, indented block: `with ctx.block("for (...)"):`."""
         self.emit(header + " {")
         self.indent += 1
         yield
@@ -167,14 +231,26 @@ class Ctx:
             self.emit(f"{dst.at(i)} = {src.at(i)};")
 
 
-# --- rule registry -----------------------------------------------------------
-
 RuleFn = Callable[[Ctx, JaxprEqn], None]
 
 RULES: dict[str, RuleFn] = {}
 
 
 def rule(*names: str) -> Callable[[RuleFn], RuleFn]:
+    """Register a lowering rule for one or more primitive names.
+
+    Parameters
+    ----------
+    *names : str
+        Primitive names (`eqn.primitive.name`) the rule handles.
+
+    Returns
+    -------
+    callable
+        Decorator returning the rule unchanged. The registry is a plain
+        dict; assigning `RULES[name] = fn` directly is equally valid.
+    """
+
     def register(fn: RuleFn) -> RuleFn:
         for n in names:
             RULES[n] = fn
@@ -184,10 +260,31 @@ def rule(*names: str) -> Callable[[RuleFn], RuleFn]:
 
 
 def emit_jaxpr(ctx: Ctx, jaxpr: Jaxpr, in_vals: list[CVal]) -> list[CVal]:
-    """Walk a (sub-)jaxpr, dispatching each equation to RULES.
+    """Walk a jaxpr, dispatching each equation to RULES.
 
-    Binds `jaxpr.invars` to `in_vals`, returns the CVals of `jaxpr.outvars`.
-    Rules for nested jaxprs (scan) call this recursively.
+    Rules for nested jaxprs (scan bodies, index maps) recurse through this
+    same entry point, so anything the rules support composes.
+
+    Parameters
+    ----------
+    ctx : Ctx
+        Emission state; lines are appended in place.
+    jaxpr : Jaxpr
+        The (sub-)jaxpr to lower.
+    in_vals : list of CVal
+        Bindings for `jaxpr.invars`, in order.
+
+    Returns
+    -------
+    list of CVal
+        The values of `jaxpr.outvars`.
+
+    Raises
+    ------
+    EmitError
+        If the jaxpr captures arrays as constvars.
+    NotImplementedError
+        If an equation has no registered rule.
     """
     if jaxpr.constvars:
         raise EmitError(
@@ -200,20 +297,16 @@ def emit_jaxpr(ctx: Ctx, jaxpr: Jaxpr, in_vals: list[CVal]) -> list[CVal]:
         impl = RULES.get(eqn.primitive.name)
         if impl is None:
             raise NotImplementedError(
-                f"no MSL rule for primitive '{eqn.primitive.name}' — if this "
-                "is one of the exercise stubs, its test names it; otherwise "
-                "add a rule with @rule(...) in emit.py"
+                f"no MSL rule for primitive '{eqn.primitive.name}'; add one "
+                "with @rule(...) in emit.py (planned coverage: ROADMAP)"
             )
         impl(ctx, eqn)
     return [ctx.val(v) for v in jaxpr.outvars]
 
 
-# --- driver (provided) -------------------------------------------------------
-
-
 def _check_contiguous(info: BlockInfo, what: str) -> None:
-    # Only the leading dim may be a partial slice of the array; every
-    # trailing dim must span the array fully, or the block is strided.
+    # Any partial trailing dim makes the block strided in memory, which
+    # the flat pointer-plus-offset model cannot express.
     full_block = _full_block_shape(info)
     if any(b != a for b, a in zip(full_block[1:], info.array_shape[1:], strict=True)):
         raise EmitError(
@@ -223,7 +316,7 @@ def _check_contiguous(info: BlockInfo, what: str) -> None:
 
 
 def _constant_offset(info: BlockInfo) -> str | None:
-    """Offset for index maps with no inputs (gridless / constant maps)."""
+    """Fold index maps with no inputs (gridless or constant) to an offset."""
     imj = info.index_map_jaxpr.jaxpr
     if imj.invars or imj.eqns:
         return None
@@ -231,7 +324,7 @@ def _constant_offset(info: BlockInfo) -> str | None:
     full_block = _full_block_shape(info)
     off = 0
     for o, b, s in zip(imj.outvars, full_block, strides, strict=True):
-        # No invars and no eqns means every output is an inline constant.
+        # No invars and no eqns leaves only inline constants as outputs.
         assert isinstance(o, Literal), o
         off += int(o.val) * b * s
     return str(off)
@@ -248,11 +341,30 @@ def _full_block_shape(info: BlockInfo) -> tuple[int, ...]:
 
 
 def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
-    """Assemble the full MSL source for a KernelSpec. Provided.
+    """Assemble the full MSL source for a KernelSpec.
 
-    Signature convention (dispatch.bind relies on it): kernel operands in
-    jaxpr order — inputs then outputs — bound to [[buffer(k)]] in that same
+    Signature convention, relied on by `dispatch.bind`: kernel operands in
+    jaxpr order (inputs then outputs) bound to `[[buffer(k)]]` in that same
     order, then `uint3 _pid [[thread_position_in_grid]]`.
+
+    Parameters
+    ----------
+    spec : KernelSpec
+        Traced kernel, from `palladium.trace`.
+    kernel_name : str, optional
+        Overrides `spec.name` as the MSL function name.
+
+    Returns
+    -------
+    str
+        Complete, self-contained MSL source.
+
+    Raises
+    ------
+    EmitError
+        For grids over rank 3, non-contiguous blocks, or scratch operands.
+    NotImplementedError
+        If the kernel stages a primitive with no registered rule.
     """
     name = kernel_name or spec.name
     if len(spec.grid) > 3:
@@ -263,7 +375,7 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
     params = []
     for k, info in enumerate(operands):
         _check_contiguous(info, f"operand {k}")
-        qual = "device" if k >= n_in else "device const"
+        qual = "device" if k >= n_in else "const device"
         ctype = CTYPES[info.dtype.name]
         params.append(f"{qual} {ctype}* arg{k}_base [[buffer({k})]]")
     params.append("uint3 _pid [[thread_position_in_grid]]")
@@ -275,7 +387,7 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
         ctype = CTYPES[info.dtype.name]
         offset = _constant_offset(info)
         if offset is None:
-            offset = _block_offset(ctx, spec, info)  # exercise 3
+            offset = _block_offset(ctx, spec, info)
         ctx.emit(f"{qual} {ctype}* arg{k} = arg{k}_base + {offset};")
         ref_vals.append(CVal(expr=f"arg{k}", shape=info.block_shape, ctype=ctype))
 
@@ -301,26 +413,12 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
     )
 
 
-# =============================================================================
-# Exercises. Everything below is yours. Delete each `raise` and make its test
-# green; do not change the provided code above (the tests pin its contract).
-# =============================================================================
-
-
 @rule("get")
 def _rule_get(ctx: Ctx, eqn: JaxprEqn) -> None:
-    """Exercise 1a — load a block from a Ref: `y = x_ref[...]`.
+    """Load a full block from a Ref: `y = x_ref[...]`.
 
-    Equation shape (see tests/test_01_trace.py output for a live one):
-      eqn.invars  = [ref]          ref CVal is a *device pointer* (see driver)
-      eqn.outvars = [y]            a thread-local value to declare
-      eqn.params["tree"]           the indexer pytree; empty for `[...]`
-
-    Steps:
-      * `if eqn.params["tree"].num_leaves: raise NotImplementedError(...)` —
-        indexed loads like `x_ref[i]` are the stretch exercise, not this one.
-      * `src = ctx.val(eqn.invars[0])`, `dst = ctx.declare(eqn.outvars[0])`
-      * copy `dst.size` elements from src to dst (ctx.copy does the loop).
+    Indexed loads like `x_ref[i]` (a non-empty indexer tree) are ROADMAP
+    stretch 6.
     """
     if eqn.params["tree"].num_leaves:
         raise NotImplementedError("general pytrees are out of scope for now")
@@ -332,76 +430,60 @@ def _rule_get(ctx: Ctx, eqn: JaxprEqn) -> None:
 
 @rule("swap")
 def _rule_swap(ctx: Ctx, eqn: JaxprEqn) -> None:
-    """Exercise 1b — store a block to a Ref: `o_ref[...] = y`.
+    """Store a full block to a Ref: `o_ref[...] = y`.
 
-    Equation shape:
-      eqn.invars  = [ref, value]
-      eqn.outvars = [old_value]    the swapped-out value; kernels that just
-                                   store never read it, but a rule must still
-                                   bind every outvar — bind it to the *loaded*
-                                   old value only if someone asks (i.e. start
-                                   by binding it to the stored value and
-                                   revisit if a test ever reads it).
-      eqn.params["tree"]           empty for `[...]`, same restriction as get.
+    Known deviation: the outvar is bound to the ref itself, not a snapshot
+    of its pre-store contents, so reads of a swap result see the stored
+    value and stay aliased to device memory. No kernel reads a swap result
+    today; take a temp snapshot before the copy if one ever does.
     """
     if eqn.params["tree"].num_leaves:
         raise NotImplementedError("general pytrees are out of scope for now")
 
-    ref, val = eqn.invars
-    src = ctx.val(ref)
-    value = ctx.val(val)
-    ctx.copy(src, value, src.size)
-    ctx.bind(eqn.outvars[0], src)
+    ref, value = eqn.invars
+    dst_ref = ctx.val(ref)
+    stored = ctx.val(value)
+    ctx.copy(dst_ref, stored, dst_ref.size)
+    ctx.bind(eqn.outvars[0], dst_ref)
 
 
-# Exercise 2 — the elementwise table. Fill in MSL expression templates keyed
-# by primitive name; `{a}`, `{b}` are element expressions. The test tells you
-# which primitives it stages; add entries as tests (and later, your own
-# kernels) demand them. MSL reference: <metal_stdlib> provides exp, sin, cos,
-# sqrt, tanh, log, fabs, fmin/fmax, pow, fma.
+# MSL templates for pure elementwise primitives; {a}/{b} are element
+# expressions. The arity check in _rule_elementwise validates every template
+# against its equation. fmin/fmax are float-only; integer min/max needs a
+# ctype dispatch (stretch-7 pre-flight, see ROADMAP).
 ELEMENTWISE: dict[str, str] = {
+    # binary
     "add": "({a} + {b})",
+    "sub": "({a} - {b})",
     "mul": "({a} * {b})",
     "div": "({a} / {b})",
-    "sub": "({a} - {b})",
+    "min": "fmin({a}, {b})",
+    "max": "fmax({a}, {b})",
+    "pow": "pow({a}, {b})",
+    # unary
     "neg": "-{a}",
+    "abs": "fabs({a})",
     "exp": "exp({a})",
+    "log": "log({a})",
     "sin": "sin({a})",
     "cos": "cos({a})",
     "sqrt": "sqrt({a})",
     "tanh": "tanh({a})",
-    "log": "log({a})",
-    "abs": "fabs({a})",
-    "min": "fmin({a}, {b})",
-    "max": "fmax({a}, {b})",
-    "pow": "pow({a}, {b})",
 }
 
 
 def _rule_elementwise(ctx: Ctx, eqn: JaxprEqn) -> None:
-    """Exercise 2 — one rule for every pure elementwise primitive.
+    """One rule for every pure elementwise primitive.
 
-    Steps:
-      * template = ELEMENTWISE[eqn.primitive.name]
-      * dst = ctx.declare(eqn.outvars[0]); operands via ctx.val(...)
-      * one loop over dst.size (rank-0 output: "loop" of one, no brackets —
-        CVal.at handles both if you use a real loop only when dst.shape).
-      * `dst.at(i) = template.format(a=..., b=...)` — CVal.at makes scalar
-        operands (literals like 2.0f, program ids) just work.
+    Three templates are derived rather than looked up: integer_pow expands
+    to repeated multiplication (a reciprocal for negative y) because the
+    exponent lives in params, not operands; convert_element_type casts to
+    the output's ctype; broadcast_in_dim is "{a}" because the element loop
+    already broadcasts scalars.
 
-    Three primitives need a twist:
-      * integer_pow: exponent is in eqn.params["y"]; emit repeated
-        multiplication (y is tiny in practice) rather than pow().
-      * convert_element_type: cast, `(({ctype}){a})` with the *output* ctype.
-      * broadcast_in_dim (scalar -> array, e.g. `jnp.zeros((4,)) + pid`
-        stages one): template "{a}" is already correct — CVal.at ignores the
-        index on the scalar side. Reject array -> array broadcasts.
-    Register the rule once you have it:
-        for _name in [*ELEMENTWISE, "integer_pow", "convert_element_type",
-                      "broadcast_in_dim"]:
-            RULES[_name] = _rule_elementwise
-    (a line you add below the function, or extend `rule(...)` usage — your
-    call; the registry is just a dict.)
+    The arity check guards both directions: a template field no operand
+    fills, and an operand no field consumes (the silent-drop hazard). The
+    "ab" alphabet caps arity at 2 until select_n lands (ROADMAP stretch 7).
     """
 
     dst = ctx.declare(eqn.outvars[0])
@@ -410,7 +492,7 @@ def _rule_elementwise(ctx: Ctx, eqn: JaxprEqn) -> None:
 
     if opname == "integer_pow":
         exp: int = eqn.params["y"]
-        body = " * ".join(["{a}"] * abs(exp))          # "{a} * {a} * {a}"
+        body = " * ".join(["{a}"] * abs(exp))
         template = f"({body})" if exp > 0 else f"(1.0f / ({body}))"
     elif opname == "convert_element_type":
         template = f"(({dst.ctype}){{a}})"
@@ -421,7 +503,7 @@ def _rule_elementwise(ctx: Ctx, eqn: JaxprEqn) -> None:
     else:
         template = ELEMENTWISE[eqn.primitive.name]
 
-    fields = _template_fields(template)                 # abs -> {"a"}, pow -> {"a", "b"}
+    fields = _template_fields(template)
     expected = set("ab"[: len(ops)])
     if fields != expected:
         raise EmitError(
@@ -430,8 +512,8 @@ def _rule_elementwise(ctx: Ctx, eqn: JaxprEqn) -> None:
         )
 
     def assign(idx: str) -> str:
-          inputs = {name: op.at(idx) for name, op in zip("ab", ops)}
-          return f"{dst.at(idx)} = {template.format(**inputs)};"
+        inputs = {name: op.at(idx) for name, op in zip("ab", ops)}
+        return f"{dst.at(idx)} = {template.format(**inputs)};"
 
     if dst.shape:
         idx = ctx.fresh("_i")
@@ -441,58 +523,43 @@ def _rule_elementwise(ctx: Ctx, eqn: JaxprEqn) -> None:
         ctx.emit(assign("0"))
 
 
-
-
-for _name in [
-    *ELEMENTWISE,
-    "integer_pow",
-    "convert_element_type",
-    "broadcast_in_dim"
-]:
+for _name in [*ELEMENTWISE, "integer_pow", "convert_element_type", "broadcast_in_dim"]:
     RULES[_name] = _rule_elementwise
+
 
 @rule("program_id")
 def _rule_program_id(ctx: Ctx, eqn: JaxprEqn) -> None:
-    """Exercise 3a — `pl.program_id(axis)` -> a component of _pid.
+    """`pl.program_id(axis)` -> a component of _pid, as a rank-0 int.
 
-    eqn.params["axis"] picks from _PID; bind the outvar to a rank-0 int CVal
-    (no declaration needed — a CVal's expr can be any C expression).
+    Pure aliasing, no storage or code. The (int) cast keeps index
+    arithmetic signed: uint underflow in an index map is an out-of-bounds
+    read with no diagnostic.
     """
     axis: int = eqn.params["axis"]
     ctx.bind(eqn.outvars[0], CVal(f"(int){_PID[axis]}", (), "int"))
 
 
 def _block_offset(ctx: Ctx, spec: KernelSpec, info: BlockInfo) -> str:
-    """Exercise 3b — element offset of this program's block, as a C expr.
+    """Element offset of this program instance's block, as a C expression.
 
-    Called by the driver for every operand whose index map actually uses the
-    grid indices (constant maps are already handled).
-
-    The index map is itself a tiny jaxpr: `lambda i: (i, 0)` has
-    invars=[i], no eqns, outvars=[i, Literal 0]. Its inputs are the grid
-    indices in grid-axis order — bind invar k to CVal(_PID[k], (), "int")
-    and evaluate it with emit_jaxpr (maps with arithmetic in them then work
-    for free, using your exercise-2 rules). The result is the *block index*
-    per array dim; convert to elements with
+    The index map is itself a jaxpr taking grid indices in grid-axis
+    order; binding them to _pid components and recursing through
+    emit_jaxpr lets maps with arithmetic (`i * 16 + j`) reuse the
+    elementwise rules. Map outputs are block indices per array dim,
+    converted to elements as
 
         offset = sum(idx[d] * full_block[d] * stride[d] for d in dims)
 
-    using _full_block_shape(info) and _element_strides(info.array_shape) —
-    build the sum as a C expression string, constants folded or not, the
-    Metal compiler does not care.
+    Zero-literal terms are elided for legibility of the emitted pointer
+    lines; the `or "0"` fallback keeps an all-zero map valid MSL.
     """
     pid_vals = [CVal(f"(int){_PID[k]}", (), "int") for k in range(len(spec.grid))]
-
-    # block indices per array dimension
     out_vals = emit_jaxpr(ctx, info.index_map_jaxpr.jaxpr, pid_vals)
     block_shape = _full_block_shape(info)
     strides = _element_strides(info.array_shape)
 
     offsets = []
-    for (val, shape, stride) in zip(out_vals, block_shape, strides, strict=True):
-        # elide 0 literals from output index calculations.
-        # shape * stride != 0 except for zero-sized arrays,
-        # which are uninteresting.
+    for val, shape, stride in zip(out_vals, block_shape, strides, strict=True):
         if val.expr == "0":
             continue
         offsets.append(f"{val.expr} * {shape * stride}")
@@ -500,45 +567,22 @@ def _block_offset(ctx: Ctx, spec: KernelSpec, info: BlockInfo) -> str:
     return " + ".join(offsets) or "0"
 
 
-
-
 @rule("scan")
 def _rule_scan(ctx: Ctx, eqn: JaxprEqn) -> None:
-    """Exercise 4 — `lax.fori_loop` / pure-carry `lax.scan` -> a C for-loop.
+    """`lax.fori_loop` / pure-carry `lax.scan` -> a C for-loop.
 
-    fori_loop stages as scan with no xs/ys, but usually WITH consts: any
-    value read before the loop and used inside it (per-thread ODE
-    parameters, say) rides along as a constant operand. Operand order is
-    scan's invariant: consts first, then carries.
+    fori_loop stages as scan with no xs/ys but usually with consts: values
+    read before the loop ride along as constant operands, ordered before
+    the carries in eqn.invars and body.invars alike. Consts pass through
+    unchanged; carries get fresh mutable loop variables, declared on the
+    outvars so the final values are bound for downstream equations.
 
-      eqn.outvars            final carries -> num_carry = len(eqn.outvars)
-      eqn.invars             [*consts, *carries]; num_consts = the rest
-      eqn.params["length"]   trip count (a Python int — loops are static)
-      eqn.params["jaxpr"]    the body as a ClosedJaxpr; body = param.jaxpr
-                             body.invars = [*consts, *carries] too
-      eqn.params["reverse"]  raise EmitError if True (fori never sets it)
-
-    A scan with ys (outvars beyond the carries — i.e. a real lax.scan that
-    stacks per-step outputs) is out of scope: detect it by body.outvars
-    being longer than eqn.outvars... it cannot happen here, because ys
-    would make len(body.outvars) > num_carry; guard with an EmitError if
-    you want the sharp edge labeled.
-
-    Steps:
-      * consts: bind directly — `const_vals = [ctx.val(v) for v in
-        eqn.invars[:num_consts]]`; they are never written, no copies needed.
-      * carries: declare a mutable loop var per carry (ctx.declare on each
-        *outvar* gives correctly-typed storage), copy the initial values in
-        (ctx.copy from the trailing invars).
-      * `with ctx.block(f"for (uint _s = 0; _s < {length}; ++_s)"):`
-          - run the body: `outs = emit_jaxpr(ctx, body, const_vals +
-            carry_vals)` — fresh SSA names inside the loop are re-declared
-            every iteration; MSL is fine with that;
-          - copy `outs` back into the carry vars (the loop-carried
-            dependence; do NOT skip it — the body's outputs are new SSA
-            names, not your loop vars).
-      * the carry vars are already bound to eqn.outvars if you declared
-        them via ctx.declare(outvar). Done.
+    The copy-back runs in two phases because scan updates all carries
+    simultaneously while C statements are sequential: a body that forwards
+    or permutes its carries stages outputs that alias the carry variables,
+    and writing them in order clobbers unread values (tests/test_05:
+    test_carry_permutation). Phase 1 snapshots endangered reads into temps
+    and skips self-forward no-ops; phase 2 overwrites the carries safely.
     """
     num_carry = len(eqn.outvars)
     num_consts = len(eqn.invars) - num_carry
@@ -552,7 +596,6 @@ def _rule_scan(ctx: Ctx, eqn: JaxprEqn) -> None:
     if reverse:
         raise EmitError("no reverse-mode scan support, use lax.fori_loop")
 
-    # bind consts directly
     const_vals = [ctx.val(v) for v in eqn.invars[:num_consts]]
 
     carries = []
@@ -561,25 +604,29 @@ def _rule_scan(ctx: Ctx, eqn: JaxprEqn) -> None:
         ctx.copy(dst, ctx.val(invar), dst.size)
         carries.append(dst)
 
-    carry_exprs = set(c.expr for c in carries)
+    carry_exprs = {c.expr for c in carries}
     idx = ctx.fresh("_s")
     with ctx.block(f"for (uint {idx} = 0; {idx} < {length}; ++{idx})"):
         outs = emit_jaxpr(ctx, body, const_vals + carries)
-        # Phase 1: for each output, decide what phase 2 will copy from.
         sources = []
         for out, carry in zip(outs, carries, strict=True):
             if out.expr == carry.expr:
-                sources.append(None) # self-forward: no copy needed at all
-            elif out.expr in carry_exprs: # aliases a *different* carry: snapshot it
+                # Self-forward: the value is already in place.
+                sources.append(None)
+            elif out.expr in carry_exprs:
+                # Aliases a different carry: snapshot before any overwrite.
                 tmp = CVal(ctx.fresh(), out.shape, out.ctype)
-                ctx.emit(f"{tmp.ctype} {tmp.expr}[{tmp.size}];" if tmp.shape
-                        else f"{tmp.ctype} {tmp.expr};")
+                ctx.emit(
+                    f"{tmp.ctype} {tmp.expr}[{tmp.size}];"
+                    if tmp.shape
+                    else f"{tmp.ctype} {tmp.expr};"
+                )
                 ctx.copy(tmp, out, out.size)
                 sources.append(tmp)
             else:
-                sources.append(out) # fresh SSA name: can't be clobbered
+                # Fresh SSA name: no carry write can clobber it.
+                sources.append(out)
 
-        # Phase 2: now it's safe to overwrite the carries.
         for src, carry in zip(sources, carries, strict=True):
             if src is not None:
                 ctx.copy(carry, src, carry.size)

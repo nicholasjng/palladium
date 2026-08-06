@@ -1,15 +1,14 @@
 """Step 1 of the pipeline: get the kernel jaxpr out of Pallas.
 
 `pl.pallas_call` does not run the kernel; it stages it into a single
-`pallas_call` equation whose params carry the kernel body (a stateful jaxpr
-over `Ref`s) and the grid/block structure. We trace the *wrapped* call with
-`jax.make_jaxpr`, find that equation, and repackage the parts the emitter
-needs into a `KernelSpec`.
+`pallas_call` equation whose params carry the kernel body (a stateful
+jaxpr over Refs) and the grid/block structure. Tracing the wrapped call
+with `jax.make_jaxpr` and repackaging that equation is everything this
+module does.
 
-This module is provided (not an exercise): it is JAX-version-sensitive
-plumbing, and the interesting compiler work lives downstream in `emit.py`.
-Verified against JAX 0.11.0; the version-sensitive bits are the
-`grid_mapping` / `block_mapping` dataclass fields, see `_block_infos`.
+Verified against JAX 0.11; the version-sensitive surface is the
+`grid_mapping` / `block_mapping` dataclass fields (see `_block_infos`),
+which is why the jax dependency is pinned to one minor.
 """
 
 from __future__ import annotations
@@ -27,32 +26,57 @@ __all__ = ["BlockInfo", "KernelSpec", "trace"]
 
 @dataclasses.dataclass(frozen=True)
 class BlockInfo:
-    """One kernel operand: the block a single program instance sees."""
+    """One kernel operand: the block a single program instance sees.
+
+    Attributes
+    ----------
+    block_shape : tuple of int
+        Kernel-visible block shape, squeezed dims removed.
+    array_shape : tuple of int
+        Shape of the full underlying array.
+    dtype : numpy.dtype
+        Element type, shared by block and array.
+    index_map_jaxpr : ClosedJaxpr
+        The staged BlockSpec index map: grid indices to block index, in
+        units of blocks.
+    """
 
     block_shape: tuple[int, ...]
     array_shape: tuple[int, ...]
     dtype: np.dtype
-    # Jaxpr mapping grid indices -> block index (in units of blocks), i.e.
-    # the staged form of the BlockSpec index_map.
     index_map_jaxpr: ClosedJaxpr
 
 
 @dataclasses.dataclass(frozen=True)
 class KernelSpec:
-    """Everything the emitter needs, and nothing it doesn't."""
+    """Everything the emitter needs, and nothing it doesn't.
+
+    Attributes
+    ----------
+    name : str
+        Kernel name, used as the MSL function name.
+    jaxpr : Jaxpr
+        The kernel body: a stateful jaxpr over Refs.
+    grid : tuple of int
+        Pallas grid; `(1,)` for gridless calls.
+    inputs, outputs : tuple of BlockInfo
+        Operand descriptions in jaxpr order.
+    raw_params : dict
+        The full, unprocessed pallas_call params. Future features (scratch
+        shapes, dimension semantics) reach in here rather than growing
+        this dataclass speculatively.
+    """
 
     name: str
-    jaxpr: Jaxpr  # the kernel body: a stateful Jaxpr over Refs
+    jaxpr: Jaxpr
     grid: tuple[int, ...]
     inputs: tuple[BlockInfo, ...]
     outputs: tuple[BlockInfo, ...]
-    # The full, unprocessed pallas_call params. Later exercises (scratch
-    # shapes, dimension semantics) reach in here rather than growing this
-    # dataclass speculatively.
     raw_params: dict[str, Any]
 
     @property
     def num_programs(self) -> int:
+        """Total number of program instances, one Metal thread each."""
         n = 1
         for g in self.grid:
             n *= g
@@ -60,12 +84,8 @@ class KernelSpec:
 
 
 def _block_dim(dim: Any) -> int | None:
-    """Normalize one block_shape entry across JAX's dim-semantics types.
-
-    JAX 0.11 stages BlockSpec shapes as Blocked(block_size=N) / Element /
-    Squeezed objects rather than plain ints. Squeezed dims vanish from the
-    kernel-visible block; everything else carries a block size.
-    """
+    # JAX 0.11 stages BlockSpec shapes as Blocked/Element/Squeezed objects
+    # rather than plain ints; squeezed dims vanish from the visible block.
     if isinstance(dim, (int, np.integer)):
         return int(dim)
     if hasattr(dim, "block_size"):
@@ -93,9 +113,25 @@ def _block_infos(block_mappings: list[Any]) -> tuple[BlockInfo, ...]:
 def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
     """Extract a KernelSpec from a function that calls `pl.pallas_call`.
 
-    `pallas_fn` is the *wrapped* callable returned by `pl.pallas_call(...)`
-    (or any function that invokes exactly one pallas_call); `example_args`
-    are arrays (or ShapeDtypeStructs) fixing shapes and dtypes.
+    Parameters
+    ----------
+    pallas_fn : callable
+        The wrapped callable returned by `pl.pallas_call(...)`, or any
+        function that invokes exactly one pallas_call.
+    *example_args
+        Arrays or `jax.ShapeDtypeStruct`s fixing shapes and dtypes; no
+        data is read.
+
+    Returns
+    -------
+    KernelSpec
+
+    Raises
+    ------
+    ValueError
+        If tracing finds zero or more than one pallas_call equation.
+    NotImplementedError
+        For PrefetchScalarGridSpec kernels.
     """
     closed = jax.make_jaxpr(pallas_fn)(*example_args)
     eqns = [e for e in closed.jaxpr.eqns if e.primitive.name == "pallas_call"]
@@ -107,14 +143,15 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
     if len(eqns) > 1:
         raise ValueError(
             f"found {len(eqns)} pallas_call equations; palladium handles one "
-            "kernel at a time — trace them separately"
+            "kernel at a time, trace them separately"
         )
     eqn = eqns[0]
     params = dict(eqn.params)
     grid_mapping = params["grid_mapping"]
 
     kernel_jaxpr = params["jaxpr"]
-    if hasattr(kernel_jaxpr, "jaxpr"):  # ClosedJaxpr on some versions
+    if hasattr(kernel_jaxpr, "jaxpr"):
+        # ClosedJaxpr on some JAX versions, bare Jaxpr on others.
         kernel_jaxpr = kernel_jaxpr.jaxpr
 
     if grid_mapping.num_index_operands:
@@ -125,7 +162,8 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
 
     grid = tuple(int(g) for g in grid_mapping.grid)
     if not grid:
-        grid = (1,)  # gridless pallas_call: a single program instance
+        # Gridless pallas_call: a single program instance.
+        grid = (1,)
 
     return KernelSpec(
         name=params.get("name") or "palladium_kernel",

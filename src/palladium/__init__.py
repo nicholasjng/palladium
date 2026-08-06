@@ -2,7 +2,8 @@
 
 Pipeline: trace (Pallas -> KernelSpec) -> emit (KernelSpec -> MSL text)
 -> bind (MSL -> callable, via metal-runtime). `metal_call` composes the
-three behind a `pl.pallas_call`-shaped entry point.
+three behind a `pl.pallas_call`-shaped entry point; `debug_msl` exposes
+the intermediate text.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ __all__ = [
     "KernelSpec",
     "MetalCallable",
     "bind",
+    "debug_msl",
     "emit_jaxpr",
     "emit_msl",
     "metal_call",
@@ -37,9 +39,18 @@ CacheKey = tuple[tuple[tuple[int, ...], str], ...]
 class MetalCallable:
     """The palladium pipeline behind a `pl.pallas_call`-shaped call.
 
-    Takes and returns NumPy arrays; retraces per input shape/dtype and
-    caches the compiled kernel per shape in `.cache`. `.interpret` is the
-    same pallas_call with interpret=True — the CPU correctness oracle.
+    Retraces per input shape/dtype because block layouts and loop bounds
+    are baked into the emitted MSL; identical shapes hit `cache`, and
+    identical source hits metal-runtime's library cache below that.
+
+    Attributes
+    ----------
+    interpret : callable
+        The same pallas_call with `interpret=True`: the CPU oracle every
+        correctness check diffs against.
+    cache : dict
+        Maps input-shape signatures to compiled `BoundKernel`s;
+        `cache[key].msl_source` is the emitted text for that shape.
     """
 
     def __init__(
@@ -58,6 +69,7 @@ class MetalCallable:
         self.cache: dict[CacheKey, BoundKernel] = {}
 
     def __call__(self, *args) -> np.ndarray | tuple[np.ndarray, ...]:
+        """Run the kernel on the GPU; NumPy in, NumPy out."""
         arrays = [np.asarray(a) for a in args]
         key: CacheKey = tuple((a.shape, a.dtype.str) for a in arrays)
         bound = self.cache.get(key)
@@ -73,11 +85,56 @@ class MetalCallable:
         return bound(*arrays)
 
 
+def debug_msl(kernel: Callable, *example_args, **pallas_kwargs) -> str:
+    """Trace `kernel` through pallas_call and return the emitted MSL.
+
+    The one-call version of the debugging loop. The per-operand pointer
+    lines at the top of the body carry the BlockSpec offsets; the rest is
+    the kernel jaxpr, statement by statement.
+
+    Parameters
+    ----------
+    kernel : callable
+        A Pallas kernel function (operates on Refs).
+    *example_args
+        Arrays or `jax.ShapeDtypeStruct`s fixing input shapes; no data is
+        read and nothing is compiled or dispatched.
+    **pallas_kwargs
+        The usual `pl.pallas_call` keywords (out_shape, grid, ...).
+
+    Returns
+    -------
+    str
+        The MSL source `metal_call` would compile for these shapes.
+
+    Examples
+    --------
+    >>> print(palladium.debug_msl(k, x, out_shape=...))  # doctest: +SKIP
+    """
+    import jax.experimental.pallas as pl
+
+    spec = trace(pl.pallas_call(kernel, **pallas_kwargs), *example_args)
+    return emit_msl(spec)
+
+
 def metal_call(kernel: Callable, **pallas_kwargs) -> MetalCallable:
     """`pl.pallas_call`, but the kernel runs on the Apple GPU.
 
-    Takes the same keywords as `pl.pallas_call` (out_shape, grid, in_specs,
-    out_specs, ...) plus `math_mode=` / `threadgroup=` for the Metal side.
+    Parameters
+    ----------
+    kernel : callable
+        A Pallas kernel function (operates on Refs).
+    **pallas_kwargs
+        The usual `pl.pallas_call` keywords (out_shape, grid, in_specs,
+        out_specs, ...), plus two Metal-side extras: `math_mode`
+        (metal_runtime.MathMode, FAST by default) and `threadgroup`
+        (explicit threadgroup size; None lets the runtime choose).
+
+    Returns
+    -------
+    MetalCallable
+        NumPy-in/NumPy-out callable with `.interpret` (the CPU oracle)
+        and `.cache` (per-shape compiled kernels).
     """
     from metal_runtime import MathMode
 
