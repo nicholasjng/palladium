@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-metal-runtime = { path = "../metal-runtime" }
+metal-runtime = { git = "https://github.com/nicholasjng/metal-runtime.git", rev = "ba943ee62b09a16ed859d6f3a2103579a8347eb6" }
 
 [dependency-groups]
 dev = [

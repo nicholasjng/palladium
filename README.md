@@ -1,36 +1,66 @@
 # palladium
 
-Pallas kernels on Apple GPU: trace a `pl.pallas_call`, emit Metal Shading
-Language, dispatch through [metal-runtime](../metal-runtime). The point is
-the benchmark story in `examples/` — hand-written-kernel ODE integration vs
-Diffrax — and the emitter that gets us there is deliberately left as
-test-driven exercises. See `ROADMAP.md` for the plan.
+Pallas kernels on Apple GPU: trace a `pl.pallas_call`, emit Metal Shading Language,
+dispatch through [metal-runtime](https://github.com/nicholasjng/metal-runtime).
+The result is hand-written kernels running faster than Diffrax on ODE integration, measured in `examples/`.
 
 ## Setup
 
-Expects the sibling checkout `../metal-runtime` (path dependency).
-
 ```sh
 uv sync
-uv run pytest -m "not exercise"   # provided baseline: must be green
+uv run pytest -m "not exercise"   # baseline sanity check: must be green
 ```
 
-## Working the exercises
+metal-runtime is a git dependency (`pyproject.toml`), no sibling checkout needed.
+Developing metal-runtime itself: point `[tool.uv.sources]` at a local `path` instead of a git revision.
+
+## Status
+
+Exercises 1-5 (block load/store, elementwise, grids, loops, the RK4 capstone) and stretch 7 (per-thread adaptive stepping) are done:
 
 ```sh
-uv run pytest tests/ -x           # first red test = your next exercise
+uv run pytest tests/                              # everything green
+uv run python examples/02_adaptive_lockstep.py     # the headline result
 ```
 
-The stubs live in `src/palladium/emit.py`; each names its test file, each
-test file names its stub, and every docstring carries the hints. Order:
+`02_adaptive_lockstep.py` runs a Van der Pol ensemble through Diffrax's
+`vmap`-synchronized adaptive solve and palladium's per-thread adaptive
+kernel (Bogacki-Shampine 3(2), FSAL, PI controller), and prints
+wall-clock and step-count comparisons for both.
 
-1. `test_02_emit_copy.py` — block load/store
-2. `test_03_emit_elementwise.py` — the elementwise table
-3. `test_04_grid_blocks.py` — grids, program_id, BlockSpec offsets
-4. `test_05_loops.py` — fori_loop -> C for-loop (the one that matters)
-5. `test_06_capstone_rk4.py` — batched RK4 Lotka-Volterra, no new rules
+## Integrating with JAX
 
-Debugging: the emitter's output is just text — read it.
+Today `metal_call(...)` is NumPy-in, NumPy-out: it traces a kernel once,
+compiles it, and runs it eagerly. It does not compose with `jax.jit` yet;
+`MetalCallable.__call__` calls `np.asarray` on its arguments, which fails
+the moment one is a tracer, so a `metal_call` result cannot sit inside a
+larger jitted computation.
+
+The fix does not need a new JAX backend or PJRT plugin. It needs
+`jax.ffi.ffi_call`: register `dispatch.bind`/`BoundKernel.launch` as an
+FFI target under the `"cpu"` platform JAX already runs on, the same
+mechanism `jax-triton` used before Pallas absorbed it. CPU stays the
+JAX-visible device; Metal is reached through the FFI escape hatch. That
+turns a hand-rolled Metal kernel into an ordinary JAX primitive:
+traceable, jittable, composable with surrounding `jax.numpy` code.
+
+## How the emitter was built
+
+Test-driven, one primitive group at a time. The stubs live in
+`src/palladium/emit.py`; each names its test file, each test file names
+its stub, and every docstring carries the hints.
+
+1. `test_02_emit_copy.py`: block load/store
+2. `test_03_emit_elementwise.py`: the elementwise table
+3. `test_04_grid_blocks.py`: grids, program_id, BlockSpec offsets
+4. `test_05_loops.py`: fori_loop -> C for-loop (the one that matters)
+5. `test_06_capstone_rk4.py`: batched RK4 Lotka-Volterra, no new rules
+6. `test_07_preflight.py` / `test_08_adaptive.py`: comparisons and
+   select_n, then the adaptive controller kernel built on top of them
+
+`uv run pytest tests/ -x` finds the first red test when a new stretch is scaffolded.
+
+Debugging: the emitter's output is just text, read it.
 `print(palladium.debug_msl(kernel, *args, **pallas_kwargs))` is the
 one-call version; `PALLADIUM_DUMP_MSL=1` (or `=<dir>`) dumps every
 kernel's source at compile time, and Metal compile errors arrive with the
@@ -43,30 +73,27 @@ line-numbered source attached. The CPU oracle for any kernel is
   regenerate after intended emitter changes with
   `PALLADIUM_REGEN_GOLDEN=1 uv run pytest tests/test_msl_snapshots.py`
   and review the diff.
-- CI (`.github/workflows/ci.yml`) lints, type-checks, and tests on every
-  push, plus a weekly canary against jax latest — the early-warning system
-  for upstream changes to kernel staging (jax is pinned to one minor for
-  exactly that reason). GitHub's hosted macOS runners have no Apple GPU,
-  so CI covers the text half only (trace, emitted-MSL snapshots — which is
-  everything the canary needs); dispatch correctness is validated locally
-  with `uv run pytest` before pushing.
 - `uv run mew run` benchmarks the ensemble solve (palladium vs Diffrax),
   filter with `--tag palladium|diffrax`.
 - `uv run pytest -m fuzz` differential-fuzzes the emitter: Hypothesis
   generates random kernels (expression trees, loops with permuted
   carries) and diffs Metal against the interpret oracle under SAFE math.
   Excluded from default runs; scale with `PALLADIUM_FUZZ_EXAMPLES`. On a
-  failure, Hypothesis shrinks to a minimal kernel — turn it into a named
+  failure, Hypothesis shrinks to a minimal kernel, turn it into a named
   regression test. Grow the generators alongside stretch 6: every new
   indexing feature should land with generated coverage from day one.
 
 ## Examples
 
-`01_ode_ensembles.py` (activates after the capstone) - `02_adaptive_lockstep.py`
-(runs today, measures the vmap lockstep tax) - `03_sde_montecarlo.py` (runs
-today, hand-written MSL Monte Carlo) - `04_reaction_diffusion.py` (baseline
-today, Metal version gated on stretch exercise 6).
+- `01_ode_ensembles.py`: batched RK4 Lotka-Volterra, palladium vs
+  jit(vmap(diffeqsolve)).
+- `02_adaptive_lockstep.py`: the lockstep tax. Diffrax vs palladium's
+  per-thread adaptive controller on a Van der Pol ensemble.
+- `03_sde_montecarlo.py`: hand-written MSL Monte Carlo, no palladium
+  codegen, the runtime performance bar.
+- `04_reaction_diffusion.py`: Gray-Scott stencil. CPU baseline only; the
+  Metal version needs stretch 6, indexed ref access.
 
 ```sh
-uv run python examples/03_sde_montecarlo.py
+uv run python examples/02_adaptive_lockstep.py
 ```
