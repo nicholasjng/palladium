@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["scikit-build-core>=1.0"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "palladium"
@@ -15,10 +15,20 @@ dependencies = [
     "metal-runtime",
 ]
 
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["src/palladium"]
+cmake.version = ">=3.24"
+cmake.build-type = "Release"
+
 [tool.uv.sources]
-metal-runtime = { git = "https://github.com/nicholasjng/metal-runtime.git", rev = "ba943ee62b09a16ed859d6f3a2103579a8347eb6" }
+metal-runtime = { path = "../metal-runtime" }
 
 [dependency-groups]
+build = [
+    "scikit-build-core>=1.0",
+]
 dev = [
     "diffrax>=0.6",
     "hypothesis>=6.100",
@@ -30,10 +40,8 @@ dev = [
 ]
 
 [tool.uv]
-default-groups = ["dev"]
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/palladium"]
+no-build-isolation-package = ["palladium"]
+default-groups = ["build", "dev"]
 
 [tool.mew]
 benchpaths = ["benchmarks"]

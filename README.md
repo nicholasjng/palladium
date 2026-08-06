@@ -11,13 +11,18 @@ uv sync
 uv run pytest -m "not exercise"   # baseline sanity check: must be green
 ```
 
+`uv sync` also compiles `native/ffi/palladium_ffi.cpp` (scikit-build-core,
+root `CMakeLists.txt`); needs CMake and Ninja on `PATH` (`brew install
+cmake ninja`), same as metal-runtime.
+
 metal-runtime is a git dependency (`pyproject.toml`), no sibling checkout needed.
 Developing metal-runtime itself: point `[tool.uv.sources]` at a local `path` instead of a git revision.
 
 ## Status
 
-Exercises 1-5 (block load/store, elementwise, grids, loops, the RK4 capstone) and stretches 6-8
-(indexed ref access, per-thread adaptive stepping, counter-based RNG) are done:
+Exercises 1-5 (block load/store, elementwise, grids, loops, the RK4 capstone) and stretches 6-10
+(indexed ref access, per-thread adaptive stepping, counter-based RNG, df32 precision, jax.ffi
+integration) are done:
 
 ```sh
 uv run pytest tests/                              # everything green
@@ -31,18 +36,38 @@ wall-clock and step-count comparisons for both.
 
 ## Integrating with JAX
 
-Today `metal_call(...)` is NumPy-in, NumPy-out: it traces a kernel once,
-compiles it, and runs it eagerly. It does not compose with `jax.jit` yet;
-`MetalCallable.__call__` calls `np.asarray` on its arguments, which fails
-the moment one is a tracer, so a `metal_call` result cannot sit inside a
-larger jitted computation.
+`metal_call(...)` is NumPy-in, NumPy-out: it traces a kernel once,
+compiles it, and runs it eagerly. `MetalCallable.__call__` calls
+`np.asarray` on its arguments, which fails the moment one is a tracer,
+so a `metal_call` result cannot sit inside a jitted computation.
 
-The fix does not need a new JAX backend or PJRT plugin. It needs
-`jax.ffi.ffi_call`: register `dispatch.bind`/`BoundKernel.launch` as an
-FFI target under the `"cpu"` platform JAX already runs on. CPU stays the
-JAX-visible device; Metal is reached through the FFI escape hatch.
-That turns a hand-rolled Metal kernel into an ordinary JAX primitive:
-traceable, jittable, composable with surrounding `jax.numpy` code.
+`metal_call_jit(...)` (`src/palladium/ffi.py`) is the fix: same
+`pl.pallas_call`-shaped entry point, but dispatch happens through
+`jax.ffi.ffi_call` against a registered FFI target instead of eagerly.
+CPU stays the JAX-visible platform (`register_ffi_target(...,
+platform="cpu")`); Metal is reached through the FFI escape hatch, no new
+PJRT client needed. The result is an ordinary JAX primitive: traceable,
+jittable, composable with surrounding `jax.numpy` code.
+
+```python
+call = palladium.metal_call_jit(kernel, out_shape=jax.ShapeDtypeStruct((8, 8), jnp.float32))
+
+@jax.jit
+def composed(x, y):
+    return jnp.sum(call(x, y) ** 2)  # a real GPU dispatch inside a jit trace
+```
+
+One generic native handler (`native/ffi/palladium_ffi.cpp`) backs every
+palladium kernel: MSL source, entry point name, grid, and math mode
+travel as FFI attributes (baked into the HLO at trace time), and
+`RemainingArgs`/`RemainingRets` cover any input/output count. Nothing to
+build separately: the repo root's `CMakeLists.txt` (scikit-build-core)
+compiles it and ships `libpalladium_ffi.dylib` inside the `palladium`
+package as part of `uv sync`/`pip install`, the same way metal-runtime
+ships `libmetal_runtime_c.dylib`. `metal_call_jit` finds it via
+`importlib.resources`; `PALLADIUM_FFI_LIBRARY` overrides the path for an
+out-of-tree build. Not differentiable: `ffi_call` has no JVP/transpose
+rule by default.
 
 ## How the emitter was built
 
@@ -96,6 +121,9 @@ line-numbered source attached. The CPU oracle for any kernel is
   comparison, both validated against Black-Scholes.
 - `04_reaction_diffusion.py`: Gray-Scott stencil, one thread per grid
   point, halo reads via indexed ref access. Beats the CPU baseline.
+- `05_df32_precision.py`: does compensated arithmetic (df32) buy real
+  accuracy on the RK4 capstone. FAST vs SAFE vs df32, all measured
+  against a true float64 reference, not against each other.
 
 ```sh
 uv run python examples/02_adaptive_lockstep.py

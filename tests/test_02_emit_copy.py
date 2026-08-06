@@ -54,3 +54,30 @@ def test_copy_matches_interpret_oracle(rng):
     )
     x = rng.standard_normal(128, dtype=np.float32)
     np.testing.assert_array_equal(f(x), np.asarray(f.interpret(x)))
+
+
+def _sum_and_diff_kernel(x_ref, y_ref, sum_ref, diff_ref):
+    sum_ref[...] = x_ref[...] + y_ref[...]
+    diff_ref[...] = x_ref[...] - y_ref[...]
+
+
+def test_multi_output_kernel(rng):
+    """Two output refs: `_rule_swap` is generic over which ref it targets,
+    and dispatch.py's BoundKernel.launch already loops over spec.outputs,
+    so this needs no new emitter or dispatch code, only a kernel that
+    exercises it."""
+    f = palladium.metal_call(
+        _sum_and_diff_kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct((32,), jnp.float32),
+            jax.ShapeDtypeStruct((32,), jnp.float32),
+        ),
+    )
+    x = rng.standard_normal(32, dtype=np.float32)
+    y = rng.standard_normal(32, dtype=np.float32)
+    s, d = f(x, y)
+    np.testing.assert_array_equal(s, x + y)
+    np.testing.assert_array_equal(d, x - y)
+    s_ref, d_ref = f.interpret(x, y)
+    np.testing.assert_array_equal(s, np.asarray(s_ref))
+    np.testing.assert_array_equal(d, np.asarray(d_ref))

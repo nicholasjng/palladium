@@ -15,11 +15,13 @@ import numpy as np
 
 from palladium.dispatch import BoundKernel, bind
 from palladium.emit import emit_jaxpr, emit_msl, rule
+from palladium.ffi import FfiCallable, metal_call_jit
 from palladium.trace import BlockInfo, KernelSpec, trace
 
 __all__ = [
     "BlockInfo",
     "BoundKernel",
+    "FfiCallable",
     "KernelSpec",
     "MetalCallable",
     "bind",
@@ -27,6 +29,7 @@ __all__ = [
     "emit_jaxpr",
     "emit_msl",
     "metal_call",
+    "metal_call_jit",
     "rule",
     "trace",
 ]
