@@ -1,12 +1,6 @@
 """jax.ffi bridge: registers palladium kernels as a real JAX primitive,
 composable with jax.jit, through metal-runtime's C API (`native/ffi/`).
 
-The native handler (`libpalladium_ffi.dylib`) is built by scikit-build-core
-as part of the normal package build (`uv sync`/`pip install`), from the
-repo root's `CMakeLists.txt`; nothing to build separately. Found via
-`importlib.resources`, same pattern as `metal_runtime.c_api`, so this
-works for both an editable dev install (dylib in the CMake build dir)
-and a real wheel install (dylib inside the installed package).
 `PALLADIUM_FFI_LIBRARY` overrides the path for an out-of-tree build.
 """
 

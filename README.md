@@ -22,16 +22,9 @@ oracle = call.interpret(y0, dt)          # the same kernel on the CPU interprete
 print(call.explain(y0, dt))              # launch geometry, emitted MSL size
 ```
 
-The bundled Lotka-Volterra RK4 ensemble example runs tens of times
-faster than `jax.jit(vmap(diffeqsolve))` on CPU at N=100,000 (M1 Pro);
-see `docs/performance.md` for the measurement discipline behind
-comparisons like this.
-
-Note: an earlier iteration of this project also grew a cooperative
-SIMD-group/MMA GEMM lowering (matmuls, flash attention, MLP training).
-That capability outgrew being a side feature and was split out into its
-own sibling project, `mgemm`; palladium stays scoped to hand-authored
-control-flow kernels.
+The bundled Lotka-Volterra RK4 ensemble example runs tens of times faster
+than `jax.jit(vmap(diffeqsolve))` on CPU at N=100,000 (M1 Pro);
+see `docs/performance.md` for the measurement discipline behind comparisons like this.
 
 ## Setup
 

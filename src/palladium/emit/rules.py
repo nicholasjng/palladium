@@ -137,9 +137,6 @@ def _rule_random_unwrap(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None
 
 
 # Threefry-2x32-20, the algorithm `jax._src.random.threefry2x32` runs by default.
-# Verified against `jax.random.bits(key, shape, 'uint32')` bit-for-bit:
-# rotations, key schedule, counter construction (flat row-major index,
-# hi word 0 for any shape under 2**32 elements).
 _THREEFRY_ROT0 = (13, 15, 26, 6)
 _THREEFRY_ROT1 = (17, 29, 16, 24)
 
@@ -197,8 +194,7 @@ def _rule_random_bits(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     dst = declare(env, cursor, eqn.outvars[0])
     k1, k2 = key.at("0"), key.at("1")
 
-    idx = cursor.fresh("_i")
-    with cursor.block(f"for (uint {idx} = 0; {idx} < {dst.size}; ++{idx})"):
+    with cursor.loop(dst.size) as idx:
         b0, b1 = _emit_threefry2x32(cursor, k1, k2, "0u", idx)
         cursor.emit(f"{dst.at(idx)} = {b0} ^ {b1};")
 
@@ -390,10 +386,6 @@ def _rule_broadcast_in_dim(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> N
     aval = shaped(eqn.outvars[0].aval)
     out_shape = tuple(int(d) for d in aval.shape)
     if src.shape and src.size == math.prod(out_shape):
-        # Pure rank change (broadcast_dimensions are strictly increasing,
-        # so row-major flat order is preserved): alias, no copy. Scalar
-        # expressions (literals, rank-0 values) keep the copy path; they
-        # have no storage to alias.
         env.bind(eqn.outvars[0], dataclasses.replace(src, shape=out_shape))
         return
     dst = declare(env, cursor, eqn.outvars[0])
@@ -493,18 +485,10 @@ def _rule_dot_general(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         _emit_dot_general_m1_vectorized(cursor, lhs, rhs, dst, k, n)
         return
 
-    i, j, kk, acc = (
-        cursor.fresh("_mi"),
-        cursor.fresh("_ni"),
-        cursor.fresh("_ki"),
-        cursor.fresh("_acc"),
-    )
-    with (
-        cursor.block(f"for (uint {i} = 0; {i} < {m}; ++{i})"),
-        cursor.block(f"for (uint {j} = 0; {j} < {n}; ++{j})"),
-    ):
+    acc = cursor.fresh("_acc")
+    with cursor.loop(m, "_mi") as i, cursor.loop(n, "_ni") as j:
         cursor.emit(f"{dst.ctype} {acc} = 0;")
-        with cursor.block(f"for (uint {kk} = 0; {kk} < {k}; ++{kk})"):
+        with cursor.loop(k, "_ki") as kk:
             lhs_idx = f"{i} * {k} + {kk}"
             rhs_idx = f"{j} * {k} + {kk}" if rhs.transposed else f"{kk} * {n} + {j}"
             a_elem = lhs.at(lhs_idx)
@@ -543,25 +527,23 @@ def _emit_dot_general_m1_vectorized(
     """
     n4 = n // 4
     rspace = rhs.space
-    kk, j4, acc, ak, brow = (
-        cursor.fresh("_ki"),
-        cursor.fresh("_j4"),
+    acc, ak, brow = (
         cursor.fresh("_acc4"),
         cursor.fresh("_ak"),
         cursor.fresh("_brow"),
     )
     cursor.emit(f"thread float4 {acc}[{n4}];")
-    with cursor.block(f"for (uint {j4} = 0; {j4} < {n4}u; ++{j4})"):
+    with cursor.loop(f"{n4}u", "_j4") as j4:
         cursor.emit(f"{acc}[{j4}] = float4(0.0f);")
-    with cursor.block(f"for (uint {kk} = 0; {kk} < {k}u; ++{kk})"):
+    with cursor.loop(f"{k}u", "_ki") as kk:
         cursor.emit(f"float {ak} = {lhs.at(kk)};")
         cursor.emit(
             f"{rspace} const float4* {brow} = "
             f"({rspace} const float4*)({rhs.expr}) + {kk} * {n4}u;"
         )
-        with cursor.block(f"for (uint {j4} = 0; {j4} < {n4}u; ++{j4})"):
+        with cursor.loop(f"{n4}u", "_j4") as j4:
             cursor.emit(f"{acc}[{j4}] += {ak} * {brow}[{j4}];")
-    with cursor.block(f"for (uint {j4} = 0; {j4} < {n4}u; ++{j4})"):
+    with cursor.loop(f"{n4}u", "_j4") as j4:
         cursor.emit(f"((thread float4*)&{dst.expr}[0])[{j4}] = {acc}[{j4}];")
 
 
@@ -584,26 +566,23 @@ def _emit_dot_general_rowdot_vectorized(
     Pure text emission, no bindings: takes a Cursor, not an Environment.
     """
     k4 = k // 4
-    i, j, kk, acc, arow, brow = (
-        cursor.fresh("_mi"),
-        cursor.fresh("_ni"),
-        cursor.fresh("_k4"),
+    acc, arow, brow = (
         cursor.fresh("_acc4"),
         cursor.fresh("_arow"),
         cursor.fresh("_brow"),
     )
-    with cursor.block(f"for (uint {i} = 0; {i} < {m}; ++{i})"):
+    with cursor.loop(m, "_mi") as i:
         cursor.emit(
             f"{lhs.space} const float4* {arow} = "
             f"({lhs.space} const float4*)({lhs.expr}) + {i} * {k4}u;"
         )
-        with cursor.block(f"for (uint {j} = 0; {j} < {n}; ++{j})"):
+        with cursor.loop(n, "_ni") as j:
             cursor.emit(
                 f"{rhs.space} const float4* {brow} = "
                 f"({rhs.space} const float4*)({rhs.expr}) + {j} * {k4}u;"
             )
             cursor.emit(f"float4 {acc} = float4(0.0f);")
-            with cursor.block(f"for (uint {kk} = 0; {kk} < {k4}u; ++{kk})"):
+            with cursor.loop(f"{k4}u", "_k4") as kk:
                 cursor.emit(f"{acc} += {arow}[{kk}] * {brow}[{kk}];")
             cursor.emit(
                 f"{dst.at(f'{i} * {n} + {j}')} = {acc}.x + {acc}.y + {acc}.z + {acc}.w;"
@@ -677,8 +656,7 @@ def _rule_reduce_max(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """`jnp.max(x, axis=...)` -> the same nested-loop shape as
     `reduce_sum`, `fmax`-combining from `-INFINITY` instead of summing
     from 0. Verified against a real jaxpr before implementing:
-    `jnp.max` stages as `reduce_max[axes=...]`, exactly parallel to
-    `reduce_sum`.
+    `jnp.max` stages as `reduce_max[axes=...]`, exactly parallel to `reduce_sum`.
     """
     _emit_reduce(env, cursor, eqn, "-INFINITY", lambda acc, x: f"fmax({acc}, {x})")
 
@@ -687,8 +665,7 @@ def _rule_reduce_max(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 def _rule_program_id(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """`pl.program_id(axis)` -> a component of _pid, as a rank-0 int.
 
-    Pure aliasing, no storage or code. The (int) cast keeps index
-    arithmetic signed.
+    Pure aliasing, no storage or code. The (int) cast keeps index arithmetic signed.
     """
     axis: int = eqn.params["axis"]
     env.bind(eqn.outvars[0], CVal(f"(int){_PID[axis]}", (), "int"))
@@ -972,8 +949,7 @@ def _copy_back_carries(cursor: Cursor, outs: list[CVal], carries: list[CVal]) ->
         if c.shape:
             by_size.setdefault(c.size, []).append((o, c))
     for size, group in by_size.items():
-        i = cursor.fresh("_i")
-        with cursor.block(f"for (uint {i} = 0; {i} < {size}; ++{i})"):
+        with cursor.loop(size) as i:
             stage(group, i)
 
 

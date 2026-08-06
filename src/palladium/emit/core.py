@@ -2,8 +2,7 @@
 
 CVal, Cursor (MSL text position) and Environment (jaxpr Var bindings),
 the rule registries, jaxpr walking, ref views, and MSL assembly.
-Per-primitive lowering rules live in `rules` (one thread per program
-instance).
+Per-primitive lowering rules live in `rules` (one thread per program instance).
 """
 
 from __future__ import annotations
@@ -24,10 +23,9 @@ from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 from palladium.errors import EmitError, UnsupportedPrimitiveError
 from palladium.trace import BlockInfo, KernelSpec
 
-__all__ = ["EmitError"]  # re-export; the class lives in palladium.errors
+__all__ = ["EmitError"]
 
 
-# limit compute primitive arity to a maximum of 6.
 MAX_PRIMITIVE_ARITY = 6
 PRIMITIVE_INVARS = string.ascii_lowercase[:MAX_PRIMITIVE_ARITY]
 
@@ -37,10 +35,6 @@ def _template_fields(template: str) -> set[str]:
 
 
 def _unwrapped(expr: str) -> str:
-    # The RHS of an assignment is syntactically complete, so one wrapping
-    # paren pair is always redundant there; stripping it keeps the emitted
-    # text readable. Safe only at assign sites: template parens elsewhere
-    # defend operand atomicity (see the ELEMENTWISE comment).
     if not (expr.startswith("(") and expr.endswith(")")):
         return expr
     depth = 0
@@ -173,10 +167,20 @@ class Cursor:
         self.indent -= 1
         self.emit("}")
 
+    @contextlib.contextmanager
+    def loop(self, count: int | str, prefix: str = "_i") -> Iterator[str]:
+        """Emit `for (uint idx = 0; idx < count; ++idx)`; yields `idx`.
+
+        `count` is inlined verbatim, so pass e.g. `f"{n}u"` where the
+        call site needs an unsigned-literal suffix.
+        """
+        idx = self.fresh(prefix)
+        with self.block(f"for (uint {idx} = 0; {idx} < {count}; ++{idx})"):
+            yield idx
+
     def copy(self, dst: CVal, src: CVal, count: int) -> None:
         """Emit `count` element assignments dst[i] = src[i] as a loop."""
-        i = self.fresh("_i")
-        with self.block(f"for (uint {i} = 0; {i} < {count}; ++{i})"):
+        with self.loop(count) as i:
             self.emit(f"{dst.at(i)} = {src.at(i)};")
 
 
@@ -529,10 +533,7 @@ def ref_view(env: Environment, ref: CVal, indexer: NDIndexer) -> CVal:
                 raise EmitError(
                     f"ref access dim {d}: stride {idx.stride} != 1 is unimplemented"
                 )
-            # pl.Slice.size/.start are typed `int | Array` upstream (a
-            # Slice can be user-constructed with a dynamic size), but a
-            # kernel jaxpr equation never carries one: size is always
-            # static (verified against real jaxprs) and a dynamic start
+            # pl.Slice.size is always static, and a dynamic start
             # is always a jaxpr atom (Var/Literal), never a live Array.
             kept.append((d, cast(int, idx.size)))
             start = idx.start
@@ -542,11 +543,7 @@ def ref_view(env: Environment, ref: CVal, indexer: NDIndexer) -> CVal:
                 else env.val(cast(Atom, start)).expr
             )
         else:
-            # NDIndexer.indices is typed to also admit fancy/advanced
-            # (gather-style) integer-array indexers upstream, but a
-            # kernel jaxpr's get/swap params never carry one: this
-            # emitter's supported subset has no such rule, and a
-            # non-Slice index here is always a jaxpr atom.
+            # A non-Slice index here is always a jaxpr atom.
             expr = env.val(cast(Atom, idx)).expr
         if expr != "0":
             terms.append(f"{expr} * {stride}")
