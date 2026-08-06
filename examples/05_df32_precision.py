@@ -1,6 +1,7 @@
 """Example 5: does compensated arithmetic (df32) buy real accuracy here.
 
-Stretch 9. Same RK4 Lotka-Volterra capstone as example 1, three ways:
+Docs: math modes, docs/performance.md (math mode).
+Same RK4 Lotka-Volterra capstone as example 1, three ways:
 FAST (the default), SAFE (same float32 kernel, reassociation off), and
 DF32 (metal-runtime's df32 prelude: float32x2 compensated arithmetic,
 hand-written MSL since the Pallas/jnp frontend has no df32 dtype to trace

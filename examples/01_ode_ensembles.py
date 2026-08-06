@@ -1,14 +1,12 @@
 """Example 1: massive ensembles of small ODEs, palladium vs Diffrax.
 
+Docs: the classic execution model in docs/supported-subset.md.
 One Metal thread integrates one Lotka-Volterra system (RK4, fixed step)
 with its own parameters; the grid is the ensemble. The Diffrax baseline is
 the same ensemble under jit(vmap(diffeqsolve)) on the CPU backend; on
 macOS that IS the practical Diffrax deployment (jax-metal is stale and
 cannot run it; see ROADMAP).
 
-The palladium path activates once exercises 1-5 are green:
-    uv run pytest tests/ -m exercise
-Until then this script still runs and prints the baseline numbers.
 """
 
 import time
@@ -128,8 +126,7 @@ def main():
             "(fixed- vs adaptive-step, f32; not a bug at ~1e-3)"
         )
     except NotImplementedError as e:
-        print(f"palladium path pending: {e}")
-        print("finish the exercises: uv run pytest tests/ -m exercise")
+        print(f"palladium path unavailable: {e}")
 
 
 if __name__ == "__main__":
