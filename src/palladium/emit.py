@@ -426,8 +426,7 @@ class _Slice(Protocol):
     not imported, same reasoning as `trace.py`'s `type(dim).__name__ ==
     "Squeezed"` check. `start` is a plain Python int when static, an atom
     (Var, possibly Literal) when dynamic (`pl.dslice`); `size`/`stride`
-    are always static, verified against real jaxprs, see NEXT.md history
-    (folded into this docstring once landed).
+    are always static, verified against real jaxprs.
     """
 
     start: int | Atom
@@ -561,12 +560,10 @@ def _rule_random_unwrap(state: EmitState, eqn: JaxprEqn) -> None:
     state.bind(eqn.outvars[0], state.val(eqn.invars[0]))
 
 
-# Threefry-2x32-20, the algorithm `jax._src.random.threefry2x32` runs by
-# default (jax_threefry_partitionable=True). Verified against
-# `jax.random.bits(key, shape, 'uint32')` bit-for-bit before writing this
-# (see NEXT.md): rotations, key schedule, and the counter construction
-# (flat row-major index, hi word 0 for any shape under 2**32 elements)
-# all checked against ground truth, not transcribed from memory.
+# Threefry-2x32-20, the algorithm `jax._src.random.threefry2x32` runs by default.
+# Verified against `jax.random.bits(key, shape, 'uint32')` bit-for-bit:
+# rotations, key schedule, counter construction (flat row-major index,
+# hi word 0 for any shape under 2**32 elements).
 _THREEFRY_ROT0 = (13, 15, 26, 6)
 _THREEFRY_ROT1 = (17, 29, 16, 24)
 

@@ -2,11 +2,11 @@
 
 Non-Slice indices (scalar Var or Literal atoms) squeeze that dim into a
 pointer offset; Slice indices keep the dim. Verified against real jaxprs
-before implementing (see NEXT.md): a Slice's `start` is a plain Python int
-when static, a Var when dynamic (`pl.dslice`); a non-Slice index is always
-an ordinary atom, same as any other jaxpr value. Only the first kept dim
-may be partial (the same contiguous-block discipline BlockSpec blocks
-already follow); non-unit strides are unimplemented.
+before implementing: a Slice's `start` is a plain Python int when static,
+a Var when dynamic (`pl.dslice`); a non-Slice index is always an ordinary
+atom, same as any other jaxpr value. Only the first kept dim may be
+partial (the same contiguous-block discipline BlockSpec blocks already
+follow); non-unit strides are unimplemented.
 
 This does not touch a Ref's own BlockSpec binding (`test_04_grid_blocks.py`'s
 `test_noncontiguous_block_is_rejected` still holds): strided or multi-dim

@@ -10,7 +10,7 @@ implementing, and every rule here is checked bit-for-bit against JAX's
 own output (`jax.random.bits`, `jax.random.uniform`, `jax.random.fold_in`
 key data), not just "close enough": Threefry-2x32-20 is a specific,
 well-defined algorithm, and this reproduces it exactly rather than
-substituting a different hash validated only statistically. See NEXT.md.
+substituting a different hash validated only statistically.
 """
 
 import jax
