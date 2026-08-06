@@ -160,4 +160,4 @@ def test_conditional_accumulation_in_loop(rng):
     r = rng.uniform(0.01, 0.2, 256).astype(np.float32)
     got = f(y0, r)
     _oracle_check(f, y0, r)
-    assert np.all(got <= 1.0 + 1e-6), "accept/reject failed to cap growth"
+    assert np.all(got <= 1.0 + 1e-6), "accept/reject failed to cap growth"  # ty: ignore[unsupported-operator]

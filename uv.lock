@@ -351,22 +351,15 @@ source = { editable = "." }
 dependencies = [
     { name = "jax" },
     { name = "metal-runtime" },
-    { name = "numpy" },
 ]
 
 [package.dev-dependencies]
-bench = [
-    { name = "mew-bench" },
-]
 dev = [
+    { name = "diffrax" },
     { name = "hypothesis" },
+    { name = "mew-bench" },
     { name = "pytest" },
     { name = "ruff" },
-]
-examples = [
-    { name = "diffrax" },
-]
-typing = [
     { name = "ty" },
 ]
 
@@ -374,18 +367,17 @@ typing = [
 requires-dist = [
     { name = "jax", specifier = ">=0.11,<0.12" },
     { name = "metal-runtime", directory = "../metal-runtime" },
-    { name = "numpy", specifier = ">=1.26" },
 ]
 
 [package.metadata.requires-dev]
-bench = [{ name = "mew-bench" }]
 dev = [
+    { name = "diffrax", specifier = ">=0.6" },
     { name = "hypothesis", specifier = ">=6.100" },
+    { name = "mew-bench", specifier = ">=0.1.0" },
     { name = "pytest", specifier = ">=8" },
     { name = "ruff", specifier = ">=0.6" },
+    { name = "ty", specifier = ">=0.0.66" },
 ]
-examples = [{ name = "diffrax", specifier = ">=0.6" }]
-typing = [{ name = "ty", specifier = ">=0.0.66" }]
 
 [[package]]
 name = "pluggy"

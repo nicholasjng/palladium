@@ -12,7 +12,6 @@ authors = [{ name = "Nicholas Junge", email = "nicho.junge@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = [
     "jax>=0.11,<0.12",
-    "numpy>=1.26",
     "metal-runtime",
 ]
 
@@ -21,23 +20,16 @@ metal-runtime = { path = "../metal-runtime" }
 
 [dependency-groups]
 dev = [
+    "diffrax>=0.6",
     "hypothesis>=6.100",
+    "mew-bench>=0.1.0",
     "pytest>=8",
     "ruff>=0.6",
-]
-examples = [
-    "diffrax>=0.6",
-]
-bench = [
-    "mew-bench",
-]
-typing = [
     "ty>=0.0.66",
 ]
 
 [tool.uv]
-default-groups = ["bench", "dev", "examples", "typing"]
-
+default-groups = ["dev"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/palladium"]
