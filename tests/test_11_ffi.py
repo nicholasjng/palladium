@@ -143,3 +143,62 @@ def test_math_mode_safe_is_actually_requested(rng):
     want = np.asarray(f.interpret(x))
     assert np.array_equal(np.isnan(got), np.isnan(want))
     np.testing.assert_allclose(got[~np.isnan(got)], want[~np.isnan(want)])
+
+
+def test_cooperative_kernel_dispatches_through_ffi(rng):
+    """A query-blocked attention kernel takes the cooperative model
+    through the FFI path: the launch must carry the (32, 1, 1)
+    threadgroup geometry or every SIMD-group would compute instance 0."""
+    from jax.experimental import pallas as pl
+
+    seq, hd, bq, bkv = 256, 64, 8, 32
+    scale = 1.0 / (hd**0.5)
+
+    def kernel(q_ref, k_ref, v_ref, o_ref):
+        q = q_ref[...]
+
+        def step(j, carry):
+            m, l, o = carry
+            kj = k_ref[pl.dslice(j * bkv, bkv), :]
+            vj = v_ref[pl.dslice(j * bkv, bkv), :]
+            s = jnp.dot(q, kj.T) * scale
+            m_new = jnp.maximum(m, jnp.max(s, axis=1, keepdims=True))
+            corr = jnp.exp(m - m_new)
+            p = jnp.exp(s - m_new)
+            l_new = l * corr + jnp.sum(p, axis=1, keepdims=True)
+            return (m_new, l_new, o * corr + jnp.dot(p, vj))
+
+        m0 = jnp.full((bq, 1), -jnp.inf, jnp.float32)
+        l0 = jnp.zeros((bq, 1), jnp.float32)
+        o0 = jnp.zeros((bq, hd), jnp.float32)
+        m, l, o = jax.lax.fori_loop(0, seq // bkv, step, (m0, l0, o0))
+        o_ref[...] = o / l
+
+    f = palladium.metal_call_jit(
+        kernel,
+        grid=(seq // bq,),
+        in_specs=[
+            pl.BlockSpec((bq, hd), lambda i: (i, 0)),
+            pl.BlockSpec((seq, hd), lambda i: (0, 0)),
+            pl.BlockSpec((seq, hd), lambda i: (0, 0)),
+        ],
+        out_specs=pl.BlockSpec((bq, hd), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((seq, hd), jnp.float32),
+    )
+    q = rng.standard_normal((seq, hd)).astype(np.float32)
+    k = rng.standard_normal((seq, hd)).astype(np.float32)
+    v = rng.standard_normal((seq, hd)).astype(np.float32)
+
+    got = np.asarray(f(q, k, v))
+    want = np.asarray(f.interpret(q, k, v))
+    np.testing.assert_allclose(got, want, atol=1e-4)
+
+    # the cached entry must actually be the cooperative lowering
+    (entry,) = f._cache.values()
+    assert entry[2] is True and "simdgroup" in entry[1]
+
+    # and it composes inside jax.jit next to jnp ops
+    jitted = jax.jit(lambda q, k, v: jnp.tanh(f(q, k, v)).sum())
+    np.testing.assert_allclose(
+        float(jitted(q, k, v)), float(np.tanh(want).sum()), rtol=1e-4
+    )

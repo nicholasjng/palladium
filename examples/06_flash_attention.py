@@ -27,16 +27,42 @@ Single head, single sequence (no batch/heads grid dims yet): batching
 those in is a straightforward grid extension (no dot_general widening
 needed, everything stays rank-2 per thread), not done here.
 
-Honest result: correct, and genuinely parallel across the grid (unlike
-the training kernel this replaced, which needed cross-thread gradient
-reduction this repo doesn't build and so ran on a single thread), but
-still roughly 15-20x *slower* than jax.jit here, and that ratio
-doesn't close as N grows or as `BLOCK_KV` is tuned (checked 4 through
-128; 128 hits the same stack-pressure wall again at N*head_dim scale).
-The bottleneck isn't missing parallelism this time, it's that
-`_rule_dot_general` is a naive scalar triple-nested loop (no
-vectorization), competing against XLA's heavily vectorized, jit-compiled
-CPU matmul. See ROADMAP stretch 17 for what closing that gap would need.
+Honest result: correct, and — after the emitter work this example drove
+(see `docs/reward-spec-matmul-emitter.md` for the scoring methodology
+and history) — **faster than `jax.jit` CPU at every measured shape**:
+2.8x at seq 1024 (0.49ms vs 1.36ms wall) and 3.8x at seq 4096 (3.8ms vs
+14.2ms), block_kv=32, measured heat-soaked. The GPU advantage grows with
+seq_len, which is what reward spec v0.3.0 scores (worst-case across
+shapes, normalized to the ~4x practical ceiling; current score 0.693).
+Five emitter changes closed the original ~17x gap and pushed well past
+parity, each verified against the `.interpret` oracle and `jax.jit` at
+three seeds:
+
+1. Ref slices became pointer views instead of element-wise thread-local
+   copies (the two streamed K/V blocks alone were 2048 scalar device
+   loads plus ~12KB of stack per fori_loop iteration).
+2. `kj.T` fuses into `dot_general` (a lazy `transposed` view), making
+   QK^T a unit-stride float4 row-dot on both operands.
+3. Kernels like this one lower to a simdgroup-cooperative execution
+   model (`emit.is_simdgroup_cooperative`): one 32-thread SIMD-group per
+   program instance, with lane-sharded values and simd_sum/max
+   reductions — 32x the threads at seq_len=1024, which was ~2x
+   under-occupied per the scaling measurement.
+4. The cooperative model generalized from one query row per instance to
+   R rows (`block_q` below; columns-per-lane layout), so each K/V
+   element loaded from device serves R rows — the query-blocking lever
+   `docs/query-blocking-scratch.md` measured at 2x on hand-written
+   stand-ins, transferring to this generated kernel within ~11%.
+5. Both cooperative dots lower to the SIMD-group matrix units
+   (`simdgroup_float8x8`) when tile-divisible, with the softmax
+   probabilities staged through a threadgroup tile — 1.9x more device
+   time at the worst shape (0.468ms -> 0.242ms at seq 1024).
+
+Thermal caveat, measured: the GPU down-clocks up to ~3x under sustained
+dispatch load (the effect `docs/simdgroup-matmul-design.md` documented)
+while the CPU side barely moves. The current ~1.4x margin absorbs most
+of it; deep heat-soak can still push individual readings below parity
+without any code change.
 """
 
 import time
@@ -45,7 +71,7 @@ import numpy as np
 
 SEQ_LEN = 1024
 HEAD_DIM = 64
-BLOCK_KV = 16
+BLOCK_KV = 32
 SEED = 0
 
 
@@ -78,10 +104,19 @@ def golden_attention(q: np.ndarray, k: np.ndarray, v: np.ndarray, scale: float):
     return np.asarray(out), dt
 
 
-def palladium_attention(seq_len: int, head_dim: int, block_kv: int):
-    """Online-softmax attention: one thread per query, streaming K/V in
+def palladium_attention(seq_len: int, head_dim: int, block_kv: int, block_q: int = 8):
+    """Online-softmax attention, blocked over queries *and* keys: each
+    program instance owns `block_q` query rows, streaming K/V in
     `block_kv`-sized chunks, carrying (running max, running sum, running
-    output) across the fori_loop, normalizing once at the end.
+    output) per row across the fori_loop, normalizing once at the end.
+
+    `block_q` is the R of the emitter's cooperative model: with one
+    32-lane SIMD-group per instance, every K/V element loaded from device
+    serves `block_q` rows instead of one. 8 measured fastest here, the
+    same knee `docs/query-blocking-scratch.md` found on hand-written
+    stand-ins (reuse and SIMD-group count trade off inversely; 8 is a
+    property of seq_len=1024, not a constant of the algorithm).
+    `block_q=1` reproduces the previous one-row-per-instance kernel.
     """
     import jax
     import jax.numpy as jnp
@@ -92,36 +127,36 @@ def palladium_attention(seq_len: int, head_dim: int, block_kv: int):
     scale = 1.0 / (head_dim**0.5)
 
     def kernel(q_ref, k_ref, v_ref, o_ref):
-        q = q_ref[...]  # (1, head_dim)
+        q = q_ref[...]  # (block_q, head_dim)
 
         def step(j, carry):
             m, l, o = carry
             kj = k_ref[pl.dslice(j * block_kv, block_kv), :]
             vj = v_ref[pl.dslice(j * block_kv, block_kv), :]
-            s = jnp.dot(q, kj.T) * scale  # (1, block_kv)
+            s = jnp.dot(q, kj.T) * scale  # (block_q, block_kv)
             m_block = jnp.max(s, axis=1, keepdims=True)
             m_new = jnp.maximum(m, m_block)
             correction = jnp.exp(m - m_new)
-            p = jnp.exp(s - m_new)  # (1, block_kv)
+            p = jnp.exp(s - m_new)  # (block_q, block_kv)
             l_new = l * correction + jnp.sum(p, axis=1, keepdims=True)
             o_new = o * correction + jnp.dot(p, vj)
             return (m_new, l_new, o_new)
 
-        m0 = jnp.full((1, 1), -jnp.inf, jnp.float32)
-        l0 = jnp.zeros((1, 1), jnp.float32)
-        o0 = jnp.zeros((1, head_dim), jnp.float32)
+        m0 = jnp.full((block_q, 1), -jnp.inf, jnp.float32)
+        l0 = jnp.zeros((block_q, 1), jnp.float32)
+        o0 = jnp.zeros((block_q, head_dim), jnp.float32)
         m, l, o = jax.lax.fori_loop(0, seq_len // block_kv, step, (m0, l0, o0))
         o_ref[...] = o / l
 
     return palladium.metal_call(
         kernel,
-        grid=(seq_len,),
+        grid=(seq_len // block_q,),
         in_specs=[
-            pl.BlockSpec((1, head_dim), lambda i: (i, 0)),
+            pl.BlockSpec((block_q, head_dim), lambda i: (i, 0)),
             pl.BlockSpec((seq_len, head_dim), lambda i: (0, 0)),
             pl.BlockSpec((seq_len, head_dim), lambda i: (0, 0)),
         ],
-        out_specs=pl.BlockSpec((1, head_dim), lambda i: (i, 0)),
+        out_specs=pl.BlockSpec((block_q, head_dim), lambda i: (i, 0)),
         out_shape=jax.ShapeDtypeStruct((seq_len, head_dim), jnp.float32),
     )
 
@@ -147,8 +182,9 @@ def main():
     err = np.abs(np.asarray(got) - want).max()
     print(f"max abs deviation from jax.jit: {err:.2e}")
     print(
-        "not faster here: dot_general is a naive scalar loop, competing "
-        "against XLA's vectorized CPU matmul (see module docstring)"
+        "single-shot timing above is illustrative only; see "
+        "benchmarks/reward_matmul_emitter.py for the soaked-median "
+        "methodology (and the module docstring for the thermal caveat)"
     )
 
 

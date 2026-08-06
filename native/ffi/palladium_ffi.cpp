@@ -110,7 +110,9 @@ bool wrap_one(xla::ffi::AnyBuffer buf, std::vector<MRBuffer *> &wrapped,
 xla::ffi::Error PalladiumDispatch(std::string_view msl_source,
                                   std::string_view function_name,
                                   int64_t grid_x, int64_t grid_y,
-                                  int64_t grid_z, int64_t math_mode,
+                                  int64_t grid_z, int64_t threadgroup_x,
+                                  int64_t threadgroup_y, int64_t threadgroup_z,
+                                  int64_t math_mode,
                                   xla::ffi::RemainingArgs args,
                                   xla::ffi::RemainingRets rets) {
   if (math_mode < MR_MATH_MODE_SAFE || math_mode > MR_MATH_MODE_FAST) {
@@ -153,6 +155,11 @@ xla::ffi::Error PalladiumDispatch(std::string_view msl_source,
   desc.grid_x = (size_t)grid_x;
   desc.grid_y = (size_t)grid_y;
   desc.grid_z = (size_t)grid_z;
+  // threadgroup_x == 0 lets the runtime choose (c_api.cpp); the
+  // cooperative execution model requires an explicit (32, 1, 1).
+  desc.threadgroup_x = (size_t)threadgroup_x;
+  desc.threadgroup_y = (size_t)threadgroup_y;
+  desc.threadgroup_z = (size_t)threadgroup_z;
 
   char *err = nullptr;
   MRStatus status = mr_dispatch(&desc, &err);
@@ -194,6 +201,9 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(palladium_dispatch, PalladiumDispatch,
                                   .Attr<int64_t>("grid_x")
                                   .Attr<int64_t>("grid_y")
                                   .Attr<int64_t>("grid_z")
+                                  .Attr<int64_t>("threadgroup_x")
+                                  .Attr<int64_t>("threadgroup_y")
+                                  .Attr<int64_t>("threadgroup_z")
                                   .Attr<int64_t>("math_mode")
                                   .RemainingArgs()
                                   .RemainingRets());

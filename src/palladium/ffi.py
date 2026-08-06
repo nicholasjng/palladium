@@ -23,7 +23,8 @@ from typing import Any
 import jax
 import numpy as np
 
-from palladium.emit import emit_msl
+from palladium.emit import emit_msl, is_simdgroup_cooperative
+from palladium.emit.core import SIMDGROUP_WIDTH
 from palladium.trace import KernelSpec, trace
 
 __all__ = ["FfiCallable", "metal_call_jit"]
@@ -74,7 +75,7 @@ class FfiCallable:
     `MetalCallable` caches `BoundKernel`s.
 
     Not differentiable: `ffi_call` has no JVP/transpose rule by default
-    (ROADMAP's `custom_vjp` tier is the path if ever needed).
+    (a `custom_vjp` wrapper is the path if ever needed).
 
     Attributes
     ----------
@@ -91,24 +92,32 @@ class FfiCallable:
         self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
         value = math_mode.value if hasattr(math_mode, "value") else math_mode
         self._math_mode = _MATH_MODE_ORDINALS[value]
-        self._cache: dict[tuple, tuple[KernelSpec, str]] = {}
+        self._cache: dict[tuple, tuple[KernelSpec, str, bool]] = {}
 
-    def _spec_and_msl(self, args: tuple) -> tuple[KernelSpec, str]:
+    def _spec_and_msl(self, args: tuple) -> tuple[KernelSpec, str, bool]:
         key = tuple((a.shape, np.dtype(a.dtype).str) for a in args)
         entry = self._cache.get(key)
         if entry is None:
             shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
             spec = trace(self._staged, *shapes)
-            entry = (spec, emit_msl(spec))
+            cooperative = is_simdgroup_cooperative(spec)
+            entry = (spec, emit_msl(spec, cooperative=cooperative), cooperative)
             self._cache[key] = entry
         return entry
 
     def __call__(self, *args):
         """Dispatch via jax.ffi; traceable and jittable."""
         _register()
-        spec, msl_source = self._spec_and_msl(args)
+        spec, msl_source, cooperative = self._spec_and_msl(args)
         # MRLaunchDesc always wants 3 grid dims; palladium grids are 1-3D.
         grid = tuple(spec.grid) + (1, 1, 1)
+        if cooperative:
+            # One SIMD-group (one threadgroup) per instance; must match
+            # emit_msl's instance indexing, same as dispatch.BoundKernel.
+            grid = (grid[0] * SIMDGROUP_WIDTH, *grid[1:])
+            threadgroup = (SIMDGROUP_WIDTH, 1, 1)
+        else:
+            threadgroup = (0, 0, 0)  # runtime chooses
         out_structs = [
             jax.ShapeDtypeStruct(info.array_shape, info.dtype) for info in spec.outputs
         ]
@@ -120,6 +129,9 @@ class FfiCallable:
             grid_x=int(grid[0]),
             grid_y=int(grid[1]),
             grid_z=int(grid[2]),
+            threadgroup_x=int(threadgroup[0]),
+            threadgroup_y=int(threadgroup[1]),
+            threadgroup_z=int(threadgroup[2]),
             math_mode=self._math_mode,
         )
 
