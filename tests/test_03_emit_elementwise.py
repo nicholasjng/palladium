@@ -91,3 +91,35 @@ def test_lotka_volterra_rhs(rng):
     want1, want2 = f.interpret(x, y)
     np.testing.assert_allclose(got1, np.asarray(want1), rtol=1e-5)
     np.testing.assert_allclose(got2, np.asarray(want2), rtol=1e-5)
+
+
+def test_row_vector_broadcasts_against_matrix_matches_numpy(rng):
+    """A dense layer's bias add: `x @ w + b`, `b` shape (32,) broadcasting
+    against a (4, 32) matmul result. Verified against a real jaxpr before
+    fixing: `b` stages `broadcast_in_dim` to (1, 32), then `add` between
+    (4, 32) and (1, 32), not same-shape operands throughout, so
+    `_rule_elementwise` has to broadcast per operand, not assume every
+    operand matches `dst`'s shape."""
+
+    def kernel(x_ref, w_ref, b_ref, o_ref):
+        o_ref[...] = jnp.dot(x_ref[...], w_ref[...]) + b_ref[...]
+
+    x = rng.standard_normal((4, 1), dtype=np.float32)
+    w = rng.standard_normal((1, 32), dtype=np.float32)
+    b = rng.standard_normal((32,), dtype=np.float32)
+    f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((4, 32), jnp.float32))
+    got = f(x, w, b)
+    np.testing.assert_allclose(got, x @ w + b, rtol=1e-4, atol=1e-4)
+
+
+def test_column_vector_broadcasts_against_matrix_matches_numpy(rng):
+    """Broadcasting along the other axis: (4, 1) against (4, 32)."""
+
+    def kernel(x_ref, col_ref, o_ref):
+        o_ref[...] = x_ref[...] + col_ref[...]
+
+    x = rng.standard_normal((4, 32), dtype=np.float32)
+    col = rng.standard_normal((4, 1), dtype=np.float32)
+    f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((4, 32), jnp.float32))
+    got = f(x, col)
+    np.testing.assert_allclose(got, x + col, rtol=1e-5, atol=1e-6)

@@ -342,6 +342,13 @@ def _element_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(math.prod(shape[d + 1 :]) for d in range(len(shape)))
 
 
+def _flat_index(terms: list[tuple[str, int]]) -> str:
+    """C expression for `sum(var * stride for var, stride in terms)`,
+    omitting the `* 1` for a unit stride and any zero-stride term."""
+    parts = [var if stride == 1 else f"{var} * {stride}" for var, stride in terms if stride != 0]
+    return " + ".join(parts) or "0"
+
+
 def _full_block_shape(info: BlockInfo) -> tuple[int, ...]:
     """block_shape with squeezed dims restored as 1, rank-matched to array."""
     missing = len(info.array_shape) - len(info.block_shape)
@@ -397,7 +404,11 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
         if offset is None:
             offset = _block_offset(state, spec, info)
         state.emit(f"{qual} {ctype}* arg{k} = arg{k}_base + {offset};")
-        ref_vals.append(CVal(expr=f"arg{k}", shape=info.block_shape, ctype=ctype))
+
+        # access scalar refs (shape == ()) as axis-1 arrays, since all refs are pointers.
+        ref_vals.append(
+            CVal(expr=f"arg{k}", shape=info.block_shape or (1,), ctype=ctype)
+        )
 
     n_refs = len(operands)
     if len(spec.jaxpr.invars) != n_refs:
