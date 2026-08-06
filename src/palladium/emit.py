@@ -45,8 +45,30 @@ __all__ = ["RULES", "CVal", "Ctx", "EmitError", "emit_jaxpr", "emit_msl", "rule"
 Atom = Var | Literal
 
 
+# limit compute primitive arity to a maximum of 6.
+MAX_PRIMITIVE_ARITY = 6
+PRIMITIVE_INVARS = string.ascii_lowercase[:MAX_PRIMITIVE_ARITY]
+
+
 def _template_fields(template: str) -> set[str]:
     return {f for _, f, _, _ in string.Formatter().parse(template) if f}
+
+
+def _unwrapped(expr: str) -> str:
+    # The RHS of an assignment is syntactically complete, so one wrapping
+    # paren pair is always redundant there; stripping it keeps the emitted
+    # text readable. Safe only at assign sites: template parens elsewhere
+    # defend operand atomicity (see the ELEMENTWISE comment).
+    if not (expr.startswith("(") and expr.endswith(")")):
+        return expr
+    depth = 0
+    for i, ch in enumerate(expr):
+        depth += ch == "("
+        depth -= ch == ")"
+        if depth == 0 and i < len(expr) - 1:
+            # The leading paren closes early: shapes like (a) * (b).
+            return expr
+    return expr[1:-1]
 
 
 def _shaped(aval: object) -> ShapedArray:
@@ -170,7 +192,12 @@ class Ctx:
         if isinstance(atom, Literal):
             ctype = CTYPES[str(_shaped(atom.aval).dtype)]
             v = atom.val
-            expr = f"{float(v)!r}f" if ctype in ("float", "half") else str(int(v))
+            if math.isinf(v):
+                expr = "-INFINITY" if v < 0 else "INFINITY"
+            elif math.isnan(v):
+                expr = "NAN"
+            else:
+                expr = f"{float(v)!r}f" if ctype in ("float", "half") else str(int(v))
             return CVal(expr=expr, shape=(), ctype=ctype)
         return self.env[atom]
 
@@ -447,10 +474,32 @@ def _rule_swap(ctx: Ctx, eqn: JaxprEqn) -> None:
     ctx.bind(eqn.outvars[0], dst_ref)
 
 
+@rule("jit")
+def _inline_jit(ctx: Ctx, eqn: JaxprEqn) -> None:
+    """Inline a jit-wrapped call by walking its body jaxpr.
+
+    Inlines a jit body into an MSL program. This is used often, because
+    many library functions in jax.numpy are jit-decorated.
+    """
+    inner: Jaxpr = eqn.params["jaxpr"]
+    body = inner.jaxpr
+    if inner.consts:
+        raise EmitError("jit with consts is unsupported")
+
+    invals = [ctx.val(invar) for invar in eqn.invars]
+    outvals = emit_jaxpr(ctx, body, invals)
+
+    for outvar, val in zip(eqn.outvars, outvals, strict=True):
+        ctx.bind(outvar, val)
+
+
 # MSL templates for pure elementwise primitives; {a}/{b} are element
 # expressions. The arity check in _rule_elementwise validates every template
 # against its equation. fmin/fmax are float-only; integer min/max needs a
 # ctype dispatch (stretch-7 pre-flight, see ROADMAP).
+# The parens are deliberate: CVal.expr admits any rvalue, so a template
+# must not assume its operands bind tighter than its own operator. Only
+# the assign site may strip them (_unwrapped).
 ELEMENTWISE: dict[str, str] = {
     # binary
     "add": "({a} + {b})",
@@ -469,6 +518,13 @@ ELEMENTWISE: dict[str, str] = {
     "cos": "cos({a})",
     "sqrt": "sqrt({a})",
     "tanh": "tanh({a})",
+    # ternary
+    "select_n": "({a} ? {c} : {b})",  # a: predicate, c when true, b when false
+    # logical
+    "lt": "({a} < {b})",
+    "le": "({a} <= {b})",
+    "gt": "({b} < {a})",
+    "ge": "({b} <= {a})",
 }
 
 
@@ -500,20 +556,23 @@ def _rule_elementwise(ctx: Ctx, eqn: JaxprEqn) -> None:
         if dst.shape and any(op.shape for op in ops):
             raise EmitError("array-to-array broadcasts are unimplemented")
         template = "{a}"
+    elif opname == "select_n":
+        if (pred_type := ops[0].ctype) != "bool":
+            raise EmitError(
+                f"select_n requires predicate of type bool, got {pred_type}"
+            )
+        template = ELEMENTWISE[opname]
     else:
-        template = ELEMENTWISE[eqn.primitive.name]
+        template = ELEMENTWISE[opname]
 
     fields = _template_fields(template)
-    expected = set("ab"[: len(ops)])
+    expected = set(PRIMITIVE_INVARS[: len(ops)])
     if fields != expected:
-        raise EmitError(
-            f"{opname}: template references {sorted(fields)}, "
-            f"equation has {len(ops)} operand(s)"
-        )
+        raise EmitError(f"{opname} requires {len(fields)} operands, got {len(ops)}")
 
     def assign(idx: str) -> str:
-        inputs = {name: op.at(idx) for name, op in zip("ab", ops)}
-        return f"{dst.at(idx)} = {template.format(**inputs)};"
+        inputs = {name: op.at(idx) for name, op in zip(PRIMITIVE_INVARS, ops)}
+        return f"{dst.at(idx)} = {_unwrapped(template.format(**inputs))};"
 
     if dst.shape:
         idx = ctx.fresh("_i")
