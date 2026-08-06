@@ -26,6 +26,7 @@ dev = [
     "pytest>=8",
     "ruff>=0.6",
     "ty>=0.0.66",
+    "typing-extensions>=4.10",
 ]
 
 [tool.uv]

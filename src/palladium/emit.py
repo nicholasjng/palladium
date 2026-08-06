@@ -24,11 +24,15 @@ import itertools
 import math
 import string
 from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING, Protocol
 
 from jax.core import ShapedArray
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.trace import BlockInfo, KernelSpec
+
+if TYPE_CHECKING:
+    from typing_extensions import TypeIs
 
 __all__ = ["RULES", "CVal", "EmitError", "EmitState", "emit_jaxpr", "emit_msl", "rule"]
 
@@ -417,32 +421,111 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
     )
 
 
+class _Slice(Protocol):
+    """Structural stand-in for `jax._src.indexing.Slice`: a private class,
+    not imported, same reasoning as `trace.py`'s `type(dim).__name__ ==
+    "Squeezed"` check. `start` is a plain Python int when static, an atom
+    (Var, possibly Literal) when dynamic (`pl.dslice`); `size`/`stride`
+    are always static, verified against real jaxprs, see NEXT.md history
+    (folded into this docstring once landed).
+    """
+
+    start: int | Atom
+    size: int
+    stride: int
+
+
+class _NDIndexer(Protocol):
+    """Structural stand-in for `jax._src.state.indexing.NDIndexer`, same
+    reasoning as `_Slice`. One entry in `indices` per ref dimension."""
+
+    shape: tuple[int, ...]
+    indices: tuple[Atom | _Slice, ...]
+
+
+def _is_slice(idx: Atom | _Slice) -> TypeIs[_Slice]:
+    """Structural check, not `isinstance`: `_Slice` is a `Protocol` over a
+    private class, and checking by class name (not import) is this file's
+    established way of staying version-tolerant of JAX internals."""
+    return type(idx).__name__ == "Slice"
+
+
+def _ref_view(state: EmitState, ref: CVal, indexer: _NDIndexer) -> CVal:
+    """Resolve an NDIndexer against a Ref's CVal: pointer offset + kept shape.
+
+    A Slice index keeps that dim (contributes to the result's logical
+    shape, in order); any other index (a scalar Var/Literal atom) squeezes
+    it into the offset. Slice strides must be 1, and only the first kept
+    dim may be partial: the same contiguous-trailing-block discipline
+    BlockSpec blocks already follow (`_check_contiguous`). A fully-scalar
+    indexer (no kept dims) resolves to a dereferenced single element.
+
+    Raises
+    ------
+    EmitError
+        For a non-unit Slice stride, or a partial Slice anywhere but the
+        first kept dim (non-contiguous access; unimplemented).
+    """
+    strides = _element_strides(indexer.shape)
+    terms: list[str] = []
+    kept: list[tuple[int, int]] = []
+    for d, (idx, stride) in enumerate(zip(indexer.indices, strides, strict=True)):
+        if _is_slice(idx):
+            if idx.stride != 1:
+                raise EmitError(
+                    f"ref access dim {d}: stride {idx.stride} != 1 is unimplemented"
+                )
+            kept.append((d, idx.size))
+            start = idx.start
+            expr = str(start) if isinstance(start, int) else state.val(start).expr
+        else:
+            expr = state.val(idx).expr
+        if expr != "0":
+            terms.append(f"{expr} * {stride}")
+
+    for d, size in kept[1:]:
+        if size != indexer.shape[d]:
+            raise EmitError(
+                f"ref access dim {d}: a partial Slice must be the first "
+                "kept dim; non-contiguous access is unimplemented"
+            )
+
+    offset = " + ".join(terms) or "0"
+    if not kept:
+        return CVal(expr=f"{ref.expr}[{offset}]", shape=(), ctype=ref.ctype)
+    expr = f"({ref.expr} + {offset})" if offset != "0" else ref.expr
+    return CVal(expr=expr, shape=tuple(size for _, size in kept), ctype=ref.ctype)
+
+
 @rule("get")
 def _rule_get(state: EmitState, eqn: JaxprEqn) -> None:
-    """Load a full block from a Ref: `y = x_ref[...]`.
-
-    Indexed loads (`x_ref[i]`) are unsupported.
+    """Load from a Ref: `y = x_ref[...]` (full block) or an indexed access
+    like `y = x_ref[i, :]` (non-Slice dims squeeze into the offset, Slice
+    dims are kept in the loaded shape).
     """
-    if eqn.params["tree"].num_leaves:
-        raise NotImplementedError("general pytrees are out of scope for now")
-
+    indexer_args = eqn.params["tree"].unflatten(eqn.invars[1:])
     src = state.val(eqn.invars[0])
+    if indexer_args:
+        (indexer,) = indexer_args
+        src = _ref_view(state, src, indexer)
     dst = state.declare(eqn.outvars[0])
     state.copy(dst, src, dst.size)
 
 
 @rule("swap")
 def _rule_swap(state: EmitState, eqn: JaxprEqn) -> None:
-    """Store a full block to a Ref: `o_ref[...] = y`.
+    """Store to a Ref: `o_ref[...] = y` (full block) or an indexed store
+    like `o_ref[i, :] = y`.
 
-    Deviation: the outvar binds to the ref itself, not a pre-store
-    snapshot, so reads of a swap result alias device memory.
+    Deviation: the outvar binds to the (possibly indexed) ref view, not a
+    pre-store snapshot, so reads of a swap result alias device memory.
     """
-    if eqn.params["tree"].num_leaves:
-        raise NotImplementedError("general pytrees are out of scope for now")
-
-    ref, value = eqn.invars
+    ref, value = eqn.invars[0], eqn.invars[1]
+    indexer_args = eqn.params["tree"].unflatten(eqn.invars[2:])
     dst_ref = state.val(ref)
+    if indexer_args:
+        (indexer,) = indexer_args
+        dst_ref = _ref_view(state, dst_ref, indexer)
     stored = state.val(value)
     state.copy(dst_ref, stored, dst_ref.size)
     state.bind(eqn.outvars[0], dst_ref)
@@ -463,13 +546,133 @@ def _inline_jit(state: EmitState, eqn: JaxprEqn) -> None:
         state.bind(outvar, val)
 
 
-# MSL templates for pure elementwise primitives; {a}/{b} are element
-# expressions. The arity check in _rule_elementwise validates every template
-# against its equation. fmin/fmax are float-only; integer min/max needs a
-# ctype dispatch (stretch-7 pre-flight, see ROADMAP).
+@rule("random_wrap")
+def _rule_random_wrap(state: EmitState, eqn: JaxprEqn) -> None:
+    """`jax.random.wrap_key_data`: pure type-level wrap (uint32[2] array
+    to a `key<fry>[]`-typed value), no MSL. Alias, like `program_id`."""
+    state.bind(eqn.outvars[0], state.val(eqn.invars[0]))
+
+
+@rule("random_unwrap")
+def _rule_random_unwrap(state: EmitState, eqn: JaxprEqn) -> None:
+    """`jax.random.key_data`: the inverse of `random_wrap`, equally pure
+    aliasing (a `key<fry>[]`-typed value is a uint32[2] array underneath
+    the whole time; nothing to convert)."""
+    state.bind(eqn.outvars[0], state.val(eqn.invars[0]))
+
+
+# Threefry-2x32-20, the algorithm `jax._src.random.threefry2x32` runs by
+# default (jax_threefry_partitionable=True). Verified against
+# `jax.random.bits(key, shape, 'uint32')` bit-for-bit before writing this
+# (see NEXT.md): rotations, key schedule, and the counter construction
+# (flat row-major index, hi word 0 for any shape under 2**32 elements)
+# all checked against ground truth, not transcribed from memory.
+_THREEFRY_ROT0 = (13, 15, 26, 6)
+_THREEFRY_ROT1 = (17, 29, 16, 24)
+
+
+def _emit_threefry2x32(
+    state: EmitState, k1: str, k2: str, x1: str, x2: str
+) -> tuple[str, str]:
+    """Emit uint x0, x1 = threefry2x32(k1, k2, x1, x2); return their names."""
+    ks2 = state.fresh("_ks2")
+    state.emit(f"uint {ks2} = {k1} ^ {k2} ^ 0x1BD11BDAu;")
+    ks = (k1, k2, ks2)
+
+    x0 = state.fresh("_tx0")
+    x1n = state.fresh("_tx1")
+    state.emit(f"uint {x0} = {x1} + {ks[0]};")
+    state.emit(f"uint {x1n} = {x2} + {ks[1]};")
+
+    def apply_round(rot: int) -> None:
+        state.emit(f"{x0} = {x0} + {x1n};")
+        state.emit(f"{x1n} = ({x1n} << {rot}u) | ({x1n} >> {32 - rot}u);")
+        state.emit(f"{x1n} = {x0} ^ {x1n};")
+
+    # 5 groups of 4 rounds, alternating rotation sets; a, b index into ks
+    # for the post-group key-schedule addition, n is that round's counter.
+    schedule = (
+        (_THREEFRY_ROT0, 1, 2, 1),
+        (_THREEFRY_ROT1, 2, 0, 2),
+        (_THREEFRY_ROT0, 0, 1, 3),
+        (_THREEFRY_ROT1, 1, 2, 4),
+        (_THREEFRY_ROT0, 2, 0, 5),
+    )
+    for rots, a, b, n in schedule:
+        for r in rots:
+            apply_round(r)
+        state.emit(f"{x0} = {x0} + {ks[a]};")
+        state.emit(f"{x1n} = {x1n} + {ks[b]} + {n}u;")
+
+    return x0, x1n
+
+
+@rule("random_bits")
+def _rule_random_bits(state: EmitState, eqn: JaxprEqn) -> None:
+    """`jax.random.bits`: Threefry-2x32-20 counter-based bits, one hash
+    per output element. Counter is the element's flat row-major index
+    (hi word 0, lo word the index); matches jax's own construction for
+    any shape under 2**32 elements, which is every real kernel output.
+    """
+    if eqn.params["bit_width"] != 32:
+        raise NotImplementedError("random_bits: only bit_width=32 is implemented")
+
+    key = state.val(eqn.invars[0])
+    dst = state.declare(eqn.outvars[0])
+    k1, k2 = key.at("0"), key.at("1")
+
+    idx = state.fresh("_i")
+    with state.block(f"for (uint {idx} = 0; {idx} < {dst.size}; ++{idx})"):
+        b0, b1 = _emit_threefry2x32(state, k1, k2, "0u", idx)
+        state.emit(f"{dst.at(idx)} = {b0} ^ {b1};")
+
+
+@rule("random_fold_in")
+def _rule_random_fold_in(state: EmitState, eqn: JaxprEqn) -> None:
+    """`jax.random.fold_in`: a fresh key from `(key, data)`, the same
+    Threefry-2x32-20 hash seeded with (0, data) in place of a counter.
+    Verified against `jax.random.fold_in`'s `key_data` output. This is
+    the per-thread (fold in `program_id`) and per-step (fold in a loop
+    index) key derivation an SDE kernel needs so lanes don't share a
+    stream; `example 3`'s hand-written MSL notes the same requirement.
+    """
+    key = state.val(eqn.invars[0])
+    data = state.val(eqn.invars[1])
+    k1, k2 = key.at("0"), key.at("1")
+    b0, b1 = _emit_threefry2x32(state, k1, k2, "0u", data.expr)
+
+    name = state.fresh()
+    state.emit(f"uint {name}[2] = {{{b0}, {b1}}};")
+    state.bind(eqn.outvars[0], CVal(expr=name, shape=(2,), ctype="uint"))
+
+
+@rule("reshape")
+def _rule_reshape(state: EmitState, eqn: JaxprEqn) -> None:
+    """Reshape: row-major reinterpretation of the same flat storage, no
+    data movement, since `CVal.at()` already indexes flatly regardless of
+    rank. Surfaced by `jax.random.uniform(key, ())`'s internal (1,)-to-()
+    reshape (stretch 8), not previously needed.
+
+    Raises
+    ------
+    NotImplementedError
+        If `dimensions` (an axis permutation applied before reshaping)
+        is set; that needs a real copy, not just a shape reinterpretation.
+    """
+    if eqn.params["dimensions"] is not None:
+        raise NotImplementedError(
+            "reshape with a dimensions permutation is unimplemented"
+        )
+    src = state.val(eqn.invars[0])
+    state.bind(eqn.outvars[0], dataclasses.replace(src, shape=eqn.params["new_sizes"]))
+
+
+# MSL templates for pure elementwise primitives; {a}/{b} are element expressions.
+# The arity check in _rule_elementwise validates every template against its equation.
+# fmin/fmax are float-only; integer min/max needs a ctype dispatch, unimplemented.
 # The parens are deliberate: CVal.expr admits any rvalue, so a template
-# must not assume its operands bind tighter than its own operator. Only
-# the assign site may strip them (_unwrapped).
+# must not assume its operands bind tighter than its own operator.
+# Only the assign site may strip them.
 ELEMENTWISE: dict[str, str] = {
     # binary
     "add": "({a} + {b})",
@@ -489,12 +692,17 @@ ELEMENTWISE: dict[str, str] = {
     "sqrt": "sqrt({a})",
     "tanh": "tanh({a})",
     # ternary
-    "select_n": "({a} ? {c} : {b})",  # a: predicate, c when true, b when false
+    "select_n": "({a} ? {c} : {b})",  # a: predicate (bool), c when true, b when false
     # logical
     "lt": "({a} < {b})",
     "le": "({a} <= {b})",
     "gt": "({b} < {a})",
     "ge": "({b} <= {a})",
+    "eq": "({a} == {b})",
+    "ne": "({a} != {b})",
+    # bitwise, uint operands only.
+    "or": "({a} | {b})",
+    "shift_right_logical": "({a} >> {b})",
 }
 
 
@@ -520,6 +728,10 @@ def _rule_elementwise(state: EmitState, eqn: JaxprEqn) -> None:
         template = f"({body})" if exp > 0 else f"(1.0f / ({body}))"
     elif opname == "convert_element_type":
         template = f"(({dst.ctype}){{a}})"
+    elif opname == "bitcast_convert_type":
+        # Reinterprets bits without a numeric conversion (unlike
+        # convert_element_type's cast); Metal's equivalent is as_type<T>.
+        template = f"as_type<{dst.ctype}>({{a}})"
     elif opname == "broadcast_in_dim":
         if dst.shape and any(op.shape for op in ops):
             raise EmitError("array-to-array broadcasts are unimplemented")
@@ -550,7 +762,13 @@ def _rule_elementwise(state: EmitState, eqn: JaxprEqn) -> None:
         state.emit(assign("0"))
 
 
-for _name in [*ELEMENTWISE, "integer_pow", "convert_element_type", "broadcast_in_dim"]:
+for _name in [
+    *ELEMENTWISE,
+    "integer_pow",
+    "convert_element_type",
+    "bitcast_convert_type",
+    "broadcast_in_dim",
+]:
     RULES[_name] = _rule_elementwise
 
 

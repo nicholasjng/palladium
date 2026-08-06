@@ -368,6 +368,7 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
     { name = "ty" },
+    { name = "typing-extensions" },
 ]
 
 [package.metadata]
@@ -384,6 +385,7 @@ dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "ruff", specifier = ">=0.6" },
     { name = "ty", specifier = ">=0.0.66" },
+    { name = "typing-extensions", specifier = ">=4.10" },
 ]
 
 [[package]]
