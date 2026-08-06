@@ -64,6 +64,12 @@ class BoundKernel:
     kernel: mr.Kernel
     msl_source: str
     threadgroup: int | tuple[int, ...] | None = None
+    # Safe to reuse across calls: a BoundKernel is cached per input
+    # shape/dtype, so shape never changes call-to-call. Excluded from
+    # compare/repr since it's cache state, not part of a BoundKernel's identity.
+    _in_bufs: list[mr.Buffer] = dataclasses.field(
+        default_factory=list, compare=False, repr=False
+    )
 
     def __call__(self, *arrays: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
         """Dispatch over `spec.grid` threads and return the outputs.
@@ -85,14 +91,21 @@ class BoundKernel:
             raise TypeError(
                 f"kernel takes {len(spec.inputs)} arrays, got {len(arrays)}"
             )
+        first_call = len(self._in_bufs) < len(spec.inputs)
         in_bufs = []
-        for a, info in zip(arrays, spec.inputs, strict=True):
+        for i, (a, info) in enumerate(zip(arrays, spec.inputs, strict=True)):
             arr = np.ascontiguousarray(np.asarray(a, dtype=info.dtype))
             if arr.shape != info.array_shape:
                 raise TypeError(f"expected shape {info.array_shape}, got {arr.shape}")
-            in_bufs.append(mr.Buffer(arr))
+            if first_call:
+                self._in_bufs.append(mr.Buffer(arr))
+            else:
+                self._in_bufs[i].copy_from(arr)
+            in_bufs.append(self._in_bufs[i])
+        # Fresh per call, unlike inputs: to_numpy() is a live view, so reusing
+        # this buffer would mutate an array already returned to the caller.
         out_bufs = [
-            mr.Buffer.zeros(list(info.array_shape), dtype=info.dtype.name)
+            mr.Buffer.empty(list(info.array_shape), dtype=info.dtype.name)
             for info in spec.outputs
         ]
         grid = tuple(int(g) for g in spec.grid)
