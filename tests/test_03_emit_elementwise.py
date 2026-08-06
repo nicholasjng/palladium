@@ -1,6 +1,6 @@
-"""Exercise 2: the ELEMENTWISE table and `_rule_elementwise` in emit.py.
+"""The ELEMENTWISE table and `_rule_elementwise` (emit/rules.py).
 
-Primitives these kernels stage (check with test_01's printing trick if a
+Primitives these kernels stage (check with test_01's jaxpr printing if a
 name surprises you): add, sub, mul, div, max, min, exp, sin, cos, sqrt,
 tanh, neg, integer_pow, convert_element_type.
 
@@ -11,11 +11,8 @@ transcendentals need not be bit-identical to the CPU oracle.
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 import palladium
-
-pytestmark = pytest.mark.exercise
 
 
 def _check_against_oracle(kernel, args, rtol=1e-5, atol=1e-6, **shapes):

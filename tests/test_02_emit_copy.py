@@ -1,17 +1,14 @@
-"""Exercise 1: `_rule_get` and `_rule_swap` in emit.py.
+"""Block load/store: `_rule_get` and `_rule_swap` (emit/rules.py).
 
-The smallest kernel that exists: copy in, copy out. Green means your
+The smallest kernel that exists: copy in, copy out. Green means the
 emitted MSL compiles, dispatches, and the block load/store loops are right.
 """
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 import palladium
-
-pytestmark = pytest.mark.exercise
 
 
 def _copy_kernel(x_ref, o_ref):

@@ -1,4 +1,4 @@
-"""Stretch 16: `transpose` -> a materialized, permuted copy.
+"""`transpose` -> a materialized, permuted copy.
 
 Verified against a real jaxpr before implementing (see
 `_rule_transpose`'s docstring): `a.T` inside a dot product stages as its
@@ -9,11 +9,8 @@ dense layer's backward pass, `transpose` is the actual missing piece.
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 import palladium
-
-pytestmark = pytest.mark.exercise
 
 
 def test_transpose_matches_numpy(rng):

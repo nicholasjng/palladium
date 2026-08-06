@@ -1,6 +1,6 @@
-"""Exercise 5, the capstone: a batched RK4 Lotka-Volterra integrator.
+"""The capstone composition: a batched RK4 Lotka-Volterra integrator.
 
-No new emitter rules: if exercises 1-4 are green, this composes them.
+No new emitter rules: it composes load/store, elementwise, grids, and scan.
 One Metal thread integrates one (prey, predator) system over `STEPS` RK4
 steps with its own parameters; the grid is the ensemble. This is the
 kernel that examples/01_ode_ensembles.py benchmarks against Diffrax.
@@ -13,8 +13,6 @@ import pytest
 from jax.experimental import pallas as pl
 
 import palladium
-
-pytestmark = pytest.mark.exercise
 
 DT, STEPS = 0.01, 500
 

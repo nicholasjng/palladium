@@ -1,12 +1,12 @@
-"""Exercise 3: `_rule_program_id` and `_block_offset` in emit.py.
+"""Grids and blocks: `_rule_program_id` and `_block_offset`.
 
 Until now every kernel was one program instance seeing the whole array.
 These kernels tile: the grid launches many program instances and each one's
 Refs point at *its* block, so the emitted pointers need per-thread offsets
 computed from the BlockSpec index map.
 
-Requires exercise 2 (the offset arithmetic and the `+ pid` kernel reuse
-elementwise rules).
+The offset arithmetic and the `+ pid` kernel reuse the elementwise
+rules.
 """
 
 import jax
@@ -17,8 +17,6 @@ from jax.experimental import pallas as pl
 
 import palladium
 from palladium.emit import EmitError
-
-pytestmark = pytest.mark.exercise
 
 
 def test_blocked_double_1d(rng):
@@ -70,8 +68,8 @@ def test_row_blocks_2d(rng):
 
 def test_2d_grid_with_index_map_arithmetic(rng):
     """A 2D grid mapped onto rows via `i * 16 + j`. If you evaluated the
-    index map by recursing with emit_jaxpr (as the exercise hint suggests),
-    the mul/add inside it come from your exercise-2 table for free."""
+    index map by recursing with emit_jaxpr, the mul/add inside it come
+    from the ELEMENTWISE table for free."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 3.0

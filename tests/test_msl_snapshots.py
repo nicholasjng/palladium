@@ -3,7 +3,7 @@
 The oracle tests prove kernels compute the right values; these prove the
 emitter produces the *same text* it did when the snapshot was blessed.
 Unintended codegen drift (a qualifier change, a lost offset factor, an
-extra copy) shows up as a reviewable diff instead of silence. EmitState's name
+extra copy) shows up as a reviewable diff instead of silence. Cursor's name
 counter is deterministic, so snapshots are stable across runs.
 
 Regenerate after an *intended* emitter change:
@@ -94,7 +94,7 @@ def _rk4_lotka_volterra():
 
 
 def _conditional_loop():
-    # Pins the stretch-7 vocabulary in one kernel: a comparison, select_n
+    # Pins the adaptive-controller vocabulary in one kernel: a comparison, select_n
     # reached through jnp.where's jit wrapper (inlined by _inline_jit),
     # and both inside a scan with a const. The jit staging is a JAX
     # implementation detail; if an upgrade changes it, this golden turns

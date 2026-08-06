@@ -1,12 +1,11 @@
-"""Stretch 14: `dot_general` -> naive triple-nested-loop matmul.
+"""`dot_general` baseline: the scalar triple-nested-loop matmul.
 
 Scoped to exactly the plain matmul contraction, rank-2 operands, no
 batch dims: verified against a real jaxpr before implementing (see
 `_rule_dot_general`'s docstring). Batch dims and higher rank are
 unimplemented, not silently wrong; each has its own rejection test.
 
-No threadgroup-memory tiling: this is the naive O(M*N*K) version ROADMAP
-scoped as the first step, ahead of the tiled/MMA version (stretch 12).
+No threadgroup-memory tiling: this is the baseline O(M*N*K) path.
 """
 
 import jax
@@ -17,8 +16,6 @@ from jax.experimental import pallas as pl
 
 import palladium
 from palladium.emit import EmitError
-
-pytestmark = pytest.mark.exercise
 
 
 def _matmul_kernel(a_ref, b_ref, o_ref):

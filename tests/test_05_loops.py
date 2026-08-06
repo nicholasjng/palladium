@@ -1,6 +1,6 @@
-"""Exercise 4: `_rule_scan` in emit.py. fori_loop becomes a C for-loop.
+"""`_rule_scan` (emit/rules.py): fori_loop becomes a C for-loop.
 
-This is the exercise that makes the whole project worthwhile: once the
+This is the rule that makes the whole project worthwhile: once the
 time-stepping loop lives *inside* the kernel, one dispatch does the whole
 solve, and the per-step overhead that dominates XLA-driven integrators is
 gone. Everything else was setup.
@@ -9,20 +9,16 @@ gone. Everything else was setup.
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 import palladium
-
-pytestmark = pytest.mark.exercise
 
 
 def test_euler_logistic(rng):
     """dy/dt = r*y(1 - y), 100 explicit Euler steps, entirely in-kernel.
 
     The rate r is read from a Ref *before* the loop and used inside it;
-    that is how scan consts arise (see the exercise-4 docstring), and every
-    real ODE kernel has them (its parameters). Meet them here, not in the
-    capstone."""
+    that is how scan consts arise (see `_rule_scan`'s docstring), and
+    every real ODE kernel has them (its parameters)."""
     dt, steps = 0.01, 100
 
     def kernel(y0_ref, r_ref, o_ref):
@@ -119,23 +115,52 @@ def test_carry_permutation(rng):
     np.testing.assert_array_equal(got_b, np.asarray(want_b))
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Real bug, not yet fixed: a carry read directly by a fresh "
-        "computation and separately aliased into a different carry's "
-        "output comes out wrong from the 2nd loop iteration on. Not an "
-        "emitter logic error (hand-simulating the emitted C matches the "
-        "interpret oracle); a Metal compiler code-generation issue with "
-        "several per-element sub-loops over same-sized arrays inside a "
-        "repeated outer loop."
-    ),
-    strict=True,
-)
+def test_carry_permutation_beside_computed_carry():
+    """Shrunk from the emitter fuzzer (2026-08-18): a carry swap next to
+    a computed third carry miscompiles on the Metal shader compiler when
+    the loop body holds three or more thread-local array temporaries.
+    The optimizer forwards a permuted carry's read across the write it
+    must precede: with init (0, 1, 0) and body
+    (c1, c0, tanh(c0 + 0*c0)), two iterations returned carry0 == 1
+    instead of 0. Verified against hand-written MSL: snapshot arrays,
+    fused copy-back loops, and hoisted declarations all still
+    miscompile; volatile reads/writes at the hazard endpoints (what
+    `_copy_back_carries` emits for permuted carries) do not. Fully
+    scalarizing the chain also avoids it, which is expression-AST
+    territory, not a copy-back fix.
+    """
+
+    def kernel(a_ref, b_ref, c_ref, ao_ref, bo_ref, co_ref):
+        def step(_, c):
+            return (c[1], c[0], jnp.tanh(c[0] + 0.0 * c[0]))
+
+        init = (a_ref[...], b_ref[...], c_ref[...])
+        fa, fb, fc = jax.lax.fori_loop(0, 2, step, init)
+        ao_ref[...] = fa
+        bo_ref[...] = fb
+        co_ref[...] = fc
+
+    n = 16
+    f = palladium.metal_call(
+        kernel,
+        out_shape=tuple(jax.ShapeDtypeStruct((n,), jnp.float32) for _ in range(3)),
+    )
+    a = np.zeros(n, np.float32)
+    b = np.ones(n, np.float32)
+    c = np.zeros(n, np.float32)
+    got = f(a, b, c)
+    want = f.interpret(a, b, c)
+    for g, w in zip(got, want, strict=True):
+        np.testing.assert_allclose(g, np.asarray(w), rtol=1e-6, atol=1e-6)
+
+
 def test_carry_read_and_alias_conflict(rng):
     """Found by test_fuzz_loops, shrunk by hand. 3 carries, length=2:
     c0 and c2 swap (c0's new value is old c2, c2's new value is old c0),
     c1 becomes tanh(c0). c0 is both the fresh computation's input and one
-    half of the swap. Passes at length=1, fails at length>=2."""
+    half of the swap. Was a strict xfail (a Metal compiler bug, not an
+    emitter logic error); fixed by the volatile hazard endpoints in
+    `_copy_back_carries`, see test_carry_permutation_beside_computed_carry."""
 
     def kernel(x0_ref, x1_ref, x2_ref, o0_ref, o1_ref, o2_ref):
         def step(_, carry):

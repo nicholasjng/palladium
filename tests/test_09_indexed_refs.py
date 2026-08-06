@@ -1,4 +1,4 @@
-"""Stretch 6: indexed ref access (`x_ref[i, j]`) in `_rule_get`/`_rule_swap`.
+"""Indexed ref access (`x_ref[i, j]`) in `_rule_get`/`_rule_swap`.
 
 Non-Slice indices (scalar Var or Literal atoms) squeeze that dim into a
 pointer offset; Slice indices keep the dim. Verified against real jaxprs
@@ -21,8 +21,6 @@ from jax.experimental import pallas as pl
 
 import palladium
 from palladium.emit import EmitError
-
-pytestmark = pytest.mark.exercise
 
 
 def test_dynamic_scalar_index(rng):
@@ -93,8 +91,8 @@ def test_fully_scalar_indexed_get_and_swap(rng):
 def test_periodic_wraparound_index(rng):
     """Neighbour reads with periodic (wraparound) boundaries: `i == n - 1`
     stages `eq`, `i != 0` would stage `ne`. Both were missing from
-    ELEMENTWISE (only lt/le/gt/ge existed) until this stretch needed them
-    for exactly this pattern (example 4's stencil)."""
+    ELEMENTWISE (only lt/le/gt/ge existed) until indexed access needed
+    them for exactly this pattern (example 4's stencil)."""
 
     def kernel(x_ref, o_ref):
         i, j = pl.program_id(0), pl.program_id(1)

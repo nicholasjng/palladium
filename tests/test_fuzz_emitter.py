@@ -97,12 +97,26 @@ def eval_tree(tree, vals):
     return fn(*(eval_tree(a, vals) for a in tree.args))
 
 
-def trees(n_inputs: int):
+def trees(n_inputs: int, compare_refs: range | None = None):
     literals = st.floats(-2.0, 2.0, allow_nan=False, width=32).map(
         lambda v: Leaf(ref=None, lit=round(float(v), 3))
     )
     refs = st.integers(0, n_inputs - 1).map(lambda i: Leaf(ref=i, lit=None))
     leaves = st.one_of(refs, literals)
+    # Comparison operands must be bit-identical on both backends (see
+    # COMPARE). In loop bodies the tree's ref leaves are *carries*, i.e.
+    # computed values after the first iteration, so callers there pass
+    # compare_refs restricted to the loop consts; a comparison against a
+    # carry once flipped a branch on a 1-ulp tanh difference.
+    if compare_refs is None:
+        cmp_leaves = leaves
+    elif len(compare_refs) > 0:
+        cmp_refs = st.sampled_from(list(compare_refs)).map(
+            lambda i: Leaf(ref=i, lit=None)
+        )
+        cmp_leaves = st.one_of(cmp_refs, literals)
+    else:
+        cmp_leaves = literals
     return st.recursive(
         leaves,
         lambda kids: st.one_of(
@@ -112,11 +126,11 @@ def trees(n_inputs: int):
             st.tuples(st.sampled_from(sorted(BINARY)), kids, kids).map(
                 lambda t: Node(t[0], (t[1], t[2]))
             ),
-            # Conditionals: leaf-only comparison (see COMPARE), general
+            # Conditionals: comparison over stable leaves only, general
             # branches. Every instance crosses jit-inlining + select_n.
-            st.tuples(st.sampled_from(sorted(COMPARE)), leaves, leaves, kids, kids).map(
-                lambda t: Node(f"where_{t[0]}", (t[1], t[2], t[3], t[4]))
-            ),
+            st.tuples(
+                st.sampled_from(sorted(COMPARE)), cmp_leaves, cmp_leaves, kids, kids
+            ).map(lambda t: Node(f"where_{t[0]}", (t[1], t[2], t[3], t[4]))),
         ),
         max_leaves=8,
     )
@@ -192,7 +206,10 @@ def loop_cases(draw):
             *[
                 st.one_of(
                     st.integers(0, n_carry - 1),  # pass-through of carry j
-                    trees(n_carry + n_consts),
+                    trees(
+                        n_carry + n_consts,
+                        compare_refs=range(n_carry, n_carry + n_consts),
+                    ),
                 )
                 for _ in range(n_carry)
             ]
@@ -237,5 +254,134 @@ def test_fuzz_loops(case):
         make_loop_kernel(n_carry, n_consts, length, plans),
         math_mode=mr.MathMode.SAFE,
         out_shape=out_shape,
+    )
+    _assert_matches_oracle(f, args)
+
+
+@st.composite
+def switch_cases(draw):
+    n_inputs = draw(st.integers(1, 3))
+    n_branches = draw(st.integers(2, 4))
+    branches = tuple(draw(trees(n_inputs)) for _ in range(n_branches))
+    blocked = draw(st.booleans())
+    args = draw(input_arrays(n_inputs))
+    return n_inputs, branches, blocked, args
+
+
+def make_switch_kernel(branches, n_inputs):
+    # The branch index derives from abs+scale+cast, all exact float ops,
+    # so it is bit-identical on both backends (same reasoning as COMPARE:
+    # no computed float compare may sit under control flow). Indexed off
+    # the ref, not the loaded array: value-level indexing stages `slice`,
+    # which the emitter does not lower.
+    def kernel(*refs):
+        *ins, out = refs
+        vals = [r[...] for r in ins]
+        idx = (jnp.abs(ins[0][0]) * 2.0).astype(jnp.int32)  # 0..4, clamped
+        res = jax.lax.switch(
+            idx,
+            [
+                lambda tree=tree: eval_tree(tree, vals) + 0.0 * vals[0]
+                for tree in branches
+            ],
+        )
+        out[...] = res
+
+    return kernel
+
+
+@settings(max_examples=MAX_EXAMPLES, deadline=None)
+@given(switch_cases())
+def test_fuzz_cond(case):
+    """`lax.cond`/`lax.switch`: divergent branch selection per program
+    instance (blocked grids give each block its own index), clamped
+    switch semantics, branch bodies from the same tree grammar."""
+    n_inputs, branches, blocked, args = case
+    kwargs: dict = {"out_shape": jax.ShapeDtypeStruct((N,), jnp.float32)}
+    if blocked:
+        spec = pl.BlockSpec((8,), lambda i: (i,))
+        kwargs |= {"grid": (N // 8,), "in_specs": [spec] * n_inputs, "out_specs": spec}
+    f = palladium.metal_call(
+        make_switch_kernel(branches, n_inputs),
+        math_mode=mr.MathMode.SAFE,
+        **kwargs,
+    )
+    _assert_matches_oracle(f, args)
+
+
+@st.composite
+def while_cases(draw):
+    n_carry = draw(st.integers(1, 2))
+    n_consts = draw(st.integers(0, 1))
+    plans = draw(
+        st.tuples(
+            *[
+                st.one_of(
+                    st.integers(0, n_carry - 1),
+                    trees(
+                        n_carry + n_consts,
+                        compare_refs=range(n_carry, n_carry + n_consts),
+                    ),
+                )
+                for _ in range(n_carry)
+            ]
+        )
+    )
+    blocked = draw(st.booleans())
+    args = draw(input_arrays(n_carry + n_consts))
+    return n_carry, n_consts, plans, blocked, args
+
+
+def make_while_kernel(n_carry, n_consts, plans):
+    # Trip count 0..4 derives from exact float ops on input element 0, so
+    # every instance's count is bit-identical on both backends while
+    # *differing across instances* under a blocked grid: divergent
+    # while-loop trip counts are exactly what the classic model must
+    # support.
+    def kernel(*refs):
+        ins, outs = refs[: n_carry + n_consts], refs[n_carry + n_consts :]
+        init = tuple(r[...] for r in ins[:n_carry])
+        consts = [r[...] for r in ins[n_carry:]]
+        trips = (jnp.abs(ins[0][0]) * 2.0).astype(jnp.int32)
+
+        def cond(state):
+            return state[0] < trips
+
+        def body(state):
+            i, *carry = state
+            vals = list(carry) + consts
+            new = []
+            for plan in plans:
+                if isinstance(plan, int):
+                    new.append(carry[plan])
+                else:
+                    new.append(jnp.tanh(eval_tree(plan, vals) + 0.0 * carry[0]))
+            return (i + 1, *new)
+
+        final = jax.lax.while_loop(cond, body, (jnp.int32(0), *init))
+        for out, value in zip(outs, final[1:]):
+            out[...] = value
+
+    return kernel
+
+
+@settings(max_examples=MAX_EXAMPLES, deadline=None)
+@given(while_cases())
+def test_fuzz_while(case):
+    n_carry, n_consts, plans, blocked, args = case
+    block = 8
+    out_shape = tuple(jax.ShapeDtypeStruct((N,), jnp.float32) for _ in range(n_carry))
+    kwargs: dict = {"out_shape": out_shape}
+    if blocked:
+        spec = pl.BlockSpec((block,), lambda i: (i,))
+        kwargs |= {
+            "grid": (N // block,),
+            "in_specs": [spec] * (n_carry + n_consts),
+            "out_specs": [spec] * n_carry,
+        }
+    f = palladium.metal_call(
+        make_while_kernel(n_carry, n_consts, plans),
+        math_mode=mr.MathMode.SAFE,
+        **kwargs,
     )
     _assert_matches_oracle(f, args)

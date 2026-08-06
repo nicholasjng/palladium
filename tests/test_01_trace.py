@@ -1,7 +1,7 @@
-"""Provided, green from day one: tracing Pallas into KernelSpecs.
+"""Tracing Pallas into KernelSpecs.
 
-Also your map of the territory: run with -s and read the printed jaxprs;
-every exercise rule consumes exactly these structures.
+Also the map of the territory: run with -s and read the printed jaxprs;
+every emitter rule consumes exactly these structures.
 """
 
 import jax
@@ -54,20 +54,21 @@ def test_gridded_spec_and_loop_staging(rng):
     assert spec.inputs[0].block_shape == (8,)
     assert spec.inputs[0].array_shape == (128,)
     names = [e.primitive.name for e in spec.jaxpr.eqns]
-    # fori_loop stages as a pure-carry scan: this is what exercise 4 lowers.
+    # fori_loop stages as a pure-carry scan: this is what the scan rule lowers.
     assert "scan" in names
     scan_eqn = next(e for e in spec.jaxpr.eqns if e.primitive.name == "scan")
     assert scan_eqn.params["length"] == 10
     assert len(scan_eqn.invars) == len(scan_eqn.outvars)
-    # The BlockSpec index map is itself a jaxpr; exercise 3 evaluates it.
+    # The BlockSpec index map is itself a jaxpr; the block-offset lowering evaluates it.
     imj = spec.inputs[0].index_map_jaxpr.jaxpr
     assert len(imj.invars) == 1 and not imj.eqns
     print("\n", spec.jaxpr)
 
 
 def test_interpret_mode_is_the_oracle(rng):
-    """interpret=True runs the kernel on CPU, the reference for every
-    exercise. (Without it, pallas_call refuses to run on CPU at all.)"""
+    """interpret=True runs the kernel on CPU, the reference every
+    lowering test diffs against. (Without it, pallas_call refuses to run
+    on CPU at all.)"""
     f = pl.pallas_call(
         _mad_kernel,
         out_shape=jax.ShapeDtypeStruct((32,), jnp.float32),
@@ -87,3 +88,23 @@ def test_trace_rejects_multiple_pallas_calls(rng):
     x = rng.standard_normal(4, dtype=np.float32)
     with pytest.raises(ValueError, match="2 pallas_call"):
         trace(two_calls, x, x)
+
+
+def test_non_blocked_dims_rejected():
+    """pl.Element/Indirect/BoundedSlice dims duck-type as Blocked through
+    their block_size attribute but mean different indexing semantics;
+    the tracer must reject them by name, never lower them silently."""
+    from palladium.errors import TraceError
+
+    def kernel(x_ref, o_ref):
+        o_ref[...] = x_ref[...]
+
+    call = pl.pallas_call(
+        kernel,
+        grid=(2,),
+        in_specs=[pl.BlockSpec((pl.Element(8),), lambda i: (i,))],
+        out_specs=pl.BlockSpec((8,), lambda i: (i,)),
+        out_shape=jax.ShapeDtypeStruct((16,), jnp.float32),
+    )
+    with pytest.raises(TraceError, match="Element"):
+        trace(call, jax.ShapeDtypeStruct((16,), jnp.float32))

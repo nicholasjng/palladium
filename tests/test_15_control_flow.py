@@ -8,12 +8,9 @@ model. The interpret oracle is the reference throughout.
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from jax.experimental import pallas as pl
 
 import palladium
-
-pytestmark = pytest.mark.exercise
 
 
 def _per_row(kernel, n_rows, *arrays, n_in):

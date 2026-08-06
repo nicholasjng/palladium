@@ -1,7 +1,7 @@
-"""Provided, green from day one: the runtime side works without palladium.
+"""The runtime side works without palladium.
 
-If these fail, the problem is the metal-runtime install (or the machine),
-not your emitter; fix that before touching any exercise.
+If these fail, the problem is the metal-runtime install (or the
+machine), not the emitter; fix that first.
 """
 
 import metal_runtime as mr
