@@ -214,3 +214,47 @@ CPU comparison closer than roughly a 2x margin. Anything reported from a
 single trial, or from a script that reuses GPU-clock state left over
 from unrelated prior measurements, should be treated as provisional
 until re-measured this way.
+
+## Steps 2-4 outcome (2026-08-13): built, but not the way this doc scoped it
+
+The execution-model fork landed in `emit.py` (see the "simdgroup-
+cooperative execution model" section there) and took flash attention
+(`examples/06`) from 0.06x to 0.88-0.92x of `jax.jit` CPU on a rested
+M1 Pro (`docs/reward-spec-matmul-emitter.md` has the full calibration
+history). Three of this doc's four "what has to change" items shipped,
+with one deliberate substitution:
+
+- **Item 1 (threadgroup memory + barriers): built differently.** The
+  shapes real kernels stage ((1,16)/(1,64) values, scalars) never need
+  staging; SIMD-group *functions* (`simd_broadcast`/`simd_sum`/
+  `simd_max`/`simd_shuffle_xor`) cover all cross-lane traffic with
+  uniform control flow and zero shared memory. Threadgroup-memory
+  staging of the K block *was* implemented and measured — 0.43-0.79x
+  interleaved, occupancy loss from the per-threadgroup allocation beat
+  the coalescing win — and reverted (dead-ends note in `emit.py`).
+- **Item 2 (tile-granularity shapes): moot** at these sizes — no 8x8
+  tiles involved; the cooperative dot shards output columns over lanes
+  with clamped-index masking, so any (1,k)@(k,n) works.
+- **Item 3 (launch config): as scoped.** One 32-thread threadgroup per
+  program instance (`dispatch.BoundKernel.cooperative`), instance =
+  `threadgroup_position_in_grid.x`, lane = `thread_index_in_simdgroup`.
+- **Item 4 (opt-in fork): as scoped.** `emit.is_simdgroup_cooperative`
+  admits a kernel only when it stages an m==1 `dot_general` on a
+  device-view rhs and every primitive has a cooperative lowering;
+  everything else keeps the one-thread-per-instance model untouched.
+
+`simdgroup_matrix` itself — this doc's original subject — is still only
+in the standalone `palladium.simdgroup_matmul`: with m==1 per program
+instance, 8x8 MMA tiles would waste 7/8 of every tile, and the
+cooperative row-dot + lane-sharding model won instead. The intrinsics
+become relevant again only if a kernel with m >= 8 per-instance matmuls
+enters the benchmark set (ROADMAP stretch 12's own gating condition).
+
+**Update (2026-08-14):** the m == 1 restriction noted above is gone — the
+cooperative model now lowers `m == R` dot_generals (columns-per-lane
+layout, `docs/query-blocking-scratch.md` has the motivating measurement,
+reward spec v0.2.0 the resulting calibration: saturated at 1.42x over
+jax.jit with block_q=8). Stretch 12's gating condition — an MMA-friendly
+kernel in the benchmark set — is now genuinely met: the blocked kernel's
+(8, 64) @ (64, 32) QK^T is exactly a simdgroup_matrix shape, so the MMA
+intrinsics are the next untapped win if more speed is ever needed here.
