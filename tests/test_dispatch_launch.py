@@ -29,7 +29,12 @@ def _make_bound(n: int):
     info_in = BlockInfo((n,), (n,), np.dtype(np.float32), no_jaxpr)
     info_out = BlockInfo((n,), (n,), np.dtype(np.float32), no_jaxpr)
     spec = KernelSpec(
-        name="inc", jaxpr=no_jaxpr, grid=(n,), inputs=(info_in,), outputs=(info_out,), raw_params={}
+        name="inc",
+        jaxpr=no_jaxpr,
+        grid=(n,),
+        inputs=(info_in,),
+        outputs=(info_out,),
+        raw_params={},
     )
     return bind(spec, _INC_SOURCE)
 
