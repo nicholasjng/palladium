@@ -3,7 +3,12 @@ import pytest
 
 # Modules that only manipulate text/jaxprs and never touch the GPU; they
 # keep running on machines (and CI runners) without a Metal device.
-_NO_GPU_MODULES = {"test_01_trace", "test_msl_snapshots"}
+_NO_GPU_MODULES = {
+    "test_01_trace",
+    "test_18_effects",
+    "test_20_write_races",
+    "test_msl_snapshots",
+}
 
 
 def pytest_collection_modifyitems(config, items):

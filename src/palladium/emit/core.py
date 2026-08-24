@@ -424,6 +424,10 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
     env = Environment()
     cursor = Cursor()
     ref_vals: list[CVal] = []
+    # Aliased inputs share their buffer with an output, so a bound view
+    # would observe the in-place write; dropping readonly forces gets to
+    # copy. trace() already guarantees all such reads precede the write.
+    aliased_inputs = {i for i, _ in spec.aliases}
     for k, info in enumerate(operands):
         qual = "device" if k >= n_in else "const device"
         ctype = CTYPES[info.dtype.name]
@@ -439,7 +443,7 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
                 shape=info.block_shape or (1,),
                 ctype=ctype,
                 space="device",
-                readonly=k < n_in,
+                readonly=k < n_in and k not in aliased_inputs,
                 align=_block_offset_align(spec, info),
             )
         )

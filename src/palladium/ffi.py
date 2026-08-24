@@ -226,8 +226,15 @@ class FfiCallable:
             jax.ShapeDtypeStruct(lead + tuple(info.array_shape), info.dtype)
             for info in spec.outputs
         ]
-        result_shapes = out_structs[0] if len(out_structs) == 1 else out_structs
-        return jax.ffi.ffi_call(_TARGET_NAME, result_shapes, vmap_method=vmap_method)(
+        result_shape_dtypes = out_structs[0] if len(out_structs) == 1 else out_structs
+        return jax.ffi.ffi_call(
+            _TARGET_NAME,
+            result_shape_dtypes=result_shape_dtypes,
+            vmap_method=vmap_method,
+            # In-place pairs from pallas input_output_aliases,
+            # XLA may then donate the input buffer.
+            input_output_aliases=dict(spec.aliases) or None,
+        )(
             *args,
             msl_source=msl_source,
             function_name=spec.name,

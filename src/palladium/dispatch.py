@@ -82,12 +82,26 @@ class PendingResult:
     batch: mr.Batch
     out_bufs: list[mr.Buffer]
     done: bool = False
+    # Output indices that alias an input buffer: read back as a copy, not
+    # a live view, since the buffer is rewritten by the next launch.
+    copy_out: frozenset[int] = frozenset()
+    _results: tuple[np.ndarray, ...] | None = None
 
     def wait(self) -> np.ndarray | tuple[np.ndarray, ...]:
-        """Block until the GPU is done, then return the outputs."""
-        self.batch.wait()
-        self.done = True
-        outs = tuple(_read_buffer(b) for b in self.out_bufs)
+        """Block until the GPU is done, then return the outputs.
+
+        Results are materialized once and cached: the slot ring calls
+        this before rewriting an aliased output's buffer, so the arrays
+        a later caller-side `wait()` returns stay intact.
+        """
+        if self._results is None:
+            self.batch.wait()
+            self.done = True
+            self._results = tuple(
+                np.array(arr) if i in self.copy_out else arr
+                for i, arr in enumerate(_read_buffer(b) for b in self.out_bufs)
+            )
+        outs = self._results
         return outs[0] if len(outs) == 1 else outs
 
 
@@ -204,9 +218,14 @@ class BoundKernel:
             # Fresh per call, unlike inputs: to_numpy() is a live view, so
             # reusing this buffer would mutate an array a caller might still
             # be holding from an earlier, not-yet-waited-on PendingResult.
+            # Aliased outputs instead share the slot's input buffer (the
+            # in-place contract) and are copied out on wait().
+            alias_of = {j: i for i, j in spec.aliases}
             out_bufs = [
-                mr.Buffer.empty(list(info.array_shape), dtype=info.dtype.name)
-                for info in spec.outputs
+                slot.in_bufs[alias_of[j]]
+                if j in alias_of
+                else mr.Buffer.empty(list(info.array_shape), dtype=info.dtype.name)
+                for j, info in enumerate(spec.outputs)
             ]
             pending = self._dispatch(slot.in_bufs, out_bufs)
             slot.pending = pending
@@ -234,8 +253,9 @@ class BoundKernel:
             return slot
         slot = self._slots[self._next]
         assert slot.pending is not None  # full ring: every slot launched
-        slot.pending.batch.wait()
-        slot.pending.done = True
+        # wait(), not batch.wait(): reusing the slot rewrites its buffers,
+        # so an aliased output must be materialized for its caller first.
+        slot.pending.wait()
         self._advance()
         return slot
 
@@ -272,7 +292,8 @@ class BoundKernel:
             buffers=[*in_bufs, *out_bufs],
         )
         batch.commit()
-        return PendingResult(batch, out_bufs)
+        copy_out = frozenset(j for _, j in self.spec.aliases)
+        return PendingResult(batch, out_bufs, copy_out=copy_out)
 
     def pinned(
         self, *arrays: np.ndarray
@@ -285,6 +306,12 @@ class BoundKernel:
         observed (data is copied at pin time). Outputs stay fresh per
         call, same reasoning as `launch`.
         """
+        if self.spec.aliases:
+            raise DispatchError(
+                "pinned() is unsupported for kernels with "
+                "input_output_aliases: the kernel writes its pinned input "
+                "in place, so repeated calls would not see the original data"
+            )
         pending = self.launch(*arrays)
         pending.wait()
         # Detach the slot that served the upload: its buffers become

@@ -10,14 +10,15 @@ version-sensitive (see `_block_infos`).
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import jax
 import jax.experimental.pallas as pl
 import numpy as np
-from jax.extend.core import ClosedJaxpr, Jaxpr
+from jax.extend.core import ClosedJaxpr, Jaxpr, Literal, Var
 
+from palladium import effects
 from palladium.errors import TraceError
 
 __all__ = ["BlockInfo", "KernelSpec", "trace"]
@@ -62,6 +63,9 @@ class KernelSpec:
         Operand descriptions in jaxpr order.
     raw_params : dict
         Full, unprocessed pallas_call params.
+    aliases : tuple of (int, int)
+        Validated `input_output_aliases` pairs (input index, output index):
+        the two refs share one buffer, so the kernel updates in place.
     """
 
     name: str
@@ -70,6 +74,7 @@ class KernelSpec:
     inputs: tuple[BlockInfo, ...]
     outputs: tuple[BlockInfo, ...]
     raw_params: dict[str, Any]
+    aliases: tuple[tuple[int, int], ...] = ()
 
     @property
     def num_programs(self) -> int:
@@ -114,6 +119,114 @@ def _block_infos(block_mappings: list[Any]) -> tuple[BlockInfo, ...]:
     return tuple(infos)
 
 
+def _validate_aliases(
+    jaxpr: Jaxpr,
+    aliases: tuple[tuple[int, int], ...],
+    inputs: tuple[BlockInfo, ...],
+    outputs: tuple[BlockInfo, ...],
+) -> None:
+    """One buffer behind both refs is only transparent when (a) both
+    sides slice it identically, and (b) every read of the input executes
+    before any write of the output; Pallas semantics keep the input's
+    pre-call values visible throughout. (b) is checked on effect order
+    over the kernel eqns, which covers sub-jaxprs.
+    """
+    for i, j in aliases:
+        a, b = inputs[i], outputs[j]
+        if (
+            a.array_shape != b.array_shape
+            or a.dtype != b.dtype
+            or a.block_shape != b.block_shape
+            or str(a.index_map_jaxpr) != str(b.index_map_jaxpr)
+        ):
+            raise TraceError(
+                f"input_output_aliases pair ({i}, {j}): input and output "
+                "must have identical array shape, dtype, block shape, and "
+                "BlockSpec index map to share one buffer"
+            )
+        x_var = jaxpr.invars[i]
+        o_var = jaxpr.invars[len(inputs) + j]
+        last_read = max(
+            (n for n, e in enumerate(jaxpr.eqns) if effects.eqn_reads_ref(e, x_var)),
+            default=-1,
+        )
+        first_write = min(
+            (n for n, e in enumerate(jaxpr.eqns) if effects.eqn_writes_ref(e, o_var)),
+            default=len(jaxpr.eqns),
+        )
+        if last_read >= first_write:
+            raise TraceError(
+                f"input_output_aliases pair ({i}, {j}): input {i} is read "
+                f"after (or while) output {j} is written. The refs share "
+                "one buffer on the GPU, so that read would observe the "
+                "in-place write; reorder the kernel to read all its input "
+                "before the first write to the aliased output"
+            )
+
+
+def _depends_on(
+    jaxpr: Jaxpr, seeds: set[Var], targets: Sequence[Var | Literal]
+) -> bool:
+    """Forward data-dependence over top-level eqns: does any of `targets`
+    depend on a var in `seeds`? Coarse across sub-jaxpr eqns: any
+    tainted invar taints all outvars."""
+    tainted = set(seeds)
+    for eqn in jaxpr.eqns:
+        if any(isinstance(v, Var) and v in tainted for v in eqn.invars):
+            tainted.update(eqn.outvars)
+    return any(isinstance(v, Var) and v in tainted for v in targets)
+
+
+def _map_uses_axis(index_map: ClosedJaxpr, axis: int) -> bool:
+    inner = index_map.jaxpr
+    if axis >= len(inner.invars):
+        return False
+    seed = inner.invars[axis]
+    return seed in inner.outvars or _depends_on(inner, {seed}, list(inner.outvars))
+
+
+def _validate_parallel_writes(
+    jaxpr: Jaxpr,
+    outputs: tuple[BlockInfo, ...],
+    grid: tuple[int, ...],
+    n_in: int,
+) -> None:
+    """Program instances run as parallel threads, so instances writing
+    the same output element race. Rejects the provable case: a grid axis
+    that neither the output's index map nor any top-level write index
+    depends on. Writes inside sub-jaxprs and non-injective maps that use
+    the axis pass unchecked (best-effort by design).
+    """
+    for j, info in enumerate(outputs):
+        o_var = jaxpr.invars[n_in + j]
+        writes = [
+            e for e in jaxpr.eqns if e.primitive.name == "swap" and e.invars[0] is o_var
+        ]
+        if not writes:
+            continue  # no top-level writes to analyze; sub-jaxprs stay unchecked
+        for axis, extent in enumerate(grid):
+            if extent <= 1 or _map_uses_axis(info.index_map_jaxpr, axis):
+                continue
+            pid_vars = {
+                out
+                for e in jaxpr.eqns
+                if e.primitive.name == "program_id" and e.params["axis"] == axis
+                for out in e.outvars
+            }
+            for eqn in writes:
+                indexer_args = list(eqn.invars[2:])
+                if not (pid_vars and _depends_on(jaxpr, pid_vars, indexer_args)):
+                    raise TraceError(
+                        f"output {j} is written identically by all "
+                        f"{extent} program instances along grid axis "
+                        f"{axis}: neither its BlockSpec index map nor the "
+                        "write index depends on that axis, and instances "
+                        "run as parallel threads, so the writes race. Make "
+                        f"the output BlockSpec index map use grid axis "
+                        f"{axis}, or index the write with pl.program_id({axis})"
+                    )
+
+
 def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
     """Extract a KernelSpec from a function that calls `pl.pallas_call`.
 
@@ -133,8 +246,9 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
     Raises
     ------
     TraceError
-        If tracing finds zero or more than one pallas_call equation, or
-        for PrefetchScalarGridSpec kernels.
+        If tracing finds zero or more than one pallas_call equation, for
+        PrefetchScalarGridSpec kernels, or when the kernel body carries
+        effects palladium cannot perform on the GPU (debug prints, callbacks).
     """
     closed = jax.make_jaxpr(pallas_fn)(*example_args)
     eqns = [e for e in closed.jaxpr.eqns if e.primitive.name == "pallas_call"]
@@ -157,6 +271,16 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
         # ClosedJaxpr on some JAX versions, bare Jaxpr on others.
         kernel_jaxpr = kernel_jaxpr.jaxpr
 
+    foreign = effects.foreign_effects(kernel_jaxpr)
+    if foreign:
+        names = ", ".join(sorted({type(e).__name__ for e in foreign}))
+        raise TraceError(
+            f"kernel body has effects palladium cannot perform on the GPU: "
+            f"{names}. Only Ref reads and writes are supported; remove "
+            "debug prints, callbacks, and other host-side effects from the "
+            "kernel."
+        )
+
     if grid_mapping.num_index_operands:
         raise TraceError("PrefetchScalarGridSpec is not supported")
 
@@ -168,11 +292,21 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
         # Gridless pallas_call: a single program instance.
         grid = (1,)
 
+    inputs = _block_infos(mappings[:n_in])
+    outputs = _block_infos(mappings[n_in : n_in + n_out])
+    aliases = tuple(
+        (int(i), int(j)) for i, j in params.get("input_output_aliases") or ()
+    )
+    if aliases:
+        _validate_aliases(kernel_jaxpr, aliases, inputs, outputs)
+    _validate_parallel_writes(kernel_jaxpr, outputs, grid, n_in)
+
     return KernelSpec(
         name=params.get("name") or "palladium_kernel",
         jaxpr=kernel_jaxpr,
         grid=grid,
-        inputs=_block_infos(mappings[:n_in]),
-        outputs=_block_infos(mappings[n_in : n_in + n_out]),
+        inputs=inputs,
+        outputs=outputs,
         raw_params=params,
+        aliases=aliases,
     )
