@@ -8,9 +8,11 @@
 // thread pool with no opt-out trait, so KernelCache below is
 // mutex-guarded the same way metal-runtime's own caches are.
 
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "c_api.h"
@@ -112,12 +114,17 @@ xla::ffi::Error PalladiumDispatch(std::string_view msl_source,
                                   int64_t grid_x, int64_t grid_y,
                                   int64_t grid_z, int64_t threadgroup_x,
                                   int64_t threadgroup_y, int64_t threadgroup_z,
-                                  int64_t math_mode,
+                                  int64_t math_mode, int64_t batch_size,
+                                  xla::ffi::Span<const int64_t> elem_strides,
                                   xla::ffi::RemainingArgs args,
                                   xla::ffi::RemainingRets rets) {
   if (math_mode < MR_MATH_MODE_SAFE || math_mode > MR_MATH_MODE_FAST) {
     return xla::ffi::Error::InvalidArgument(
         "palladium_dispatch: math_mode out of range");
+  }
+  if (batch_size < 1) {
+    return xla::ffi::Error::InvalidArgument(
+        "palladium_dispatch: batch_size must be >= 1");
   }
   std::string error;
   auto [library, pipeline] = KernelCache::instance().get_or_compile(
@@ -147,6 +154,13 @@ xla::ffi::Error PalladiumDispatch(std::string_view msl_source,
       return xla::ffi::Error::Internal(error);
   }
 
+  if (elem_strides.size() != wrapped.size()) {
+    for (auto *b : wrapped)
+      mr_release_buffer(b);
+    return xla::ffi::Error::InvalidArgument(
+        "palladium_dispatch: elem_strides must have one entry per buffer");
+  }
+
   MRLaunchDesc desc{};
   desc.pipeline = pipeline;
   desc.buffers = wrapped.data();
@@ -161,20 +175,74 @@ xla::ffi::Error PalladiumDispatch(std::string_view msl_source,
   desc.threadgroup_y = (size_t)threadgroup_y;
   desc.threadgroup_z = (size_t)threadgroup_z;
 
+  // One grid dispatch per batch element, offset elem_strides[i] * element
+  // bytes into each buffer (stride 0 = shared across elements), with up to
+  // kMaxInFlight command buffers on the queue at once: the ~130us fixed
+  // dispatch cost is queue latency that overlaps across in-flight batches
+  // (metal-runtime's devlog measures ~4x at depth 8), which is the entire
+  // point of looping here instead of letting jax.vmap re-enter per element.
+  constexpr size_t kMaxInFlight = 8;
+  std::vector<MRBatch *> in_flight;
+  in_flight.reserve(std::min<size_t>((size_t)batch_size, kMaxInFlight + 1));
+  size_t head = 0;
   char *err = nullptr;
-  MRStatus status = mr_dispatch(&desc, &err);
-  if (status != MR_OK) {
-    xla::ffi::Error e =
-        xla::ffi::Error::Internal(err ? err : "mr_dispatch failed");
-    if (err)
-      mr_free_error_message(err);
+
+  auto abandon = [&](xla::ffi::Error e) {
+    // Outstanding batches must finish before the buffers they read are
+    // released; their own errors are moot once we're failing anyway.
+    for (size_t i = head; i < in_flight.size(); ++i) {
+      char *werr = nullptr;
+      mr_batch_wait(in_flight[i], &werr);
+      if (werr)
+        mr_free_error_message(werr);
+      mr_release_batch(in_flight[i]);
+    }
     for (auto *b : wrapped)
       mr_release_buffer(b);
     return e;
+  };
+
+  for (int64_t element = 0; element < batch_size; ++element) {
+    for (size_t i = 0; i < wrapped.size(); ++i)
+      offsets[i] = (size_t)(element * elem_strides[i]);
+    if (in_flight.size() - head == kMaxInFlight) {
+      MRStatus status = mr_batch_wait(in_flight[head], &err);
+      mr_release_batch(in_flight[head]);
+      ++head;
+      if (status != MR_OK) {
+        xla::ffi::Error e =
+            xla::ffi::Error::Internal(err ? err : "mr_batch_wait failed");
+        if (err)
+          mr_free_error_message(err);
+        return abandon(std::move(e));
+      }
+    }
+    MRBatch *batch = nullptr;
+    if (mr_dispatch_async(&desc, &batch, &err) != MR_OK) {
+      xla::ffi::Error e =
+          xla::ffi::Error::Internal(err ? err : "mr_dispatch_async failed");
+      if (err)
+        mr_free_error_message(err);
+      return abandon(std::move(e));
+    }
+    in_flight.push_back(batch);
+  }
+  for (; head < in_flight.size(); ++head) {
+    MRStatus status = mr_batch_wait(in_flight[head], &err);
+    mr_release_batch(in_flight[head]);
+    if (status != MR_OK) {
+      xla::ffi::Error e =
+          xla::ffi::Error::Internal(err ? err : "mr_batch_wait failed");
+      if (err)
+        mr_free_error_message(err);
+      ++head;
+      return abandon(std::move(e));
+    }
   }
 
   // Only outputs need flushing back (no-op on the zero-copy path).
-  // Inputs are read-only to the kernel.
+  // Inputs are read-only to the kernel. One flush per whole buffer, after
+  // the loop: every batch element wrote its slice into the same wrapping.
   for (size_t i = n_inputs; i < wrapped.size(); ++i) {
     if (mr_buffer_flush_to(wrapped[i], &err) != MR_OK) {
       xla::ffi::Error e =
@@ -205,5 +273,8 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(palladium_dispatch, PalladiumDispatch,
                                   .Attr<int64_t>("threadgroup_y")
                                   .Attr<int64_t>("threadgroup_z")
                                   .Attr<int64_t>("math_mode")
+                                  .Attr<int64_t>("batch_size")
+                                  .Attr<xla::ffi::Span<const int64_t>>(
+                                      "elem_strides")
                                   .RemainingArgs()
                                   .RemainingRets());

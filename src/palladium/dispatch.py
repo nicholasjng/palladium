@@ -74,16 +74,30 @@ class PendingResult:
         Already committed; `wait()` blocks on it if unfinished.
     out_bufs : list of metal_runtime.Buffer
         This launch's outputs, read back on `wait()`.
+    done : bool
+        True once `wait()` has returned; lets `BoundKernel` reuse the
+        input-buffer slot without re-blocking on finished work.
     """
 
     batch: mr.Batch
     out_bufs: list[mr.Buffer]
+    done: bool = False
 
     def wait(self) -> np.ndarray | tuple[np.ndarray, ...]:
         """Block until the GPU is done, then return the outputs."""
         self.batch.wait()
+        self.done = True
         outs = tuple(_read_buffer(b) for b in self.out_bufs)
         return outs[0] if len(outs) == 1 else outs
+
+
+@dataclasses.dataclass
+class _Slot:
+    """One ring entry: private input buffers plus the launch that last
+    read them; overwritable only once that launch is known finished."""
+
+    in_bufs: list[mr.Buffer]
+    pending: PendingResult | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,28 +114,28 @@ class BoundKernel:
         Exact source that compiled.
     threadgroup : int or tuple of int, optional
         Explicit threadgroup size; None lets the runtime choose.
+    pipeline_depth : int
+        Maximum launches in flight at once; see the field comment.
     """
 
     spec: KernelSpec
     kernel: mr.Kernel
     msl_source: str
     threadgroup: int | tuple[int, ...] | None = None
-    # Safe to reuse across calls: a BoundKernel is cached per input
-    # shape/dtype, so shape never changes call-to-call. Excluded from
-    # compare/repr since it's cache state, not part of a BoundKernel's identity.
-    _in_bufs: list[mr.Buffer] = dataclasses.field(
+    # Maximum number of launches in flight at once.
+    # Each concurrent launch needs its own input buffers, so the ceiling is also a memory bound:
+    # depth x input bytes, though the ring only grows when launches actually overlap.
+    pipeline_depth: int = 8
+    # Ring of input-buffer slots, LRU-ordered, grown on demand up to
+    # pipeline_depth. Buffer reuse is safe across calls: a BoundKernel is
+    # cached per input shape/dtype, so shape never changes call-to-call.
+    _slots: list[_Slot] = dataclasses.field(
         default_factory=list, compare=False, repr=False
     )
-    # copy_from() into a reused _in_bufs entry races an in-flight GPU read of
-    # that same shared-storage buffer unless the prior launch is known done;
-    # waited on (a no-op if the caller already did) before the next reuse.
-    _last_pending: PendingResult | None = dataclasses.field(
-        default=None, compare=False, repr=False
-    )
-    # Serializes the upload-and-commit phase: concurrent launches share
-    # _in_bufs, and each launch waits out the previous batch before
-    # overwriting them, so under the lock every in-flight batch has
-    # already read its inputs. Waiting on results stays unlocked.
+    # Index of the least-recently-launched slot, the next reuse candidate.
+    _next: int = dataclasses.field(default=0, compare=False, repr=False)
+    # Serializes slot acquisition and the upload-and-commit phase,
+    # to avoid races with the GPU.
     _launch_lock: threading.Lock = dataclasses.field(
         default_factory=threading.Lock, compare=False, repr=False
     )
@@ -132,11 +146,15 @@ class BoundKernel:
         `__call__` is `launch` followed by `wait()`. Thread-safe: uploads
         are serialized on a per-kernel lock, waits are not.
 
+        Launches without intervening waits overlap on the GPU queue, up
+        to `pipeline_depth` in flight, amortizing the fixed per-dispatch
+        queue latency; past that, `launch` blocks on the oldest.
+
         Parameters
         ----------
         *arrays : numpy.ndarray
             One array per kernel input, matching `spec.inputs` shapes;
-            copied into fresh or reused device buffers (see `_in_bufs`).
+            copied into fresh or reused device buffers (see `_slots`).
 
         Returns
         -------
@@ -155,35 +173,34 @@ class BoundKernel:
             raise DispatchError(
                 f"kernel takes {len(spec.inputs)} arrays, got {len(arrays)}"
             )
+        # Validated and made contiguous before any slot is acquired, so an
+        # argument error never blocks on (or claims) in-flight work.
+        natives = []
+        for i, (a, info) in enumerate(zip(arrays, spec.inputs, strict=True)):
+            arr = np.asarray(a)
+            if arr.dtype != info.dtype:
+                raise DispatchError(
+                    f"argument {i}: dtype {arr.dtype} does not match the "
+                    f"traced {info.dtype}; cast explicitly"
+                )
+            if arr.shape != info.array_shape:
+                raise DispatchError(
+                    f"argument {i}: expected shape {info.array_shape}, got {arr.shape}"
+                )
+            # Non-contiguous inputs are copied, not rejected: upload
+            # copies into the device buffer anyway. Contiguity must
+            # come first: _to_native's view needs a contiguous array.
+            arr = np.ascontiguousarray(arr)
+            natives.append(_to_native(arr))
         with self._launch_lock:
-            if self._last_pending is not None:
-                # No-op if the caller already waited; guarantees the GPU
-                # is done reading _in_bufs before they are overwritten.
-                self._last_pending.batch.wait()
-            first_call = len(self._in_bufs) < len(spec.inputs)
-            in_bufs = []
-            for i, (a, info) in enumerate(zip(arrays, spec.inputs, strict=True)):
-                arr = np.asarray(a)
-                if arr.dtype != info.dtype:
-                    raise DispatchError(
-                        f"argument {i}: dtype {arr.dtype} does not match the "
-                        f"traced {info.dtype}; cast explicitly"
-                    )
-                if arr.shape != info.array_shape:
-                    raise DispatchError(
-                        f"argument {i}: expected shape {info.array_shape}, "
-                        f"got {arr.shape}"
-                    )
-                # Non-contiguous inputs are copied, not rejected: upload
-                # copies into the device buffer anyway. Contiguity must
-                # come first: _to_native's view needs a contiguous array.
-                arr = np.ascontiguousarray(arr)
-                native, relabel = _to_native(arr)
-                if first_call:
-                    self._in_bufs.append(mr.Buffer(native, dtype=relabel))
-                else:
-                    self._in_bufs[i].copy_from(native, dtype=relabel)
-                in_bufs.append(self._in_bufs[i])
+            slot = self._acquire_slot()
+            if not slot.in_bufs:
+                slot.in_bufs.extend(
+                    mr.Buffer(native, dtype=relabel) for native, relabel in natives
+                )
+            else:
+                for buf, (native, relabel) in zip(slot.in_bufs, natives, strict=True):
+                    buf.copy_from(native, dtype=relabel)
             # Fresh per call, unlike inputs: to_numpy() is a live view, so
             # reusing this buffer would mutate an array a caller might still
             # be holding from an earlier, not-yet-waited-on PendingResult.
@@ -191,7 +208,39 @@ class BoundKernel:
                 mr.Buffer.empty(list(info.array_shape), dtype=info.dtype.name)
                 for info in spec.outputs
             ]
-            return self._dispatch(in_bufs, out_bufs)
+            pending = self._dispatch(slot.in_bufs, out_bufs)
+            slot.pending = pending
+            return pending
+
+    def _acquire_slot(self) -> _Slot:
+        """Pick the slot for the next launch; call under `_launch_lock`.
+
+        Reuses the least-recently-launched slot if its work is finished
+        (a launch-then-wait caller stays at one slot), grows the ring up
+        to `pipeline_depth` while launches overlap, then blocks on the
+        oldest in-flight batch: the queue is FIFO, so it finishes first.
+        """
+        if self._slots:
+            slot = self._slots[self._next]
+            if slot.pending is None or slot.pending.done:
+                self._advance()
+                return slot
+        if len(self._slots) < self.pipeline_depth:
+            slot = _Slot(in_bufs=[])
+            # Inserted at the cursor, so ring order stays launch order and
+            # _next keeps pointing at the least-recently-launched slot.
+            self._slots.insert(self._next, slot)
+            self._advance()
+            return slot
+        slot = self._slots[self._next]
+        assert slot.pending is not None  # full ring: every slot launched
+        slot.pending.batch.wait()
+        slot.pending.done = True
+        self._advance()
+        return slot
+
+    def _advance(self) -> None:
+        object.__setattr__(self, "_next", (self._next + 1) % len(self._slots))
 
     def __call__(self, *arrays: np.ndarray) -> np.ndarray | tuple[np.ndarray, ...]:
         """Dispatch over `spec.grid` threads and return the outputs.
@@ -200,7 +249,7 @@ class BoundKernel:
         ----------
         *arrays : numpy.ndarray
             One array per kernel input, matching `spec.inputs` shapes;
-            copied into fresh or reused device buffers (see `_in_bufs`).
+            copied into fresh or reused device buffers (see `_slots`).
 
         Returns
         -------
@@ -223,9 +272,7 @@ class BoundKernel:
             buffers=[*in_bufs, *out_bufs],
         )
         batch.commit()
-        pending = PendingResult(batch, out_bufs)
-        object.__setattr__(self, "_last_pending", pending)
-        return pending
+        return PendingResult(batch, out_bufs)
 
     def pinned(
         self, *arrays: np.ndarray
@@ -240,17 +287,25 @@ class BoundKernel:
         """
         pending = self.launch(*arrays)
         pending.wait()
+        # Detach the slot that served the upload: its buffers become
+        # private to this callable, so later launch() calls can't
+        # overwrite the pinned data (they allocate a replacement slot).
+        with self._launch_lock:
+            index = next(i for i, s in enumerate(self._slots) if s.pending is pending)
+            in_bufs = self._slots.pop(index).in_bufs
+            object.__setattr__(
+                self, "_next", self._next % len(self._slots) if self._slots else 0
+            )
 
         def call() -> np.ndarray | tuple[np.ndarray, ...]:
-            with self._launch_lock:
-                if self._last_pending is not None:
-                    self._last_pending.batch.wait()
-                out_bufs = [
-                    mr.Buffer.empty(list(info.array_shape), dtype=info.dtype.name)
-                    for info in self.spec.outputs
-                ]
-                pending = self._dispatch(self._in_bufs, out_bufs)
-            return pending.wait()
+            # No lock and no wait-before-dispatch: the pinned inputs are
+            # never rewritten and outputs are fresh per call, so there is
+            # no buffer to race.
+            out_bufs = [
+                mr.Buffer.empty(list(info.array_shape), dtype=info.dtype.name)
+                for info in self.spec.outputs
+            ]
+            return self._dispatch(in_bufs, out_bufs).wait()
 
         return call
 
@@ -261,6 +316,7 @@ def bind(
     *,
     math_mode: mr.MathMode = mr.MathMode.FAST,
     threadgroup: int | tuple[int, ...] | None = None,
+    pipeline_depth: int = 8,
 ) -> BoundKernel:
     """Compile emitted MSL into a dispatchable kernel.
 
@@ -276,6 +332,9 @@ def bind(
         compensated arithmetic.
     threadgroup : int or tuple of int, optional
         Explicit threadgroup size; None lets the runtime choose.
+    pipeline_depth : int, optional
+        Maximum launches in flight at once for `BoundKernel.launch`
+        callers, 8 by default; 1 restores strictly serial dispatch.
 
     Returns
     -------
@@ -283,17 +342,21 @@ def bind(
 
     Raises
     ------
+    ValueError
+        `pipeline_depth` is not a positive integer.
     metal_runtime.CompileError
         On MSL compile failure, with the line-numbered source attached.
+        Fragment-assembled source (`metal_runtime.build_source`, the
+        tensorops path) is re-raised as-is instead: Metal's diagnostic
+        already names the fragment and line, which the flat dump's line
+        numbers would only obscure.
     """
+    if pipeline_depth < 1:
+        raise ValueError(f"pipeline_depth must be >= 1, got {pipeline_depth}")
     _dump_msl(spec.name, msl_source)
     try:
         kernel = mr.Kernel(msl_source, spec.name, math_mode=math_mode)
-    except mr.CompileError as e:
-        raise mr.CompileError(
-            f"{e}\n\npalladium-emitted source:\n{_numbered(msl_source)}"
-        ) from None
-    except RuntimeError as e:
+    except mr.PipelineBuildError as e:
         if "stack space" in str(e):
             # Metal's pipeline creation rejects kernels whose thread-local
             # arrays overflow the per-thread stack; translate the opaque
@@ -306,9 +369,16 @@ def bind(
                 "instance touches a smaller block."
             ) from None
         raise
+    except mr.CompileError as e:
+        if msl_source.startswith("#line ") or "\n#line " in msl_source:
+            raise
+        raise mr.CompileError(
+            f"{e}\n\npalladium-emitted source:\n{_numbered(msl_source)}"
+        ) from None
     return BoundKernel(
         spec=spec,
         kernel=kernel,
         msl_source=msl_source,
         threadgroup=threadgroup,
+        pipeline_depth=pipeline_depth,
     )

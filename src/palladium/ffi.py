@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ctypes
 import importlib.resources
+import math
 import os
 import threading
 from collections.abc import Callable
@@ -79,12 +80,14 @@ def _register() -> None:
         _registered = True
 
 
-# jax.ffi.ffi_call's batching methods that re-invoke the target once per
-# batch element, which is the only shape palladium can honor: the grid
-# and MSL source are baked as FFI attributes for the unbatched shape, so
-# the whole-batch methods (expand_dims, broadcast_all) would dispatch
-# that grid over batched buffers and return wrong results silently.
-_SAFE_VMAP_METHODS = (None, "sequential", "sequential_unrolled")
+# Batching methods palladium can honor. The grid is baked per unbatched
+# shape, so jax.ffi's own whole-batch methods (expand_dims, broadcast_all)
+# would silently dispatch it over batched buffers; they stay rejected.
+# The sequential methods re-invoke the target once per element, each a
+# full blocking dispatch. 'pipelined' (palladium's own, via custom_vmap)
+# makes one FFI call whose native handler loops over the batch with
+# several dispatches in flight. One vmap level only.
+_SAFE_VMAP_METHODS = (None, "sequential", "sequential_unrolled", "pipelined")
 
 
 class FfiCallable:
@@ -131,6 +134,9 @@ class FfiCallable:
         self._cache: dict[tuple, tuple[KernelSpec, str]] = {}
         # Guards trace/emit on a cache miss, mirroring MetalCallable.
         self._lock = threading.Lock()
+        self._pipelined = (
+            self._build_pipelined() if vmap_method == "pipelined" else None
+        )
 
     def explain(self, *args) -> KernelDiagnostics:
         """Report how the kernel executes for these inputs, mirroring
@@ -163,17 +169,65 @@ class FfiCallable:
     def __call__(self, *args):
         """Dispatch via jax.ffi; traceable and jittable."""
         _register()
-        spec, msl_source = self._spec_and_msl(args)
+        if self._pipelined is not None:
+            return self._pipelined(*args)
+        return self._ffi_dispatch(args, vmap_method=self._vmap_method)
+
+    def _build_pipelined(self):
+        """The 'pipelined' batching rule: under jax.vmap, one FFI call
+        handling the whole batch natively; unvmapped calls take the
+        ordinary single-dispatch path."""
+        import jax.custom_batching
+
+        @jax.custom_batching.custom_vmap
+        def pipelined(*args):
+            return self._ffi_dispatch(args, vmap_method=None)
+
+        @pipelined.def_vmap
+        def _pipelined_vmap_rule(axis_size, in_batched, *args):
+            out = self._ffi_dispatch(
+                args, vmap_method=None, in_batched=in_batched, axis_size=axis_size
+            )
+            return out, jax.tree.map(lambda _: True, out)
+
+        return pipelined
+
+    def _ffi_dispatch(
+        self,
+        args: tuple,
+        *,
+        vmap_method: str | None,
+        in_batched: list[bool] | None = None,
+        axis_size: int | None = None,
+    ):
+        """Build and invoke the ffi_call. With `axis_size`/`in_batched`
+        (batched args carry the batch at axis 0, unbatched ones ride
+        along at stride 0), the native handler loops over the batch;
+        without them, one plain dispatch."""
+        batched = in_batched if in_batched is not None else [False] * len(args)
+        unbatched = [
+            jax.ShapeDtypeStruct(a.shape[1:] if b else a.shape, a.dtype)
+            for a, b in zip(args, batched, strict=True)
+        ]
+        spec, msl_source = self._spec_and_msl(tuple(unbatched))
         # MRLaunchDesc always wants 3 grid dims; palladium grids are 1-3D.
         grid = tuple(spec.grid) + (1, 1, 1)
         threadgroup = (0, 0, 0)  # runtime chooses
+        in_strides = [
+            np.dtype(u.dtype).itemsize * math.prod(u.shape) if b else 0
+            for u, b in zip(unbatched, batched, strict=True)
+        ]
+        out_strides = [
+            np.dtype(info.dtype).itemsize * math.prod(info.array_shape)
+            for info in spec.outputs
+        ]
+        lead = () if axis_size is None else (int(axis_size),)
         out_structs = [
-            jax.ShapeDtypeStruct(info.array_shape, info.dtype) for info in spec.outputs
+            jax.ShapeDtypeStruct(lead + tuple(info.array_shape), info.dtype)
+            for info in spec.outputs
         ]
         result_shapes = out_structs[0] if len(out_structs) == 1 else out_structs
-        return jax.ffi.ffi_call(
-            _TARGET_NAME, result_shapes, vmap_method=self._vmap_method
-        )(
+        return jax.ffi.ffi_call(_TARGET_NAME, result_shapes, vmap_method=vmap_method)(
             *args,
             msl_source=msl_source,
             function_name=spec.name,
@@ -184,6 +238,8 @@ class FfiCallable:
             threadgroup_y=int(threadgroup[1]),
             threadgroup_z=int(threadgroup[2]),
             math_mode=self._math_mode,
+            batch_size=1 if axis_size is None else int(axis_size),
+            elem_strides=np.asarray(in_strides + out_strides, dtype=np.int64),
         )
 
 
@@ -198,11 +254,11 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
         The usual `pl.pallas_call` keywords (out_shape, grid, in_specs,
         out_specs, ...), plus `math_mode` (`metal_runtime.MathMode`,
         FAST by default; SAFE for df32-prelude kernels) and
-        `vmap_method` ('sequential' or 'sequential_unrolled'; None, the
-        default, rejects `jax.vmap`). The sequential methods dispatch
-        once per batch element, each paying the fixed dispatch floor, so
-        a batch dimension in the Pallas grid is the fast path; vmap is
-        the convenience.
+        `vmap_method` ('pipelined', 'sequential', or
+        'sequential_unrolled'; None, the default, rejects `jax.vmap`).
+        'pipelined' handles the whole batch in one FFI call and is the
+        fastest vmap path; a batch dimension in the Pallas grid still
+        beats it (one dispatch total).
 
     Returns
     -------
