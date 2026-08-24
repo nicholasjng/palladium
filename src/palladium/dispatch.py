@@ -373,8 +373,8 @@ def bind(
         `pipeline_depth` is not a positive integer.
     metal_runtime.CompileError
         On MSL compile failure, with the line-numbered source attached.
-        Fragment-assembled source (`metal_runtime.build_source`, the
-        tensorops path) is re-raised as-is instead: Metal's diagnostic
+        Fragment-assembled source (`metal_runtime.build_source`) is
+        re-raised as-is instead: Metal's diagnostic
         already names the fragment and line, which the flat dump's line
         numbers would only obscure.
     """

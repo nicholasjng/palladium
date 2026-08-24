@@ -19,7 +19,10 @@ import os
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from metal_runtime import MathMode
 
 import jax
 import numpy as np
@@ -113,7 +116,7 @@ class FfiCallable:
         self,
         kernel: Callable,
         pallas_kwargs: dict[str, Any],
-        math_mode: Any,
+        math_mode: MathMode | str,
         vmap_method: str | None = None,
     ) -> None:
         import jax.experimental.pallas as pl
@@ -128,8 +131,8 @@ class FfiCallable:
             )
         self._staged = pl.pallas_call(kernel, **pallas_kwargs)
         self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
-        value = math_mode.value if hasattr(math_mode, "value") else math_mode
-        self._math_mode = _MATH_MODE_ORDINALS[value]
+        # MathMode is a StrEnum, so members index the dict as their value.
+        self._math_mode = _MATH_MODE_ORDINALS[math_mode]
         self._vmap_method = vmap_method
         self._cache: dict[tuple, tuple[KernelSpec, str]] = {}
         # Guards trace/emit on a cache miss, mirroring MetalCallable.
@@ -152,7 +155,7 @@ class FfiCallable:
         shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
         return explain_spec(trace(self._staged, *shapes))
 
-    def _spec_and_msl(self, args: tuple) -> tuple[KernelSpec, str]:
+    def _spec_and_msl(self, args: tuple[Any, ...]) -> tuple[KernelSpec, str]:
         key = tuple((a.shape, np.dtype(a.dtype).str) for a in args)
         entry = self._cache.get(key)
         if entry is None:
@@ -194,7 +197,7 @@ class FfiCallable:
 
     def _ffi_dispatch(
         self,
-        args: tuple,
+        args: tuple[Any, ...],
         *,
         vmap_method: str | None,
         in_batched: list[bool] | None = None,
@@ -261,8 +264,8 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
         The usual `pl.pallas_call` keywords (out_shape, grid, in_specs,
         out_specs, ...), plus `math_mode` (`metal_runtime.MathMode`,
         FAST by default; SAFE for df32-prelude kernels) and
-        `vmap_method` ('pipelined', 'sequential', or
-        'sequential_unrolled'; None, the default, rejects `jax.vmap`).
+        `vmap_method` ('pipelined', 'sequential', or 'sequential_unrolled';
+        None, the default, rejects `jax.vmap`).
         'pipelined' handles the whole batch in one FFI call and is the
         fastest vmap path; a batch dimension in the Pallas grid still
         beats it (one dispatch total).

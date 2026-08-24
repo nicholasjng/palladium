@@ -9,12 +9,12 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable
-from typing import Any
 
-from jax.extend.core import Jaxpr, JaxprEqn
+from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.emit.core import (
     _PID,
+    CTYPES,
     ELEMENTWISE,
     PRIMITIVE_INVARS,
     RULES,
@@ -24,14 +24,14 @@ from palladium.emit.core import (
     Environment,
     _element_strides,
     _flat_index,
-    _ref_view,
-    _shaped,
     _template_fields,
     _transpose_is_dot_rhs_only,
     _unwrapped,
     declare,
     emit_jaxpr,
+    ref_view,
     rule,
+    shaped,
 )
 
 
@@ -45,14 +45,31 @@ def _rule_get(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     instead of copying: nothing can write through a `const device` ref,
     so the view has snapshot semantics. Full-block (un-indexed) loads
     still copy; those are small per-thread blocks that are re-read many
-    times, where a thread-local copy pays off.
+    times, where a thread-local copy pays off. The exception is a block
+    consumed only as scan xs, read once per element: it binds the ref
+    directly instead of paying per-thread stack for a copy.
     """
     indexer_args = eqn.params["tree"].unflatten(eqn.invars[1:])
     src = env.val(eqn.invars[0])
+    out_aval = shaped(eqn.outvars[0].aval)
+    if (
+        not indexer_args
+        and src.readonly
+        and src.space == "device"
+        and src.shape
+        and out_aval.shape
+        and math.prod(src.shape) == math.prod(tuple(int(d) for d in out_aval.shape))
+        and _consumed_only_as_scan_xs(env, eqn.outvars[0])
+    ):
+        env.bind(
+            eqn.outvars[0],
+            dataclasses.replace(src, shape=tuple(int(d) for d in out_aval.shape)),
+        )
+        return
     if indexer_args:
         (indexer,) = indexer_args
-        view = _ref_view(env, src, indexer)
-        aval = _shaped(eqn.outvars[0].aval)
+        view = ref_view(env, src, indexer)
+        aval = shaped(eqn.outvars[0].aval)
         if (
             view.readonly
             and view.space == "device"
@@ -82,9 +99,10 @@ def _rule_swap(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     dst_ref = env.val(ref)
     if indexer_args:
         (indexer,) = indexer_args
-        dst_ref = _ref_view(env, dst_ref, indexer)
+        dst_ref = ref_view(env, dst_ref, indexer)
     stored = env.val(value)
-    cursor.copy(dst_ref, stored, dst_ref.size)
+    if stored.expr != dst_ref.expr:
+        cursor.copy(dst_ref, stored, dst_ref.size)
     env.bind(eqn.outvars[0], dst_ref)
 
 
@@ -238,7 +256,7 @@ def _rule_transpose(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """
     src = env.val(eqn.invars[0])
     outvar = eqn.outvars[0]
-    if _transpose_is_dot_rhs_only(env.consumers, eqn) and not src.transposed:
+    if _transpose_is_dot_rhs_only(env, eqn) and not src.transposed:
         env.bind(
             outvar,
             dataclasses.replace(
@@ -369,7 +387,7 @@ def _rule_broadcast_in_dim(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> N
     replicating size-1 (or absent) input dims.
     """
     src = env.val(eqn.invars[0])
-    aval = _shaped(eqn.outvars[0].aval)
+    aval = shaped(eqn.outvars[0].aval)
     out_shape = tuple(int(d) for d in aval.shape)
     if src.shape and src.size == math.prod(out_shape):
         # Pure rank change (broadcast_dimensions are strictly increasing,
@@ -678,64 +696,214 @@ def _rule_program_id(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 
 @rule("scan")
 def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """`lax.fori_loop` / pure-carry `lax.scan` -> a C for-loop.
+    """`lax.fori_loop` / `lax.scan` -> a C for-loop.
 
-    fori_loop stages as scan with no xs/ys, usually with consts ordered
-    before carries in both eqn.invars and body.invars. Consts pass through
-    unchanged; carries get fresh mutable loop variables bound on the
-    outvars.
+    Consts pass through unchanged; carries get fresh mutable loop
+    variables bound on the outvars; scanned xs bind per-iteration
+    strided views; stacked ys stream straight to a device ref
+    (`_ys_stream_target`) or fill thread-local stacked storage, bounded
+    by the per-thread stack.
 
-    Copy-back runs in two phases: scan updates all carries simultaneously,
-    so phase 1 snapshots reads that alias other carries into temps
-    (skipping self-forward no-ops), then phase 2 overwrites the carries.
+    Copy-back runs in two phases: scan updates all carries
+    simultaneously, so phase 1 snapshots reads that alias other carries
+    into temps, then phase 2 overwrites the carries. ys slices are
+    stored before copy-back, while the body outputs still hold this
+    iteration's values.
     """
     length: int = eqn.params["length"]
     body: Jaxpr = eqn.params["jaxpr"]
-    num_carry = len(eqn.outvars)
-    num_consts = len(eqn.invars) - num_carry
-
-    _check_pure_carry_scan(eqn, body)
-
     reverse: bool = eqn.params.get("reverse", False)
-    if reverse:
-        raise EmitError("no reverse-mode scan support, use lax.fori_loop")
+    shape = _scan_shape(env, eqn)
+    num_carry = shape.num_carry
 
-    const_vals = [env.val(v) for v in eqn.invars[:num_consts]]
+    const_vals = [env.val(v) for v in eqn.invars[: shape.num_consts]]
+    xs_vals = [env.val(v) for v in eqn.invars[shape.first_xs :]]
+    if any(xs.transposed for xs in xs_vals):
+        raise EmitError("scanning a lazily transposed xs is unsupported")
 
     carries = []
-    for invar, outvar in zip(eqn.invars[num_consts:], eqn.outvars, strict=True):
+    for invar, outvar in zip(
+        eqn.invars[shape.num_consts : shape.first_xs],
+        eqn.outvars[:num_carry],
+        strict=True,
+    ):
         dst = declare(env, cursor, outvar)
         cursor.copy(dst, env.val(invar), dst.size)
         carries.append(dst)
 
+    ys_targets = []
+    for outvar in eqn.outvars[num_carry:]:
+        target = _ys_stream_target(env, outvar)
+        if target is not None:
+            env.bind(outvar, target)
+        else:
+            target = declare(env, cursor, outvar)
+        ys_targets.append(target)
+
     idx = cursor.fresh("_s")
-    with cursor.block(f"for (uint {idx} = 0; {idx} < {length}; ++{idx})"):
-        outs = emit_jaxpr(env, cursor, body, const_vals + carries)
-        _copy_back_carries(cursor, outs, carries)
+    if reverse:
+        # Signed index: a uint would wrap instead of failing `>= 0`.
+        # xs/ys keep their stacked positions under reverse, so the same
+        # idx-based addressing serves both directions.
+        header = f"for (int {idx} = {length - 1}; {idx} >= 0; --{idx})"
+    else:
+        header = f"for (uint {idx} = 0; {idx} < {length}; ++{idx})"
+    with cursor.block(header):
+        x_slices = [
+            _xs_slice(xs, bv, idx)
+            for xs, bv in zip(xs_vals, body.invars[shape.first_xs :], strict=True)
+        ]
+        outs = emit_jaxpr(env, cursor, body, const_vals + carries + x_slices)
+        for target, y in zip(ys_targets, outs[num_carry:], strict=True):
+            cursor.copy(target.slot(idx, (y.size,)), y, y.size)
+        _copy_back_carries(cursor, outs[:num_carry], carries)
 
 
-def _check_pure_carry_scan(eqn: JaxprEqn, body: Jaxpr) -> None:
-    """Reject scans with stacked ys or scanned xs.
+@dataclasses.dataclass(frozen=True)
+class ScanShape:
+    """The operand split of one scan eqn: `eqn.invars` is consts,
+    carries, xs in that order (xs from index `first_xs`), and
+    `eqn.outvars` is carries then stacked ys."""
 
-    Detected structurally, not from params (the param layout is JAX
-    version-sensitive): a carry's eqn aval matches its body aval, while
-    ys/xs carry an extra stacked length dim, so any rank mismatch in the
-    pairwise zip means the scan is not pure-carry.
+    num_consts: int
+    num_carry: int
+    num_xs: int
+
+    @property
+    def first_xs(self) -> int:
+        return self.num_consts + self.num_carry
+
+
+def _scan_shape(env: Environment, eqn: JaxprEqn) -> ScanShape:
+    """The operand split for `eqn`, memoized per emission."""
+    key = ("scan_shape", id(eqn))
+    shape = env.rule_cache.get(key)
+    if shape is None:
+        shape = _split_scan_operands(eqn, eqn.params["jaxpr"], eqn.params["length"])
+        env.rule_cache[key] = shape
+    assert isinstance(shape, ScanShape)
+    return shape
+
+
+def _split_scan_operands(eqn: JaxprEqn, body: Jaxpr, length: int) -> ScanShape:
+    """Structurally classify scan operands into (consts, carries, xs) and
+    outputs into (carries, ys).
+
+    Derived from avals, not params: jax 0.11's scan params carry no
+    num_carry/num_consts. A carry keeps its aval across eqn and body,
+    a const likewise, while xs/ys gain a leading `length` dim; carries
+    lead the outvars and trail-align against the body's x slices, so the
+    counts fall out of pairwise aval comparison.
     """
 
-    def rank(atom: Any) -> int:
+    def sig(atom: Var | Literal) -> tuple[tuple[int, ...], str]:
         # Consts may be Refs, whose aval is not a ShapedArray but still
-        # exposes .shape.
-        return len(getattr(atom.aval, "shape", ()))
+        # exposes .shape/.dtype.
+        aval = atom.aval
+        shape = tuple(int(d) for d in getattr(aval, "shape", ()))
+        return shape, str(getattr(aval, "dtype", ""))
 
-    if len(body.outvars) != len(eqn.outvars) or any(
-        rank(ov) != rank(bv) for ov, bv in zip(eqn.outvars, body.outvars, strict=True)
+    def stacked(outer: Var | Literal, inner: Var | Literal) -> bool:
+        (o_shape, o_dtype), (i_shape, i_dtype) = sig(outer), sig(inner)
+        return o_dtype == i_dtype and o_shape == (length, *i_shape)
+
+    if len(body.outvars) != len(eqn.outvars) or len(body.invars) != len(eqn.invars):
+        raise EmitError("unrecognized scan structure: eqn/body arity mismatch")
+
+    num_carry = 0
+    while num_carry < len(eqn.outvars) and sig(eqn.outvars[num_carry]) == sig(
+        body.outvars[num_carry]
     ):
-        raise EmitError("lax.scan with stacked ys not supported, use lax.fori_loop")
-    if any(
-        rank(iv) != rank(bv) for iv, bv in zip(eqn.invars, body.invars, strict=True)
+        num_carry += 1
+    for ov, bv in zip(eqn.outvars[num_carry:], body.outvars[num_carry:], strict=True):
+        if not stacked(ov, bv):
+            raise EmitError(
+                "unrecognized scan structure: outputs after the carries "
+                "must all be stacked ys"
+            )
+
+    num_xs = 0
+    while num_xs < len(eqn.invars) - num_carry and stacked(
+        eqn.invars[len(eqn.invars) - 1 - num_xs],
+        body.invars[len(body.invars) - 1 - num_xs],
     ):
-        raise EmitError("lax.scan with scanned xs not supported, use lax.fori_loop")
+        num_xs += 1
+    num_consts = len(eqn.invars) - num_carry - num_xs
+    for iv, bv in zip(
+        eqn.invars[num_consts : num_consts + num_carry],
+        body.invars[num_consts : num_consts + num_carry],
+        strict=True,
+    ):
+        if sig(iv) != sig(bv):
+            raise EmitError(
+                "unrecognized scan structure: carry avals disagree between eqn and body"
+            )
+    return ScanShape(num_consts, num_carry, num_xs)
+
+
+def _xs_slice(xs: CVal, body_invar: Var, idx: str) -> CVal:
+    """This iteration's x: a strided view into the stacked xs value
+    (an immutable SSA value, so no copy is needed)."""
+    aval = shaped(body_invar.aval)
+    shape = tuple(int(d) for d in aval.shape)
+    if not shape:
+        return CVal(expr=xs.at(idx), shape=(), ctype=xs.ctype)
+    return xs.slot(idx, shape)
+
+
+def _consumed_only_as_scan_xs(env: Environment, var: Var) -> bool:
+    """Whether every consumer of `var` is a scan taking it as xs.
+
+    xs elements are read once per scan, so a device view costs what the
+    copy would; consts are re-read every iteration and keep the copy.
+    """
+    if env.escapes(var) or not env.consumer_eqns(var):
+        return False
+    for eqn in env.consumer_eqns(var):
+        if eqn.primitive.name != "scan":
+            return False
+        try:
+            shape = _scan_shape(env, eqn)
+        except EmitError:
+            # Malformed scan: fall back to the copy; the scan rule will
+            # raise the real diagnostic when it gets there.
+            return False
+        if any(iv is var for iv in eqn.invars[: shape.first_xs]):
+            return False
+    return True
+
+
+def _ys_stream_target(env: Environment, outvar: Var) -> CVal | None:
+    """The device ref to stream a stacked ys into, or None for the
+    thread-local fallback.
+
+    Streaming writes the ref earlier than its swap; that is unobservable
+    only while the ref feeds nothing but that one full-block swap and
+    shares its buffer with no other ref (`env.no_stream_refs`). The swap
+    then degenerates to a self-copy, which `_rule_swap` skips.
+    """
+    swap = env.sole_consumer(outvar)
+    if (
+        swap is None
+        or swap.primitive.name != "swap"
+        or len(swap.invars) != 2  # an indexed swap targets a sub-block
+        or swap.invars[1] is not outvar
+    ):
+        return None
+    ref_var = swap.invars[0]
+    if (
+        not isinstance(ref_var, Var)  # a ref is always a Var, never a Literal
+        or env.sole_consumer(ref_var) is not swap
+        or ref_var in env.no_stream_refs
+    ):
+        return None
+    ref = env.bindings.get(ref_var)
+    if ref is None or ref.space != "device" or ref.readonly or ref.transposed:
+        return None
+    aval = shaped(outvar.aval)
+    if ref.size != math.prod(aval.shape) or ref.ctype != CTYPES[str(aval.dtype)]:
+        return None
+    return ref
 
 
 def _copy_back_carries(cursor: Cursor, outs: list[CVal], carries: list[CVal]) -> None:

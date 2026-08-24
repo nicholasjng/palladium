@@ -8,10 +8,16 @@ info), `cursor` is the write position into the growing MSL text. Most
 rules touch both; a few need only one (a pure aliasing rule never calls
 `cursor`, a pure text-emission helper never calls `env`).
 
-A word on stability: `rule` itself is public API, but writing a rule
-means touching emitter internals (`Environment`, `Cursor`, `CVal`) that
-sit outside the frozen surface and may change between minor versions.
-Pin your version if you ship custom rules.
+A word on stability: the rule-author surface is the *public* names in
+`palladium.emit.core`: `rule`, `declare`, `emit_jaxpr` (for rules with
+sub-jaxprs), the `Environment`/`Cursor`/`CVal` types with their public
+methods (including `env.val`/`bind`, the def-use queries
+`sole_consumer`/`consumer_eqns`/`escapes`, `cursor.copy`, `CVal.at` and
+`CVal.slot`), plus the helpers `shaped` (aval -> ShapedArray) and
+`ref_view` (an indexed view into a Ref) and the `CTYPES`/`ELEMENTWISE`
+tables. Underscore-prefixed names are internals that change without
+notice. The public surface is still not frozen API across minor
+versions; pin your version if you ship custom rules.
 
 ## Worked example: `floor`
 
@@ -43,7 +49,10 @@ That is the whole mechanism. The pieces:
   `cursor.block(header)` is a context manager for a braced block;
   `cursor.fresh(prefix)` returns a unique C identifier.
 - `CVal.at(index)` indexes arrays and absorbs scalars: `expr[i]` for
-  shaped values, plain `expr` for rank-0.
+  shaped values, plain `expr` for rank-0. `CVal.slot(index, shape)`
+  builds a strided view (element offset `index * prod(shape)`) with
+  space, readonly, and alignment propagated correctly; use it instead
+  of hand-formatting pointer arithmetic.
 - `eqn.params` carries the primitive's parameters (axes, dimension
   numbers, ...); `eqn.invars`/`eqn.outvars` the operands.
 

@@ -39,9 +39,6 @@ def _classic_call():
     return palladium.metal_call(kernel, out_shape=_shaped(8, 8))
 
 
-# --- explain() -------------------------------------------------------------
-
-
 def test_explain_reports_geometry():
     diag = _classic_call().explain(_shaped(8, 8), _shaped(8, 8))
     assert diag.grid == (1,)
@@ -80,9 +77,6 @@ def test_palladium_explain_env_logs_once_per_compile(monkeypatch, capsys, rng):
     assert err.count("palladium kernel") == 1
 
 
-# --- error taxonomy --------------------------------------------------------
-
-
 def test_all_errors_are_palladium_errors():
     for exc in (TraceError, EmitError, UnsupportedPrimitiveError, DispatchError):
         assert issubclass(exc, palladium.PalladiumError)
@@ -112,7 +106,10 @@ def test_batched_dot_general_rejected():
         )
 
 
-def test_scan_with_stacked_ys_rejected():
+def test_scan_with_stacked_ys_now_lowers():
+    """Formerly a typed rejection; stacked ys/scanned xs are supported
+    (tests/test_21_stacked_scan.py has the behavior coverage)."""
+
     def kernel(x_ref, o_ref):
         def body(c, x):
             return c + x, c
@@ -120,8 +117,8 @@ def test_scan_with_stacked_ys_rejected():
         _c, ys = jax.lax.scan(body, x_ref[0], x_ref[...])
         o_ref[...] = ys
 
-    with pytest.raises(EmitError, match="stacked ys"):
-        palladium.debug_msl(kernel, _shaped(8), out_shape=_shaped(8))
+    msl = palladium.debug_msl(kernel, _shaped(8), out_shape=_shaped(8))
+    assert "for (uint" in msl
 
 
 def test_strided_ref_access_rejected():
@@ -144,9 +141,6 @@ def test_multiple_pallas_calls_rejected():
 
     with pytest.raises(TraceError, match="2 pallas_call"):
         palladium.trace(two_calls, _shaped(8))
-
-
-# --- call boundary ---------------------------------------------------------
 
 
 def test_float64_input_rejected_with_hint():
@@ -172,9 +166,6 @@ def test_bound_kernel_rejects_dtype_and_shape_mismatch(rng):
         bound(x[:4])
     with pytest.raises(DispatchError, match="takes 1 arrays"):
         bound(x, x)
-
-
-# --- dot-rule contract -----------------------------------------------------
 
 
 def _run_and_compare(kernel, out_shape, *arrays, tol=1e-5):

@@ -113,11 +113,28 @@ def _conditional_loop():
     return palladium.trace(f, x, x)
 
 
+def _dense_output_scan():
+    # Pins the stacked-scan vocabulary: a scanned xs sliced per step, a
+    # stacked ys streaming straight to the output ref (no thread-local
+    # trajectory array), and the consuming swap degenerating to a no-op.
+    def kernel(y0_ref, ts_ref, o_ref):
+        def step(y, t):
+            y_next = y + 0.1 * t * y
+            return y_next, y_next
+
+        _, ys = jax.lax.scan(step, y0_ref[...], ts_ref[...])
+        o_ref[...] = ys
+
+    f = pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct((16, 4), jnp.float32))
+    return palladium.trace(f, np.zeros(4, np.float32), np.zeros(16, np.float32))
+
+
 SNAPSHOTS = {
     "copy_2d": _copy_2d,
     "blocked_saxpy": _blocked_saxpy,
     "rk4_lotka_volterra": _rk4_lotka_volterra,
     "conditional_loop": _conditional_loop,
+    "dense_output_scan": _dense_output_scan,
 }
 
 

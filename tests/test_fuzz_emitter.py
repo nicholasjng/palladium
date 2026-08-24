@@ -50,7 +50,10 @@ UNARY = {
     "sin": jnp.sin,
     "cos": jnp.cos,
     "tanh": jnp.tanh,
-    "sqrt_abs": lambda a: jnp.sqrt(jnp.abs(a)),
+    # The offset bounds the derivative (<= 1): bare sqrt(|x|) has an
+    # infinite slope at 0 and amplifies sub-tolerance backend
+    # differences when iterated (Metal's tanh flushes |x| < ~2^-25 to 0).
+    "sqrt_abs": lambda a: jnp.sqrt(jnp.abs(a) + 0.25),
     "exp_negabs": lambda a: jnp.exp(-jnp.abs(a)),  # bounded (0, 1]
 }
 BINARY = {
@@ -252,6 +255,133 @@ def test_fuzz_loops(case):
     out_shape = tuple(jax.ShapeDtypeStruct((N,), jnp.float32) for _ in range(n_carry))
     f = palladium.metal_call(
         make_loop_kernel(n_carry, n_consts, length, plans),
+        math_mode=mr.MathMode.SAFE,
+        out_shape=out_shape,
+    )
+    _assert_matches_oracle(f, args)
+
+
+@st.composite
+def scan_cases(draw):
+    """lax.scan with scanned xs and stacked ys: slices of raw input data
+    scan per step, carries evolve tamed trees, and each stacked ys is
+    either swap-consumed directly (the streaming path) or nudged through
+    an add first (the thread-local path)."""
+    n_carry = draw(st.integers(1, 2))
+    n_consts = draw(st.integers(0, 1))
+    n_xs = draw(st.integers(0, 2))
+    n_ys = draw(st.integers(0, 2))
+    # Full-block xs take the aliased device-read path; sliced xs read a
+    # thread-local copy through the same strided-view machinery.
+    full_block_xs = draw(st.booleans())
+    length = N if full_block_xs else draw(st.integers(1, 6))
+    reverse = draw(st.booleans())
+    n_vals = n_carry + n_consts + n_xs
+    # Consts and xs are raw input data, bit-identical on both backends,
+    # so they are stable comparison operands; carries are not.
+    stable = range(n_carry, n_vals)
+    carry_plans = draw(
+        st.tuples(
+            *[
+                st.one_of(
+                    st.integers(0, n_carry - 1),
+                    trees(n_vals, compare_refs=stable),
+                )
+                for _ in range(n_carry)
+            ]
+        )
+    )
+    ys_plans = draw(
+        st.tuples(
+            *[
+                st.tuples(trees(n_vals, compare_refs=stable), st.booleans())
+                for _ in range(n_ys)
+            ]
+        )
+    )
+    args = draw(input_arrays(n_carry + n_consts + n_xs))
+    return (
+        n_carry,
+        n_consts,
+        n_xs,
+        length,
+        full_block_xs,
+        reverse,
+        carry_plans,
+        ys_plans,
+        args,
+    )
+
+
+def make_scan_kernel(
+    n_carry, n_consts, n_xs, length, full_block_xs, reverse, carry_plans, ys_plans
+):
+    def kernel(*refs):
+        n_in = n_carry + n_consts + n_xs
+        ins, outs = refs[:n_in], refs[n_in:]
+        init = tuple(r[...] for r in ins[:n_carry])
+        consts = [r[...] for r in ins[n_carry : n_carry + n_consts]]
+        xs_refs = ins[n_carry + n_consts :]
+        if full_block_xs:
+            xs = tuple(r[...] for r in xs_refs) or None
+        else:
+            xs = tuple(r[0:length] for r in xs_refs) or None
+
+        def body(carry, x):
+            xvals = [] if x is None else list(x)
+            vals = list(carry) + consts + xvals
+            new = []
+            for plan in carry_plans:
+                if isinstance(plan, int):
+                    new.append(carry[plan])
+                else:
+                    new.append(jnp.tanh(eval_tree(plan, vals) + 0.0 * carry[0]))
+            ys = tuple(
+                jnp.tanh(eval_tree(plan, vals) + 0.0 * carry[0]) for plan, _ in ys_plans
+            )
+            return tuple(new), (ys if ys else None)
+
+        final, stacked = jax.lax.scan(body, init, xs, length=length, reverse=reverse)
+        for out, value in zip(outs[:n_carry], final, strict=True):
+            out[...] = value
+        if ys_plans:
+            for (_, direct), out, ys_value in zip(
+                ys_plans, outs[n_carry:], stacked, strict=True
+            ):
+                out[...] = ys_value if direct else ys_value + 0.0
+
+    return kernel
+
+
+@settings(max_examples=MAX_EXAMPLES, deadline=None)
+@given(scan_cases())
+def test_fuzz_scan_xs_ys(case):
+    (
+        n_carry,
+        n_consts,
+        n_xs,
+        length,
+        full_block_xs,
+        reverse,
+        carry_plans,
+        ys_plans,
+        args,
+    ) = case
+    out_shape = tuple(
+        [jax.ShapeDtypeStruct((N,), jnp.float32)] * n_carry
+        + [jax.ShapeDtypeStruct((length, N), jnp.float32)] * len(ys_plans)
+    )
+    f = palladium.metal_call(
+        make_scan_kernel(
+            n_carry,
+            n_consts,
+            n_xs,
+            length,
+            full_block_xs,
+            reverse,
+            carry_plans,
+            ys_plans,
+        ),
         math_mode=mr.MathMode.SAFE,
         out_shape=out_shape,
     )

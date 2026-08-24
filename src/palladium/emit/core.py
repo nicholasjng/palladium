@@ -17,15 +17,6 @@ from collections.abc import Callable, Iterator
 from typing import cast
 
 import jax.experimental.pallas as pl
-
-# Pinned private import: NDIndexer sits in the same module as pl.Slice
-# (jax._src.state.indexing) but, unlike Slice/ds/dslice, isn't re-exported
-# through jax.experimental.pallas -- an apparent oversight, since it's the
-# actual type `eqn.params["tree"].unflatten(...)` hands back for a get/swap
-# indexer, not a new kind of API surface. PR filed upstream to close the
-# gap (jax/experimental/pallas/__init__.py, alongside the existing `from
-# jax._src.state.indexing import Slice as Slice` line); drop this import
-# for `from jax.experimental.pallas import NDIndexer` once it lands.
 from jax._src.state.indexing import NDIndexer
 from jax.core import Atom, ShapedArray
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
@@ -62,7 +53,7 @@ def _unwrapped(expr: str) -> str:
     return expr[1:-1]
 
 
-def _shaped(aval: object) -> ShapedArray:
+def shaped(aval: object) -> ShapedArray:
     # Invariant, not a hope: every non-Ref value in a Pallas kernel jaxpr
     # is shaped, and Refs never pass through declare()/val().
     assert isinstance(aval, ShapedArray), aval
@@ -131,6 +122,20 @@ class CVal:
         """Element count; 1 for scalars (`math.prod(()) == 1`)."""
         return math.prod(self.shape)
 
+    def slot(self, index: str, shape: tuple[int, ...]) -> CVal:
+        """A view of `shape` at slot `index`: element offset
+        `index * prod(shape)` into this storage. Space, readonly, and
+        ctype carry over; alignment composes as gcd with the slot size.
+        """
+        assert self.shape and not self.transposed, self
+        size = math.prod(shape)
+        return dataclasses.replace(
+            self,
+            expr=f"({self.expr} + {index} * {size})",
+            shape=shape,
+            align=math.gcd(self.align, size),
+        )
+
     def at(self, index: str) -> str:
         """`expr` for scalars, `expr[index]` for arrays: the only
         rank-0/rank-N absorption the emitter does."""
@@ -189,8 +194,15 @@ class Environment:
         Var -> defining eqn, for rules that need lookahead.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, no_stream_refs: frozenset[Var] = frozenset()) -> None:
         self.bindings: dict[Var, CVal] = {}
+        # Refs sharing a buffer with another ref (input_output_aliases):
+        # never scan-ys streaming targets, since reads through the twin
+        # var are invisible here.
+        self.no_stream_refs = no_stream_refs
+        # Per-emission scratch for rules that memoize per-eqn analyses,
+        # conventionally keyed ("name", id(eqn)).
+        self.rule_cache: dict[object, object] = {}
         # Var -> its consuming equations at that var's own jaxpr level
         # (None marks "is a jaxpr outvar", i.e. escapes the level).
         # Populated by emit_jaxpr before walking each (sub-)jaxpr; Vars
@@ -204,7 +216,7 @@ class Environment:
         """Resolve a jaxpr atom: Vars from bindings, Literals formatted
         in place."""
         if isinstance(atom, Literal):
-            ctype = CTYPES[str(_shaped(atom.aval).dtype)]
+            ctype = CTYPES[str(shaped(atom.aval).dtype)]
             v = atom.val
             if math.isinf(v):
                 expr = "-INFINITY" if v < 0 else "INFINITY"
@@ -220,6 +232,23 @@ class Environment:
         self.bindings[var] = cval
         return cval
 
+    def consumer_eqns(self, var: Var) -> list[JaxprEqn]:
+        """Consuming equations at `var`'s own jaxpr level, without the
+        None outvar marker (see `escapes`)."""
+        return [e for e in self.consumers.get(var, []) if e is not None]
+
+    def escapes(self, var: Var) -> bool:
+        """Whether `var` is an outvar of its (sub-)jaxpr level."""
+        return None in self.consumers.get(var, ())
+
+    def sole_consumer(self, var: Var) -> JaxprEqn | None:
+        """The single consuming equation, or None when `var` escapes,
+        is unused, or has several consumers."""
+        uses = self.consumers.get(var, [])
+        if len(uses) == 1 and uses[0] is not None:
+            return uses[0]
+        return None
+
 
 def declare(env: Environment, cursor: Cursor, var: Var) -> CVal:
     """Emit thread-local storage for `var` and bind it in `env`. Use for
@@ -229,7 +258,7 @@ def declare(env: Environment, cursor: Cursor, var: Var) -> CVal:
     declaration) and an Environment (it binds the result) — everything
     else a rule does is purely one or the other.
     """
-    aval = _shaped(var.aval)
+    aval = shaped(var.aval)
     ctype = CTYPES[str(aval.dtype)]
     shape = tuple(int(d) for d in aval.shape)
     name = cursor.fresh()
@@ -421,12 +450,16 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
         params.append(f"{qual} {ctype}* arg{k}_base [[buffer({k})]]")
     params.append("uint3 _pid [[thread_position_in_grid]]")
 
-    env = Environment()
+    env = Environment(
+        no_stream_refs=frozenset(
+            spec.jaxpr.invars[k] for i, j in spec.aliases for k in (i, n_in + j)
+        )
+    )
     cursor = Cursor()
     ref_vals: list[CVal] = []
-    # Aliased inputs share their buffer with an output, so a bound view
-    # would observe the in-place write; dropping readonly forces gets to
-    # copy. trace() already guarantees all such reads precede the write.
+    # Aliased inputs share their buffer with an output; dropping readonly
+    # forces gets to copy instead of binding a view that would observe
+    # the in-place write.
     aliased_inputs = {i for i, _ in spec.aliases}
     for k, info in enumerate(operands):
         qual = "device" if k >= n_in else "const device"
@@ -470,7 +503,7 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
     )
 
 
-def _ref_view(env: Environment, ref: CVal, indexer: NDIndexer) -> CVal:
+def ref_view(env: Environment, ref: CVal, indexer: NDIndexer) -> CVal:
     """Resolve an NDIndexer against a Ref's CVal: pointer offset + kept shape.
 
     A Slice index keeps that dim (contributes to the result's logical
@@ -549,9 +582,7 @@ def _ref_view(env: Environment, ref: CVal, indexer: NDIndexer) -> CVal:
     )
 
 
-def _transpose_is_dot_rhs_only(
-    consumers: dict[Var, list[JaxprEqn | None]], eqn: JaxprEqn
-) -> bool:
+def _transpose_is_dot_rhs_only(env: Environment, eqn: JaxprEqn) -> bool:
     """Whether this rank-2 `(1, 0)` transpose is consumed *only* as the
     rhs of dot_general equations (never as lhs, never escaping as a
     jaxpr outvar), i.e. safe to lower as a lazy `transposed` CVal that
@@ -559,13 +590,16 @@ def _transpose_is_dot_rhs_only(
     if tuple(eqn.params["permutation"]) != (1, 0):
         return False
     outvar = eqn.outvars[0]
-    uses = consumers.get(outvar, [])
-    return bool(uses) and all(
-        use is not None
-        and use.primitive.name == "dot_general"
-        and use.invars[1] is outvar
-        and use.invars[0] is not outvar
-        for use in uses
+    uses = env.consumer_eqns(outvar)
+    return (
+        bool(uses)
+        and not env.escapes(outvar)
+        and all(
+            use.primitive.name == "dot_general"
+            and use.invars[1] is outvar
+            and use.invars[0] is not outvar
+            for use in uses
+        )
     )
 
 

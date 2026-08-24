@@ -50,10 +50,14 @@ the output dtype.
 
 Reductions: `reduce_sum`, `reduce_max` over any axis subset.
 
-Control flow: `lax.fori_loop` and pure-carry `lax.scan` (stacked ys,
-scanned xs, and reverse are rejected; carry avals must match),
-`lax.while_loop` (data-dependent, divergent trip counts are fine),
-`lax.cond`/`lax.switch` (clamped index semantics).
+Control flow: `lax.fori_loop` and full `lax.scan` (scanned xs, stacked
+ys, and `reverse=True`), `lax.while_loop` (data-dependent, divergent
+trip counts are fine), `lax.cond`/`lax.switch` (clamped index
+semantics). Stacked ys live on the per-thread stack unless their only
+use is a full-block store to an otherwise untouched output ref, in
+which case they stream straight to device memory with no stack cost:
+the dense-output stepper idiom `_, ys = lax.scan(step, y0, ts);
+o_ref[...] = ys` takes the streaming path.
 
 RNG: `jax.random.bits` and `jax.random.fold_in` (Threefry-2x32-20,
 bit-exact against jax, 32-bit widths), plus `wrap_key_data`/`key_data`.
