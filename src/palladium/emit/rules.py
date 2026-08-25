@@ -717,15 +717,9 @@ def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
             target = declare(env, cursor, outvar)
         ys_targets.append(target)
 
-    idx = cursor.fresh("_s")
-    if reverse:
-        # Signed index: a uint would wrap instead of failing `>= 0`.
-        # xs/ys keep their stacked positions under reverse, so the same
-        # idx-based addressing serves both directions.
-        header = f"for (int {idx} = {length - 1}; {idx} >= 0; --{idx})"
-    else:
-        header = f"for (uint {idx} = 0; {idx} < {length}; ++{idx})"
-    with cursor.block(header):
+    # xs/ys keep their stacked positions under reverse, so the same
+    # idx-based addressing serves both directions.
+    with cursor.loop(length, "_s", reverse=reverse) as idx:
         x_slices = [
             _xs_slice(xs, bv, idx)
             for xs, bv in zip(xs_vals, body.invars[shape.first_xs :], strict=True)

@@ -168,14 +168,28 @@ class Cursor:
         self.emit("}")
 
     @contextlib.contextmanager
-    def loop(self, count: int | str, prefix: str = "_i") -> Iterator[str]:
-        """Emit `for (uint idx = 0; idx < count; ++idx)`; yields `idx`.
+    def loop(
+        self, count: int | str, prefix: str = "_i", reverse: bool = False
+    ) -> Iterator[str]:
+        """Emit a counted for-loop over `[0, count)`; yields the index name.
+
+        Ascending by default: `for (uint idx = 0; idx < count; ++idx)`.
+        With `reverse=True`, descending from `count - 1` to 0 with a
+        *signed* index -- a uint would wrap past zero instead of failing
+        `>= 0`, looping forever.
 
         `count` is inlined verbatim, so pass e.g. `f"{n}u"` where the
-        call site needs an unsigned-literal suffix.
+        call site needs an unsigned-literal suffix. An int `count` folds
+        `count - 1` at emit time so the reverse header carries a literal
+        bound rather than an expression.
         """
         idx = self.fresh(prefix)
-        with self.block(f"for (uint {idx} = 0; {idx} < {count}; ++{idx})"):
+        if reverse:
+            first = count - 1 if isinstance(count, int) else f"{count} - 1"
+            header = f"for (int {idx} = {first}; {idx} >= 0; --{idx})"
+        else:
+            header = f"for (uint {idx} = 0; {idx} < {count}; ++{idx})"
+        with self.block(header):
             yield idx
 
     def copy(self, dst: CVal, src: CVal, count: int) -> None:
