@@ -9,9 +9,11 @@ from palladium.emit.core import (
     Cursor,
     CVal,
     EmitError,
+    EmitStats,
     Environment,
     emit_jaxpr,
     emit_msl,
+    emit_msl_stats,
     rule,
 )
 
@@ -20,8 +22,10 @@ __all__ = [
     "CVal",
     "Cursor",
     "EmitError",
+    "EmitStats",
     "Environment",
     "emit_jaxpr",
     "emit_msl",
+    "emit_msl_stats",
     "rule",
 ]

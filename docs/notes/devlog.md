@@ -66,3 +66,29 @@ be Python-only — `palladium_ffi.cpp` had bound `threadgroup_x/y/z` and
 set them on the launch descriptor all along. Worth remembering as a
 pattern: the native handler is more capable than the Python that calls
 it, so check the C++ before scoping C++ work.
+
+## API ergonomics pass   (2026-08-25)
+
+**Done:** six consumer-facing additions, none of which change emitted
+code. `verify()` on both callables (differential check against the
+interpret oracle or an explicit `reference=`, returning the GPU output);
+per-instance storage accounting surfaced through `explain()` and the
+stack-overflow error; a `"simdgroup"` threadgroup sentinel plus device
+budget checks; `.primitive` on `UnsupportedPrimitiveError` and a new
+`StackOverflowError` carrying `.stack_bytes`; `FfiCallable.pin` refusing
+with a reason; and LRU bounds on all three kernel caches (the native
+pipeline cache, and the Python spec caches on both callables).
+
+**Why:** the interpret-oracle diff was hand-rolled in ~40 places across
+the suite, and the two facts that make it correct (FAST-math tolerance,
+and that cooperative kernels have no interpret oracle) lived only in
+prose. `verify()` is where that knowledge now lives.
+
+**Note:** two bugs found by writing the tests rather than the code. The
+`"simdgroup"` sentinel resolved in diagnostics but reached
+`mr.Batch.add` as a raw string, because `bind()` normalized only for the
+*check* and stored the raw value -- normalization now happens once, at
+the top of `bind`. And `metal_call_jit` silently forwarded `cache_size`
+to `pallas_call`. Also worth remembering: the stack figure is not
+liveness-aware, but neither is Metal's own pipeline check, so it
+over-counts in exactly the same places.

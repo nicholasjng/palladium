@@ -11,6 +11,7 @@ import importlib.resources
 import math
 import os
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -30,8 +31,15 @@ from palladium.diagnostics import (
 from palladium.emit import emit_msl
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec, trace
+from palladium.verify import DEFAULT_ATOL, DEFAULT_RTOL, verify_against
 
 __all__ = ["FfiCallable", "metal_call_jit"]
+
+
+def _unwrap(outs):
+    """Match `__call__`'s convention: a bare array for single-output."""
+    return outs[0] if len(outs) == 1 else outs
+
 
 _TARGET_NAME = "palladium_dispatch"
 _LIBRARY_NAME = "libpalladium_ffi.dylib"
@@ -119,6 +127,7 @@ class FfiCallable:
         math_mode: MathMode | str,
         vmap_method: str | None = None,
         threadgroup: int | tuple[int, ...] | None = None,
+        cache_size: int = 256,
     ) -> None:
         import jax.experimental.pallas as pl
 
@@ -136,7 +145,12 @@ class FfiCallable:
         self._math_mode = _MATH_MODE_ORDINALS[math_mode]
         self._vmap_method = vmap_method
         self._threadgroup = normalize_threadgroup(threadgroup)
-        self._cache: dict[tuple, tuple[KernelSpec, str]] = {}
+        # Bounded for the same reason the native pipeline cache is: a
+        # long-lived process tracing many shapes would otherwise hold every
+        # spec and MSL string it ever produced. Insertion-ordered dict,
+        # re-inserted on hit, so popping the first item evicts the LRU.
+        self._cache: OrderedDict[tuple, tuple[KernelSpec, str]] = OrderedDict()
+        self._cache_size = cache_size
         # Guards trace/emit on a cache miss, mirroring MetalCallable.
         self._lock = threading.Lock()
         self._pipelined = (
@@ -157,9 +171,54 @@ class FfiCallable:
         shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
         return explain_spec(trace(self._staged, *shapes), self._threadgroup)
 
+    def verify(
+        self,
+        *args,
+        reference=None,
+        rtol: float = DEFAULT_RTOL,
+        atol: float = DEFAULT_ATOL,
+    ):
+        """Run through jax.ffi and diff against a reference.
+
+        Mirrors `MetalCallable.verify`; see it for the full contract.
+        Arguments reach the GPU as JAX arrays here, so a `reference=`
+        callable receives whatever you pass in.
+        """
+        shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
+        return _unwrap(
+            verify_against(
+                self.__call__,
+                None if reference is not None else self.interpret,
+                trace(self._staged, *shapes).uses_threadgroup,
+                args,
+                reference,
+                rtol,
+                atol,
+            )
+        )
+
+    def pin(self, *args) -> Callable[[], Any]:
+        """Not available on the jax.ffi path; use `metal_call(...).pin`.
+
+        `MetalCallable.pin` holds device buffers across dispatches,
+        which requires owning the upload. Under `jax.jit`, XLA owns
+        operand buffers and their lifetimes and the FFI handler receives
+        whatever XLA hands it, so there is nothing for palladium to pin.
+        The equivalent win comes from keeping inputs as device arrays and
+        letting `jit` reuse or donate them.
+        """
+        raise NotImplementedError(
+            "FfiCallable.pin is not available: under jax.jit, XLA owns "
+            "operand buffers, so there is nothing for palladium to pin "
+            "across calls. Use palladium.metal_call(...).pin for the eager "
+            "path, or keep inputs as device arrays and let jit reuse them."
+        )
+
     def _spec_and_msl(self, args: tuple[Any, ...]) -> tuple[KernelSpec, str]:
         key = tuple((a.shape, np.dtype(a.dtype).str) for a in args)
         entry = self._cache.get(key)
+        if entry is not None:
+            self._cache.move_to_end(key)
         if entry is None:
             with self._lock:
                 entry = self._cache.get(key)
@@ -180,6 +239,8 @@ class FfiCallable:
                         )
                     entry = (spec, emit_msl(spec))
                     self._cache[key] = entry
+                    while self._cache_size and len(self._cache) > self._cache_size:
+                        self._cache.popitem(last=False)
         return entry
 
     def __call__(self, *args):
@@ -303,4 +364,7 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
     math_mode = pallas_kwargs.pop("math_mode", MathMode.FAST)
     vmap_method = pallas_kwargs.pop("vmap_method", None)
     threadgroup = pallas_kwargs.pop("threadgroup", None)
-    return FfiCallable(kernel, pallas_kwargs, math_mode, vmap_method, threadgroup)
+    cache_size = pallas_kwargs.pop("cache_size", 256)
+    return FfiCallable(
+        kernel, pallas_kwargs, math_mode, vmap_method, threadgroup, cache_size
+    )

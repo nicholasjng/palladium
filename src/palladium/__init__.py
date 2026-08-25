@@ -9,6 +9,7 @@ the intermediate text.
 from __future__ import annotations
 
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 
@@ -22,6 +23,7 @@ from palladium.errors import (
     DispatchError,
     EmitError,
     PalladiumError,
+    StackOverflowError,
     TraceError,
     UnsupportedPrimitiveError,
 )
@@ -33,6 +35,12 @@ from palladium.threadgroup import (
     threads_per_threadgroup,
 )
 from palladium.trace import BlockInfo, KernelSpec, ScratchInfo, trace
+from palladium.verify import (
+    DEFAULT_ATOL,
+    DEFAULT_RTOL,
+    VerificationError,
+    verify_against,
+)
 
 __all__ = [
     "BlockInfo",
@@ -45,8 +53,10 @@ __all__ = [
     "MetalCallable",
     "PalladiumError",
     "ScratchInfo",
+    "StackOverflowError",
     "TraceError",
     "UnsupportedPrimitiveError",
+    "VerificationError",
     "barrier",
     "bind",
     "debug_msl",
@@ -112,6 +122,7 @@ class MetalCallable:
         pallas_kwargs: dict[str, Any],
         math_mode: Any,
         threadgroup: int | tuple[int, ...] | None,
+        cache_size: int = 256,
     ) -> None:
         import jax.experimental.pallas as pl
 
@@ -119,7 +130,12 @@ class MetalCallable:
         self._math_mode = math_mode
         self._threadgroup = threadgroup
         self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
-        self.cache: dict[CacheKey, BoundKernel] = {}
+        # Bounded like the jax.ffi path's: each entry holds a compiled
+        # Metal pipeline, so an unbounded cache in a long-lived process
+        # tracing many shapes retains every one. Insertion-ordered and
+        # re-inserted on hit, so popping the first item evicts the LRU.
+        self.cache: OrderedDict[CacheKey, BoundKernel] = OrderedDict()
+        self._cache_size = cache_size
         # Guards trace/emit/compile on a cache miss: concurrent first
         # calls on the same shape must compile exactly once.
         self._lock = threading.Lock()
@@ -138,6 +154,55 @@ class MetalCallable:
         _check_dtypes(args)
         return explain_spec(trace(self._staged, *args), self._threadgroup)
 
+    def verify(
+        self,
+        *args,
+        reference=None,
+        rtol: float = DEFAULT_RTOL,
+        atol: float = DEFAULT_ATOL,
+    ):
+        """Run on the GPU and diff against a reference; return the output.
+
+        The project's validation doctrine in one call. By default the
+        reference is this kernel's own `interpret=True` oracle, so a
+        round trip is `f.verify(x)` instead of a hand-rolled
+        `assert_allclose(f(x), f.interpret(x))`.
+
+        Parameters
+        ----------
+        *args
+            Kernel inputs, same as `__call__`.
+        reference : callable, optional
+            Alternative reference taking the same arguments. Required
+            for kernels using `palladium.threadgroup_memory`: interpret
+            models each program instance as a threadgroup of one, so it
+            computes a different thing and comparing to it is
+            meaningless. `verify` refuses rather than pass silently.
+        rtol, atol : float, optional
+            Tolerances. The defaults allow for FAST math, which reorders
+            float arithmetic and approximates transcendentals.
+
+        Returns
+        -------
+        The GPU output, so `verify` can replace a call site directly.
+
+        Raises
+        ------
+        VerificationError
+            On disagreement, naming the worst element and its index.
+        """
+        return _unwrap(
+            verify_against(
+                self.__call__,
+                None if reference is not None else self.interpret,
+                trace(self._staged, *args).uses_threadgroup,
+                args,
+                reference,
+                rtol,
+                atol,
+            )
+        )
+
     def pin(self, *args) -> Callable[[], np.ndarray | tuple[np.ndarray, ...]]:
         """Upload the inputs once; return a zero-argument callable that
         re-dispatches on the pinned device buffers (see
@@ -153,6 +218,8 @@ class MetalCallable:
         arrays = [np.asarray(a) for a in args]
         key: CacheKey = tuple((a.shape, a.dtype.str) for a in arrays)
         bound = self.cache.get(key)
+        if bound is not None:
+            self.cache.move_to_end(key)
         if bound is None:
             with self._lock:
                 bound = self.cache.get(key)
@@ -167,7 +234,14 @@ class MetalCallable:
                         threadgroup=self._threadgroup,
                     )
                     self.cache[key] = bound
+                    while self._cache_size and len(self.cache) > self._cache_size:
+                        self.cache.popitem(last=False)
         return bound(*arrays)
+
+
+def _unwrap(outs):
+    """Match `__call__`'s convention: a bare array for single-output."""
+    return outs[0] if len(outs) == 1 else outs
 
 
 def debug_msl(kernel: Callable, *example_args, **pallas_kwargs) -> str:
@@ -234,4 +308,5 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> MetalCallable:
 
     math_mode = pallas_kwargs.pop("math_mode", MathMode.FAST)
     threadgroup = pallas_kwargs.pop("threadgroup", None)
-    return MetalCallable(kernel, pallas_kwargs, math_mode, threadgroup)
+    cache_size = pallas_kwargs.pop("cache_size", 256)
+    return MetalCallable(kernel, pallas_kwargs, math_mode, threadgroup, cache_size)

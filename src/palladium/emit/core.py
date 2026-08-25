@@ -63,6 +63,17 @@ CTYPES = {
     "bool": "bool",
 }
 
+# Size of each CTYPES value, for the per-thread stack estimate in
+# `Cursor.account`. MSL bool is one byte.
+CTYPE_BYTES = {
+    "float": 4,
+    "half": 2,
+    "bfloat": 2,
+    "int": 4,
+    "uint": 4,
+    "bool": 1,
+}
+
 _PID = ("_pid.x", "_pid.y", "_pid.z")
 _TID = "_tid.x"
 _TPT = "_tpt.x"
@@ -138,6 +149,31 @@ class CVal:
         return self.expr if not self.shape else f"{self.expr}[{index}]"
 
 
+@dataclasses.dataclass(frozen=True)
+class EmitStats:
+    """Per-program-instance storage one emitted kernel declares.
+
+    Attributes
+    ----------
+    thread_bytes : int
+        Bytes of `thread`-space storage: loaded blocks, intermediates,
+        scratch. Bounded by the per-thread stack, which Metal does not
+        publish a figure for -- treat this as the number to shrink when
+        pipeline creation fails, not as a value with a known ceiling.
+    threadgroup_bytes : int
+        Bytes of `threadgroup`-space storage, shared per group. Unlike
+        the stack, this has a real published budget:
+        `metal_runtime.device_info()["max_threadgroup_memory_length"]`.
+
+    Neither figure is liveness-aware. MSL declarations are function
+    scoped and Metal's own pipeline check is equally conservative, so
+    this over-counts in exactly the places Metal does.
+    """
+
+    thread_bytes: int
+    threadgroup_bytes: int
+
+
 class Cursor:
     """The write position into one kernel's growing MSL text.
 
@@ -151,6 +187,20 @@ class Cursor:
         self.lines: list[str] = []
         self.indent = 1
         self._names = itertools.count()
+        # Running total of thread-local bytes declared, and the separate
+        # threadgroup-space total. Not liveness-aware: MSL declarations
+        # are function-scoped and Metal's own pipeline check is equally
+        # conservative, so this over-counts exactly where Metal does.
+        self.thread_bytes = 0
+        self.threadgroup_bytes = 0
+
+    def account(self, ctype: str, count: int, space: str = "thread") -> None:
+        """Record `count` elements of `ctype` declared in `space`."""
+        nbytes = CTYPE_BYTES[ctype] * max(count, 1)
+        if space == "threadgroup":
+            self.threadgroup_bytes += nbytes
+        else:
+            self.thread_bytes += nbytes
 
     def emit(self, line: str) -> None:
         """Append one MSL line at the current indentation."""
@@ -283,6 +333,7 @@ def declare(env: Environment, cursor: Cursor, var: Var) -> CVal:
     shape = tuple(int(d) for d in aval.shape)
     name = cursor.fresh()
     size = math.prod(shape)
+    cursor.account(ctype, size)
     cursor.emit(f"{ctype} {name}[{size}];" if shape else f"{ctype} {name};")
     cval = CVal(expr=name, shape=shape, ctype=ctype)
     env.bind(var, cval)
@@ -377,7 +428,8 @@ def emit_jaxpr(
         in_vals,
         RULES,
         lambda name: UnsupportedPrimitiveError(
-            f"no MSL rule for primitive '{name}'; add one with @rule(...)"
+            f"no MSL rule for primitive '{name}'; add one with @rule(...)",
+            primitive=name,
         ),
     )
 
@@ -429,8 +481,10 @@ def _full_block_shape(info: BlockInfo) -> tuple[int, ...]:
     return (1,) * missing + info.block_shape
 
 
-def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
-    """Assemble the full MSL source for a KernelSpec.
+def emit_msl_stats(
+    spec: KernelSpec, kernel_name: str | None = None
+) -> tuple[str, EmitStats]:
+    """Assemble the full MSL source for a KernelSpec, with its storage stats.
 
     Signature convention (relied on by `dispatch.bind`): operands in
     jaxpr order (inputs then outputs) bound to `[[buffer(k)]]`, then
@@ -446,8 +500,9 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
 
     Returns
     -------
-    str
-        Complete, self-contained MSL source.
+    tuple of (str, EmitStats)
+        Complete, self-contained MSL source, and the per-instance
+        storage the kernel declares.
 
     Raises
     ------
@@ -511,6 +566,7 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
         # Both spaces are compile-time-sized local arrays; only the
         # qualifier differs. MSL requires threadgroup variables at kernel
         # scope, which is where these already land.
+        cursor.account(ctype, size, info.space)
         scratch_op = f"{info.space} {ctype} scratch{k}"
         scratch_op += f"[{size}];" if shape else ";"
         cursor.emit(scratch_op)
@@ -533,7 +589,7 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
     emit_jaxpr(env, cursor, spec.jaxpr, ref_vals)
 
     head = f"kernel void {name}(\n    " + ",\n    ".join(params) + ")\n{"
-    return "\n".join(
+    source = "\n".join(
         [
             "#include <metal_stdlib>",
             "using namespace metal;",
@@ -544,6 +600,19 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
             "",
         ]
     )
+    return source, EmitStats(
+        thread_bytes=cursor.thread_bytes,
+        threadgroup_bytes=cursor.threadgroup_bytes,
+    )
+
+
+def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
+    """Assemble the full MSL source for a KernelSpec.
+
+    Thin wrapper over `emit_msl_stats` for callers that only want the
+    text. See that function for the full contract.
+    """
+    return emit_msl_stats(spec, kernel_name)[0]
 
 
 def ref_view(env: Environment, ref: CVal, indexer: NDIndexer) -> CVal:

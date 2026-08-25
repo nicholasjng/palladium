@@ -18,7 +18,9 @@ from pathlib import Path
 import metal_runtime as mr
 import numpy as np
 
-from palladium.errors import DispatchError, EmitError
+from palladium.diagnostics import check_threadgroup, normalize_threadgroup
+from palladium.emit import emit_msl_stats
+from palladium.errors import DispatchError, EmitError, StackOverflowError
 from palladium.trace import KernelSpec
 
 __all__ = ["BoundKernel", "PendingResult", "bind"]
@@ -380,6 +382,11 @@ def bind(
     """
     if pipeline_depth < 1:
         raise ValueError(f"pipeline_depth must be >= 1, got {pipeline_depth}")
+    # Resolve sentinels ('simdgroup') and int shorthand once, here: what
+    # BoundKernel stores goes straight to mr.Batch.add, which takes only
+    # ints and sequences.
+    threadgroup = normalize_threadgroup(threadgroup)
+    check_threadgroup(spec, threadgroup)
     if spec.uses_threadgroup and threadgroup is None:
         raise EmitError(
             f"kernel {spec.name!r} declares threadgroup_memory scratch, so it "
@@ -396,13 +403,19 @@ def bind(
         if "stack space" in str(e):
             # Metal's pipeline creation rejects kernels whose thread-local
             # arrays overflow the per-thread stack; translate the opaque
-            # message into the actual fix.
-            raise EmitError(
+            # message into the actual fix. Re-emitting to recover the byte
+            # count is wasted work only on this already-failing path, and it
+            # turns "too large" into a number to aim at.
+            measured = emit_msl_stats(spec)[1].thread_bytes
+            raise StackOverflowError(
                 f"{e}\n\nEvery loaded block and intermediate value lives in "
-                "thread-local memory, and this kernel's per-instance blocks "
-                "are too large for the per-thread stack. Shrink them by "
-                "adding or refining the grid and BlockSpecs so each program "
-                "instance touches a smaller block."
+                f"thread-local memory, and this kernel declares about "
+                f"{measured} bytes of it per program instance -- too much for "
+                "the per-thread stack. Shrink it by adding or refining the "
+                "grid and BlockSpecs so each program instance touches a "
+                "smaller block; palladium.metal_call(...).explain(*args) "
+                "reports the figure without compiling.",
+                stack_bytes=measured,
             ) from None
         raise
     except mr.CompileError as e:

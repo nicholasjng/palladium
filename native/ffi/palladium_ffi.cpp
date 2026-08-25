@@ -9,6 +9,8 @@
 // mutex-guarded the same way metal-runtime's own caches are.
 
 #include <algorithm>
+#include <cstdlib>
+#include <list>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -24,6 +26,25 @@ namespace {
 // MRLibrary/MRPipeline for the process lifetime. mr_compile_library
 // itself doesn't cache (unlike the Python bindings' library_for()), so
 // this exists because nothing upstream provides it.
+// Compiled kernels are keyed by (source, entry point, math mode) and each
+// holds a Metal library and pipeline for the process lifetime. A long-lived
+// process tracing many shapes (a server with dynamic batch sizes) would grow
+// without bound, so the cache is an LRU with a cap. The default is generous
+// relative to any realistic working set of distinct shapes; PALLADIUM_KERNEL_
+// CACHE_SIZE overrides it, and 0 disables eviction entirely.
+constexpr size_t kDefaultKernelCacheSize = 256;
+
+static size_t kernel_cache_capacity() {
+  const char *env = std::getenv("PALLADIUM_KERNEL_CACHE_SIZE");
+  if (!env || !*env)
+    return kDefaultKernelCacheSize;
+  char *end = nullptr;
+  unsigned long v = std::strtoul(env, &end, 10);
+  if (end == env || *end)
+    return kDefaultKernelCacheSize;
+  return (size_t)v;
+}
+
 class KernelCache {
 public:
   static KernelCache &instance() {
@@ -46,8 +67,10 @@ public:
     {
       std::lock_guard<std::mutex> lock(mutex_);
       auto it = entries_.find(key);
-      if (it != entries_.end())
-        return it->second;
+      if (it != entries_.end()) {
+        touch(it);
+        return it->second->second;
+      }
     }
 
     // Compiled outside the lock: holding it across a compile/build would
@@ -77,19 +100,50 @@ public:
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = entries_.find(key);
     if (it != entries_.end()) {
+      // Lost the compile race; release ours and use the winner's.
       mr_release_pipeline(pipeline);
       mr_release_library(library);
-      return it->second;
+      touch(it);
+      return it->second->second;
     }
-    auto entry = std::make_pair(library, pipeline);
-    entries_.emplace(std::move(key), entry);
+    Entry entry{library, pipeline};
+    order_.push_front({key, entry});
+    entries_.emplace(std::move(key), order_.begin());
+    evict_if_needed();
     return entry;
   }
 
 private:
+  using Entry = std::pair<MRLibrary *, MRPipeline *>;
+  using Node = std::pair<std::string, Entry>;
+  using Iter = std::list<Node>::iterator;
+
+  // Most-recently-used at the front. Called with mutex_ held.
+  void touch(std::unordered_map<std::string, Iter>::iterator it) {
+    order_.splice(order_.begin(), order_, it->second);
+  }
+
+  // Called with mutex_ held. Releasing a library/pipeline still referenced by
+  // an in-flight dispatch would be a use-after-free, but mr_dispatch retains
+  // what it needs for the lifetime of the command buffer, so an evicted entry
+  // stays alive until that work drains.
+  void evict_if_needed() {
+    const size_t cap = capacity_;
+    if (cap == 0)
+      return;
+    while (entries_.size() > cap) {
+      Node &victim = order_.back();
+      mr_release_pipeline(victim.second.second);
+      mr_release_library(victim.second.first);
+      entries_.erase(victim.first);
+      order_.pop_back();
+    }
+  }
+
   std::mutex mutex_;
-  std::unordered_map<std::string, std::pair<MRLibrary *, MRPipeline *>>
-      entries_;
+  const size_t capacity_ = kernel_cache_capacity();
+  std::list<Node> order_;
+  std::unordered_map<std::string, Iter> entries_;
 };
 
 // Wraps one FFI buffer via mr_wrap_buffer, appending to `wrapped`/`offsets`.

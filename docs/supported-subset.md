@@ -92,6 +92,22 @@ any of this -- it runs instances sequentially and reports
 cooperative kernel must be validated against a reference implementation
 rather than the interpret oracle.
 
+## Checking your kernel
+
+`call.verify(*args)` runs the kernel and diffs it against a reference,
+defaulting to this kernel's own `interpret=True` oracle with tolerances
+that allow for FAST math. It returns the GPU output, so it can replace
+a call site directly. Kernels using `threadgroup_memory` must pass an
+explicit `reference=`: interpret has no threadgroups and models each
+program instance as a group of one, so the oracle would be comparing
+against a different computation.
+
+`call.explain(*args)` reports launch geometry plus the per-instance
+storage the kernel declares -- `thread_bytes` (the per-thread stack
+figure to shrink when pipeline creation fails) and, for cooperative
+kernels, `threadgroup_bytes` against the device budget. It emits MSL to
+measure; it compiles and dispatches nothing.
+
 ## Hard limits
 
 - Per-thread stack: loaded blocks and intermediates are thread-local
