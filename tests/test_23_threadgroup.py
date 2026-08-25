@@ -394,3 +394,88 @@ def test_cooperative_effects_pass_the_gpu_effect_gate():
     )
     spec = palladium.trace(staged, jax.ShapeDtypeStruct((TG,), jnp.float32))
     assert effects.foreign_effects(spec.jaxpr) == []
+
+
+# --- vmap over cooperative kernels ---------------------------------------
+
+
+def _batched_block_sums(xb, tg):
+    """Per-thread broadcast of each group's sum, for every batch row."""
+    out = np.empty_like(xb)
+    for start in range(0, xb.shape[-1], tg):
+        block = xb[..., start : start + tg]
+        out[..., start : start + tg] = block.sum(axis=-1, keepdims=True)
+    return out
+
+
+@pytest.mark.parametrize(
+    "vmap_method", ["sequential", "sequential_unrolled", "pipelined"]
+)
+@pytest.mark.parametrize("n", [TG * 4, 100])
+def test_vmap_over_a_cooperative_kernel(vmap_method, n):
+    """Every vmap method must preserve threadgroup semantics.
+
+    The concern was that 'pipelined' handles a whole batch in one FFI
+    call and might therefore widen the grid, moving threadgroup
+    boundaries. It does not: the native handler issues one dispatch per
+    batch element with the same grid and threadgroup, varying only the
+    buffer offsets, so each element sees exactly the geometry it would
+    unbatched. n=100 is not a multiple of TG, so every element also
+    exercises the partial tail group.
+    """
+    batch = 4
+    xb = np.stack([np.arange(n, dtype=np.float32) * (j + 1) for j in range(batch)])
+    f = palladium.metal_call_jit(
+        _block_sum_kernel,
+        grid=(n,),
+        in_specs=[pl.BlockSpec((1,), lambda i: (i,))],
+        out_specs=pl.BlockSpec((1,), lambda i: (i,)),
+        out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
+        scratch_shapes=[threadgroup_memory((TG,), jnp.float32)],
+        threadgroup=TG,
+        vmap_method=vmap_method,
+    )
+    got = np.asarray(jax.jit(jax.vmap(f))(jnp.asarray(xb)))
+    np.testing.assert_allclose(got, _batched_block_sums(xb, TG), rtol=1e-6)
+
+
+def test_vmap_methods_agree_with_each_other_on_a_cooperative_kernel():
+    """Cross-check the three paths rather than only the NumPy reference:
+    a shared misunderstanding of the batching contract would show up as
+    disagreement between them even if one matched by luck."""
+    n, batch = 100, 3
+    xb = np.stack([np.arange(n, dtype=np.float32) * (j + 1) for j in range(batch)])
+
+    def run(method):
+        f = palladium.metal_call_jit(
+            _block_sum_kernel,
+            grid=(n,),
+            in_specs=[pl.BlockSpec((1,), lambda i: (i,))],
+            out_specs=pl.BlockSpec((1,), lambda i: (i,)),
+            out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
+            scratch_shapes=[threadgroup_memory((TG,), jnp.float32)],
+            threadgroup=TG,
+            vmap_method=method,
+        )
+        return np.asarray(jax.jit(jax.vmap(f))(jnp.asarray(xb)))
+
+    base = run("sequential")
+    for method in ("sequential_unrolled", "pipelined"):
+        np.testing.assert_allclose(run(method), base, rtol=1e-6)
+
+
+def test_vmap_over_a_cooperative_kernel_still_needs_a_threadgroup():
+    """Batching must not become a way around the explicit-size contract."""
+    n = 64
+    f = palladium.metal_call_jit(
+        _block_sum_kernel,
+        grid=(n,),
+        in_specs=[pl.BlockSpec((1,), lambda i: (i,))],
+        out_specs=pl.BlockSpec((1,), lambda i: (i,)),
+        out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
+        scratch_shapes=[threadgroup_memory((TG,), jnp.float32)],
+        vmap_method="pipelined",
+    )
+    xb = jnp.zeros((2, n), jnp.float32)
+    with pytest.raises(EmitError, match="explicit"):
+        jax.jit(jax.vmap(f))(xb)

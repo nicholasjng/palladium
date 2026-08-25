@@ -58,7 +58,10 @@ never inferred), `palladium.thread_index()`, and
 size no larger than the declared extent. Both `metal_call` and
 `metal_call_jit` accept it; leaving it unset is a loud error on either
 path, since a runtime-chosen size is commonly larger than the declared
-extent and indexing past it corrupts silently.
+extent and indexing past it corrupts silently. `jax.vmap` composes over
+cooperative kernels under every supported `vmap_method`: each batch
+element is dispatched with the kernel's own grid and threadgroup, so
+batching does not move threadgroup boundaries.
 
 Control flow: `lax.fori_loop` and full `lax.scan` (scanned xs, stacked
 ys, and `reverse=True`), `lax.while_loop` (data-dependent, divergent

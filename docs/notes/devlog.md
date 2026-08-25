@@ -92,3 +92,24 @@ the top of `bind`. And `metal_call_jit` silently forwarded `cache_size`
 to `pallas_call`. Also worth remembering: the stack figure is not
 liveness-aware, but neither is Metal's own pipeline check, so it
 over-counts in exactly the same places.
+
+## B.6 — vmap over cooperative kernels   (2026-08-25)
+
+**Done:** eight tests in `tests/test_23_threadgroup.py` covering
+`jax.vmap` over a threadgroup kernel under all three vmap methods, at
+both an exact multiple of the threadgroup size and a partial tail group,
+cross-checked between methods as well as against NumPy. Sabotage-checked
+by aliasing the per-element buffer offsets and by dropping the
+threadgroup on the batched path.
+
+**Why:** the last open item from Part B, and the one flagged as a
+possible silent-corruption case.
+
+**Note:** the concern was unfounded, and the reason is worth
+remembering. `pipelined` is documented as handling the whole batch in
+"one FFI call", which I read as one dispatch with a widened grid --
+which would have moved threadgroup boundaries. Reading
+`palladium_ffi.cpp` shows it issues `batch_size` separate
+`mr_dispatch_async` calls sharing one `MRLaunchDesc`, varying only
+buffer offsets. One FFI call, N dispatches, unchanged geometry per
+element. Check the dispatch loop, not the docstring.

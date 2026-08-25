@@ -236,12 +236,21 @@ normalize the knob differently. The stale `(32,1,1)` comment in
 Cooperative kernels now run on both paths, including nested in
 `jax.jit`.
 
-### Still open
+### vmap (resolved 2026-08-25)
 
-- **`jax.vmap` over a cooperative kernel is unexercised.** The FFI path
-  only permits the sequential vmap methods, which dispatch once per
-  batch element, so each element gets its own threadgroups and the model
-  should hold -- but no test covers it.
+All three vmap methods preserve threadgroup semantics, including
+`pipelined`, and `tests/test_23_threadgroup.py` covers each against a
+NumPy reference and against each other.
+
+The worry was that `pipelined` "handles the whole batch in one FFI call"
+and might therefore widen the grid, moving threadgroup boundaries. It
+does not: one FFI call is not one dispatch. `palladium_ffi.cpp` issues
+`batch_size` separate `mr_dispatch_async` calls with the *same*
+`MRLaunchDesc` -- same grid, same threadgroup -- varying only the buffer
+offsets, with a bounded in-flight window. Each batch element therefore
+sees exactly the geometry it would unbatched, tail group included.
+
+### Still open
 - **The extent contract is one-sided and unenforced.** `bind()` and
   `ffi.py` require an *explicit* threadgroup; neither checks it against
   the declared extent, because palladium cannot tell which scratch array
