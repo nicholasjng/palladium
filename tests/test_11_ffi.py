@@ -232,6 +232,57 @@ def test_vmap_pipelined_multi_output(rng):
     np.testing.assert_allclose(np.asarray(got_d), xs * xs, rtol=1e-6)
 
 
+def test_vmap_works_by_default(rng):
+    """The default is 'pipelined': jax.vmap composes with no opt-in. Was
+    None, which sent users to jax.ffi's own NotImplementedError — and that
+    message recommends expand_dims/broadcast_all, the two methods
+    metal_call_jit rejects as silently wrong here."""
+
+    def kernel(x_ref, o_ref):
+        o_ref[...] = jnp.tanh(x_ref[...]) * 2.0
+
+    kwargs = {"out_shape": jax.ShapeDtypeStruct((16,), jnp.float32)}
+    f = palladium.metal_call_jit(kernel, **kwargs)
+    xs = rng.standard_normal((12, 16)).astype(np.float32)
+
+    got = np.asarray(jax.vmap(f)(xs))
+    explicit = palladium.metal_call_jit(kernel, **kwargs, vmap_method="pipelined")
+    np.testing.assert_array_equal(got, np.asarray(jax.vmap(explicit)(xs)))
+    np.testing.assert_array_equal(got, np.stack([np.asarray(f(x)) for x in xs]))
+
+
+def test_nested_vmap_batches_outer_levels_sequentially(rng):
+    """One pipelined FFI call is one vmap level; an enclosing vmap batches
+    the ffi_call itself, one dispatch per outer element."""
+
+    def kernel(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 3.0
+
+    f = palladium.metal_call_jit(
+        kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32)
+    )
+    xs = rng.standard_normal((3, 5, 8)).astype(np.float32)
+    np.testing.assert_array_equal(np.asarray(jax.vmap(jax.vmap(f))(xs)), xs * 3.0)
+
+
+def test_vmap_method_none_refuses_batching_in_palladium_terms():
+    """Opting out still reports through palladium: the custom_vmap rule
+    raises before jax.ffi can suggest the unsafe whole-batch methods."""
+
+    def kernel(x_ref, o_ref):
+        o_ref[...] = x_ref[...]
+
+    f = palladium.metal_call_jit(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
+        vmap_method=None,
+    )
+    x = np.ones((8,), dtype=np.float32)
+    np.testing.assert_array_equal(np.asarray(f(x)), x)  # unvmapped still works
+    with pytest.raises(ValueError, match="vmap_method='pipelined'"):
+        jax.vmap(f)(np.ones((4, 8), dtype=np.float32))
+
+
 def test_whole_batch_vmap_methods_rejected():
     # expand_dims/broadcast_all re-invoke the target once with batched
     # buffers, but the launch grid is baked per unbatched shape; accepting
@@ -239,7 +290,7 @@ def test_whole_batch_vmap_methods_rejected():
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...]
 
-    with pytest.raises(ValueError, match="sequential"):
+    with pytest.raises(ValueError, match="pipelined"):
         palladium.metal_call_jit(
             kernel,
             out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),

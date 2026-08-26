@@ -86,12 +86,15 @@ Two transformation notes:
   a backward kernel from forward MSL). Author the backward pass as a
   second Pallas kernel and pair the two with `jax.custom_vjp`,
   gradient-checked against `jax.grad` of the plain jnp expression.
-- **`jax.vmap`**: pass `vmap_method="sequential"` (or
-  `"sequential_unrolled"`) to `metal_call_jit`. Each batch element is a
-  separate dispatch paying the fixed dispatch floor, so this is the
-  convenience path; putting the batch dimension in the Pallas grid is
-  the fast one. Whole-batch methods are rejected (the launch grid is
-  baked per unbatched shape).
+- **`jax.vmap`**: works out of the box. The default
+  `vmap_method="pipelined"` sends the whole batch through one FFI call
+  and loops it in the native handler with several dispatches in flight;
+  nested vmap falls back to one dispatch per outer element.
+  `"sequential"` and `"sequential_unrolled"` make every batch element a
+  separate dispatch paying the fixed dispatch floor, and `None` refuses
+  batching altogether. Either way, putting the batch dimension in the
+  Pallas grid is faster still (one dispatch total). Whole-batch methods
+  are rejected (the launch grid is baked per unbatched shape).
 
 ## Seeing what you got
 

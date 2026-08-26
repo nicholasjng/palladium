@@ -10,6 +10,21 @@ weekly CI canary tests against jax head and the pin widens when it
 passes. metal-runtime is consumed as a path dependency during
 development; the pin moves to a tagged release when one exists.
 
+## Unreleased
+
+### Changed
+
+- `metal_call_jit`'s `vmap_method` now defaults to `"pipelined"`
+  instead of `None`, so `jax.vmap` composes over a kernel with no
+  opt-in. The old default raised jax.ffi's own `NotImplementedError`,
+  whose message recommends `expand_dims`/`broadcast_all` — the two
+  whole-batch methods palladium rejects, since the launch grid is baked
+  per unbatched shape. `vmap_method=None` still refuses batching, but
+  now raises palladium's own error naming the usable methods.
+- Nested `jax.vmap` over a pipelined kernel works instead of erroring:
+  the innermost level is the single batched FFI call, outer levels
+  batch the `ffi_call` one dispatch per element.
+
 ## 0.3.0 (2026-08-19)
 
 ### Scope
