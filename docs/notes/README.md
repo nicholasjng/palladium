@@ -5,6 +5,10 @@ records, kept for provenance. Nothing here is user documentation (that
 lives one level up in `docs/`), and nothing here is a stability
 promise.
 
+- [emitter-feature-sketches.md](emitter-feature-sketches.md): 2026-09-06
+  review follow-up; typed lowering, storage/views, masked blocks, primitive
+  coverage, fusion, cooperative reductions, and validation gates.
+
 - [emitter-simplifications.md](emitter-simplifications.md): running
   list of deferred work with the measurements gating each item;
   includes the Metal compiler carry-permutation bug record.

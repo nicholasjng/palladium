@@ -7,15 +7,14 @@ applied are listed at the bottom for the record.
 
 ## Correctness-adjacent
 
-- **`dot_general` ignores `preferred_element_type`.** Accumulation dtype
-  comes from the output aval. Accidentally right for f16-in/f32-out on
-  the scalar path (the accumulator is the output ctype), but untested,
-  and every vectorized/MMA path additionally gates on f32. Honor the
-  parameter explicitly before any mixed-precision kernel lands.
-- **Rank-1 `dot_general` (matvec) is rejected**, because `jnp.dot(v, M)`
-  stages a contraction on lhs dim 0. Canonicalize by treating rank-1 lhs
-  as `(1, k)` (and rank-1 rhs as `(k, 1)`) at the top of both dot rules;
-  small, mechanical, needs a test.
+The earlier rank-1 dot and mixed-precision accumulation items are now
+implemented: rank-1 operands canonicalize to matrices, and the scalar
+path promotes products to the output accumulation dtype. The vectorized
+paths remain f32-only. See `tests/test_16_diagnostics.py`.
+
+Current correctness follow-ups and feature designs are recorded in
+[emitter-feature-sketches.md](emitter-feature-sketches.md), including
+integer semantics, strided views, and cooperative builtin requirements.
 
 ## Small polish
 
@@ -86,7 +85,7 @@ oracle test first, since the fuzzer only found this one by chance.
   emitted MSL verified byte-identical before/after.
 - `cond` (with `lax.switch` clamping), `while`, `and`/`xor`/`not`, and
   `clamp` added to the classic model with oracle-backed tests
-  (`tests/test_17_control_flow.py`). The adaptive-ODE workarounds
+  (`tests/test_15_control_flow.py`). The adaptive-ODE workarounds
   (select-instead-of-branch, fixed-budget self-stalling loops, avoiding
   `&&`) are no longer forced by the emitter.
 - Scan's two-phase carry copy-back factored into `_copy_back_carries`,
