@@ -1,12 +1,11 @@
 """Exception hierarchy: everything palladium raises derives from
 PalladiumError, split by pipeline stage (trace, emit, dispatch).
 
-TraceError doubles as ValueError and DispatchError as TypeError so
-call sites that predate the hierarchy keep their behavior.
+TraceError also subclasses ValueError, DispatchError TypeError.
 
-Errors that a caller might reasonably branch on carry the deciding
-value as an attribute, so handlers can inspect a field instead of
-matching on message text: `UnsupportedPrimitiveError.primitive` and
+Errors worth branching on carry the deciding value as an attribute, so
+handlers need not match on message text:
+`UnsupportedPrimitiveError.primitive` and
 `StackOverflowError.stack_bytes`/`.limit`.
 """
 
@@ -46,9 +45,7 @@ class UnsupportedPrimitiveError(EmitError, NotImplementedError):
     Attributes
     ----------
     primitive : str or None
-        Name of the missing primitive, so a caller can branch on it
-        (fall back to CPU for a known-soft set, say) without parsing the
-        message.
+        Name of the missing primitive, for callers branching on it.
     """
 
     def __init__(self, *args: object, primitive: str | None = None) -> None:

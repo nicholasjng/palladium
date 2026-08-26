@@ -7,7 +7,7 @@ cooperative MMA model, FFI cooperative dispatch; 91 tests green).
 author a Pallas kernel within a documented subset, get either a fast
 kernel or a clear error, and trust the package not to change under them
 without a version bump. It does not mean an upstream JAX backend
-(ROADMAP stretch 11) or whole-jaxpr lowering
+(a PJRT plugin) or whole-jaxpr lowering
 (`whole-jaxpr-lowering-plan.md`, shelved). Those stay out of scope.
 
 The plan is four phases. Phases 1 and 2 are the substance; 3 and 4 are
@@ -81,7 +81,7 @@ naming the offending primitive and the nearest supported alternative.
    contract in the `metal_call` docstring and the user docs; keep SAFE
    as the documented escape for compensated arithmetic.
 
-Acceptance gate: a test file (`test_18_diagnostics.py`) that asserts
+Acceptance gate: a test file (`test_16_diagnostics.py`) that asserts
 (a) `explain()` output for one cooperative and one fallback kernel
 names the correct model and reason, (b) five representative
 out-of-subset kernels each raise the right exception type with the

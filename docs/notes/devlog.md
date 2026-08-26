@@ -2,7 +2,7 @@
 
 Per-card narrative from the tutor arc: what landed, why it was next, and
 the one decision worth remembering. Status checkboxes live in
-`.tutor/progress.md`; this is the prose companion. Newest at the bottom.
+the commit log; this is the prose companion. Newest at the bottom.
 
 ## A — Per-invocation scratch operands   (2026-08-24)
 

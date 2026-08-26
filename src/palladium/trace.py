@@ -36,11 +36,10 @@ class ScratchInfo:
         Buffer element type.
     space: str
         Metal address space: `"thread"` (private to one program
-        instance, the `pl.MemorySpace` default) or `"threadgroup"`
-        (shared across the threadgroup, requested via
-        `palladium.threadgroup_memory`). Decides the qualifier
-        `emit_msl` declares the storage with, and nothing else -- both
-        are compile-time-sized local arrays.
+        instance, the default) or `"threadgroup"` (shared across the
+        threadgroup, requested via `palladium.threadgroup_memory`). Sets
+        the qualifier `emit_msl` declares the storage with; both are
+        compile-time-sized local arrays.
     """
 
     shape: tuple[int, ...]
@@ -73,7 +72,8 @@ class BlockInfo:
 
 @dataclasses.dataclass(frozen=True)
 class KernelSpec:
-    """Everything the emitter needs, and nothing it doesn't.
+    """The emitter's input: a traced pallas_call, reduced to what MSL
+    emission needs.
 
     Attributes
     ----------
@@ -107,9 +107,8 @@ class KernelSpec:
     def uses_threadgroup(self) -> bool:
         """Whether any scratch entry lives in `threadgroup` space.
 
-        True means the kernel communicates across threads, so the
-        dispatch threadgroup size stops being a free tuning knob and
-        becomes part of the kernel's contract (`palladium.bind`).
+        True makes the dispatch threadgroup size part of the kernel's
+        contract rather than a tuning knob; `bind` then requires it.
         """
         return any(info.space == "threadgroup" for info in self.scratch)
 
@@ -162,11 +161,11 @@ def _validate_aliases(
     inputs: tuple[BlockInfo, ...],
     outputs: tuple[BlockInfo, ...],
 ) -> None:
-    """One buffer behind both refs is only transparent when (a) both
-    sides slice it identically, and (b) every read of the input executes
-    before any write of the output; Pallas semantics keep the input's
-    pre-call values visible throughout. (b) is checked on effect order
-    over the kernel eqns, which covers sub-jaxprs.
+    """One buffer behind both refs is transparent only when (a) both sides
+    slice it identically and (b) every read of the input precedes any
+    write of the output, since Pallas keeps the input's pre-call values
+    visible throughout. (b) is checked on effect order over the eqns,
+    which covers sub-jaxprs.
     """
     for i, j in aliases:
         a, b = inputs[i], outputs[j]
@@ -228,11 +227,11 @@ def _validate_parallel_writes(
     grid: tuple[int, ...],
     n_in: int,
 ) -> None:
-    """Program instances run as parallel threads, so instances writing
-    the same output element race. Rejects the provable case: a grid axis
-    that neither the output's index map nor any top-level write index
-    depends on. Writes inside sub-jaxprs and non-injective maps that use
-    the axis pass unchecked (best-effort by design).
+    """Program instances run as parallel threads, so two writing the same
+    output element race. Rejects the provable case: a grid axis that
+    neither the output's index map nor any top-level write index depends
+    on. Best-effort: writes inside sub-jaxprs and non-injective maps that
+    use the axis pass unchecked.
     """
     for j, info in enumerate(outputs):
         o_var = jaxpr.invars[n_in + j]

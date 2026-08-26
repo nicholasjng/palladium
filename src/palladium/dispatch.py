@@ -46,10 +46,8 @@ def _numbered(msl_source: str) -> str:
     )
 
 
-# NumPy refuses to export ml_dtypes extension dtypes over DLPack, so a
-# bfloat16 array cannot cross into mr.Buffer as-is. The same bytes ship
-# as uint16 and the buffer is relabeled; a pure reinterpretation, so the
-# round trip is lossless and costs one O(1) view.
+# NumPy will not export ml_dtypes dtypes over DLPack, so bfloat16 ships as
+# uint16 with the buffer relabeled: a lossless O(1) reinterpretation.
 def _to_native(arr: np.ndarray) -> tuple[np.ndarray, str | None]:
     if arr.dtype.name == "bfloat16":
         return arr.view(np.uint16), "bfloat16"
@@ -68,7 +66,7 @@ def _read_buffer(buf: mr.Buffer) -> np.ndarray:
 class PendingResult:
     """A launched kernel whose command buffer may still be executing.
 
-    Returned by `BoundKernel.launch`, committed but not waited on.
+    Returned by `BoundKernel.launch`: committed, not waited on.
 
     Attributes
     ----------
@@ -78,7 +76,7 @@ class PendingResult:
         This launch's outputs, read back on `wait()`.
     done : bool
         True once `wait()` has returned; lets `BoundKernel` reuse the
-        input-buffer slot without re-blocking on finished work.
+        input-buffer slot without re-blocking.
     """
 
     batch: mr.Batch
@@ -92,9 +90,8 @@ class PendingResult:
     def wait(self) -> np.ndarray | tuple[np.ndarray, ...]:
         """Block until the GPU is done, then return the outputs.
 
-        Results are materialized once and cached: the slot ring calls
-        this before rewriting an aliased output's buffer, so the arrays
-        a later caller-side `wait()` returns stay intact.
+        Results are materialized once and cached: the slot ring calls this
+        before rewriting an aliased output's buffer.
         """
         if self._results is None:
             self.batch.wait()
@@ -138,9 +135,8 @@ class BoundKernel:
     kernel: mr.Kernel
     msl_source: str
     threadgroup: int | tuple[int, ...] | None = None
-    # Maximum number of launches in flight at once.
-    # Each concurrent launch needs its own input buffers, so the ceiling is also a memory bound:
-    # depth x input bytes, though the ring only grows when launches actually overlap.
+    # Max launches in flight. Each needs its own input buffers, so this
+    # bounds memory too: depth x input bytes, allocated only on overlap.
     pipeline_depth: int = 8
     # Ring of input-buffer slots, LRU-ordered, grown on demand up to
     # pipeline_depth. Buffer reuse is safe across calls: a BoundKernel is
@@ -159,12 +155,10 @@ class BoundKernel:
     def launch(self, *arrays: np.ndarray) -> PendingResult:
         """Encode and commit one dispatch without blocking on the result.
 
-        `__call__` is `launch` followed by `wait()`. Thread-safe: uploads
-        are serialized on a per-kernel lock, waits are not.
-
-        Launches without intervening waits overlap on the GPU queue, up
-        to `pipeline_depth` in flight, amortizing the fixed per-dispatch
-        queue latency; past that, `launch` blocks on the oldest.
+        `__call__` is `launch` then `wait()`. Thread-safe: uploads are
+        serialized on a per-kernel lock, waits are not. Launches without
+        intervening waits overlap up to `pipeline_depth` in flight,
+        amortizing queue latency; past that, `launch` blocks on the oldest.
 
         Parameters
         ----------
@@ -218,10 +212,9 @@ class BoundKernel:
                 for buf, (native, relabel) in zip(slot.in_bufs, natives, strict=True):
                     buf.copy_from(native, dtype=relabel)
             # Fresh per call, unlike inputs: to_numpy() is a live view, so
-            # reusing this buffer would mutate an array a caller might still
-            # be holding from an earlier, not-yet-waited-on PendingResult.
-            # Aliased outputs instead share the slot's input buffer (the
-            # in-place contract) and are copied out on wait().
+            # reuse would mutate an array an earlier PendingResult's caller
+            # still holds. Aliased outputs share the slot's input buffer
+            # (the in-place contract) and are copied out on wait().
             alias_of = {j: i for i, j in spec.aliases}
             out_bufs = [
                 slot.in_bufs[alias_of[j]]
@@ -303,10 +296,9 @@ class BoundKernel:
         """Upload `arrays` once; return a zero-argument callable that
         re-dispatches on the pinned device buffers.
 
-        Skips the per-call input upload of `__call__` for repeated calls
-        on unchanging inputs. Later mutation of the passed arrays is not
-        observed (data is copied at pin time). Outputs stay fresh per
-        call, same reasoning as `launch`.
+        Skips `__call__`'s per-call upload. Later mutation of the passed
+        arrays is not observed (copied at pin time); outputs stay fresh
+        per call, same as `launch`.
         """
         if self.spec.aliases:
             raise DispatchError(
@@ -375,16 +367,13 @@ def bind(
         `pipeline_depth` is not a positive integer.
     metal_runtime.CompileError
         On MSL compile failure, with the line-numbered source attached.
-        Fragment-assembled source (`metal_runtime.build_source`) is
-        re-raised as-is instead: Metal's diagnostic
-        already names the fragment and line, which the flat dump's line
-        numbers would only obscure.
+        Fragment-assembled source (`metal_runtime.build_source`) re-raises
+        as-is: Metal's diagnostic already names the fragment and line.
     """
     if pipeline_depth < 1:
         raise ValueError(f"pipeline_depth must be >= 1, got {pipeline_depth}")
-    # Resolve sentinels ('simdgroup') and int shorthand once, here: what
-    # BoundKernel stores goes straight to mr.Batch.add, which takes only
-    # ints and sequences.
+    # Resolve sentinels and int shorthand once: what BoundKernel stores
+    # goes straight to mr.Batch.add, which takes only ints and sequences.
     threadgroup = normalize_threadgroup(threadgroup)
     check_threadgroup(spec, threadgroup)
     if spec.uses_threadgroup and threadgroup is None:
@@ -401,11 +390,9 @@ def bind(
         kernel = mr.Kernel(msl_source, spec.name, math_mode=math_mode)
     except mr.PipelineBuildError as e:
         if "stack space" in str(e):
-            # Metal's pipeline creation rejects kernels whose thread-local
-            # arrays overflow the per-thread stack; translate the opaque
-            # message into the actual fix. Re-emitting to recover the byte
-            # count is wasted work only on this already-failing path, and it
-            # turns "too large" into a number to aim at.
+            # Metal rejects kernels whose thread-local arrays overflow the
+            # per-thread stack. Re-emit to recover the byte count: wasted
+            # work only on this already-failing path.
             measured = emit_msl_stats(spec)[1].thread_bytes
             raise StackOverflowError(
                 f"{e}\n\nEvery loaded block and intermediate value lives in "

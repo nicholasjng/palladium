@@ -1,22 +1,15 @@
 """Differential verification against a reference implementation.
 
-The project's validation doctrine is "diff every kernel against the
-`interpret=True` oracle with f32-honest tolerances", and until now every
-consumer hand-rolled it -- 40-odd copies of the same
-`assert_allclose(f(x), f.interpret(x))` across the test suite. This is
-that comparison as one call, with the two facts that make it correct
-built in rather than left to each caller.
+`assert_allclose(f(x), f.interpret(x))` as one call, with two defaults
+built in:
 
-Fact one: FAST math is the default, and it reorders float arithmetic and
-uses approximate transcendentals, so results are not bit-equal to the
-CPU oracle. The default tolerance reflects that.
-
-Fact two: cooperative kernels have no interpret oracle at all. Interpret
-runs program instances sequentially with no notion of a threadgroup, so
-it reports `thread_index() == 0` and `threads_per_threadgroup() == 1` --
-a kernel that reduces across threads computes something *different*
-there. Comparing against it would be meaningless, so `verify` refuses
-and asks for an explicit `reference=` instead.
+- FAST math (the default) reorders float arithmetic and approximates
+  transcendentals, so GPU results are not bit-equal to the CPU oracle;
+  the default tolerances reflect that.
+- Kernels using `threadgroup_memory` have no interpret oracle: interpret
+  reports `thread_index() == 0` and `threads_per_threadgroup() == 1`, so
+  a cross-thread reduction computes something else there. `verify`
+  refuses and asks for an explicit `reference=`.
 """
 
 from __future__ import annotations
@@ -28,9 +21,7 @@ import numpy as np
 
 __all__ = ["VerificationError", "verify_against"]
 
-# FAST math reorders arithmetic and approximates transcendentals; this is
-# the tolerance the existing suite settled on for f32 kernels after
-# measuring, not a guess.
+# Measured against the f32 kernels in the suite under FAST math.
 DEFAULT_RTOL = 1e-5
 DEFAULT_ATOL = 1e-6
 
@@ -38,8 +29,8 @@ DEFAULT_ATOL = 1e-6
 class VerificationError(AssertionError):
     """A kernel's GPU output disagreed with its reference.
 
-    Subclasses AssertionError so pytest reports it as a plain assertion
-    failure, while still being catchable as a distinct type.
+    Subclasses AssertionError so pytest reports it as an assertion
+    failure while it stays catchable as a distinct type.
 
     Attributes
     ----------
@@ -128,8 +119,8 @@ def verify_against(
 ) -> tuple[np.ndarray, ...]:
     """Run `gpu_fn` and a reference over `args`; raise on disagreement.
 
-    Shared by `MetalCallable.verify` and `FfiCallable.verify`; see
-    `MetalCallable.verify` for the user-facing contract.
+    Backs `MetalCallable.verify` and `FfiCallable.verify`, which document
+    the user-facing contract.
     """
     if reference is None:
         if uses_threadgroup:

@@ -77,14 +77,8 @@ CacheKey = tuple[tuple[tuple[int, ...], str], ...]
 
 
 def _check_dtypes(args: tuple) -> None:
-    """Reject unsupported element types before tracing, with the fix in
-    the message; without this they surface as a KeyError deep in emit.
-
-    bfloat16 is supported on both paths: NumPy will not export
-    ml_dtypes extension dtypes over DLPack, so the eager path ships the
-    bytes as uint16 and relabels the buffer (see dispatch._to_native, a
-    lossless reinterpretation); the FFI path passes raw pointers.
-    """
+    """Reject unsupported dtypes before tracing; they otherwise surface
+    as a KeyError inside emit."""
     for i, a in enumerate(args):
         dtype = getattr(a, "dtype", None)
         name = np.dtype(dtype if dtype is not None else np.asarray(a).dtype).name
@@ -130,20 +124,16 @@ class MetalCallable:
         self._math_mode = math_mode
         self._threadgroup = threadgroup
         self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
-        # Bounded like the jax.ffi path's: each entry holds a compiled
-        # Metal pipeline, so an unbounded cache in a long-lived process
-        # tracing many shapes retains every one. Insertion-ordered and
-        # re-inserted on hit, so popping the first item evicts the LRU.
+        # LRU: each entry holds a compiled Metal pipeline. Insertion-ordered
+        # and re-inserted on hit, so popping the first item evicts the LRU.
         self.cache: OrderedDict[CacheKey, BoundKernel] = OrderedDict()
         self._cache_size = cache_size
-        # Guards trace/emit/compile on a cache miss: concurrent first
-        # calls on the same shape must compile exactly once.
+        # Concurrent first calls on one shape must compile exactly once.
         self._lock = threading.Lock()
 
     def explain(self, *args) -> KernelDiagnostics:
-        """Report how the kernel executes for these inputs: launch
-        geometry and emitted MSL size. Emits MSL to measure it; compiles
-        and dispatches nothing.
+        """Report launch geometry and emitted MSL size for these inputs.
+        Emits MSL; compiles and dispatches nothing.
 
         Parameters
         ----------
@@ -163,10 +153,7 @@ class MetalCallable:
     ):
         """Run on the GPU and diff against a reference; return the output.
 
-        The project's validation doctrine in one call. By default the
-        reference is this kernel's own `interpret=True` oracle, so a
-        round trip is `f.verify(x)` instead of a hand-rolled
-        `assert_allclose(f(x), f.interpret(x))`.
+        The reference defaults to this kernel's `interpret=True` oracle.
 
         Parameters
         ----------
@@ -175,16 +162,14 @@ class MetalCallable:
         reference : callable, optional
             Alternative reference taking the same arguments. Required
             for kernels using `palladium.threadgroup_memory`: interpret
-            models each program instance as a threadgroup of one, so it
-            computes a different thing and comparing to it is
-            meaningless. `verify` refuses rather than pass silently.
+            models each instance as a threadgroup of one, so it computes
+            something else; `verify` refuses rather than pass silently.
         rtol, atol : float, optional
-            Tolerances. The defaults allow for FAST math, which reorders
-            float arithmetic and approximates transcendentals.
+            Tolerances, defaulting wide enough for FAST math.
 
         Returns
         -------
-        The GPU output, so `verify` can replace a call site directly.
+        The GPU output.
 
         Raises
         ------
@@ -205,9 +190,8 @@ class MetalCallable:
 
     def pin(self, *args) -> Callable[[], np.ndarray | tuple[np.ndarray, ...]]:
         """Upload the inputs once; return a zero-argument callable that
-        re-dispatches on the pinned device buffers (see
-        `BoundKernel.pinned`). Use for repeated calls on unchanging
-        inputs. Later mutation of the passed arrays is not observed."""
+        re-dispatches on the pinned device buffers. For repeated calls on
+        unchanging inputs; later mutation of the arrays is not observed."""
         arrays = [np.asarray(a) for a in args]
         self(*arrays)  # populate the shape cache (trace/emit/compile)
         key: CacheKey = tuple((a.shape, a.dtype.str) for a in arrays)
@@ -246,9 +230,6 @@ def _unwrap(outs):
 
 def debug_msl(kernel: Callable, *example_args, **pallas_kwargs) -> str:
     """Trace `kernel` through pallas_call and return the emitted MSL.
-
-    Per-operand pointer lines at the top of the body carry the BlockSpec
-    offsets; the rest is the kernel jaxpr, statement by statement.
 
     Parameters
     ----------
@@ -290,13 +271,11 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> MetalCallable:
 
     Notes
     -----
-    The default FAST math mode reorders float arithmetic and uses
-    approximate transcendentals, so results are not bit-equal to the
-    `interpret` oracle: expect ~1e-6 relative deviation for f32
-    elementwise work, up to ~1e-4 through exp/log-heavy kernels and
-    reductions (whose combine order also differs). Use SAFE for IEEE
-    ordering, and always for compensated arithmetic (FAST deletes the
-    error terms).
+    FAST math reorders float arithmetic and approximates transcendentals,
+    so results are not bit-equal to the `interpret` oracle: ~1e-6 relative
+    for f32 elementwise work, up to ~1e-4 through exp/log-heavy kernels and
+    reductions. Use SAFE for IEEE ordering, and always for compensated
+    arithmetic (FAST deletes the error terms).
 
     Returns
     -------

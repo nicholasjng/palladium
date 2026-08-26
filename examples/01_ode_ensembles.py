@@ -5,7 +5,7 @@ One Metal thread integrates one Lotka-Volterra system (RK4, fixed step)
 with its own parameters; the grid is the ensemble. The Diffrax baseline is
 the same ensemble under jit(vmap(diffeqsolve)) on the CPU backend; on
 macOS that IS the practical Diffrax deployment (jax-metal is stale and
-cannot run it; see ROADMAP).
+cannot run it).
 
 """
 

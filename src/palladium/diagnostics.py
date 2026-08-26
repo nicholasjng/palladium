@@ -41,9 +41,9 @@ class KernelDiagnostics:
     msl_lines : int
         Line count of the emitted source.
     thread_bytes : int
-        Per-instance `thread`-space storage. This is the figure to
-        shrink (via the grid and BlockSpecs) when pipeline creation
-        fails for stack space; Metal publishes no ceiling for it.
+        Per-instance `thread`-space storage; the figure to shrink (via
+        the grid and BlockSpecs) when pipeline creation fails for stack
+        space. Metal publishes no ceiling for it.
     threadgroup_bytes : int
         Per-group `threadgroup`-space storage, 0 unless the kernel uses
         `palladium.threadgroup_memory`.
@@ -83,9 +83,8 @@ def _human(nbytes: int) -> str:
 def device_limits() -> dict[str, Any]:
     """`metal_runtime.device_info()`, or an empty dict with no device.
 
-    Diagnostics must work on a machine without a GPU (the emitter and
-    tracer do), so every consumer treats a missing device as "unknown
-    limits" rather than an error.
+    Diagnostics work without a GPU, as the emitter and tracer do, so
+    consumers treat a missing device as unknown limits, not an error.
     """
     try:
         import metal_runtime as mr
@@ -100,17 +99,16 @@ def device_limits() -> dict[str, Any]:
 def normalize_threadgroup(
     threadgroup: int | tuple[int, ...] | None,
 ) -> tuple[int, ...] | None:
-    """The one place `threadgroup=` is turned into a tuple of ints.
+    """The one place `threadgroup=` becomes a tuple of ints.
 
     The knob is `int | tuple[int, ...] | None` at every entry point
-    (`metal_call`, `metal_call_jit`, `bind`, `explain`), and None means
-    "let the runtime choose". Shared so the eager and jax.ffi paths
-    cannot normalize it differently.
+    (`metal_call`, `metal_call_jit`, `bind`, `explain`); None means "let
+    the runtime choose". Shared so the eager and jax.ffi paths cannot
+    normalize it differently.
 
-    Also accepts the string `"simdgroup"`, resolving to the device's
-    SIMD width. A cooperative reduction over exactly one SIMD group is
-    the common case and the one with no cross-simdgroup latency, so it
-    deserves a name rather than a magic 32 at every call site.
+    Also accepts `"simdgroup"`, resolving to the device's SIMD width: a
+    reduction over exactly one SIMD group is the common case and pays no
+    cross-simdgroup latency.
     """
     if threadgroup is None:
         return None
@@ -130,10 +128,10 @@ def simdgroup_width() -> int:
 def check_threadgroup(spec: KernelSpec, threadgroup: tuple[int, ...] | None) -> None:
     """Validate a cooperative kernel's launch geometry against the device.
 
-    Two checks, both of which fail silently otherwise: threadgroup-space
-    storage over the device budget (Metal rejects the pipeline with a
-    less specific message), and a group larger than the device permits.
-    Kernels with no threadgroup storage are unaffected.
+    Checks threadgroup-space storage against the device budget (Metal
+    otherwise rejects the pipeline with a vaguer message) and the group
+    size against the device maximum. Kernels with no threadgroup storage
+    are unaffected.
     """
     if not spec.uses_threadgroup:
         return
@@ -200,8 +198,7 @@ def log_compile(
 ) -> None:
     """One stderr line per compiled kernel when PALLADIUM_EXPLAIN is set.
 
-    Called on the cache-miss path of MetalCallable and FfiCallable, so
-    repeated calls on cached shapes stay silent.
+    Called on the cache-miss path, so cached shapes stay silent.
     """
     if _explain_enabled():
         print(explain_spec(spec, threadgroup), file=sys.stderr)
