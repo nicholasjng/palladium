@@ -45,11 +45,9 @@ def _rule_get(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 
     An indexed load from a read-only (input) ref binds the pointer view
     instead of copying: nothing can write through a `const device` ref,
-    so the view has snapshot semantics. Full-block (un-indexed) loads
-    still copy; those are small per-thread blocks that are re-read many
-    times, where a thread-local copy pays off. The exception is a block
-    consumed only as scan xs, read once per element: it binds the ref
-    directly instead of paying per-thread stack for a copy.
+    so the view has snapshot semantics. Full-block loads copy, since
+    those blocks are re-read many times -- except a block consumed only
+    as scan xs, read once per element, which binds the ref directly.
     """
     indexer_args = eqn.params["tree"].unflatten(eqn.invars[1:])
     src = env.val(eqn.invars[0])
@@ -93,8 +91,8 @@ def _rule_swap(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """Store to a Ref: `o_ref[...] = y` (full block) or an indexed store
     like `o_ref[i, :] = y`.
 
-    Deviation: the outvar binds to the (possibly indexed) ref view, not a
-    pre-store snapshot, so reads of a swap result alias device memory.
+    A used result snapshots the old contents before the write. Ordinary
+    stores discard that result and need no snapshot.
     """
     ref, value = eqn.invars[0], eqn.invars[1]
     indexer_args = eqn.params["tree"].unflatten(eqn.invars[2:])
@@ -103,9 +101,15 @@ def _rule_swap(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         (indexer,) = indexer_args
         dst_ref = ref_view(env, dst_ref, indexer)
     stored = env.val(value)
+    outvar = eqn.outvars[0]
+    used = bool(env.consumer_eqns(outvar)) or env.escapes(outvar)
+    if used:
+        old = declare(env, cursor, outvar)
+        cursor.copy(old, dst_ref, old.size)
     if stored.expr != dst_ref.expr:
         cursor.copy(dst_ref, stored, dst_ref.size)
-    env.bind(eqn.outvars[0], dst_ref)
+    if not used:
+        env.bind(outvar, dst_ref)
 
 
 @rule("jit")
@@ -232,6 +236,14 @@ def _rule_reshape(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     if eqn.params["dimensions"] is not None:
         raise EmitError("reshape with a dimensions permutation is unimplemented")
     src = env.val(eqn.invars[0])
+    new_shape = eqn.params["new_sizes"]
+    if bool(src.shape) != bool(new_shape):
+        # Rank zero uses a scalar expression, while ranked values use
+        # indexable storage. A shape-only alias cannot cross that boundary.
+        dst = declare(env, cursor, eqn.outvars[0])
+        scalar = dataclasses.replace(src, expr=src.at("0"), shape=())
+        cursor.copy(dst, scalar, 1)
+        return
     env.bind(eqn.outvars[0], dataclasses.replace(src, shape=eqn.params["new_sizes"]))
 
 
@@ -239,11 +251,10 @@ def _rule_reshape(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 def _rule_transpose(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """`x.T` / `jnp.transpose(x, perm)` -> a materialized, permuted copy.
 
-    A real copy, not a view like reshape: transposed storage is
-    different bytes in the row-major flat-array model. `a.T` inside a
-    dot product stages as a standalone `transpose` equation ahead of
-    `dot_general`; the contraction itself always stays (lhs dim 1,
-    rhs dim 0).
+    A real copy, not a view like reshape: transposed storage is different
+    bytes in the row-major flat-array model. `a.T` inside a dot product
+    stages as a standalone `transpose` equation ahead of `dot_general`;
+    the contraction itself stays (lhs dim 1, rhs dim 0).
 
     Exception: a rank-2 transpose consumed only as `dot_general` rhs
     never materializes. It binds a `transposed` CVal (untransposed
@@ -307,6 +318,9 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         template = "(!{a})" if ops[0].ctype == "bool" else "(~{a})"
     elif opname == "integer_pow":
         exp: int = eqn.params["y"]
+        if exp == 0:
+            cursor.copy(dst, CVal("1", (), dst.ctype), dst.size)
+            return
         body = " * ".join(["{a}"] * abs(exp))
         template = f"({body})" if exp > 0 else f"(1.0f / ({body}))"
     elif opname == "convert_element_type":
@@ -433,10 +447,9 @@ def _rule_dot_general(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     ctype, and mixed-precision products are cast to it before the
     multiply. The vectorized paths require f32 end to end.
 
-    The scalar path keeps `i, j` outer with `k` innermost on purpose: an
-    `i, k, j` reorder turns the single per-`(i, j)` write into `k`
-    read-modify-writes of `dst` per `j` and is slower in practice. Keep
-    the reduction in a scalar register.
+    The scalar path keeps `i, j` outer with `k` innermost: an `i, k, j`
+    reorder turns the single per-`(i, j)` write into `k`
+    read-modify-writes of `dst` per `j`, and measures slower.
     """
     (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = eqn.params[
         "dimension_numbers"
@@ -927,16 +940,13 @@ def _copy_back_carries(cursor: Cursor, outs: list[CVal], carries: list[CVal]) ->
     Environment.
 
     Carry permutations (an output that IS another carry) additionally
-    read and write through volatile pointers. This is a workaround for
-    a Metal compiler bug: with three or more thread-local array
-    temporaries live in the loop, the optimizer forwards a permuted
-    carry's read across the write it must precede, producing wrong
-    results on M-series GPUs (found by the emitter fuzzer; regression
-    test and minimized MSL in tests/test_05_loops.py). Snapshot arrays,
-    fused loops, and hoisted declarations all still miscompile; volatile
-    on the hazard endpoints is the narrowest fix that survives, and it
-    costs nothing on the common permutation-free path, which stays
-    non-volatile.
+    read and write through volatile pointers, working around a Metal
+    compiler bug: with three or more thread-local array temporaries live
+    in the loop, the optimizer forwards a permuted carry's read across
+    the write it must precede, producing wrong results on M-series GPUs.
+    Snapshot arrays, fused loops, and hoisted declarations all still
+    miscompile; volatile on the hazard endpoints is the narrowest fix
+    that survives. The permutation-free path stays non-volatile.
     """
     updates = [
         (out, carry)

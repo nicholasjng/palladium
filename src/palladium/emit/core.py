@@ -93,9 +93,9 @@ class CVal:
         C type name, always a value of CTYPES (`"float"`, not `"float32"`).
     space : str
         Metal address space of the storage behind `expr`: `"thread"` for
-        emitter-declared locals, `"threadgroup"` for per-threadgroup locals,
-        `"device"` for kernel operand refs and views of them.
-        Pointer casts must be qualified with this; a mis-qualified cast is invalid MSL.
+        emitter-declared locals, `"threadgroup"` for per-threadgroup
+        locals, `"device"` for operand refs and views of them. Pointer
+        casts must carry it; a mis-qualified cast is invalid MSL.
     readonly : bool
         True for `const device` input refs and views of them. Only
         readonly device storage may be aliased instead of copied by
@@ -107,11 +107,10 @@ class CVal:
         at `expr[j * shape[0] + i]`. Set only when every consumer is a
         `dot_general` rhs, so no flat-indexing consumer can misread it.
     align : int
-        Guaranteed element alignment of the storage behind `expr`: the
-        offset from a 16-byte-aligned base is a known multiple of this
-        many elements. 0 means exactly aligned (the gcd identity, and the
-        de-facto assumption for declared thread locals); a vectorized
-        path needing N-element loads requires `align % N == 0`. Composed
+        Guaranteed element alignment: the offset from a 16-byte-aligned
+        base is a known multiple of this many elements. 0 means exactly
+        aligned (the gcd identity, assumed for declared thread locals);
+        an N-element vectorized load requires `align % N == 0`. Composed
         through views as the gcd of the base alignment and every offset
         term's provable multiple.
     """
@@ -157,17 +156,14 @@ class EmitStats:
     ----------
     thread_bytes : int
         Bytes of `thread`-space storage: loaded blocks, intermediates,
-        scratch. Bounded by the per-thread stack, which Metal does not
-        publish a figure for -- treat this as the number to shrink when
-        pipeline creation fails, not as a value with a known ceiling.
+        scratch. Bounded by the per-thread stack, for which Metal
+        publishes no figure; shrink this when pipeline creation fails.
     threadgroup_bytes : int
-        Bytes of `threadgroup`-space storage, shared per group. Unlike
-        the stack, this has a real published budget:
+        Bytes of `threadgroup`-space storage, shared per group. Budget:
         `metal_runtime.device_info()["max_threadgroup_memory_length"]`.
 
-    Neither figure is liveness-aware. MSL declarations are function
-    scoped and Metal's own pipeline check is equally conservative, so
-    this over-counts in exactly the places Metal does.
+    Neither figure is liveness-aware: MSL declarations are function
+    scoped, and Metal's own pipeline check is equally conservative.
     """
 
     thread_bytes: int
@@ -293,7 +289,15 @@ class Environment:
             elif math.isnan(v):
                 expr = "NAN"
             else:
-                expr = f"{float(v)!r}f" if ctype in ("float", "half") else str(int(v))
+                expr = (
+                    f"{float(v)!r}f"
+                    if ctype in ("float", "half", "bfloat")
+                    else str(int(v))
+                )
+            if ctype == "bfloat":
+                # MSL does not implicitly narrow a float expression to
+                # bfloat. Keep literals typed so arithmetic stays bfloat.
+                expr = f"bfloat({expr})"
             return CVal(expr=expr, shape=(), ctype=ctype)
         return self.bindings[atom]
 
@@ -666,6 +670,15 @@ def ref_view(env: Environment, ref: CVal, indexer: NDIndexer) -> CVal:
                 f"ref access dim {d}: a partial Slice must be the first "
                 "kept dim; non-contiguous access is unimplemented"
             )
+
+    # Squeezed trailing dimensions can make even full slices strided:
+    # x[:, 1] is a column, not a contiguous span starting at x[0, 1].
+    kept_strides = _element_strides(tuple(size for _, size in kept))
+    if any(
+        size > 1 and strides[d] != expected
+        for (d, size), expected in zip(kept, kept_strides, strict=True)
+    ):
+        raise EmitError("ref access is non-contiguous; strided views are unimplemented")
 
     offset = " + ".join(terms) or "0"
     if not kept:

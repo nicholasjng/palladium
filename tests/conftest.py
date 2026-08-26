@@ -8,6 +8,7 @@ _NO_GPU_MODULES = {
     "test_18_effects",
     "test_20_write_races",
     "test_msl_snapshots",
+    "test_emit_regressions",
 }
 
 
