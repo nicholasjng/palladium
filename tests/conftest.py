@@ -1,14 +1,15 @@
 import numpy as np
 import pytest
 
-# Modules that only manipulate text/jaxprs and never touch the GPU; they
-# keep running on machines (and CI runners) without a Metal device.
+# Modules with device-independent checks; any GPU tests within them
+# handle their own skips, so pure checks still run without Metal.
 _NO_GPU_MODULES = {
     "test_01_trace",
     "test_18_effects",
     "test_20_write_races",
     "test_msl_snapshots",
     "test_emit_regressions",
+    "test_emit_features",
 }
 
 

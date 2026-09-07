@@ -13,7 +13,6 @@ import jax
 import jax.numpy as jnp
 import metal_runtime as mr
 import numpy as np
-import pytest
 
 import palladium
 
@@ -68,9 +67,8 @@ def test_where_asymmetric_branches(rng):
     _oracle_check(f, x, y)
 
 
-def test_select_n_rejects_integer_predicate(rng):
-    """lax.select_n with an int index: the predicate-type guard fires
-    first, naming the root cause rather than the operand-count symptom."""
+def test_select_n_accepts_integer_predicate(rng):
+    """Integer indices select among all cases, not just false/true."""
 
     def kernel(i_ref, x_ref, o_ref):
         idx = i_ref[...]
@@ -78,10 +76,9 @@ def test_select_n_rejects_integer_predicate(rng):
         o_ref[...] = jax.lax.select_n(idx, x, x + 1.0, x + 2.0)
 
     f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((8,), F32))
-    idx = np.zeros(8, dtype=np.int32)
-    x = np.zeros(8, dtype=np.float32)
-    with pytest.raises(palladium.emit.EmitError, match="predicate of type bool"):
-        f(idx, x)
+    idx = np.arange(8, dtype=np.int32) % 3
+    x = rng.standard_normal(8).astype(np.float32)
+    _oracle_check(f, idx, x)
 
 
 def test_inf_literal(rng):

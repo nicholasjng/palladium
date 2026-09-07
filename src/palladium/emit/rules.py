@@ -223,20 +223,17 @@ def _rule_random_fold_in(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> Non
 
 @rule("reshape")
 def _rule_reshape(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """Reshape: row-major reinterpretation of the same flat storage, no
-    data movement, since `CVal.at()` already indexes flatly regardless of
-    rank.
-
-    Raises
-    ------
-    EmitError
-        If `dimensions` (an axis permutation applied before reshaping)
-        is set; that needs a real copy, not just a shape reinterpretation.
+    """Reshape aliases row-major storage where possible. An axis
+    permutation copies directly into the reshaped destination, without
+    allocating an intermediate transposed array.
     """
-    if eqn.params["dimensions"] is not None:
-        raise EmitError("reshape with a dimensions permutation is unimplemented")
     src = env.val(eqn.invars[0])
     new_shape = eqn.params["new_sizes"]
+    perm = eqn.params["dimensions"]
+    if perm is not None and tuple(perm) != tuple(range(len(src.shape))):
+        dst = declare(env, cursor, eqn.outvars[0])
+        _emit_permuted_copy(cursor, src, dst, tuple(perm))
+        return
     if bool(src.shape) != bool(new_shape):
         # Rank zero uses a scalar expression, while ranked values use
         # indexable storage. A shape-only alias cannot cross that boundary.
@@ -275,8 +272,20 @@ def _rule_transpose(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         return
     perm: tuple[int, ...] = eqn.params["permutation"]
     dst = declare(env, cursor, eqn.outvars[0])
+    _emit_permuted_copy(cursor, src, dst, perm)
+
+
+def _emit_permuted_copy(
+    cursor: Cursor, src: CVal, dst: CVal, perm: tuple[int, ...]
+) -> None:
+    """Copy the permuted source in row-major order into flat dst storage.
+
+    The destination may reshape that order; its rank is independent of
+    the iteration domain, which is the source shape after permutation.
+    """
+    perm_shape = tuple(src.shape[d] for d in perm)
     src_strides = _element_strides(src.shape)
-    dst_strides = _element_strides(dst.shape)
+    dst_strides = _element_strides(perm_shape)
     rank = len(src.shape)
     idx_vars = [cursor.fresh(f"_t{d}") for d in range(rank)]
 
@@ -291,7 +300,7 @@ def _rule_transpose(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
             cursor.emit(f"{dst.at(dst_idx)} = {src.at(src_idx)};")
             return
         with cursor.block(
-            f"for (uint {idx_vars[d]} = 0; {idx_vars[d]} < {dst.shape[d]}; ++{idx_vars[d]})"
+            f"for (uint {idx_vars[d]} = 0; {idx_vars[d]} < {perm_shape[d]}; ++{idx_vars[d]})"
         ):
             emit_loops(d + 1)
 
@@ -389,6 +398,46 @@ for _name in [
     "not",
 ]:
     RULES[_name] = _rule_elementwise
+
+
+@rule("select_n")
+def _rule_select_n(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """Select among equal-shaped cases using a scalar or per-element index.
+
+    Integer selection uses a balanced comparison tree, as JAX's lowering
+    does. Out-of-range indices select the nearest endpoint case; JAX's
+    public contract leaves those indices implementation-defined.
+    """
+    which, *cases = [env.val(v) for v in eqn.invars]
+    if which.ctype not in ("bool", "int", "uint"):
+        raise EmitError(f"select_n requires a bool or integer index, got {which.ctype}")
+    if not cases or (which.ctype == "bool" and len(cases) > 2):
+        raise EmitError("select_n needs at least one case and bool permits at most two")
+    if len(cases) == 1:
+        env.bind(eqn.outvars[0], cases[0])
+        return
+    if which.ctype == "bool":
+        # Preserve the established boolean codegen, including its snapshots.
+        _rule_elementwise(env, cursor, eqn)
+        return
+
+    dst = declare(env, cursor, eqn.outvars[0])
+
+    def select(index: str, lo: int, hi: int) -> str:
+        if hi - lo == 1:
+            return cases[lo].at(index)
+        mid = (lo + hi) // 2
+        threshold = f"{mid}u" if which.ctype == "uint" else str(mid)
+        left, right = select(index, lo, mid), select(index, mid, hi)
+        return f"({which.at(index)} < {threshold} ? {left} : {right})"
+
+    if dst.shape:
+        with cursor.loop(dst.size) as index:
+            cursor.emit(
+                f"{dst.at(index)} = {_unwrapped(select(index, 0, len(cases)))};"
+            )
+    else:
+        cursor.emit(f"{dst.expr} = {_unwrapped(select('0', 0, len(cases)))};")
 
 
 @rule("broadcast_in_dim")

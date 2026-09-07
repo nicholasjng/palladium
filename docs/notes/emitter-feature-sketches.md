@@ -176,3 +176,43 @@ Suggested sequencing: remaining correctness repairs and typed validation;
 storage/views and value-level indexing; masked blocks and primitive tail;
 measured fusion; SIMD-group reductions. Whole-jaxpr lowering remains a
 separate scope, described in `whole-jaxpr-lowering-plan.md`.
+
+## 8. Captured arrays: frontend work required
+
+Investigation on 2026-09-07 with JAX 0.11.1: Pallas's
+`_trace_kernel_to_jaxpr` rejects captured non-Ref constants itself, before
+palladium's emitter sees the kernel. Merely accepting jaxpr constvars in
+the emitter cannot enable closure arrays through `metal_call`.
+
+A future implementation needs a frontend that traces the kernel in its
+grid/Ref environment, lifts captured arrays into hidden read-only operands,
+and preserves those operands through eager and FFI dispatch. It should
+handle constants captured by nested jit/control-flow bodies too, without
+patching JAX globals or inspecting Python closure cells as a substitute for
+tracing. Public argument arity, BlockSpec ordering, input/output alias
+indices, and batching strides must remain consistent after lifting.
+
+Own immutable snapshots per specialization, cache eager uploads, and keep
+constants at zero batch stride in the FFI path. Define when captures are
+snapshotted and how retracing sees changed captures. Do not put large
+coefficient arrays into generated source by default.
+
+Gates: captured coefficients versus explicit operands in eager, pinned,
+FFI, jit, and vmap paths; distinct callable captures with identical shapes;
+nested captures; buffer lifetime; alias index preservation; unsupported
+constant dtype diagnostics. This remains deferred until the frontend
+adapter is designed; explicit array operands still work today.
+
+## 9. Initial feature increment (2026-09-07)
+
+Permuted reshape now copies the permuted element order directly into the
+final destination, using the same traversal as materialized transpose.
+Identity permutations retain the ordinary reshape path. No intermediate
+transposed array is allocated.
+
+`select_n` now accepts int32/uint32 indices and arbitrary case counts,
+including one case. A balanced comparison tree follows the installed
+JAX lowering; scalar indices choose whole arrays and array indices choose
+per element. Boolean selection retains its existing emission. Out-of-range
+integer indices choose endpoint cases in palladium, but JAX's public
+contract leaves this behavior implementation-defined.

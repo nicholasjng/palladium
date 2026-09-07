@@ -57,7 +57,9 @@ That is the whole mechanism. The pieces:
   numbers, ...); `eqn.invars`/`eqn.outvars` the operands.
 
 Rules apply to the one-thread-per-instance model, where plain element
-loops are the correct shape and divergence is free.
+loops preserve per-instance semantics. Divergence is valid for independent
+instances, but can affect performance; synchronization in cooperative
+kernels requires appropriate participation by the other threads.
 
 ## Non-negotiables
 
@@ -69,10 +71,10 @@ Copied from this project's own validation doctrine:
 2. **Break it on purpose.** Once the test is green, sabotage the rule
    (drop a term, flip an index) and confirm the test fails. A test that
    cannot fail is decoration.
-3. **Watch the state discipline.** A rule must bind every outvar
-   exactly once, and must not cache pointers across equations: `swap`
-   results alias device memory, and scan carries are rebound per
-   iteration.
+3. **Watch the state discipline.** A rule must bind every outvar and
+   preserve value snapshots across mutations. Used `swap` results contain
+   the pre-store values; they must not alias the updated ref. Scan carries
+   use mutable storage, so pointer aliases require particular care.
 4. **Cover the shapes you claim.** If the rule handles broadcasting or
    higher ranks, test those; if it does not, reject them with an
    `EmitError` naming the case instead of emitting wrong loops.

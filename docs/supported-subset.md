@@ -37,8 +37,15 @@ bitcast_convert_type`, comparisons (`lt le gt ge eq ne`), logical and
 bitwise `and or xor not`, `shift_right_logical`. Operands broadcast
 NumPy-style against the output shape.
 
+Selection: `select_n` accepts a boolean predicate or an int32/uint32
+index, scalar or matching the case shape. Integer indices select among
+any nonempty set of equally shaped, equally typed cases. Out-of-range
+indices select the nearest endpoint case in palladium; JAX leaves that
+behavior implementation-defined, so portable kernels should use valid indices.
+
 Structure: `broadcast_in_dim`, `reshape` (row-major reinterpretation;
-a `dimensions` permutation is rejected), `transpose` (materialized
+an optional `dimensions` permutation copies into the reshaped destination),
+`transpose` (materialized
 copy, except a rank-2 transpose consumed only as a dot rhs, which fuses
 lazily and costs nothing), `program_id`, inlined `jit` calls.
 
