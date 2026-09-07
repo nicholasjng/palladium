@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import sys
-from typing import Any
+from typing import Any, Literal
 
 from palladium.emit import emit_msl_stats
 from palladium.errors import EmitError
@@ -97,7 +97,7 @@ def device_limits() -> dict[str, Any]:
 
 
 def normalize_threadgroup(
-    threadgroup: int | tuple[int, ...] | None,
+    threadgroup: int | tuple[int, ...] | Literal["simdgroup", "threadgroup"] | None,
 ) -> tuple[int, ...] | None:
     """The one place `threadgroup=` becomes a tuple of ints.
 

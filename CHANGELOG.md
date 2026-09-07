@@ -12,6 +12,13 @@ development; the pin moves to a tagged release when one exists.
 
 ## Unreleased
 
+### Added
+
+- Reshape with a dimension permutation, copied directly into the final
+  destination without an intermediate transpose array.
+- Integer-indexed `select_n` with scalar or per-element int32/uint32
+  indices and arbitrary nonempty case counts.
+
 ### Changed
 
 - `metal_call_jit`'s `vmap_method` now defaults to `"pipelined"`

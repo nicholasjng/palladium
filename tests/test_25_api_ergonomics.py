@@ -174,7 +174,10 @@ def test_stack_overflow_carries_the_measured_size():
     )
     with pytest.raises(StackOverflowError) as excinfo:
         f(np.zeros(n, dtype=np.float32))
-    assert excinfo.value.stack_bytes >= n * 4
+
+    stack_bytes = excinfo.value.stack_bytes
+    assert stack_bytes is not None
+    assert stack_bytes >= n * 4
 
 
 # --- threadgroup sizing --------------------------------------------------
