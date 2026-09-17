@@ -330,6 +330,50 @@ class MpsCallable:
         differentiated.defvjp(forward, backward)
         return differentiated
 
+    def with_auxiliary_vjp(
+        self, backward_call: Callable, output_count: int
+    ) -> Callable:
+        """Attach a VJP while retaining trailing forward outputs as residuals.
+
+        The first ``output_count`` outputs are the public primal result. Any
+        trailing outputs are saved for the backward call after the primals and
+        before the output cotangents. This supports checkpointed adjoints:
+        one fused forward dispatch can return both its visible final state and
+        an internal checkpoint buffer consumed by one fused backward dispatch.
+        """
+        if output_count < 1:
+            raise ValueError("output_count must be positive")
+
+        def split_outputs(raw_outputs):
+            values = _as_tuple(raw_outputs)
+            if output_count >= len(values):
+                raise ValueError(
+                    "with_auxiliary_vjp requires at least one trailing auxiliary output"
+                )
+            public = values[:output_count]
+            return (public[0] if len(public) == 1 else public), values[output_count:]
+
+        @jax.custom_vjp
+        def differentiated(*args):
+            public, _ = split_outputs(self(*args))
+            return public
+
+        def forward(*args):
+            public, auxiliaries = split_outputs(self(*args))
+            return public, (*args, *auxiliaries)
+
+        def backward(residual, cotangents):
+            input_cotangents = _as_tuple(
+                backward_call(*residual, *_as_tuple(cotangents))
+            )
+            # The custom-VJP protocol validates the returned pytree against
+            # the primal arguments. Keep this method agnostic about the number
+            # of auxiliary arrays, which is encoded in backward_call's ABI.
+            return input_cotangents
+
+        differentiated.defvjp(forward, backward)
+        return differentiated
+
     def __call__(self, *args):
         _register_mps_lowering()
         spec, msl_source = self._staged._spec_and_msl(args)
