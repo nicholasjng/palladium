@@ -727,7 +727,6 @@ ELEMENTWISE: dict[str, str] = {
     "sub": "({a} - {b})",
     "mul": "({a} * {b})",
     "div": "({a} / {b})",
-    "rem": "({a} % {b})",
     "min": "fmin({a}, {b})",
     "max": "fmax({a}, {b})",
     "pow": "pow({a}, {b})",
@@ -740,8 +739,6 @@ ELEMENTWISE: dict[str, str] = {
     "cos": "cos({a})",
     "sqrt": "sqrt({a})",
     "tanh": "tanh({a})",
-    # Works for both integer loop-normalization values and floating-point data.
-    "sign": "(({a} > 0) ? 1 : (({a} < 0) ? -1 : 0))",
     # ternary
     "select_n": "({a} ? {c} : {b})",  # a: predicate (bool), c when true, b when false
     "clamp": "clamp({b}, {a}, {c})",  # jaxpr order (min, x, max) -> metal (x, min, max)

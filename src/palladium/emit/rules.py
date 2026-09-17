@@ -325,6 +325,19 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 
     if opname == "not":
         template = "(!{a})" if ops[0].ctype == "bool" else "(~{a})"
+    elif opname == "sign":
+        # Return the original zero/NaN, preserving signed zero and NaNs.
+        template = (
+            f"(({{a}} > 0) ? {dst.ctype}(1) : (({{a}} < 0) ? {dst.ctype}(-1) : {{a}}))"
+        )
+    elif opname == "rem":
+        if ops[0].ctype in ("float", "half", "bfloat"):
+            template = f"{dst.ctype}(fmod(float({{a}}), float({{b}})))"
+        elif ops[0].ctype == "uint":
+            template = "({b} == 0 ? {a} : ({a} % {b}))"
+        else:
+            # Avoid undefined integer remainder at zero and INT_MIN/-1.
+            template = "({b} == 0 ? {a} : ({b} == -1 ? 0 : ({a} % {b})))"
     elif opname == "integer_pow":
         exp: int = eqn.params["y"]
         if exp == 0:
@@ -396,6 +409,8 @@ for _name in [
     "convert_element_type",
     "bitcast_convert_type",
     "not",
+    "sign",
+    "rem",
 ]:
     RULES[_name] = _rule_elementwise
 

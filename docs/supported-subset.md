@@ -32,10 +32,18 @@ error taxonomy in `docs/getting-started.md`.
 ## Primitives
 
 Elementwise: `add sub mul div min max pow neg abs exp log sin cos sqrt
-tanh integer_pow clamp select_n convert_element_type
+tanh sign rem integer_pow clamp select_n convert_element_type
 bitcast_convert_type`, comparisons (`lt le gt ge eq ne`), logical and
 bitwise `and or xor not`, `shift_right_logical`. Operands broadcast
 NumPy-style against the output shape.
+
+`sign` preserves zero and NaN inputs under SAFE math. `rem` uses
+truncating remainder (the dividend's sign), with floating-point `fmod`
+and integer `%`. Integer remainder by zero returns the dividend, matching
+the tested JAX CPU backend; signed INT_MIN remainder -1 returns zero.
+FAST mode does not promise IEEE NaN/signed-zero behavior.
+Dynamic-bound `fori_loop` is tested with negative bounds and empty ranges
+through the native Metal runtime.
 
 Selection: `select_n` accepts a boolean predicate or an int32/uint32
 index, scalar or matching the case shape. Integer indices select among
