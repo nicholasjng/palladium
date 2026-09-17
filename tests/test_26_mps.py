@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
 
 import palladium
 
@@ -95,6 +96,14 @@ def _add_with_auxiliary_vjp_kernel(
     del x_ref, y_ref, auxiliary_ref
     x_gradient_ref[...] = cotangent_ref[...]
     y_gradient_ref[...] = cotangent_ref[...]
+
+
+def _checkpoint_kernel(x_ref, final_ref, checkpoints_ref):
+    x = x_ref[0]
+    for checkpoint in range(3):
+        checkpoints_ref[0, checkpoint] = x
+        x = x + 1
+    final_ref[0] = x
 
 
 def test_descriptor_round_trip_is_stable():
@@ -211,6 +220,28 @@ def test_mps_call_can_save_auxiliaries_for_its_pallas_vjp():
             jax.jit(jax.grad(lambda a, b: jnp.sum(call(a, b) ** 2), (0, 1)))(x, y)
         ),
         np.asarray((2 * (x + y), 2 * (x + y))),
+    )
+
+
+def test_mps_call_can_emit_per_trajectory_checkpoint_rows():
+    n = 8
+    point = pl.BlockSpec((1,), lambda i: (i,))
+    checkpoint_row = pl.BlockSpec((1, 3), lambda i: (i, 0))
+    call = palladium.mps_call_jit(
+        _checkpoint_kernel,
+        grid=(n,),
+        in_specs=[point],
+        out_specs=(point, checkpoint_row),
+        out_shape=(
+            jax.ShapeDtypeStruct((n,), jnp.float32),
+            jax.ShapeDtypeStruct((n, 3), jnp.float32),
+        ),
+    )
+    x = jnp.arange(n, dtype=jnp.float32)
+    final, got_checkpoints = jax.jit(call)(x)
+    np.testing.assert_array_equal(np.asarray(final), np.asarray(x + 3))
+    np.testing.assert_array_equal(
+        np.asarray(got_checkpoints), np.asarray(jnp.stack((x, x + 1, x + 2), axis=1))
     )
 
 
