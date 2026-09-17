@@ -44,35 +44,74 @@ This isolates the key product question: can a fused Pallas solve participate
 in a real `value_and_grad` training loop while preserving a clear numerical
 contract?
 
-### Initial result
+### Validated training workflow
 
-`examples/07_mps_parameter_recovery.py` now fits shared Lotka--Volterra
-parameters from 4,096 final-state observations. Its backward call propagates
-six RK4 forward sensitivities, then contracts them with the output cotangent.
-On the MPS integration environment, 500 Adam steps recovered `(1.099902,
-0.399927, 0.101211, 0.401802)` from truth `(1.1, 0.4, 0.1, 0.4)`, with final
-loss `3.17e-08`. The fused forward/backward run took 6.3 seconds, compared
-with 26.5 seconds when the pullback used the JAX reference. The example checks
-the initial loss and gradients against that reference before timing.
+The reusable experimental workload lives in `palladium.ode_training`.
+`make_solver` selects pure JAX, fused forward with a reference VJP, the
+six-direction tangent VJP, or the discrete reverse VJP. A forward-only variant
+is also available. State count, step count, timestep, and checkpoint interval
+are explicit factory arguments; the final partial checkpoint segment is handled
+without integrating beyond the requested time.
 
-This establishes value-and-gradient correctness, an end-to-end optimizer path,
-and a first full-step speedup for this small-input problem. The current kernel
-is a tangent-transpose, not the scalable reverse-time/checkpointed adjoint:
-its cost grows with the number of differentiated inputs.
+The reverse kernel stores one state per checkpoint and recomputes the prefix
+inside that segment for each reverse step. It uses O(steps * interval) work and
+8 * trajectories * ceil(steps / interval) bytes of saved float32 states.
+It does not yet replay each segment once into a temporary local tape.
+Interval 1 supplies the full-history oracle.
 
-The forward RK4 call now emits ten `(x, y)` checkpoint pairs per trajectory as
-private custom-VJP residuals. They remain on MPS and are delivered to the
-backward call without becoming model outputs. The current backward kernel still
-uses the tangent-transpose reference while the reverse chunk sweep is built;
-this separates the checkpoint-buffer ABI validation from the reverse-math
-change.
+Tests compare arbitrary signed output cotangents and all six input gradients
+against a CPU JAX VJP for multiple random inputs, horizons and intervals,
+including intervals longer than the trajectory and nondivisible segments.
+Forward, tangent, reference-VJP and reverse variants share the test workload.
+The recovery test checks loss reduction, parameter accuracy, and several Adam
+updates against the pure-JAX implementation.
 
-Shared scalar parameters need expansion to per-trajectory arrays at the MPS
-call boundary. MLX currently represents literal-size inputs in Metal's
-`constant` address space, whereas Palladium's generated ABI expects `device`
-pointers. JAX's transpose of `broadcast_to` correctly reduces the reference
-VJP back to the four shared scalars. General scalar/constant-address-space
-support belongs in a future descriptor and native-handler extension.
+Loss, VJP, and Adam now run inside one `jax.jit`. Observations are generated
+on CPU outside training. Model inputs, checkpoints, gradients and optimizer
+updates remain on MPS during each training step.
+
+The default 4,096-trajectory recovery run completed 500 updates in 0.471 s
+(one synchronization at the end), reducing loss from 0.24893 to 3.10e-08.
+Recovered parameters were (1.099902, 0.399927, 0.101211, 0.401802).
+This total is separate from the individually synchronized latency benchmark.
+
+Run from the jax-mps checkout (with the Palladium custom-call handler installed):
+
+```sh
+JAX_PLATFORMS=mps,cpu env -u VIRTUAL_ENV uv run python ../palladium/examples/07_mps_parameter_recovery.py --n 4096 --steps 100 --interval 10 --iterations 500
+JAX_PLATFORMS=mps,cpu env -u VIRTUAL_ENV uv run python ../palladium/benchmarks/bench_mps_training.py --repeats 15
+```
+
+The benchmark measures complete Adam updates from identical optimizer states,
+rotates variant order, synchronizes every sample, and excludes input transfers.
+It reports lowering/compilation and first execution separately; first execution
+can include lazy Metal compilation and persistent caches are not cleared.
+
+Measured locally with JAX 0.11.1, 4,096 trajectories, 100 RK4 steps, and
+15 repetitions:
+
+| Variant | Median update (ms) | Min–max (ms) | Saved checkpoint states (MiB) | Compile / first execute (ms) |
+|---|---:|---:|---:|---:|
+| Pure JAX on MPS | 39.173 | 37.674–42.363 | — | 56.8 / 76.3 |
+| Fused forward, reference VJP | 39.064 | 38.192–41.684 | — | 49.1 / 128.9 |
+| Fused tangent VJP | 0.503 | 0.478–0.578 | 0 | 83.6 / 4.2 |
+| Reverse, interval 1 | 0.479 | 0.451–1.007 | 3.125 | 33.5 / 97.8 |
+| Reverse, interval 5 | 0.496 | 0.471–0.603 | 0.625 | 28.7 / 92.5 |
+| Reverse, interval 10 | 0.482 | 0.470–0.502 | 0.3125 | 28.6 / 3.0 |
+| Reverse, interval 25 | 0.622 | 0.595–0.925 | 0.125 | 28.1 / 93.5 |
+
+This run gives about 81x lower median update latency for interval 10 than pure
+JAX on MPS. Saved-state bytes are not peak device memory; JAX's internal adjoint
+storage is not measured by that column. Results are specific to this small
+Lotka–Volterra workload and do not establish a CNF speedup. Earlier multi-second
+training totals included Python-dispatched optimizer operations and are not
+directly comparable to these complete compiled steps.
+
+Shared scalar parameters are expanded to per-trajectory inputs because the
+current MLX adapter may place small inputs in Metal's constant address space,
+whereas Palladium expects device pointers. This adapter limitation remains.
+IEEE NaN and signed-zero semantics for sign/remainder are tested through
+metal-runtime SAFE mode; the MPS bridge currently supports FAST only.
 
 ## Phase 2: conditional continuous normalizing flow
 
