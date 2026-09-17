@@ -13,6 +13,67 @@ import pytest
 import palladium
 
 
+def _lv_rk4_step(x, y, a, b, c, d, dt=0.01):
+    def rhs(x_, y_):
+        return a * x_ - b * x_ * y_, c * x_ * y_ - d * y_
+
+    k1x, k1y = rhs(x, y)
+    k2x, k2y = rhs(x + 0.5 * dt * k1x, y + 0.5 * dt * k1y)
+    k3x, k3y = rhs(x + 0.5 * dt * k2x, y + 0.5 * dt * k2y)
+    k4x, k4y = rhs(x + dt * k3x, y + dt * k3y)
+    return (
+        x + dt / 6 * (k1x + 2 * k2x + 2 * k3x + k4x),
+        y + dt / 6 * (k1y + 2 * k2y + 2 * k3y + k4y),
+    )
+
+
+def _lv_rk4_step_vjp(x, y, a, b, c, d, bar_x, bar_y, dt=0.01):
+    """Manual transpose of the *discrete* RK4 update, in reverse order."""
+
+    def rhs(x_, y_):
+        return a * x_ - b * x_ * y_, c * x_ * y_ - d * y_
+
+    def transpose_rhs(x_, y_, bar_fx, bar_fy):
+        return (
+            (a - b * y_) * bar_fx + c * y_ * bar_fy,
+            -b * x_ * bar_fx + (c * x_ - d) * bar_fy,
+            x_ * bar_fx,
+            -x_ * y_ * bar_fx,
+            x_ * y_ * bar_fy,
+            -y_ * bar_fy,
+        )
+
+    k1x, k1y = rhs(x, y)
+    x2, y2 = x + 0.5 * dt * k1x, y + 0.5 * dt * k1y
+    k2x, k2y = rhs(x2, y2)
+    x3, y3 = x + 0.5 * dt * k2x, y + 0.5 * dt * k2y
+    k3x, k3y = rhs(x3, y3)
+    x4, y4 = x + dt * k3x, y + dt * k3y
+    k4x, k4y = rhs(x4, y4)
+    del k4x, k4y
+
+    bar_a = bar_b = bar_c = bar_d = x * 0
+    bar_k1x, bar_k1y = dt / 6 * bar_x, dt / 6 * bar_y
+    bar_k2x, bar_k2y = dt / 3 * bar_x, dt / 3 * bar_y
+    bar_k3x, bar_k3y = dt / 3 * bar_x, dt / 3 * bar_y
+    bar_k4x, bar_k4y = dt / 6 * bar_x, dt / 6 * bar_y
+    bar_x4, bar_y4, da, db, dc, dd = transpose_rhs(x4, y4, bar_k4x, bar_k4y)
+    bar_a, bar_b, bar_c, bar_d = bar_a + da, bar_b + db, bar_c + dc, bar_d + dd
+    # x4/y4 = x/y + dt*k3; add their adjoints before transposing k3.
+    bar_x0, bar_y0 = bar_x + bar_x4, bar_y + bar_y4
+    bar_k3x, bar_k3y = bar_k3x + dt * bar_x4, bar_k3y + dt * bar_y4
+    bar_x3, bar_y3, da, db, dc, dd = transpose_rhs(x3, y3, bar_k3x, bar_k3y)
+    bar_a, bar_b, bar_c, bar_d = bar_a + da, bar_b + db, bar_c + dc, bar_d + dd
+    bar_x0, bar_y0 = bar_x0 + bar_x3, bar_y0 + bar_y3
+    bar_k2x, bar_k2y = bar_k2x + 0.5 * dt * bar_x3, bar_k2y + 0.5 * dt * bar_y3
+    bar_x2, bar_y2, da, db, dc, dd = transpose_rhs(x2, y2, bar_k2x, bar_k2y)
+    bar_a, bar_b, bar_c, bar_d = bar_a + da, bar_b + db, bar_c + dc, bar_d + dd
+    bar_x0, bar_y0 = bar_x0 + bar_x2, bar_y0 + bar_y2
+    bar_k1x, bar_k1y = bar_k1x + 0.5 * dt * bar_x2, bar_k1y + 0.5 * dt * bar_y2
+    dx, dy, da, db, dc, dd = transpose_rhs(x, y, bar_k1x, bar_k1y)
+    return bar_x0 + dx, bar_y0 + dy, bar_a + da, bar_b + db, bar_c + dc, bar_d + dd
+
+
 def _add_kernel(x_ref, y_ref, o_ref):
     o_ref[...] = x_ref[...] + y_ref[...]
 
@@ -51,6 +112,19 @@ def test_descriptor_round_trip_is_stable():
         aliases=(),
     )
     assert palladium.MpsDispatchDescriptor.from_json(descriptor.to_json()) == descriptor
+
+
+def test_manual_rk4_step_transpose_matches_jax_vjp():
+    values = tuple(
+        jnp.asarray(value, jnp.float32) for value in (1.1, 0.9, 1.0, 0.4, 0.1, 0.4)
+    )
+    cotangents = (jnp.asarray(0.7, jnp.float32), jnp.asarray(-0.3, jnp.float32))
+    _, pullback = jax.vjp(_lv_rk4_step, *values)
+    expected = pullback(cotangents)
+    actual = _lv_rk4_step_vjp(*values, *cotangents)
+    np.testing.assert_allclose(
+        np.asarray(actual), np.asarray(expected), rtol=2e-6, atol=2e-7
+    )
 
 
 def test_mps_call_has_a_portable_cpu_fallback():
