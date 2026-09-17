@@ -24,10 +24,8 @@ from jax.experimental import pallas as pl
 import palladium
 
 DT, STEPS, N, ITERATIONS, LEARNING_RATE = 0.01, 100, 4_096, 500, 3e-2
-# The full-history reverse-adjoint oracle stores every pre-step state. Once its
-# transpose is validated, raise this to retain sparse checkpoints and recompute
-# only within each checkpoint interval.
-CHECKPOINT_INTERVAL = 1
+# Store one pre-step state per segment; the reverse sweep recomputes locally.
+CHECKPOINT_INTERVAL = 10
 CHECKPOINTS = STEPS // CHECKPOINT_INTERVAL
 
 
@@ -249,10 +247,34 @@ def make_fused_solve():
 
         def reverse_step(index, carry):
             lx, ly, ga, gb, gc, gd = carry
+            step_index = STEPS - 1 - index
+            checkpoint_index = step_index // CHECKPOINT_INTERVAL
+            local_step = step_index % CHECKPOINT_INTERVAL
             x, y = (
-                checkpoint_x_ref[:, STEPS - 1 - index],
-                checkpoint_y_ref[:, STEPS - 1 - index],
+                checkpoint_x_ref[:, checkpoint_index],
+                checkpoint_y_ref[:, checkpoint_index],
             )
+
+            def advance(_, state):
+                sx, sy = state
+                sk1x, sk1y = rhs(sx, sy)
+                sk2x, sk2y = rhs(sx + 0.5 * DT * sk1x, sy + 0.5 * DT * sk1y)
+                sk3x, sk3y = rhs(sx + 0.5 * DT * sk2x, sy + 0.5 * DT * sk2y)
+                sk4x, sk4y = rhs(sx + DT * sk3x, sy + DT * sk3y)
+                return (
+                    sx + DT / 6 * (sk1x + 2 * sk2x + 2 * sk3x + sk4x),
+                    sy + DT / 6 * (sk1y + 2 * sk2y + 2 * sk3y + sk4y),
+                )
+
+            def bounded_advance(i, state):
+                return jax.lax.cond(
+                    i < local_step,
+                    lambda current: advance(i, current),
+                    lambda current: current,
+                    state,
+                )
+
+            x, y = jax.lax.fori_loop(0, CHECKPOINT_INTERVAL, bounded_advance, (x, y))
             k1x, k1y = rhs(x, y)
             x2, y2 = x + 0.5 * DT * k1x, y + 0.5 * DT * k1y
             k2x, k2y = rhs(x2, y2)
