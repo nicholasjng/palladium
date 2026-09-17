@@ -24,7 +24,10 @@ from jax.experimental import pallas as pl
 import palladium
 
 DT, STEPS, N, ITERATIONS, LEARNING_RATE = 0.01, 100, 4_096, 500, 3e-2
-CHECKPOINT_INTERVAL = 10
+# The full-history reverse-adjoint oracle stores every pre-step state. Once its
+# transpose is validated, raise this to retain sparse checkpoints and recompute
+# only within each checkpoint interval.
+CHECKPOINT_INTERVAL = 1
 CHECKPOINTS = STEPS // CHECKPOINT_INTERVAL
 
 
@@ -209,6 +212,94 @@ def make_fused_solve():
         c_gradient_ref[...] = cotangent_x * dxc + cotangent_y * dyc
         d_gradient_ref[...] = cotangent_x * dxd + cotangent_y * dyd
 
+    def rk4_reverse_vjp_kernel(
+        x_ref,
+        y_ref,
+        a_ref,
+        b_ref,
+        c_ref,
+        d_ref,
+        checkpoint_x_ref,
+        checkpoint_y_ref,
+        cotangent_x_ref,
+        cotangent_y_ref,
+        x_gradient_ref,
+        y_gradient_ref,
+        a_gradient_ref,
+        b_gradient_ref,
+        c_gradient_ref,
+        d_gradient_ref,
+    ):
+        """Exact reverse-time transpose using one stored pre-step state per row."""
+        del x_ref, y_ref
+        a, b, c, d = a_ref[...], b_ref[...], c_ref[...], d_ref[...]
+
+        def rhs(x, y):
+            return a * x - b * x * y, c * x * y - d * y
+
+        def rhs_t(x, y, fx, fy):
+            return (
+                (a - b * y) * fx + c * y * fy,
+                -b * x * fx + (c * x - d) * fy,
+                x * fx,
+                -x * y * fx,
+                x * y * fy,
+                -y * fy,
+            )
+
+        def reverse_step(index, carry):
+            lx, ly, ga, gb, gc, gd = carry
+            x, y = (
+                checkpoint_x_ref[:, STEPS - 1 - index],
+                checkpoint_y_ref[:, STEPS - 1 - index],
+            )
+            k1x, k1y = rhs(x, y)
+            x2, y2 = x + 0.5 * DT * k1x, y + 0.5 * DT * k1y
+            k2x, k2y = rhs(x2, y2)
+            x3, y3 = x + 0.5 * DT * k2x, y + 0.5 * DT * k2y
+            k3x, k3y = rhs(x3, y3)
+            x4, y4 = x + DT * k3x, y + DT * k3y
+            k4x, k4y = rhs(x4, y4)
+            del k4x, k4y
+            q1x, q1y, q2x, q2y = DT / 6 * lx, DT / 6 * ly, DT / 3 * lx, DT / 3 * ly
+            q3x, q3y, q4x, q4y = q2x, q2y, q1x, q1y
+            bx4, by4, da, db, dc, dd = rhs_t(x4, y4, q4x, q4y)
+            ga, gb, gc, gd = ga + da, gb + db, gc + dc, gd + dd
+            lx, ly = lx + bx4, ly + by4
+            q3x, q3y = q3x + DT * bx4, q3y + DT * by4
+            bx3, by3, da, db, dc, dd = rhs_t(x3, y3, q3x, q3y)
+            ga, gb, gc, gd = ga + da, gb + db, gc + dc, gd + dd
+            lx, ly, q2x, q2y = (
+                lx + bx3,
+                ly + by3,
+                q2x + 0.5 * DT * bx3,
+                q2y + 0.5 * DT * by3,
+            )
+            bx2, by2, da, db, dc, dd = rhs_t(x2, y2, q2x, q2y)
+            ga, gb, gc, gd = ga + da, gb + db, gc + dc, gd + dd
+            lx, ly, q1x, q1y = (
+                lx + bx2,
+                ly + by2,
+                q1x + 0.5 * DT * bx2,
+                q1y + 0.5 * DT * by2,
+            )
+            bx1, by1, da, db, dc, dd = rhs_t(x, y, q1x, q1y)
+            return lx + bx1, ly + by1, ga + da, gb + db, gc + dc, gd + dd
+
+        zero = a * 0
+        lx, ly, ga, gb, gc, gd = jax.lax.fori_loop(
+            0,
+            STEPS,
+            reverse_step,
+            (cotangent_x_ref[...], cotangent_y_ref[...], zero, zero, zero, zero),
+        )
+        x_gradient_ref[...] = lx
+        y_gradient_ref[...] = ly
+        a_gradient_ref[...] = ga
+        b_gradient_ref[...] = gb
+        c_gradient_ref[...] = gc
+        d_gradient_ref[...] = gd
+
     point = pl.BlockSpec((1,), lambda i: (i,))
     checkpoint_row = pl.BlockSpec((1, CHECKPOINTS), lambda i: (i, 0))
     forward = palladium.mps_call_jit(
@@ -224,7 +315,7 @@ def make_fused_solve():
         ),
     )
     backward = palladium.mps_call_jit(
-        rk4_tangent_vjp_kernel,
+        rk4_reverse_vjp_kernel,
         grid=(N,),
         in_specs=[point] * 6 + [checkpoint_row, checkpoint_row] + [point] * 2,
         out_specs=(point,) * 6,
