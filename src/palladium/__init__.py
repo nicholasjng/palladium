@@ -28,6 +28,12 @@ from palladium.errors import (
     UnsupportedPrimitiveError,
 )
 from palladium.ffi import FfiCallable, metal_call_jit
+from palladium.mps import (
+    MPS_CUSTOM_CALL_TARGET,
+    MpsCallable,
+    MpsDispatchDescriptor,
+    mps_call_jit,
+)
 from palladium.threadgroup import (
     barrier,
     thread_index,
@@ -43,6 +49,7 @@ from palladium.verify import (
 )
 
 __all__ = [
+    "MPS_CUSTOM_CALL_TARGET",
     "BlockInfo",
     "BoundKernel",
     "DispatchError",
@@ -51,6 +58,8 @@ __all__ = [
     "KernelDiagnostics",
     "KernelSpec",
     "MetalCallable",
+    "MpsCallable",
+    "MpsDispatchDescriptor",
     "PalladiumError",
     "ScratchInfo",
     "StackOverflowError",
@@ -64,6 +73,7 @@ __all__ = [
     "emit_msl",
     "metal_call",
     "metal_call_jit",
+    "mps_call_jit",
     "rule",
     "thread_index",
     "threadgroup_memory",
