@@ -56,6 +56,24 @@ def test_mps_call_requires_batch_in_the_grid():
         )
 
 
+def test_mps_call_reference_vjp_enables_cpu_training_fallback():
+    def reference(x, y):
+        return x + y
+
+    call = palladium.mps_call_jit(
+        _add_kernel,
+        out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
+        vjp_reference=reference,
+    )
+    x = jnp.arange(8, dtype=jnp.float32)
+    y = jnp.ones(8, dtype=jnp.float32)
+    loss = lambda a, b: jnp.sum(call(a, b) ** 2)
+    np.testing.assert_allclose(
+        np.asarray(jax.jit(jax.grad(loss, argnums=(0, 1)))(x, y)),
+        np.asarray((2 * (x + y), 2 * (x + y))),
+    )
+
+
 def test_mps_call_refuses_aliases_until_the_mlx_path_can_honor_them():
     def inplace(x_ref, o_ref):
         o_ref[...] = x_ref[...] + 1.0

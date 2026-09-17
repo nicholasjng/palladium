@@ -265,6 +265,34 @@ class MpsCallable:
         )
         return outputs[0] if len(outputs) == 1 else outputs
 
+    def with_reference_vjp(self, reference: Callable) -> Callable:
+        """Attach a correctness-first VJP implemented by a JAX reference.
+
+        The primal executes this callable, and therefore remains one MPS
+        custom call on jax-mps.  The pullback is calculated by JAX from
+        ``reference``.  This is useful for bringing a fused forward solve into
+        an end-to-end training loop while a Pallas discrete-adjoint kernel is
+        being developed and validated.
+
+        ``reference`` must have the same inputs, outputs, and differentiable
+        semantics as this call.  Its VJP is intentionally *not* a performance
+        solution: a training-speed claim requires a native backward kernel.
+        """
+
+        @jax.custom_vjp
+        def differentiated(*args):
+            return self(*args)
+
+        def forward(*args):
+            return self(*args), args
+
+        def backward(residual, cotangents):
+            _, pullback = jax.vjp(reference, *residual)
+            return pullback(cotangents)
+
+        differentiated.defvjp(forward, backward)
+        return differentiated
+
     def __call__(self, *args):
         _register_mps_lowering()
         spec, msl_source = self._staged._spec_and_msl(args)
@@ -291,7 +319,9 @@ class MpsCallable:
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
 
-def mps_call_jit(kernel: Callable, **pallas_kwargs) -> MpsCallable:
+def mps_call_jit(
+    kernel: Callable, *, vjp_reference: Callable | None = None, **pallas_kwargs
+) -> MpsCallable | Callable:
     """Create a Pallas call that lowers to a jax-mps Metal custom call.
 
     On the ``mps`` platform this emits ``stablehlo.custom_call
@@ -301,6 +331,10 @@ def mps_call_jit(kernel: Callable, **pallas_kwargs) -> MpsCallable:
 
     ``vmap`` is deliberately unsupported in v1; place an independent batch
     dimension directly in the Pallas grid so one invocation is one dispatch.
+    Pass ``vjp_reference`` to opt into a correctness-first custom VJP: the
+    forward pass is the MPS custom call and the backward pass is generated from
+    the matching pure-JAX reference.  A Pallas discrete-adjoint kernel remains
+    necessary for fused training performance.
     """
     from metal_runtime import MathMode
 
@@ -313,4 +347,5 @@ def mps_call_jit(kernel: Callable, **pallas_kwargs) -> MpsCallable:
             "mps_call_jit does not batch a custom call in v1; put the batch "
             "dimension in the Pallas grid so the whole batch is one dispatch"
         )
-    return MpsCallable(kernel, pallas_kwargs, math_mode, threadgroup, cache_size)
+    call = MpsCallable(kernel, pallas_kwargs, math_mode, threadgroup, cache_size)
+    return call if vjp_reference is None else call.with_reference_vjp(vjp_reference)

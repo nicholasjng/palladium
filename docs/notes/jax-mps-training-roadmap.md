@@ -8,9 +8,10 @@ autodiff backend.
 
 Palladium can trace a Pallas kernel, emit MSL, and lower it as a
 `stablehlo.custom_call @palladium.dispatch`. jax-mps encodes that dispatch on
-its existing MLX/Metal stream, so surrounding JAX work remains on MPS. The
-initial endpoint is forward-only: it has a portable interpreter fallback and
-an MPS integration test, but no differentiation rule.
+its existing MLX/Metal stream, so surrounding JAX work remains on MPS. It has
+a portable interpreter fallback and an MPS integration test. Calls may opt
+into a correctness-first custom VJP backed by a supplied pure-JAX reference:
+the primal remains fused, while the backward pass is not yet fused.
 
 The RK4 ensemble measurement supplies the motivating workload: one fused
 fixed-step solve per independent trajectory was 1.059 ms median for 100,000
@@ -41,6 +42,23 @@ learned vector field:
 This isolates the key product question: can a fused Pallas solve participate
 in a real `value_and_grad` training loop while preserving a clear numerical
 contract?
+
+### Initial result
+
+`examples/07_mps_parameter_recovery.py` now fits shared Lotka--Volterra
+parameters from 4,096 final-state observations. On the MPS integration
+environment, 500 Adam steps recovered `(1.099902, 0.399927, 0.101211,
+0.401802)` from truth `(1.1, 0.4, 0.1, 0.4)`, with final loss `3.17e-08`.
+The run took 26.5 seconds. This establishes value-and-gradient correctness and
+an end-to-end optimizer path; it must not be reported as a fused training
+speedup because its pullback is still the JAX RK4 reference.
+
+Shared scalar parameters need expansion to per-trajectory arrays at the MPS
+call boundary. MLX currently represents literal-size inputs in Metal's
+`constant` address space, whereas Palladium's generated ABI expects `device`
+pointers. JAX's transpose of `broadcast_to` correctly reduces the reference
+VJP back to the four shared scalars. General scalar/constant-address-space
+support belongs in a future descriptor and native-handler extension.
 
 ## Phase 2: conditional continuous normalizing flow
 
