@@ -99,11 +99,11 @@ def _add_with_auxiliary_vjp_kernel(
 
 
 def _checkpoint_kernel(x_ref, final_ref, checkpoints_ref):
-    x = x_ref[0]
+    x = x_ref[...]
     for checkpoint in range(3):
-        checkpoints_ref[0, checkpoint] = x
+        checkpoints_ref[:, checkpoint] = x
         x = x + 1
-    final_ref[0] = x
+    final_ref[...] = x
 
 
 def test_descriptor_round_trip_is_stable():

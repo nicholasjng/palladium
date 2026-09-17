@@ -24,6 +24,8 @@ from jax.experimental import pallas as pl
 import palladium
 
 DT, STEPS, N, ITERATIONS, LEARNING_RATE = 0.01, 100, 4_096, 500, 3e-2
+CHECKPOINT_INTERVAL = 10
+CHECKPOINTS = STEPS // CHECKPOINT_INTERVAL
 
 
 def reference_solve(x0, y0, a, b, c, d):
@@ -47,7 +49,18 @@ def reference_solve(x0, y0, a, b, c, d):
 
 
 def make_fused_solve():
-    def rk4_kernel(x_ref, y_ref, a_ref, b_ref, c_ref, d_ref, xo_ref, yo_ref):
+    def rk4_kernel(
+        x_ref,
+        y_ref,
+        a_ref,
+        b_ref,
+        c_ref,
+        d_ref,
+        xo_ref,
+        yo_ref,
+        checkpoint_x_ref,
+        checkpoint_y_ref,
+    ):
         a, b, c, d = a_ref[...], b_ref[...], c_ref[...], d_ref[...]
 
         def rhs(x, y):
@@ -64,7 +77,13 @@ def make_fused_solve():
                 y + DT / 6.0 * (k1y + 2 * k2y + 2 * k3y + k4y),
             )
 
-        x, y = jax.lax.fori_loop(0, STEPS, step, (x_ref[...], y_ref[...]))
+        def segment(index, carry):
+            x, y = carry
+            checkpoint_x_ref[:, index] = x
+            checkpoint_y_ref[:, index] = y
+            return jax.lax.fori_loop(0, CHECKPOINT_INTERVAL, step, (x, y))
+
+        x, y = jax.lax.fori_loop(0, CHECKPOINTS, segment, (x_ref[...], y_ref[...]))
         xo_ref[...] = x
         yo_ref[...] = y
 
@@ -75,6 +94,8 @@ def make_fused_solve():
         b_ref,
         c_ref,
         d_ref,
+        checkpoint_x_ref,
+        checkpoint_y_ref,
         cotangent_x_ref,
         cotangent_y_ref,
         x_gradient_ref,
@@ -93,6 +114,7 @@ def make_fused_solve():
         state or parameter dimension grows.
         """
 
+        del checkpoint_x_ref, checkpoint_y_ref
         a, b, c, d = a_ref[...], b_ref[...], c_ref[...], d_ref[...]
 
         def rhs(x, y):
@@ -188,24 +210,27 @@ def make_fused_solve():
         d_gradient_ref[...] = cotangent_x * dxd + cotangent_y * dyd
 
     point = pl.BlockSpec((1,), lambda i: (i,))
+    checkpoint_row = pl.BlockSpec((1, CHECKPOINTS), lambda i: (i, 0))
     forward = palladium.mps_call_jit(
         rk4_kernel,
         grid=(N,),
         in_specs=[point] * 6,
-        out_specs=(point, point),
+        out_specs=(point, point, checkpoint_row, checkpoint_row),
         out_shape=(
             jax.ShapeDtypeStruct((N,), jnp.float32),
             jax.ShapeDtypeStruct((N,), jnp.float32),
+            jax.ShapeDtypeStruct((N, CHECKPOINTS), jnp.float32),
+            jax.ShapeDtypeStruct((N, CHECKPOINTS), jnp.float32),
         ),
     )
     backward = palladium.mps_call_jit(
         rk4_tangent_vjp_kernel,
         grid=(N,),
-        in_specs=[point] * 8,
+        in_specs=[point] * 6 + [checkpoint_row, checkpoint_row] + [point] * 2,
         out_specs=(point,) * 6,
         out_shape=(jax.ShapeDtypeStruct((N,), jnp.float32),) * 6,
     )
-    return forward.with_vjp(backward)
+    return forward.with_auxiliary_vjp(backward, output_count=2)
 
 
 def main() -> None:

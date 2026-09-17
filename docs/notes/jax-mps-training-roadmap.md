@@ -60,6 +60,13 @@ and a first full-step speedup for this small-input problem. The current kernel
 is a tangent-transpose, not the scalable reverse-time/checkpointed adjoint:
 its cost grows with the number of differentiated inputs.
 
+The forward RK4 call now emits ten `(x, y)` checkpoint pairs per trajectory as
+private custom-VJP residuals. They remain on MPS and are delivered to the
+backward call without becoming model outputs. The current backward kernel still
+uses the tangent-transpose reference while the reverse chunk sweep is built;
+this separates the checkpoint-buffer ABI validation from the reverse-math
+change.
+
 Shared scalar parameters need expansion to per-trajectory arrays at the MPS
 call boundary. MLX currently represents literal-size inputs in Metal's
 `constant` address space, whereas Palladium's generated ABI expects `device`
