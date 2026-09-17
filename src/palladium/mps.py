@@ -293,6 +293,43 @@ class MpsCallable:
         differentiated.defvjp(forward, backward)
         return differentiated
 
+    def with_vjp(self, backward_call: Callable) -> Callable:
+        """Attach a Pallas custom VJP to this forward call.
+
+        ``backward_call`` receives the forward primals followed by one
+        cotangent per forward output. It must return one cotangent per primal,
+        in the same order. Both calls remain ordinary JAX callables, so the
+        backward computation can itself be an :class:`MpsCallable` and lower
+        to one ``palladium.dispatch`` on MPS.
+
+        This is the explicit-kernel route for a discrete adjoint (or a
+        tangent-transpose kernel).  It intentionally does not infer a
+        derivative from emitted MSL: numerical method semantics, storage, and
+        checkpointing must be selected by the kernel author.
+        """
+
+        @jax.custom_vjp
+        def differentiated(*args):
+            return self(*args)
+
+        def forward(*args):
+            return self(*args), args
+
+        def backward(residual, cotangents):
+            input_cotangents = _as_tuple(
+                backward_call(*residual, *_as_tuple(cotangents))
+            )
+            if len(input_cotangents) != len(residual):
+                raise TypeError(
+                    "Palladium VJP returned "
+                    f"{len(input_cotangents)} input cotangents for "
+                    f"{len(residual)} primals"
+                )
+            return input_cotangents
+
+        differentiated.defvjp(forward, backward)
+        return differentiated
+
     def __call__(self, *args):
         _register_mps_lowering()
         spec, msl_source = self._staged._spec_and_msl(args)

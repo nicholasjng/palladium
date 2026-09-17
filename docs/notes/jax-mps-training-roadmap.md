@@ -10,8 +10,9 @@ Palladium can trace a Pallas kernel, emit MSL, and lower it as a
 `stablehlo.custom_call @palladium.dispatch`. jax-mps encodes that dispatch on
 its existing MLX/Metal stream, so surrounding JAX work remains on MPS. It has
 a portable interpreter fallback and an MPS integration test. Calls may opt
-into a correctness-first custom VJP backed by a supplied pure-JAX reference:
-the primal remains fused, while the backward pass is not yet fused.
+into a correctness-first custom VJP backed by a supplied pure-JAX reference,
+or pair a forward and an explicit backward Pallas call. The latter makes both
+directions fused custom calls when the supplied kernel implements a valid VJP.
 
 The RK4 ensemble measurement supplies the motivating workload: one fused
 fixed-step solve per independent trajectory was 1.059 ms median for 100,000
@@ -46,12 +47,18 @@ contract?
 ### Initial result
 
 `examples/07_mps_parameter_recovery.py` now fits shared Lotka--Volterra
-parameters from 4,096 final-state observations. On the MPS integration
-environment, 500 Adam steps recovered `(1.099902, 0.399927, 0.101211,
-0.401802)` from truth `(1.1, 0.4, 0.1, 0.4)`, with final loss `3.17e-08`.
-The run took 26.5 seconds. This establishes value-and-gradient correctness and
-an end-to-end optimizer path; it must not be reported as a fused training
-speedup because its pullback is still the JAX RK4 reference.
+parameters from 4,096 final-state observations. Its backward call propagates
+six RK4 forward sensitivities, then contracts them with the output cotangent.
+On the MPS integration environment, 500 Adam steps recovered `(1.099902,
+0.399927, 0.101211, 0.401802)` from truth `(1.1, 0.4, 0.1, 0.4)`, with final
+loss `3.17e-08`. The fused forward/backward run took 6.3 seconds, compared
+with 26.5 seconds when the pullback used the JAX reference. The example checks
+the initial loss and gradients against that reference before timing.
+
+This establishes value-and-gradient correctness, an end-to-end optimizer path,
+and a first full-step speedup for this small-input problem. The current kernel
+is a tangent-transpose, not the scalable reverse-time/checkpointed adjoint:
+its cost grows with the number of differentiated inputs.
 
 Shared scalar parameters need expansion to per-trajectory arrays at the MPS
 call boundary. MLX currently represents literal-size inputs in Metal's

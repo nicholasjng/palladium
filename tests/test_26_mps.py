@@ -17,6 +17,12 @@ def _add_kernel(x_ref, y_ref, o_ref):
     o_ref[...] = x_ref[...] + y_ref[...]
 
 
+def _add_vjp_kernel(x_ref, y_ref, cotangent_ref, x_gradient_ref, y_gradient_ref):
+    del x_ref, y_ref
+    x_gradient_ref[...] = cotangent_ref[...]
+    y_gradient_ref[...] = cotangent_ref[...]
+
+
 def test_descriptor_round_trip_is_stable():
     descriptor = palladium.MpsDispatchDescriptor(
         version=1,
@@ -65,6 +71,27 @@ def test_mps_call_reference_vjp_enables_cpu_training_fallback():
         out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
         vjp_reference=reference,
     )
+    x = jnp.arange(8, dtype=jnp.float32)
+    y = jnp.ones(8, dtype=jnp.float32)
+    loss = lambda a, b: jnp.sum(call(a, b) ** 2)
+    np.testing.assert_allclose(
+        np.asarray(jax.jit(jax.grad(loss, argnums=(0, 1)))(x, y)),
+        np.asarray((2 * (x + y), 2 * (x + y))),
+    )
+
+
+def test_mps_call_accepts_a_pallas_backward_kernel():
+    forward = palladium.mps_call_jit(
+        _add_kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32)
+    )
+    backward = palladium.mps_call_jit(
+        _add_vjp_kernel,
+        out_shape=(
+            jax.ShapeDtypeStruct((8,), jnp.float32),
+            jax.ShapeDtypeStruct((8,), jnp.float32),
+        ),
+    )
+    call = forward.with_vjp(backward)
     x = jnp.arange(8, dtype=jnp.float32)
     y = jnp.ones(8, dtype=jnp.float32)
     loss = lambda a, b: jnp.sum(call(a, b) ** 2)
