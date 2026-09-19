@@ -724,6 +724,8 @@ def _transpose_is_dot_rhs_only(env: Environment, eqn: JaxprEqn) -> bool:
 ELEMENTWISE: dict[str, str] = {
     # binary
     "add": "({a} + {b})",
+    # AD cotangent accumulation; supported numeric arrays use ordinary addition.
+    "add_any": "({a} + {b})",
     "sub": "({a} - {b})",
     "mul": "({a} * {b})",
     "div": "({a} / {b})",

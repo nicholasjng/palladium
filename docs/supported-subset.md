@@ -31,11 +31,16 @@ error taxonomy in `docs/getting-started.md`.
 
 ## Primitives
 
-Elementwise: `add sub mul div min max pow neg abs exp log sin cos sqrt
+Elementwise: `add add_any sub mul div min max pow neg abs exp log sin cos sqrt
 tanh sign rem integer_pow clamp select_n convert_element_type
 bitcast_convert_type`, comparisons (`lt le gt ge eq ne`), logical and
 bitwise `and or xor not`, `shift_right_logical`. Operands broadcast
 NumPy-style against the output shape.
+
+`add_any` is the numeric cotangent accumulation emitted by JAX autodiff.
+Pure functions differentiated with `jax.vjp` inside a Pallas kernel can
+therefore compile when their resulting primitives are in this supported subset.
+This does not supply automatic differentiation rules for arbitrary MPS calls.
 
 `sign` preserves zero and NaN inputs under SAFE math. `rem` uses
 truncating remainder (the dividend's sign), with floating-point `fmod`

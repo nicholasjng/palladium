@@ -33,6 +33,16 @@ def test_saxpy_with_literal(rng):
     )
 
 
+def test_autodiff_cotangent_accumulation(rng):
+    def kernel(x_ref, out_ref):
+        out_ref[...] = jax.grad(lambda x: jnp.sum(x * x + jnp.sin(x)))(x_ref[...])
+
+    x = rng.standard_normal(32, dtype=np.float32)
+    _check_against_oracle(
+        kernel, (x,), out_shape=jax.ShapeDtypeStruct((32,), jnp.float32)
+    )
+
+
 def test_binary_zoo(rng):
     def kernel(x_ref, y_ref, o_ref):
         x, y = x_ref[...], y_ref[...]
