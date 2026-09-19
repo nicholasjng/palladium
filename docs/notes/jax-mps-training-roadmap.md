@@ -115,6 +115,13 @@ metal-runtime SAFE mode; the MPS bridge currently supports FAST only.
 
 ## Phase 2: conditional continuous normalizing flow
 
+Status (2026-09-19): the first unconditional 2D CNF is implemented and tested.
+It uses a time-dependent tanh MLP, exact divergence, and a JAX-generated
+per-step VJP compiled into the checkpointed backward Pallas kernel. Mixture
+density fitting and complete-step benchmarks are recorded in
+[the CNF note](cnf-training.md). External conditioning and a real-data
+application remain later extensions.
+
 Use the differentiated solver in a deliberately kernel-friendly CNF:
 
 ```text

@@ -5,6 +5,9 @@ records, kept for provenance. Nothing here is user documentation (that
 lives one level up in `docs/`), and nothing here is a stability
 promise.
 
+- [cnf-training.md](cnf-training.md): implemented 2D neural CNF, generated
+  discrete adjoint, mixture-density validation, and complete-step timings
+  (2026-09-19).
 - [jax-mps-training-roadmap.md](jax-mps-training-roadmap.md): staged plan for
   differentiable parameter recovery and a continuous-normalizing-flow workload
   after the Palladium/jax-mps custom-call spike (2026-09-17).
