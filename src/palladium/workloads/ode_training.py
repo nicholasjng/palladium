@@ -158,9 +158,7 @@ def make_solver(n, *, steps=100, dt=0.01, interval=10, variant="reverse"):
 
         def step(_, carry):
             x, y, dxx, dyx, dxy, dyy, dxa, dya, dxb, dyb, dxc, dyc, dxd, dyd = carry
-            x_next, y_next, dxx, dyx = tangent_step(
-                x, y, dxx, dyx, zero, zero, zero, zero
-            )
+            x_next, y_next, dxx, dyx = tangent_step(x, y, dxx, dyx, zero, zero, zero, zero)
             _, _, dxy, dyy = tangent_step(x, y, dxy, dyy, zero, zero, zero, zero)
             _, _, dxa, dya = tangent_step(x, y, dxa, dya, one, zero, zero, zero)
             _, _, dxb, dyb = tangent_step(x, y, dxb, dyb, zero, one, zero, zero)
@@ -183,28 +181,26 @@ def make_solver(n, *, steps=100, dt=0.01, interval=10, variant="reverse"):
                 dyd,
             )
 
-        _, _, dxx, dyx, dxy, dyy, dxa, dya, dxb, dyb, dxc, dyc, dxd, dyd = (
-            jax.lax.fori_loop(
-                0,
-                steps,
-                step,
-                (
-                    x_ref[...],
-                    y_ref[...],
-                    one,
-                    zero,
-                    zero,
-                    one,
-                    zero,
-                    zero,
-                    zero,
-                    zero,
-                    zero,
-                    zero,
-                    zero,
-                    zero,
-                ),
-            )
+        _, _, dxx, dyx, dxy, dyy, dxa, dya, dxb, dyb, dxc, dyc, dxd, dyd = jax.lax.fori_loop(
+            0,
+            steps,
+            step,
+            (
+                x_ref[...],
+                y_ref[...],
+                one,
+                zero,
+                zero,
+                one,
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+                zero,
+            ),
         )
         cotangent_x, cotangent_y = cotangent_x_ref[...], cotangent_y_ref[...]
         x_gradient_ref[...] = cotangent_x * dxx + cotangent_y * dyx

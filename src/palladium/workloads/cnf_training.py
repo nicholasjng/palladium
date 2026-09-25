@@ -172,9 +172,7 @@ def make_flow(n, *, width=4, steps=16, interval=4, variant="reverse", reverse=Tr
             grads = tuple(a + b for a, b in zip(grads, local_grads, strict=True))
             return cot, grads
 
-        cot, grads = jax.lax.fori_loop(
-            0, steps, reverse_step, (initial_cot, zero_grads)
-        )
+        cot, grads = jax.lax.fori_loop(0, steps, reverse_step, (initial_cot, zero_grads))
         for j in range(3):
             state_grad_ref[0, j] = cot[j]
         for j in range(count):
