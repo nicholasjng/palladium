@@ -19,8 +19,9 @@ used JAX 0.11.1; the recorded notes did not consistently retain the GPU model.
 
 Training measurements are warmed, synchronized medians over 15 samples with
 rotating variant order. Updates start from identical optimizer states; input
-transfer and first-call compilation are excluded. See the reproducible scripts
-for [RK4](../benchmarks/bench_jax_mps_rk4.py),
+transfer and first-call compilation are excluded. Run the Mew benchmarks with
+`JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/`.
+See the reproducible scripts for [RK4](../benchmarks/bench_jax_mps_rk4.py),
 [ODE training](../benchmarks/bench_mps_training.py), and
 [CNF training](../benchmarks/bench_cnf_training.py).
 

@@ -1,6 +1,6 @@
 """Ensemble ODE benchmarks: palladium's Metal kernels vs Diffrax on CPU.
 
-The measured story behind examples/01: one thread per Lotka-Volterra
+The measured story behind the ODE ensemble example: one thread per Lotka-Volterra
 system, the whole RK4 solve fused into a single dispatch, against
 jit(vmap(diffeqsolve)), the practical Diffrax deployment on macOS.
 
@@ -8,7 +8,8 @@ Dispatch rows use `use_real_time`: the GPU wait blocks without consuming
 CPU time, so Google Benchmark's CPU-time default would misreport them
 (same convention as metal-runtime's bench_overhead.py).
 
-Run with `uv run mew run benchmarks/`, filter via `--tag palladium|diffrax`.
+Run with `uv run mew run --random-interleaving benchmarks/`, filter via
+`--tag palladium` or `--tag diffrax`.
 """
 
 import functools

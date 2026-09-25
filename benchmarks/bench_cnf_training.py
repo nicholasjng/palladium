@@ -1,102 +1,59 @@
-"""Synchronized, interleaved complete CNF training steps on MPS and CPU.
+"""Benchmark complete CNF training updates with Mew.
 
-Run with JAX_PLATFORMS=mps,cpu from the modified jax-mps environment.
-MLP width and RK4 step count are identical in every variant.
+Run with ``JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/``.
 """
 
-import argparse
-import json
-import statistics
 import time
 
 import jax
-import jax.numpy as jnp
+import mew
 import numpy as np
 
-from palladium.cnf_training import initial_state, make_training_step, mixture_data
+from palladium.workloads.cnf_training import initial_state, make_training_step, mixture_data
+
+N, WIDTH, STEPS = 256, 4, 16
+INTERVALS = (1, 4, 8)
+CASES = [
+    {"platform": "cpu", "variant": "jax", "interval": 1},
+    {"platform": "mps", "variant": "jax", "interval": 1},
+    {"platform": "mps", "variant": "reference", "interval": 1},
+]
+CASES += [{"platform": "mps", "variant": "reverse", "interval": interval} for interval in INTERVALS]
+IDS = [f"{case['platform']}-{case['variant']}-k{case['interval']}" for case in CASES]
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--n", type=int, default=256)
-    parser.add_argument("--width", type=int, default=4)
-    parser.add_argument("--steps", type=int, default=16)
-    parser.add_argument("--intervals", nargs="+", type=int, default=[1, 4, 8])
-    parser.add_argument("--repeats", type=int, default=15)
-    args = parser.parse_args()
-    if min(args.n, args.width, args.steps, args.repeats, *args.intervals) < 1:
-        parser.error("all sizes and repetition counts must be positive")
-    rows, jobs = {}, {}
-    variants = [("cpu", "jax", 1), ("mps", "jax", 1), ("mps", "reference", 1)]
-    variants += [("mps", "reverse", k) for k in args.intervals]
-    expected = None
-    for platform, variant, interval in variants:
-        name = f"{platform}/{variant}/k={interval}"
-        with jax.default_device(jax.devices(platform)[0]):
-            state = initial_state(args.width)
-            data = jnp.asarray(mixture_data(args.n))
-            update, _ = make_training_step(
-                args.n,
-                width=args.width,
-                steps=args.steps,
-                interval=interval,
-                variant=variant,
-            )
-            jax.block_until_ready((state, data))
-            start = time.perf_counter()
-            executable = update.lower(state, data).compile()
-            compile_ms = (time.perf_counter() - start) * 1000
-            start = time.perf_counter()
-            result = jax.block_until_ready(executable(state, data))
-            first_ms = (time.perf_counter() - start) * 1000
-            if expected is None:
-                expected = jax.device_get(result)
-            for got, want in zip(
-                jax.tree.leaves(result), jax.tree.leaves(expected), strict=True
-            ):
-                np.testing.assert_allclose(got, want, rtol=4e-4, atol=3e-6)
-            for _ in range(3):
-                jax.block_until_ready(executable(state, data))
-            jobs[name] = executable, state, data
-            rows[name] = {
-                "compile_ms": compile_ms,
-                "first_execute_ms": first_ms,
-                "checkpoint_bytes": 12
-                * args.n
-                * ((args.steps + interval - 1) // interval)
-                if variant == "reverse"
-                else None,
-                "samples_ms": [],
-            }
-    names = list(jobs)
-    for repeat in range(args.repeats):
-        offset = repeat % len(names)
-        for name in names[offset:] + names[:offset]:
-            executable, state, data = jobs[name]
-            start = time.perf_counter()
-            jax.block_until_ready(executable(state, data))
-            rows[name]["samples_ms"].append((time.perf_counter() - start) * 1000)
-    for row in rows.values():
-        samples = row["samples_ms"]
-        row.update(
-            median_ms=statistics.median(samples),
-            min_ms=min(samples),
-            max_ms=max(samples),
+@mew.parametrize(CASES, ids=IDS, tags="cnf-training", use_real_time=True, unit="ms")
+def bench_cnf_training(state: mew.State, platform: str, variant: str, interval: int) -> None:
+    with jax.default_device(jax.devices(platform)[0]):
+        initial = initial_state(WIDTH)
+        data = mixture_data(N)
+        update, _ = make_training_step(
+            N,
+            width=WIDTH,
+            steps=STEPS,
+            interval=interval,
+            variant=variant,
         )
-    print(
-        json.dumps(
-            {
-                "jax": jax.__version__,
-                "config": vars(args),
-                "note": "Identical starting Adam states; rotated order, synchronized samples. "
-                "Checkpoint bytes exclude weights, cotangents, and other memory. "
-                "First execution may include lazy Metal compilation; caches not cleared.",
-                "results": rows,
-            },
-            indent=2,
+        jax.block_until_ready((initial, data))
+        start = time.perf_counter()
+        executable = update.lower(initial, data).compile()
+        compile_ms = (time.perf_counter() - start) * 1000
+        start = time.perf_counter()
+        actual = jax.block_until_ready(executable(initial, data))
+        first_execute_ms = (time.perf_counter() - start) * 1000
+
+        reference_update, _ = make_training_step(N, width=WIDTH, steps=STEPS, variant="jax")
+        expected = jax.block_until_ready(reference_update(initial, data))
+        for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_allclose(got, want, rtol=4e-4, atol=3e-6)
+
+        state.set_counter("compile_ms", compile_ms)
+        state.set_counter("first_execute_ms", first_execute_ms)
+        state.set_counter(
+            "checkpoint_bytes",
+            12 * N * ((STEPS + interval - 1) // interval) if variant == "reverse" else 0,
         )
-    )
-
-
-if __name__ == "__main__":
-    main()
+        for _ in range(3):
+            jax.block_until_ready(executable(initial, data))
+        for _ in state:
+            jax.block_until_ready(executable(initial, data))
