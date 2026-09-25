@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from palladium.cnf_training import (
+from palladium.workloads.cnf_training import (
     initial_state,
     make_training_step,
     mixture_data,
@@ -29,9 +29,7 @@ def main():
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--learning-rate", type=float, default=0.01)
     parser.add_argument("--device", choices=("mps", "cpu"), default="mps")
-    parser.add_argument(
-        "--variant", choices=("reverse", "reference", "jax"), default="reverse"
-    )
+    parser.add_argument("--variant", choices=("reverse", "reference", "jax"), default="reverse")
     args = parser.parse_args()
     with jax.default_device(jax.devices(args.device)[0]):
         train = jnp.asarray(mixture_data(args.n, 17))
@@ -54,9 +52,7 @@ def main():
         for index in range(args.iterations):
             state, value = update(state, train)
             if (index + 1) % 100 == 0:
-                curve.append(
-                    {"iteration": index + 1, "pre_update_train_nll": float(value)}
-                )
+                curve.append({"iteration": index + 1, "pre_update_train_nll": float(value)})
         jax.block_until_ready(state)
         train_seconds = time.perf_counter() - start
         final_nll = float(loss(state[0], heldout))

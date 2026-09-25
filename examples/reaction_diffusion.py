@@ -1,10 +1,10 @@
 """Example 4: method-of-lines PDE, the large-state contrast.
 
-Docs: indexed ref access, docs/supported-subset.md (ref indexing).
+Docs: indexed ref access, docs/supported-jax.md (Pallas kernels).
 Gray-Scott reaction-diffusion on a 128x128 grid, integrated with explicit
 Euler. The baseline is jax.jit + lax.scan on CPU. The Metal version is a
 stencil kernel: one thread per grid point, halo reads from neighbours via
-indexed ref access (`x_ref[i, j]`, `test_09_indexed_refs.py`).
+indexed ref access (`x_ref[i, j]`, `tests/memory/test_indexed_refs.py`).
 
 A PDE step depends on every thread's neighbours finishing the previous
 step first, which a single dispatch cannot guarantee across threadgroups
@@ -36,13 +36,7 @@ DU, DV, F, KK, DT = 0.16, 0.08, 0.035, 0.065, 1.0
 
 
 def laplacian(z):
-    return (
-        jnp.roll(z, 1, 0)
-        + jnp.roll(z, -1, 0)
-        + jnp.roll(z, 1, 1)
-        + jnp.roll(z, -1, 1)
-        - 4.0 * z
-    )
+    return jnp.roll(z, 1, 0) + jnp.roll(z, -1, 0) + jnp.roll(z, 1, 1) + jnp.roll(z, -1, 1) - 4.0 * z
 
 
 @jax.jit
@@ -129,9 +123,7 @@ def main():
     u.block_until_ready()
     t_cpu = time.perf_counter() - t0
     print(f"Gray-Scott {SIZE}x{SIZE}, {STEPS} Euler steps")
-    print(
-        f"  jax.jit + scan (CPU): {t_cpu:.3f} s, pattern energy {float(jnp.sum(v)):.1f}"
-    )
+    print(f"  jax.jit + scan (CPU): {t_cpu:.3f} s, pattern energy {float(jnp.sum(v)):.1f}")
 
     run_metal(u0, v0)  # trace + emit + Metal compile outside the clock
     _, got_v, t_wall, t_gpu = run_metal(u0, v0)

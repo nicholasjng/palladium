@@ -1,6 +1,6 @@
 """Example 2: the lockstep tax, or why per-thread adaptivity is the prize.
 
-Docs: divergent while-loops, docs/supported-subset.md (control flow).
+Docs: divergent while-loops, docs/supported-jax.md (control flow).
 vmap over an adaptive Diffrax solve forces the whole batch into lockstep:
 every trajectory takes (and rejects) the steps its worst neighbour needs.
 Measures that tax on the CPU by salting a mild Van der Pol ensemble with
@@ -8,7 +8,7 @@ a few stiff members, then runs the same ensembles through palladium's
 per-thread adaptive kernel (Bogacki-Shampine 3(2), FSAL, PI controller;
 `pcoeff=0.4, icoeff=0.3`, diffrax's own suggestion for "moderate
 difficulty" problems) to show the tax doesn't apply there. Full recipe
-in tests/test_08_adaptive.py.
+in tests/control_flow/test_adaptive_controller.py.
 """
 
 import time

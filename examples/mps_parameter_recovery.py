@@ -10,7 +10,7 @@ import time
 import jax
 import numpy as np
 
-from palladium.ode_training import (
+from palladium.workloads.ode_training import (
     initial_state,
     make_solver,
     make_training_step,

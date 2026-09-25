@@ -184,9 +184,7 @@ def part_a():
     print("Part A -- float64 on the CPU, one e=0.3 orbit")
     print("          per-orbit peak |E + 1/2|, first orbit vs last")
     print()
-    print(
-        f"  {'method':<26}{'h':>8}{'orbits':>8}{'first':>12}{'last':>12}{'growth':>9}"
-    )
+    print(f"  {'method':<26}{'h':>8}{'orbits':>8}{'first':>12}{'last':>12}{'growth':>9}")
     for label, fn, h, orbits in (
         ("velocity-Verlet (sympl.)", verlet_step, 0.008, 200),
         ("Heun (not sympl.)", heun_step, 0.008, 200),
@@ -195,10 +193,7 @@ def part_a():
         ("Yoshida-4 (sympl.)", yoshida4_step, 0.008, 20),
     ):
         ev = envelope(fn, h, orbits)
-        print(
-            f"  {label:<26}{h:>8}{orbits:>8}{ev[0]:>12.3e}{ev[-1]:>12.3e}"
-            f"{ev[-1] / ev[0]:>8.2f}x"
-        )
+        print(f"  {label:<26}{h:>8}{orbits:>8}{ev[0]:>12.3e}{ev[-1]:>12.3e}{ev[-1] / ev[0]:>8.2f}x")
     print()
     print("  Over the same 200 orbits at the same step size, Verlet's peak is")
     print("  unchanged and Heun's is not: that is the whole distinction, and no")
@@ -304,9 +299,7 @@ def part_b():
         cells = "".join(f"{rows[k][chunk - 1]:>13.2e}" for k in rows)
         print(f"  {chunk * CHUNK:>12,}{cells}")
     print()
-    print(
-        f"  wall clock: FAST {t_fast:.1f} s, SAFE {t_safe:.1f} s, df32 {t_df32:.1f} s"
-    )
+    print(f"  wall clock: FAST {t_fast:.1f} s, SAFE {t_safe:.1f} s, df32 {t_df32:.1f} s")
     print()
 
     # Fit over the last decade only: below it the float32 lines are still

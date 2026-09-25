@@ -1,6 +1,6 @@
 """Example 1: massive ensembles of small ODEs, palladium vs Diffrax.
 
-Docs: the classic execution model in docs/supported-subset.md.
+Docs: the classic execution model in docs/supported-jax.md.
 One Metal thread integrates one Lotka-Volterra system (RK4, fixed step)
 with its own parameters; the grid is the ensemble. The Diffrax baseline is
 the same ensemble under jit(vmap(diffeqsolve)) on the CPU backend; on
@@ -117,8 +117,7 @@ def main():
         got_x, got_y = solve(*args)
         t_metal = time.perf_counter() - t0
         print(
-            f"palladium (Apple GPU, RK4 fixed):        {t_metal:.3f} s "
-            f"({t_diffrax / t_metal:.1f}x)"
+            f"palladium (Apple GPU, RK4 fixed):        {t_metal:.3f} s ({t_diffrax / t_metal:.1f}x)"
         )
         err = np.max(np.abs(np.stack([got_x, got_y], axis=1) - baseline))
         print(
