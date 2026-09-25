@@ -46,6 +46,30 @@ def _rule_reshape(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     env.bind(eqn.outvars[0], dataclasses.replace(src, shape=eqn.params["new_sizes"]))
 
 
+@rule("squeeze")
+def _rule_squeeze(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """Remove size-one axes without moving row-major array storage."""
+    src = env.val(eqn.invars[0])
+    dimensions = tuple(eqn.params["dimensions"])
+    if (
+        len(set(dimensions)) != len(dimensions)
+        or any(axis < 0 or axis >= len(src.shape) for axis in dimensions)
+        or any(src.shape[axis] != 1 for axis in dimensions)
+    ):
+        raise EmitError("squeeze requires distinct axes of size one")
+    out_shape = tuple(size for axis, size in enumerate(src.shape) if axis not in dimensions)
+    expected_shape = tuple(int(d) for d in shaped(eqn.outvars[0].aval).shape)
+    if out_shape != expected_shape:
+        raise EmitError(f"squeeze shape mismatch: got {out_shape}, expected {expected_shape}")
+    if src.transposed:
+        raise EmitError("squeeze of a lazily transposed value is unsupported")
+    if out_shape:
+        env.bind(eqn.outvars[0], dataclasses.replace(src, shape=out_shape))
+        return
+    dst = declare(env, cursor, eqn.outvars[0])
+    cursor.emit(f"{dst.expr} = {src.read('0')};")
+
+
 @rule("transpose")
 def _rule_transpose(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """`x.T` / `jnp.transpose(x, perm)` -> a materialized, permuted copy.

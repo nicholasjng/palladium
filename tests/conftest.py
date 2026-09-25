@@ -11,7 +11,10 @@ _NO_GPU_MODULES = {
     "test_regressions",
     "test_structural_lowerings",
     "test_typed_arithmetic",
+    "test_tensorops_dot",
+    "test_tensorops_flash_attention",
     "test_views",
+    "test_pallas_flash_attention",
 }
 
 

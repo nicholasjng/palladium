@@ -23,7 +23,29 @@ transfer and first-call compilation are excluded. Run the Mew benchmarks with
 `JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/`.
 See the reproducible scripts for [RK4](../benchmarks/bench_jax_mps_rk4.py),
 [ODE training](../benchmarks/bench_mps_training.py), and
-[CNF training](../benchmarks/bench_cnf_training.py).
+[CNF training](../benchmarks/bench_cnf_training.py). The experimental
+[Pallas attention benchmark](../benchmarks/bench_pallas_flash_attention.py)
+checks causal and noncausal Pallas TensorOps lowering against a NumPy reference
+and measures resident-buffer runs at sequence lengths from 1,024 to 4,096. It
+needs an MSL 4-capable runtime.
+
+On an M1 Pro, f32 runs with shape `[1, sequence, 4, 64]` and 32×64 query/key
+tiles measured:
+
+| Sequence | Causal | Pallas-generated MSL |
+|---:|:---:|---:|
+| 1,024 | No | 0.96 ms |
+| 1,024 | Yes | 0.95 ms |
+| 2,048 | No | 3.07 ms |
+| 2,048 | Yes | 3.09 ms |
+| 4,096 | No | 11.29 ms |
+| 4,096 | Yes | 11.09 ms |
+
+These are steady-state medians with resident inputs; the generated kernel
+passed the benchmark's NumPy correctness check for both mask modes. Causal and
+noncausal timings are within the variation between runs, with no consistent
+overhead from causal masking at these sizes. These are workload-specific
+results, not a general TensorOps speedup guarantee.
 
 A separate JAX 0.11.2 forward-only probe ran 4,096 CNF trajectories for 64
 RK4 steps through CPU FFI to Metal. Warm medians were 0.510 ms at width 4,
