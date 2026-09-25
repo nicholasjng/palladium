@@ -1,125 +1,81 @@
 # Getting started
 
-palladium runs [Pallas](https://docs.jax.dev/en/latest/pallas/index.html)
-kernels on Apple GPUs. You write an ordinary Pallas kernel; palladium
-traces it, emits Metal Shading Language, compiles it through
-[metal-runtime](https://github.com/nicholasjng/metal-runtime), and gives
-you back a callable.
+Palladium accepts a function written for jax.experimental.pallas, traces its
+single pallas_call, and emits a Metal kernel. Choose an entry point based on
+where the call should run:
 
-## Install
+| Entry point | Execution |
+|---|---|
+| mps_call_jit | jax-mps custom call on the MPS platform; composable with jax.jit |
+| metal_call | Eager Metal dispatch; NumPy inputs and outputs |
+| metal_call_jit | Metal dispatch through a CPU jax.ffi target; composable with jax.jit |
 
-Requires macOS on Apple silicon, Python 3.12+, and CMake + Ninja on
-PATH (`brew install cmake ninja`).
-
-```sh
-uv sync          # builds the native FFI handler as part of the install
-uv run pytest -q # sanity check: must be green on a Metal-capable Mac
-```
+The latter two use metal-runtime. mps_call_jit requires jax-mps to be
+installed and selected. See the [README](../README.md) for the current install
+requirements.
 
 ## First kernel
 
-```python
+~~~python
 import jax
 import jax.experimental.pallas as pl
 import jax.numpy as jnp
 import numpy as np
 import palladium
 
-def saxpy(x_ref, y_ref, o_ref):
-    o_ref[...] = 2.0 * x_ref[...] + y_ref[...]
+def saxpy(x_ref, y_ref, out_ref):
+    out_ref[...] = 2.0 * x_ref[...] + y_ref[...]
 
-spec = pl.BlockSpec((256,), lambda i: (i,))
+n = 4096
+block = pl.BlockSpec((1,), lambda i: (i,))
 call = palladium.metal_call(
     saxpy,
-    grid=(16,),            # 16 program instances...
-    in_specs=[spec, spec],  # ...each seeing one 256-element block
-    out_specs=spec,
-    out_shape=jax.ShapeDtypeStruct((4096,), jnp.float32),
+    grid=(n,),
+    in_specs=(block, block),
+    out_specs=block,
+    out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
 )
+x = np.arange(n, dtype=np.float32)
+y = np.ones(n, dtype=np.float32)
+result = call(x, y)
+~~~
 
-x = np.arange(4096, dtype=np.float32)
-y = np.ones(4096, dtype=np.float32)
-out = call(x, y)   # NumPy in, NumPy out; compiled on first call
-```
+Each program instance handles one element here. Keep blocks small: Pallas
+blocks and intermediate arrays are stored per thread, and oversized kernels
+can exceed Metal's per-thread stack limit.
 
-`metal_call` takes the usual `pl.pallas_call` keywords (`out_shape`,
-`grid`, `in_specs`, `out_specs`, ...) plus two Metal extras:
-`math_mode` (`metal_runtime.MathMode`, FAST by default) and
-`threadgroup` (explicit threadgroup size; leave unset normally).
+## Check the result
 
-The grid matters more than on other backends: each program instance's
-blocks are copied into thread-local memory, so per-instance blocks must
-stay small (a gridless call over the full 4096-element array would
-overflow the per-thread stack, and says so). Parallelism comes from the
-grid, not from threads inside an instance.
+Every call exposes .interpret, which runs the same Pallas kernel through the
+CPU interpreter. Use it as the reference for independent-thread kernels:
 
-## The oracle workflow
+~~~python
+np.testing.assert_allclose(call(x, y), call.interpret(x, y), rtol=1e-5)
+~~~
 
-Every `metal_call` result carries `.interpret`, the same kernel run by
-Pallas's CPU interpreter. Diff against it while developing; it is the
-ground truth for what the kernel should compute:
+Cooperative kernels use multiple threads in a threadgroup; the interpreter
+models only one thread per instance and is not a valid reference for them.
+Supply an independent reference= to .verify for those kernels. FAST math
+is the default, so transcendental results and reduction order can differ from
+the reference.
 
-```python
-np.testing.assert_allclose(call(a, x, y), call.interpret(a, x, y), rtol=1e-5)
-```
+.explain(*args) reports the grid, threadgroup, declared storage, emitted MSL
+size, and expected execution path. It traces and emits source but does not
+compile or dispatch. palladium.debug_msl returns the generated MSL directly.
 
-FAST math means transcendentals and reduction orders are not bit-equal
-to the oracle; expect roughly 1e-6 relative deviation for f32
-elementwise work and up to 1e-4 through exp/log-heavy kernels. Pass
-`math_mode=metal_runtime.MathMode.SAFE` for IEEE ordering.
+## JAX transformations
 
-## Composing with jax.jit
+metal_call_jit supports jax.jit and jax.vmap. Its default
+vmap_method="pipelined" handles the batch in one FFI call; nested batch
+levels and the sequential methods dispatch one element at a time. Put a
+batch axis in the Pallas grid when possible.
 
-`metal_call` is eager and NumPy-based; its result cannot sit inside a
-jitted computation. `metal_call_jit` registers the kernel as a jax.ffi
-target instead, so the call is traceable and composes with surrounding
-`jax.numpy` code:
+mps_call_jit supports jax.jit; jax.vmap over its custom call is not
+supported. Neither custom-call path derives gradients from emitted MSL. Pair
+forward and backward calls with jax.custom_vjp, or provide a pure-JAX
+reference VJP where supported. See the [supported functionality](supported-jax.md)
+for details.
 
-```python
-step = palladium.metal_call_jit(kernel, out_shape=...)
-fast = jax.jit(lambda y, dt: jnp.sum(step(y, dt)))
-```
-
-Two transformation notes:
-
-- **`jax.grad`**: not differentiable by itself (palladium cannot derive
-  a backward kernel from forward MSL). Author the backward pass as a
-  second Pallas kernel and pair the two with `jax.custom_vjp`,
-  gradient-checked against `jax.grad` of the plain jnp expression.
-- **`jax.vmap`**: works out of the box. The default
-  `vmap_method="pipelined"` sends the whole batch through one FFI call
-  and loops it in the native handler with several dispatches in flight;
-  nested vmap falls back to one dispatch per outer element.
-  `"sequential"` and `"sequential_unrolled"` make every batch element a
-  separate dispatch paying the fixed dispatch floor, and `None` refuses
-  batching altogether. Either way, putting the batch dimension in the
-  Pallas grid is faster still (one dispatch total). Whole-batch methods
-  are rejected (the launch grid is baked per unbatched shape).
-
-## Seeing what you got
-
-- `call.explain(*args)` reports the launch geometry (grid, threadgroup)
-  and emitted MSL line count. Takes arrays or `jax.ShapeDtypeStruct`s;
-  compiles and runs nothing.
-- `palladium.debug_msl(kernel, *example_args, **pallas_kwargs)` returns
-  the emitted MSL text.
-- `PALLADIUM_EXPLAIN=1` prints one stderr line per newly compiled
-  kernel; `PALLADIUM_DUMP_MSL=1` prints each kernel's source (a
-  directory path writes `.metal` files instead).
-
-## When something is rejected
-
-Everything palladium raises derives from `palladium.PalladiumError`:
-
-- `TraceError`: the pallas_call itself is out of scope (multiple
-  pallas_calls, scalar prefetch grids).
-- `EmitError`: the kernel uses an unsupported case of a supported
-  primitive (non-contiguous blocks, batched dots, strided slices);
-  the message names the construct.
-- `UnsupportedPrimitiveError`: no lowering rule exists for a staged
-  primitive; the message names it, and `docs/extending.md` shows how to
-  add one.
-- `DispatchError`: a compiled kernel was called with the wrong argument
-  count, shape, or dtype. Dtypes are checked strictly and never cast.
-
-See `docs/supported-subset.md` for the full contract.
+Unsupported kernel structure raises TraceError; unsupported lowering raises
+EmitError or UnsupportedPrimitiveError. Invalid runtime arguments raise
+DispatchError. These errors derive from PalladiumError.
