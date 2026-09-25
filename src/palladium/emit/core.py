@@ -67,7 +67,9 @@ class CExpr:
 
     @classmethod
     def add(cls, *terms: CExpr) -> CExpr:
-        flattened = tuple(arg for term in terms for arg in (term.args if term.op == "add" else (term,)))
+        flattened = tuple(
+            arg for term in terms for arg in (term.args if term.op == "add" else (term,))
+        )
         kept = tuple(term for term in flattened if not (term.op == "raw" and term.value == 0))
         return cls("add", args=kept)
 
@@ -99,13 +101,17 @@ class BlockLayout:
         return cls(_full_block_shape(info), _element_strides(info.array_shape))
 
     def offset(self, indices: list[str]) -> str:
-        return CExpr.add(*(
-            CExpr.mul(CExpr.raw(index), CExpr.raw(block * stride))
-            for index, block, stride in zip(indices, self.shape, self.strides, strict=True)
-        )).render()
+        return CExpr.add(
+            *(
+                CExpr.mul(CExpr.raw(index), CExpr.raw(block * stride))
+                for index, block, stride in zip(indices, self.shape, self.strides, strict=True)
+            )
+        ).render()
 
     def alignment(self) -> int:
-        return math.gcd(0, *(block * stride for block, stride in zip(self.shape, self.strides, strict=True)))
+        return math.gcd(
+            0, *(block * stride for block, stride in zip(self.shape, self.strides, strict=True))
+        )
 
 
 def shaped(aval: object) -> ShapedArray:
@@ -538,10 +544,13 @@ def _element_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
 def _flat_index(terms: list[tuple[str, int]]) -> str:
     """C expression for `sum(var * stride for var, stride in terms)`,
     omitting the `* 1` for a unit stride and any zero-stride term."""
-    return CExpr.add(*(
-        CExpr.raw(var) if stride == 1 else CExpr.mul(CExpr.raw(var), CExpr.raw(stride))
-        for var, stride in terms if stride != 0
-    )).render()
+    return CExpr.add(
+        *(
+            CExpr.raw(var) if stride == 1 else CExpr.mul(CExpr.raw(var), CExpr.raw(stride))
+            for var, stride in terms
+            if stride != 0
+        )
+    ).render()
 
 
 def _full_block_shape(info: BlockInfo) -> tuple[int, ...]:
@@ -552,7 +561,12 @@ def _full_block_shape(info: BlockInfo) -> tuple[int, ...]:
     return (1,) * missing + info.block_shape
 
 
-def emit_msl_stats(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str, EmitStats]:
+def emit_msl_stats(
+    spec: KernelSpec,
+    kernel_name: str | None = None,
+    *,
+    dot_general: str = "default",
+) -> tuple[str, EmitStats]:
     """Assemble the full MSL source for a KernelSpec, with its storage stats.
 
     Signature convention (relied on by `dispatch.bind`): operands in
@@ -580,6 +594,15 @@ def emit_msl_stats(spec: KernelSpec, kernel_name: str | None = None) -> tuple[st
     UnsupportedPrimitiveError
         If the kernel stages a primitive with no registered rule.
     """
+    if dot_general not in ("default", "tensorops"):
+        raise ValueError("dot_general must be 'default' or 'tensorops'")
+    if dot_general == "tensorops":
+        from palladium.emit.tensorops import emit_tensorops, uses_tensorops
+
+        if uses_tensorops(spec, dot_general):
+            source, shared_bytes = emit_tensorops(spec, kernel_name)
+            return source, EmitStats(thread_bytes=0, threadgroup_bytes=shared_bytes)
+
     name = kernel_name or spec.name
     if len(spec.grid) > 3:
         raise EmitError(f"grid {spec.grid} has rank > 3; Metal grids are 3D")
@@ -713,13 +736,18 @@ def emit_msl_stats(spec: KernelSpec, kernel_name: str | None = None) -> tuple[st
     )
 
 
-def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
+def emit_msl(
+    spec: KernelSpec,
+    kernel_name: str | None = None,
+    *,
+    dot_general: str = "default",
+) -> str:
     """Assemble the full MSL source for a KernelSpec.
 
     Thin wrapper over `emit_msl_stats` for callers that only want the
     text. See that function for the full contract.
     """
-    return emit_msl_stats(spec, kernel_name)[0]
+    return emit_msl_stats(spec, kernel_name, dot_general=dot_general)[0]
 
 
 def ref_view(env: Environment, ref: CVal, indexer: NDIndexer) -> CVal:

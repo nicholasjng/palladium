@@ -152,6 +152,15 @@ def test_mps_call_requires_batch_in_the_grid():
         )
 
 
+def test_mps_call_rejects_the_metal_runtime_tensorops_lowering():
+    with pytest.raises(ValueError, match="only through the metal-runtime backend"):
+        palladium.mps_call_jit(
+            _add_kernel,
+            out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
+            dot_general="tensorops",
+        )
+
+
 def test_mps_call_reference_vjp_enables_cpu_training_fallback():
     def reference(x, y):
         return x + y

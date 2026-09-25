@@ -196,12 +196,27 @@ def check_threadgroup(spec: KernelSpec, threadgroup: tuple[int, ...] | None) -> 
 
 
 def explain_spec(
-    spec: KernelSpec, threadgroup: int | tuple[int, ...] | None = None
+    spec: KernelSpec,
+    threadgroup: int | tuple[int, ...] | None = None,
+    *,
+    dot_general: str = "default",
 ) -> KernelDiagnostics:
     """Diagnostics for a traced spec: emits MSL, compiles nothing."""
-    msl, stats = emit_msl_stats(spec)
-    grid = tuple(int(g) for g in spec.grid)
+    msl, stats = emit_msl_stats(spec, dot_general=dot_general)
     tg = normalize_threadgroup(threadgroup)
+    from palladium.emit.tensorops import SIMDGROUPS, uses_tensorops as _uses_tensorops
+
+    tensorops_kernel = _uses_tensorops(spec, dot_general)
+    if tensorops_kernel:
+        required = (simdgroup_width() * SIMDGROUPS, 1, 1)
+        provided = (tg + (1, 1, 1))[:3] if tg is not None else None
+        if provided is not None and provided != required:
+            raise EmitError(f"TensorOps dot requires threadgroup={required}, got {tg}")
+        tg = required
+        padded_grid = (tuple(int(g) for g in spec.grid) + (1, 1, 1))[:3]
+        grid = tuple(g * t for g, t in zip(padded_grid, tg, strict=True))
+    else:
+        grid = tuple(int(g) for g in spec.grid)
     check_threadgroup(spec, tg)
     limits = device_limits()
     return KernelDiagnostics(
@@ -212,7 +227,7 @@ def explain_spec(
         thread_bytes=stats.thread_bytes,
         threadgroup_bytes=stats.threadgroup_bytes,
         threadgroup_limit=limits.get("max_threadgroup_memory_length"),
-        cooperative=spec.uses_threadgroup,
+        cooperative=spec.uses_threadgroup or tensorops_kernel,
     )
 
 
@@ -225,6 +240,7 @@ def log_compile(
     threadgroup: int | tuple[int, ...] | None = None,
     *,
     execution_path: str = "metal",
+    dot_general: str = "default",
 ) -> None:
     """One stderr line per compiled kernel when PALLADIUM_EXPLAIN is set.
 
@@ -232,6 +248,9 @@ def log_compile(
     """
     if _explain_enabled():
         print(
-            dataclasses.replace(explain_spec(spec, threadgroup), execution_path=execution_path),
+            dataclasses.replace(
+                explain_spec(spec, threadgroup, dot_general=dot_general),
+                execution_path=execution_path,
+            ),
             file=sys.stderr,
         )

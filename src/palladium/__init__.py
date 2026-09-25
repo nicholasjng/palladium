@@ -126,12 +126,14 @@ class MetalCallable:
         math_mode: Any,
         threadgroup: int | tuple[int, ...] | None,
         cache_size: int = 256,
+        dot_general: str = "default",
     ) -> None:
         import jax.experimental.pallas as pl
 
         self._staged = pl.pallas_call(kernel, **pallas_kwargs)
         self._math_mode = math_mode
         self._threadgroup = threadgroup
+        self._dot_general = dot_general
         self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
         # LRU: each entry holds a compiled Metal pipeline. Insertion-ordered
         # and re-inserted on hit, so popping the first item evicts the LRU.
@@ -151,7 +153,9 @@ class MetalCallable:
             data is read.
         """
         _check_dtypes(args)
-        return explain_spec(trace(self._staged, *args), self._threadgroup)
+        return explain_spec(
+            trace(self._staged, *args), self._threadgroup, dot_general=self._dot_general
+        )
 
     def verify(
         self,
@@ -222,12 +226,13 @@ class MetalCallable:
                 if bound is None:
                     _check_dtypes(tuple(arrays))
                     spec = trace(self._staged, *arrays)
-                    log_compile(spec, self._threadgroup)
+                    log_compile(spec, self._threadgroup, dot_general=self._dot_general)
                     bound = bind(
                         spec,
-                        emit_msl(spec),
+                        emit_msl(spec, dot_general=self._dot_general),
                         math_mode=self._math_mode,
                         threadgroup=self._threadgroup,
+                        dot_general=self._dot_general,
                     )
                     self.cache[key] = bound
                     while self._cache_size and len(self.cache) > self._cache_size:
@@ -264,8 +269,9 @@ def debug_msl(kernel: Callable, *example_args, **pallas_kwargs) -> str:
     """
     import jax.experimental.pallas as pl
 
+    dot_general = pallas_kwargs.pop("dot_general", "default")
     spec = trace(pl.pallas_call(kernel, **pallas_kwargs), *example_args)
-    return emit_msl(spec)
+    return emit_msl(spec, dot_general=dot_general)
 
 
 def metal_call(kernel: Callable, **pallas_kwargs) -> MetalCallable:
@@ -277,9 +283,9 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> MetalCallable:
         A Pallas kernel function (operates on Refs).
     **pallas_kwargs
         The usual `pl.pallas_call` keywords (out_shape, grid, in_specs,
-        out_specs, ...), plus two Metal-side extras: `math_mode`
-        (metal_runtime.MathMode, FAST by default) and `threadgroup`
-        (explicit threadgroup size; None lets the runtime choose).
+        out_specs, ...), plus Metal-side extras: `math_mode`
+        (metal_runtime.MathMode, FAST by default), `threadgroup`, and
+        `dot_general="tensorops"` for the restricted TensorOps matmul path.
 
     Notes
     -----
@@ -288,6 +294,12 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> MetalCallable:
     for f32 elementwise work, up to ~1e-4 through exp/log-heavy kernels and
     reductions. Use SAFE for IEEE ordering, and always for compensated
     arithmetic (FAST deletes the error terms).
+
+    Pass `dot_general="tensorops"` to opt into the restricted,
+    threadgroup-cooperative lowering for evenly tiled float32 matrix
+    multiplication, matching batched matrix tiles, or the supported Pallas
+    online-softmax attention pattern. Other dot patterns are rejected; the
+    default keeps the general lowering.
 
     Returns
     -------
@@ -300,4 +312,7 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> MetalCallable:
     math_mode = pallas_kwargs.pop("math_mode", MathMode.FAST)
     threadgroup = pallas_kwargs.pop("threadgroup", None)
     cache_size = pallas_kwargs.pop("cache_size", 256)
-    return MetalCallable(kernel, pallas_kwargs, math_mode, threadgroup, cache_size)
+    dot_general = pallas_kwargs.pop("dot_general", "default")
+    if dot_general not in ("default", "tensorops"):
+        raise ValueError("dot_general must be 'default' or 'tensorops'")
+    return MetalCallable(kernel, pallas_kwargs, math_mode, threadgroup, cache_size, dot_general)

@@ -476,6 +476,12 @@ def mps_call_jit(
     math_mode = pallas_kwargs.pop("math_mode", MathMode.FAST)
     threadgroup = pallas_kwargs.pop("threadgroup", None)
     cache_size = pallas_kwargs.pop("cache_size", 256)
+    dot_general = pallas_kwargs.pop("dot_general", "default")
+    if dot_general != "default":
+        raise ValueError(
+            "dot_general='tensorops' is currently available only through "
+            "the metal-runtime backend, not mps_call_jit"
+        )
     vmap_method = pallas_kwargs.pop("vmap_method", None)
     if vmap_method is not None:
         raise ValueError(

@@ -20,7 +20,7 @@ import numpy as np
 
 from palladium.diagnostics import check_threadgroup, normalize_threadgroup
 from palladium.emit import emit_msl_stats
-from palladium.errors import DispatchError, StackOverflowError
+from palladium.errors import DispatchError, EmitError, StackOverflowError
 from palladium.trace import KernelSpec
 
 __all__ = ["BoundKernel", "PendingResult", "bind"]
@@ -133,6 +133,9 @@ class BoundKernel:
     kernel: mr.Kernel
     msl_source: str
     threadgroup: int | tuple[int, ...] | None = None
+    # Nonzero only for the TensorOps dot lowering, which launches one
+    # cooperative threadgroup per Pallas program instance.
+    tensorops_simdgroups: int = 0
     # Max launches in flight. Each needs its own input buffers, so this
     # bounds memory too: depth x input bytes, allocated only on overlap.
     pipeline_depth: int = 8
@@ -269,6 +272,9 @@ class BoundKernel:
     def _dispatch(self, in_bufs: list[mr.Buffer], out_bufs: list[mr.Buffer]) -> PendingResult:
         """Encode, commit, and track one dispatch on prepared buffers."""
         grid = tuple(int(g) for g in self.spec.grid)
+        if self.tensorops_simdgroups:
+            tg = tuple(self.threadgroup or (1,)) + (1, 1, 1)
+            grid = tuple(g * t for g, t in zip(grid, tg, strict=False))
         batch = mr.Batch()
         batch.add(
             self.kernel,
@@ -323,6 +329,7 @@ def bind(
     *,
     math_mode: mr.MathMode = mr.MathMode.FAST,
     threadgroup: int | tuple[int, ...] | None = None,
+    dot_general: str = "default",
     pipeline_depth: int = 8,
 ) -> BoundKernel:
     """Compile emitted MSL into a dispatchable kernel.
@@ -358,6 +365,8 @@ def bind(
     """
     if pipeline_depth < 1:
         raise ValueError(f"pipeline_depth must be >= 1, got {pipeline_depth}")
+    if dot_general not in ("default", "tensorops"):
+        raise ValueError("dot_general must be 'default' or 'tensorops'")
     # Resolve sentinels and int shorthand once: what BoundKernel stores
     # goes straight to mr.Batch.add, which takes only ints and sequences.
     threadgroup = normalize_threadgroup(threadgroup)
@@ -388,10 +397,26 @@ def bind(
         raise mr.CompileError(
             f"{e}\n\npalladium-emitted source:\n{_numbered(msl_source)}"
         ) from None
+    simdgroups = 0
+    from palladium.emit.tensorops import SIMDGROUPS, uses_tensorops
+
+    if uses_tensorops(spec, dot_general):
+        simdgroups = SIMDGROUPS
+        required = (kernel.thread_execution_width * simdgroups, 1, 1)
+        provided = (tuple(threadgroup) + (1, 1, 1))[:3] if threadgroup is not None else None
+        if provided is not None and provided != required:
+            raise EmitError(f"TensorOps dot requires threadgroup={required}, got {threadgroup}")
+        if required[0] > kernel.max_threads_per_threadgroup:
+            raise EmitError(
+                f"TensorOps dot requires {required[0]} threads per threadgroup, "
+                f"but the pipeline limit is {kernel.max_threads_per_threadgroup}"
+            )
+        threadgroup = required
     return BoundKernel(
         spec=spec,
         kernel=kernel,
         msl_source=msl_source,
         threadgroup=threadgroup,
+        tensorops_simdgroups=simdgroups,
         pipeline_depth=pipeline_depth,
     )

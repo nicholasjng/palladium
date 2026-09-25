@@ -29,6 +29,7 @@ from palladium.diagnostics import (
     explain_spec,
     log_compile,
     normalize_threadgroup,
+    simdgroup_width,
 )
 from palladium.emit import emit_msl
 from palladium.trace import KernelSpec, trace
@@ -122,6 +123,7 @@ class FfiCallable:
         vmap_method: str | None = "pipelined",
         threadgroup: int | tuple[int, ...] | None = None,
         cache_size: int = 256,
+        dot_general: str = "default",
     ) -> None:
         import jax.experimental.pallas as pl
 
@@ -142,6 +144,9 @@ class FfiCallable:
         self._execution_path = "cpu-ffi-to-metal"
         self._vmap_method = vmap_method
         self._threadgroup = normalize_threadgroup(threadgroup)
+        if dot_general not in ("default", "tensorops"):
+            raise ValueError("dot_general must be 'default' or 'tensorops'")
+        self._dot_general = dot_general
         # Bounded LRU of traced specs and emitted MSL.
         self._cache: OrderedDict[tuple, tuple[KernelSpec, str]] = OrderedDict()
         self._cache_size = cache_size
@@ -162,7 +167,11 @@ class FfiCallable:
         """
         shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
         return dataclasses.replace(
-            explain_spec(trace(self._staged, *shapes), self._threadgroup),
+            explain_spec(
+                trace(self._staged, *shapes),
+                self._threadgroup,
+                dot_general=self._dot_general,
+            ),
             execution_path=self._execution_path,
         )
 
@@ -220,8 +229,13 @@ class FfiCallable:
                     shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
                     spec = trace(self._staged, *shapes)
                     check_threadgroup(spec, self._threadgroup)
-                    log_compile(spec, self._threadgroup, execution_path=self._execution_path)
-                    entry = (spec, emit_msl(spec))
+                    log_compile(
+                        spec,
+                        self._threadgroup,
+                        execution_path=self._execution_path,
+                        dot_general=self._dot_general,
+                    )
+                    entry = (spec, emit_msl(spec, dot_general=self._dot_general))
                     self._cache[key] = entry
                     while self._cache_size and len(self._cache) > self._cache_size:
                         self._cache.popitem(last=False)
@@ -291,11 +305,28 @@ class FfiCallable:
         ]
         spec, msl_source = self._spec_and_msl(tuple(unbatched))
         # MRLaunchDesc always wants 3 grid dims; palladium grids are 1-3D.
-        grid = tuple(spec.grid) + (1, 1, 1)
+        grid = (tuple(spec.grid) + (1, 1, 1))[:3]
         # (0, 0, 0) lets the runtime choose (c_api.cpp); a cooperative
         # kernel never reaches here with None, per the check above.
-        tg = self._threadgroup or (0,)
-        threadgroup = (tuple(tg) + (1, 1, 1))[:3] if tg != (0,) else (0, 0, 0)
+        from palladium.emit.tensorops import uses_tensorops as _uses_tensorops
+
+        uses_tensorops = _uses_tensorops(spec, self._dot_general)
+        if uses_tensorops:
+            from palladium.emit.tensorops import SIMDGROUPS
+
+            required = (simdgroup_width() * SIMDGROUPS, 1, 1)
+            provided = (
+                (self._threadgroup + (1, 1, 1))[:3] if self._threadgroup is not None else None
+            )
+            if provided is not None and provided != required:
+                raise ValueError(
+                    f"TensorOps dot requires threadgroup={required}, got {self._threadgroup}"
+                )
+            grid = tuple(g * t for g, t in zip(grid, required, strict=True))
+            threadgroup = required
+        else:
+            tg = self._threadgroup or (0,)
+            threadgroup = (tuple(tg) + (1, 1, 1))[:3] if tg != (0,) else (0, 0, 0)
         in_strides = [
             np.dtype(u.dtype).itemsize * math.prod(u.shape) if b else 0
             for u, b in zip(unbatched, batched, strict=True)
@@ -348,8 +379,8 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
         'pipelined' handles the whole batch in one FFI call and is the
         fastest vmap path; a batch dimension in the Pallas grid still
         beats it (one dispatch total). `threadgroup` (int or tuple; None
-        lets the runtime choose) is required for kernels using
-        `palladium.threadgroup_memory`.
+        lets the runtime choose) and `dot_general="tensorops"` select
+        Metal execution details.
 
     Returns
     -------
@@ -367,4 +398,9 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
     vmap_method = pallas_kwargs.pop("vmap_method", "pipelined")
     threadgroup = pallas_kwargs.pop("threadgroup", None)
     cache_size = pallas_kwargs.pop("cache_size", 256)
-    return FfiCallable(kernel, pallas_kwargs, math_mode, vmap_method, threadgroup, cache_size)
+    dot_general = pallas_kwargs.pop("dot_general", "default")
+    if dot_general not in ("default", "tensorops"):
+        raise ValueError("dot_general must be 'default' or 'tensorops'")
+    return FfiCallable(
+        kernel, pallas_kwargs, math_mode, vmap_method, threadgroup, cache_size, dot_general
+    )
