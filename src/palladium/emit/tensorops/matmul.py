@@ -14,6 +14,7 @@ from palladium.trace import KernelSpec
 from ._shared import (
     _index_map_is,
     _is_empty_get,
+    _kernel_source,
     _shape,
     _TensorOpsMatmul,
     _TensorView,
@@ -480,8 +481,13 @@ def _recognize_tensorops_matmul(spec: KernelSpec) -> _MatmulPlan:
 
 def emit_tensorops_matmul(spec: KernelSpec, kernel_name: str | None = None) -> str:
     """Emit a group-cooperative MSL kernel for a tiled matrix product."""
-    source, _ = _emit_tensorops_matmul(_recognize_tensorops_matmul(spec), kernel_name)
-    return source
+    return lower_tensorops_matmul(spec, kernel_name)[0]
+
+
+def lower_tensorops_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str, int]:
+    """Emit a matmul kernel and return its threadgroup-memory requirement."""
+    plan = _recognize_tensorops_matmul(spec)
+    return _emit_tensorops_matmul(plan, kernel_name)
 
 
 def _emit_tensorops_matmul(plan: _MatmulPlan, kernel_name: str | None) -> tuple[str, int]:
@@ -498,9 +504,9 @@ def _emit_tensorops_matmul(plan: _MatmulPlan, kernel_name: str | None) -> tuple[
     b_extents, b_strides = plan.b_extents, plan.b_strides
     name = kernel_name or spec.name
     output_arg = f"arg{len(spec.inputs)}"
-    buffer_params = ",\n    ".join(
+    params = tuple(
         f"device float* arg{index} [[buffer({index})]]" for index in range(len(spec.inputs) + 1)
-    )
+    ) + ("uint3 _pid [[threadgroup_position_in_grid]]",)
     cursor = Cursor()
     if epilogue is not None:
         cursor.emit(
@@ -567,23 +573,10 @@ def _emit_tensorops_matmul(plan: _MatmulPlan, kernel_name: str | None) -> tuple[
         output_tile = CVal(f"({output_arg} + {c_offset})", (tm, tn), "float", space="device")
         emit_elementwise_store(cursor, epilogue, operands, output_tile, thread_count="THREADS")
 
-    thread_params = ""
     if epilogue is not None:
-        thread_params = (
-            ",\n    uint tid [[thread_index_in_threadgroup]],"
-            "\n    uint3 threads_per_group [[threads_per_threadgroup]]"
+        params += (
+            "uint tid [[thread_index_in_threadgroup]]",
+            "uint3 threads_per_group [[threads_per_threadgroup]]",
         )
-    source = f"""#include <metal_stdlib>
-#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-
-using namespace metal;
-using namespace mpp;
-
-kernel void {name}(
-    {buffer_params},
-    uint3 _pid [[threadgroup_position_in_grid]]{thread_params})
-{{
-{chr(10).join(cursor.lines)}
-}}
-"""
+    source = _kernel_source(name, params, cursor.lines)
     return source, cursor.threadgroup_bytes

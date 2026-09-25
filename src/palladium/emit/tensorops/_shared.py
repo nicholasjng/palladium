@@ -14,6 +14,25 @@ from palladium.trace import BlockInfo, KernelSpec
 SIMDGROUPS = 4
 
 
+def _kernel_source(name: str, parameters: tuple[str, ...], body: list[str]) -> str:
+    """Wrap emitted statements in the common Metal TensorOps kernel preamble."""
+    parameter_text = ",\n    ".join(parameters)
+    return "\n".join(
+        (
+            "#include <metal_stdlib>",
+            "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>",
+            "",
+            "using namespace metal;",
+            "using namespace mpp;",
+            "",
+            f"kernel void {name}(\n    {parameter_text})\n{{",
+            *body,
+            "}",
+            "",
+        )
+    )
+
+
 def _shape(value: Var | Literal) -> tuple[int, ...]:
     """Return a static shaped aval's dimensions or reject it clearly."""
     aval = value.aval

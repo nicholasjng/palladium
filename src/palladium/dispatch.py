@@ -273,7 +273,10 @@ class BoundKernel:
         """Encode, commit, and track one dispatch on prepared buffers."""
         grid = tuple(int(g) for g in self.spec.grid)
         if self.tensorops_simdgroups:
-            tg = tuple(self.threadgroup or (1,)) + (1, 1, 1)
+            if isinstance(self.threadgroup, int):
+                tg = (self.threadgroup, 1, 1, 1)
+            else:
+                tg = tuple(self.threadgroup or (1,)) + (1, 1, 1)
             grid = tuple(g * t for g, t in zip(grid, tg, strict=False))
         batch = mr.Batch()
         batch.add(
