@@ -4,12 +4,14 @@ import pytest
 # Modules with device-independent checks; any GPU tests within them
 # handle their own skips, so pure checks still run without Metal.
 _NO_GPU_MODULES = {
-    "test_01_trace",
-    "test_18_effects",
-    "test_20_write_races",
+    "test_kernel_spec",
+    "test_effects",
+    "test_write_safety",
     "test_msl_snapshots",
-    "test_emit_regressions",
-    "test_emit_features",
+    "test_regressions",
+    "test_structural_lowerings",
+    "test_typed_arithmetic",
+    "test_views",
 }
 
 
@@ -21,7 +23,7 @@ def pytest_collection_modifyitems(config, items):
     except mr.DeviceError as e:  # pragma: no cover - CI without a GPU
         skip = pytest.mark.skip(reason=f"no Metal device: {e}")
         for item in items:
-            if item.module.__name__ not in _NO_GPU_MODULES:
+            if item.path.stem not in _NO_GPU_MODULES:
                 item.add_marker(skip)
 
 
