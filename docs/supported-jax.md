@@ -41,6 +41,26 @@ read snapshots are preserved across later writes.
 - **Effects:** Ref reads and writes, plus Palladium's explicit cooperative
   barrier effect. Debug printing and arbitrary JAX effects are unsupported.
 
+For `metal_call` and `metal_call_jit`, `dot_general="tensorops"` opts into an
+experimental Metal Runtime lowering for a standalone, tiled float32 rank-2
+matmul or matching rank-3 batches of matrices. The batched form uses arrays
+`[B, M, K] @ [B, K, N]`, one batch per Pallas grid coordinate, and one
+threadgroup per output tile. Batch sizes must match, M and N must tile evenly,
+and each tile must contain the full K dimension. Rank-2 inputs may be
+transposed. Fused epilogues support ReLU, a same-shape residual, or column bias;
+the rank-3 path supports ReLU and a same-shape residual. Batch broadcasting,
+edge tiles, split-K, and arbitrary `dot_general` batch dimensions are not
+recognized. This is a grid of 2D products, not a batched `dot_general`
+primitive. The attention form requires rank-4 `[batch, sequence, heads, D]`
+buffers and a static key-tile scan; query and key/value lengths may differ for
+noncausal attention. Causal attention requires matching lengths. Q/output use
+query tiles, while K/V are full-sequence blocks. One Metal threadgroup computes
+each query tile and runs the score and value matmuls with Metal TensorOps. Tile
+sizes and head dimensions must be multiples of 16, and both sequence lengths
+must divide evenly into their tiles. Short query sequences need padding and
+output cropping. Unsupported jaxpr forms and layouts raise `EmitError`.
+`mps_call_jit` does not use this path.
+
 The backend supports float32, float16, bfloat16, int32, uint32, and bool, with
 operation-specific limits:
 
