@@ -94,8 +94,7 @@ def _check_dtypes(args: tuple) -> None:
         name = np.dtype(dtype if dtype is not None else np.asarray(a).dtype).name
         if name not in _CTYPES:
             hint = (
-                "; float64 usually means jax_enable_x64 is on, disable it "
-                "or cast to float32"
+                "; float64 usually means jax_enable_x64 is on, disable it or cast to float32"
                 if name == "float64"
                 else ""
             )
@@ -211,9 +210,12 @@ class MetalCallable:
         """Run the kernel on the GPU; NumPy in, NumPy out."""
         arrays = [np.asarray(a) for a in args]
         key: CacheKey = tuple((a.shape, a.dtype.str) for a in arrays)
-        bound = self.cache.get(key)
-        if bound is not None:
-            self.cache.move_to_end(key)
+        # Keep the lookup and LRU promotion together: another thread may
+        # evict this entry between `get` and `move_to_end`.
+        with self._lock:
+            bound = self.cache.get(key)
+            if bound is not None:
+                self.cache.move_to_end(key)
         if bound is None:
             with self._lock:
                 bound = self.cache.get(key)

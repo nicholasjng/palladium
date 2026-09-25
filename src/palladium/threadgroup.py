@@ -95,10 +95,8 @@ class _ThreadgroupEffect(GpuNativeEffect):
 
 _EFFECT = _ThreadgroupEffect()
 
-# Interpret mode runs the grid as a `lax.while_loop` and lowers the body
-# to MLIR for CPU: without the control_flow registration it raises
-# "Effects not supported in `while`", without the no-op lowering below,
-# "MLIR translation rule not found for platform cpu".
+# Register a no-op CPU lowering so Pallas interpret can carry this effect
+# through its while loop.
 for _set in (
     effects.control_flow_allowed_effects,
     effects.lowerable_effects,
@@ -131,15 +129,14 @@ thread_index_p.def_effectful_abstract_eval(
     lambda **_: (jax_core.ShapedArray((), np.dtype(np.int32)), {_EFFECT})
 )
 thread_index_p.def_impl(lambda **_: np.int32(0))
-mlir.register_lowering(
-    thread_index_p, mlir.lower_fun(lambda: np.int32(0), multiple_results=False)
-)
+mlir.register_lowering(thread_index_p, mlir.lower_fun(lambda: np.int32(0), multiple_results=False))
 
 
 def thread_index() -> jax.Array:
     """This thread's linear index within its threadgroup, as int32.
 
-    Lowers to `[[thread_position_in_threadgroup]]`. Distinct from
+    Linearizes `[[thread_position_in_threadgroup]]` with x fastest using
+    the actual group dimensions, including partial groups. Distinct from
     `pl.program_id`, which is the position in the whole grid.
 
     Under `interpret=True` this is always 0 (see the module docstring).
@@ -161,7 +158,7 @@ mlir.register_lowering(
 def threads_per_threadgroup() -> jax.Array:
     """How many threads are in *this* threadgroup, as int32.
 
-    Lowers to `[[threads_per_threadgroup]]`. Use it as a cooperative
+    Multiplies the dimensions of `[[threads_per_threadgroup]]`. Use it as a cooperative
     reduction's bound rather than a compile-time constant: Metal
     dispatches non-uniform threadgroups, so a grid that is not a multiple
     of the threadgroup size ends in a smaller group, and a baked-in

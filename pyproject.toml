@@ -22,13 +22,8 @@ wheel.packages = ["src/palladium"]
 cmake.version = ">=3.24"
 cmake.build-type = "Release"
 
-[tool.uv.sources]
-metal-runtime = { path = "../metal-runtime" }
-
 [dependency-groups]
-build = [
-    "scikit-build-core>=1.0",
-]
+build = ["scikit-build-core>=1.0"]
 dev = [
     "diffrax>=0.6",
     "hypothesis>=6.100",
@@ -36,12 +31,17 @@ dev = [
     "pytest>=8",
     "ruff>=0.6",
     "ty>=0.0.66",
-    "typing-extensions>=4.10",
 ]
 
 [tool.uv]
 no-build-isolation-package = ["palladium"]
 default-groups = ["build", "dev"]
+
+[tool.uv.sources]
+metal-runtime = { path = "../metal-runtime" }
+
+[tool.uv.extra-build-dependencies]
+palladium = ["jax", "metal-runtime"]
 
 [tool.mew]
 benchpaths = ["benchmarks"]
@@ -54,7 +54,7 @@ addopts = '-m "not fuzz"'
 testpaths = ["tests"]
 
 [tool.ruff]
-line-length = 88
+line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint.isort]

@@ -82,7 +82,4 @@ def eqn_reads_ref(eqn: JaxprEqn, ref: Var) -> bool:
 
 def eqn_writes_ref(eqn: JaxprEqn, ref: Var) -> bool:
     """Whether `eqn` may write `ref`, including inside sub-jaxprs."""
-    return any(
-        isinstance(e, (WriteEffect, AccumEffect)) and e.input is ref
-        for e in eqn.effects
-    )
+    return any(isinstance(e, (WriteEffect, AccumEffect)) and e.input is ref for e in eqn.effects)

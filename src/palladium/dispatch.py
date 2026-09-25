@@ -20,7 +20,7 @@ import numpy as np
 
 from palladium.diagnostics import check_threadgroup, normalize_threadgroup
 from palladium.emit import emit_msl_stats
-from palladium.errors import DispatchError, EmitError, StackOverflowError
+from palladium.errors import DispatchError, StackOverflowError
 from palladium.trace import KernelSpec
 
 __all__ = ["BoundKernel", "PendingResult", "bind"]
@@ -41,9 +41,7 @@ def _dump_msl(name: str, msl_source: str) -> None:
 
 
 def _numbered(msl_source: str) -> str:
-    return "\n".join(
-        f"{n:4d} | {line}" for n, line in enumerate(msl_source.splitlines(), 1)
-    )
+    return "\n".join(f"{n:4d} | {line}" for n, line in enumerate(msl_source.splitlines(), 1))
 
 
 # NumPy will not export ml_dtypes dtypes over DLPack, so bfloat16 ships as
@@ -141,9 +139,7 @@ class BoundKernel:
     # Ring of input-buffer slots, LRU-ordered, grown on demand up to
     # pipeline_depth. Buffer reuse is safe across calls: a BoundKernel is
     # cached per input shape/dtype, so shape never changes call-to-call.
-    _slots: list[_Slot] = dataclasses.field(
-        default_factory=list, compare=False, repr=False
-    )
+    _slots: list[_Slot] = dataclasses.field(default_factory=list, compare=False, repr=False)
     # Index of the least-recently-launched slot, the next reuse candidate.
     _next: int = dataclasses.field(default=0, compare=False, repr=False)
     # Serializes slot acquisition and the upload-and-commit phase,
@@ -180,9 +176,7 @@ class BoundKernel:
         """
         spec = self.spec
         if len(arrays) != len(spec.inputs):
-            raise DispatchError(
-                f"kernel takes {len(spec.inputs)} arrays, got {len(arrays)}"
-            )
+            raise DispatchError(f"kernel takes {len(spec.inputs)} arrays, got {len(arrays)}")
         # Validated and made contiguous before any slot is acquired, so an
         # argument error never blocks on (or claims) in-flight work.
         natives = []
@@ -205,9 +199,7 @@ class BoundKernel:
         with self._launch_lock:
             slot = self._acquire_slot()
             if not slot.in_bufs:
-                slot.in_bufs.extend(
-                    mr.Buffer(native, dtype=relabel) for native, relabel in natives
-                )
+                slot.in_bufs.extend(mr.Buffer(native, dtype=relabel) for native, relabel in natives)
             else:
                 for buf, (native, relabel) in zip(slot.in_bufs, natives, strict=True):
                     buf.copy_from(native, dtype=relabel)
@@ -274,9 +266,7 @@ class BoundKernel:
         """
         return self.launch(*arrays).wait()
 
-    def _dispatch(
-        self, in_bufs: list[mr.Buffer], out_bufs: list[mr.Buffer]
-    ) -> PendingResult:
+    def _dispatch(self, in_bufs: list[mr.Buffer], out_bufs: list[mr.Buffer]) -> PendingResult:
         """Encode, commit, and track one dispatch on prepared buffers."""
         grid = tuple(int(g) for g in self.spec.grid)
         batch = mr.Batch()
@@ -290,9 +280,7 @@ class BoundKernel:
         copy_out = frozenset(j for _, j in self.spec.aliases)
         return PendingResult(batch, out_bufs, copy_out=copy_out)
 
-    def pinned(
-        self, *arrays: np.ndarray
-    ) -> Callable[[], np.ndarray | tuple[np.ndarray, ...]]:
+    def pinned(self, *arrays: np.ndarray) -> Callable[[], np.ndarray | tuple[np.ndarray, ...]]:
         """Upload `arrays` once; return a zero-argument callable that
         re-dispatches on the pinned device buffers.
 
@@ -314,9 +302,7 @@ class BoundKernel:
         with self._launch_lock:
             index = next(i for i, s in enumerate(self._slots) if s.pending is pending)
             in_bufs = self._slots.pop(index).in_bufs
-            object.__setattr__(
-                self, "_next", self._next % len(self._slots) if self._slots else 0
-            )
+            object.__setattr__(self, "_next", self._next % len(self._slots) if self._slots else 0)
 
         def call() -> np.ndarray | tuple[np.ndarray, ...]:
             # No lock and no wait-before-dispatch: the pinned inputs are
@@ -376,15 +362,6 @@ def bind(
     # goes straight to mr.Batch.add, which takes only ints and sequences.
     threadgroup = normalize_threadgroup(threadgroup)
     check_threadgroup(spec, threadgroup)
-    if spec.uses_threadgroup and threadgroup is None:
-        raise EmitError(
-            f"kernel {spec.name!r} declares threadgroup_memory scratch, so it "
-            "must be dispatched with an explicit threadgroup= size. Leaving it "
-            "None lets the runtime pick a size (commonly far larger than the "
-            "declared extent), and a thread_index() past that extent writes "
-            "out of bounds with no error. Pass threadgroup=N with N no larger "
-            "than the leading extent of every threadgroup_memory request."
-        )
     _dump_msl(spec.name, msl_source)
     try:
         kernel = mr.Kernel(msl_source, spec.name, math_mode=math_mode)
