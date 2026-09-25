@@ -47,6 +47,67 @@ def _unwrapped(expr: str) -> str:
     return expr[1:-1]
 
 
+@dataclasses.dataclass(frozen=True)
+class CExpr:
+    """Small integer-expression tree used for address arithmetic.
+
+    Keeping sums and products structured until rendering makes address
+    simplifications (especially zero offsets) reliable without parsing C.
+    """
+
+    op: str
+    value: str | int | None = None
+    args: tuple[CExpr, ...] = ()
+
+    @classmethod
+    def raw(cls, value: str | int) -> CExpr:
+        if isinstance(value, str) and value.lstrip("-").isdigit():
+            value = int(value)
+        return cls("raw", value)
+
+    @classmethod
+    def add(cls, *terms: CExpr) -> CExpr:
+        flattened = tuple(arg for term in terms for arg in (term.args if term.op == "add" else (term,)))
+        kept = tuple(term for term in flattened if not (term.op == "raw" and term.value == 0))
+        return cls("add", args=kept)
+
+    @classmethod
+    def mul(cls, left: CExpr, right: CExpr) -> CExpr:
+        if (left.op == "raw" and left.value == 0) or (right.op == "raw" and right.value == 0):
+            return cls.raw(0)
+        return cls("mul", args=(left, right))
+
+    def render(self) -> str:
+        if self.op == "raw":
+            return str(self.value)
+        if self.op == "mul":
+            return f"{self.args[0].render()} * {self.args[1].render()}"
+        if self.op == "add":
+            return " + ".join(term.render() for term in self.args) or "0"
+        raise AssertionError(self.op)
+
+
+@dataclasses.dataclass(frozen=True)
+class BlockLayout:
+    """Shared logical/physical facts for one Pallas operand block."""
+
+    shape: tuple[int, ...]
+    strides: tuple[int, ...]
+
+    @classmethod
+    def from_info(cls, info: BlockInfo) -> BlockLayout:
+        return cls(_full_block_shape(info), _element_strides(info.array_shape))
+
+    def offset(self, indices: list[str]) -> str:
+        return CExpr.add(*(
+            CExpr.mul(CExpr.raw(index), CExpr.raw(block * stride))
+            for index, block, stride in zip(indices, self.shape, self.strides, strict=True)
+        )).render()
+
+    def alignment(self) -> int:
+        return math.gcd(0, *(block * stride for block, stride in zip(self.shape, self.strides, strict=True)))
+
+
 def shaped(aval: object) -> ShapedArray:
     # Invariant, not a hope: every non-Ref value in a Pallas kernel jaxpr
     # is shaped, and Refs never pass through declare()/val().
@@ -75,8 +136,8 @@ CTYPE_BYTES = {
 }
 
 _PID = ("_pid.x", "_pid.y", "_pid.z")
-_TID = "_tid.x"
-_TPT = "_tpt.x"
+_TID = "(_tid.x + _tpt.x * (_tid.y + _tpt.y * _tid.z))"
+_TPT = "(_tpt.x * _tpt.y * _tpt.z)"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,6 +183,10 @@ class CVal:
     readonly: bool = False
     transposed: bool = False
     align: int = 0
+    # Ref-only addressing templates; $i is a flattened logical element index.
+    # Such refs are materialized on reads, never passed to pointer optimizations.
+    index_map: str | None = None
+    valid: str | None = None
 
     @property
     def size(self) -> int:
@@ -145,7 +210,23 @@ class CVal:
     def at(self, index: str) -> str:
         """`expr` for scalars, `expr[index]` for arrays: the only
         rank-0/rank-N absorption the emitter does."""
+        if self.index_map is not None:
+            return f"{self.expr}[{self.index_map.replace('$i', f'({index})')}]"
         return self.expr if not self.shape else f"{self.expr}[{index}]"
+
+    def read(self, index: str) -> str:
+        value = self.at(index)
+        if self.valid is None:
+            return value
+        fill = {
+            "float": "NAN",
+            "half": "half(NAN)",
+            "bfloat": "bfloat(NAN)",
+            "int": "(-2147483647 - 1)",
+            "uint": "0u",
+            "bool": "false",
+        }[self.ctype]
+        return f"({self.valid.replace('$i', f'({index})')} ? {value} : {fill})"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -216,9 +297,7 @@ class Cursor:
         self.emit("}")
 
     @contextlib.contextmanager
-    def loop(
-        self, count: int | str, prefix: str = "_i", reverse: bool = False
-    ) -> Iterator[str]:
+    def loop(self, count: int | str, prefix: str = "_i", reverse: bool = False) -> Iterator[str]:
         """Emit a counted for-loop over `[0, count)`; yields the index name.
 
         Ascending by default: `for (uint idx = 0; idx < count; ++idx)`.
@@ -243,7 +322,12 @@ class Cursor:
     def copy(self, dst: CVal, src: CVal, count: int) -> None:
         """Emit `count` element assignments dst[i] = src[i] as a loop."""
         with self.loop(count) as i:
-            self.emit(f"{dst.at(i)} = {src.at(i)};")
+            assignment = f"{dst.at(i)} = {src.read(i)};"
+            if dst.valid is None:
+                self.emit(assignment)
+            else:
+                with self.block(f"if ({dst.valid.replace('$i', f'({i})')})"):
+                    self.emit(assignment)
 
 
 class Environment:
@@ -289,11 +373,7 @@ class Environment:
             elif math.isnan(v):
                 expr = "NAN"
             else:
-                expr = (
-                    f"{float(v)!r}f"
-                    if ctype in ("float", "half", "bfloat")
-                    else str(int(v))
-                )
+                expr = f"{float(v)!r}f" if ctype in ("float", "half", "bfloat") else str(int(v))
             if ctype == "bfloat":
                 # MSL does not implicitly narrow a float expression to
                 # bfloat. Keep literals typed so arithmetic stays bfloat.
@@ -404,9 +484,7 @@ def _emit_with_rules(
     return [env.val(v) for v in jaxpr.outvars]
 
 
-def emit_jaxpr(
-    env: Environment, cursor: Cursor, jaxpr: Jaxpr, in_vals: list[CVal]
-) -> list[CVal]:
+def emit_jaxpr(env: Environment, cursor: Cursor, jaxpr: Jaxpr, in_vals: list[CVal]) -> list[CVal]:
     """Walk a jaxpr with the one-thread-per-instance rules (RULES).
 
     Parameters
@@ -438,17 +516,6 @@ def emit_jaxpr(
     )
 
 
-def _check_contiguous(info: BlockInfo, what: str) -> None:
-    # Any partial trailing dim makes the block strided in memory, which
-    # the flat pointer-plus-offset model cannot express.
-    full_block = _full_block_shape(info)
-    if any(b != a for b, a in zip(full_block[1:], info.array_shape[1:], strict=True)):
-        raise EmitError(
-            f"{what}: block {info.block_shape} of array {info.array_shape} is "
-            "not contiguous; only the leading block dim may be partial"
-        )
-
-
 def _constant_offset(info: BlockInfo) -> str | None:
     """Fold index maps with no inputs (gridless or constant) to an offset."""
     imj = info.index_map_jaxpr.jaxpr
@@ -471,23 +538,21 @@ def _element_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
 def _flat_index(terms: list[tuple[str, int]]) -> str:
     """C expression for `sum(var * stride for var, stride in terms)`,
     omitting the `* 1` for a unit stride and any zero-stride term."""
-    parts = [
-        var if stride == 1 else f"{var} * {stride}"
-        for var, stride in terms
-        if stride != 0
-    ]
-    return " + ".join(parts) or "0"
+    return CExpr.add(*(
+        CExpr.raw(var) if stride == 1 else CExpr.mul(CExpr.raw(var), CExpr.raw(stride))
+        for var, stride in terms if stride != 0
+    )).render()
 
 
 def _full_block_shape(info: BlockInfo) -> tuple[int, ...]:
     """block_shape with squeezed dims restored as 1, rank-matched to array."""
+    if info.full_block_shape is not None:
+        return tuple(1 if dim is None else dim for dim in info.full_block_shape)
     missing = len(info.array_shape) - len(info.block_shape)
     return (1,) * missing + info.block_shape
 
 
-def emit_msl_stats(
-    spec: KernelSpec, kernel_name: str | None = None
-) -> tuple[str, EmitStats]:
+def emit_msl_stats(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str, EmitStats]:
     """Assemble the full MSL source for a KernelSpec, with its storage stats.
 
     Signature convention (relied on by `dispatch.bind`): operands in
@@ -511,7 +576,7 @@ def emit_msl_stats(
     Raises
     ------
     EmitError
-        For grids over rank 3, or non-contiguous blocks.
+        For grids over rank 3 or unsupported addressing forms.
     UnsupportedPrimitiveError
         If the kernel stages a primitive with no registered rule.
     """
@@ -523,12 +588,11 @@ def emit_msl_stats(
     n_in = len(spec.inputs)
     params = []
     for k, info in enumerate(operands):
-        _check_contiguous(info, f"operand {k}")
         qual = "device" if k >= n_in else "const device"
         ctype = CTYPES[info.dtype.name]
-        params.append(f"{qual} {ctype}* arg{k}_base [[buffer({k})]]")
+        params.append(f"{qual} {ctype}* arg{k} [[buffer({k})]]")
     params.append("uint3 _pid [[thread_position_in_grid]]")
-    if any(info.space == "threadgroup" for info in spec.scratch):
+    if spec.uses_threadgroup:
         params.append("uint3 _tid [[thread_position_in_threadgroup]]")
         params.append("uint3 _tpt [[threads_per_threadgroup]]")
 
@@ -546,20 +610,59 @@ def emit_msl_stats(
     for k, info in enumerate(operands):
         qual = "device" if k >= n_in else "const device"
         ctype = CTYPES[info.dtype.name]
-        offset = _constant_offset(info)
+        layout = BlockLayout.from_info(info)
+        full = layout.shape
+        strided = any(b != a for b, a in zip(full[1:], info.array_shape[1:]))
+        edge = any(a % b for a, b in zip(info.array_shape, full))
+        if strided or edge:
+            dims = info.full_block_shape
+            if dims is None:
+                dims = (None,) * (len(info.array_shape) - len(info.block_shape)) + info.block_shape
+            pids = [
+                CVal(f"(int){_PID[d]}", (), "int")
+                for d in range(len(info.index_map_jaxpr.jaxpr.invars))
+            ]
+            origins = emit_jaxpr(env, cursor, info.index_map_jaxpr.jaxpr, pids)
+            logical_strides = iter(_element_strides(info.block_shape))
+            coords = []
+            for dim, size, origin in zip(dims, full, origins, strict=True):
+                local = "0" if dim is None else f"(($i / {next(logical_strides)}) % {size})"
+                coords.append(f"(int({origin.expr}) * {size} + int({local}))")
+            address = _flat_index(list(zip(coords, _element_strides(info.array_shape))))
+            valid = " && ".join(
+                f"({c} >= 0 && {c} < {a})" for c, a in zip(coords, info.array_shape)
+            )
+            ref_vals.append(
+                CVal(
+                    f"arg{k}",
+                    info.block_shape or (1,),
+                    ctype,
+                    space="device",
+                    readonly=k < n_in and k not in aliased_inputs,
+                    index_map=address,
+                    valid=valid,
+                )
+            )
+            continue
+        constant_offset = _constant_offset(info)
+        offset = constant_offset
         if offset is None:
             offset = _block_offset(env, cursor, spec, info)
-        cursor.emit(f"{qual} {ctype}* arg{k} = arg{k}_base + {offset};")
+        if offset == "0":
+            ptr = f"arg{k}"
+        else:
+            ptr = f"arg{k}_offset"
+            cursor.emit(f"{qual} {ctype}* {ptr} = arg{k} + {offset};")
 
         # access scalar refs (shape == ()) as axis-1 arrays, since all refs are pointers.
         ref_vals.append(
             CVal(
-                expr=f"arg{k}",
+                expr=ptr,
                 shape=info.block_shape or (1,),
                 ctype=ctype,
                 space="device",
                 readonly=k < n_in and k not in aliased_inputs,
-                align=_block_offset_align(spec, info),
+                align=layout.alignment() if constant_offset is None else int(constant_offset),
             )
         )
 
@@ -620,67 +723,57 @@ def emit_msl(spec: KernelSpec, kernel_name: str | None = None) -> str:
 
 
 def ref_view(env: Environment, ref: CVal, indexer: NDIndexer) -> CVal:
-    """Resolve an NDIndexer against a Ref's CVal: pointer offset + kept shape.
+    """Compose logical Ref indexing with its underlying storage addressing.
 
-    A Slice index keeps that dim (contributes to the result's logical
-    shape, in order); any other index (a scalar Var/Literal atom) squeezes
-    it into the offset. Slice strides must be 1, and only the first kept
-    dim may be partial: the same contiguous-trailing-block discipline
-    BlockSpec blocks already follow (`_check_contiguous`). A fully-scalar
-    indexer (no kept dims) resolves to a dereferenced single element.
-
-    Raises
-    ------
-    EmitError
-        For a non-unit Slice stride, or a partial Slice anywhere but the
-        first kept dim (non-contiguous access; unimplemented).
+    Slices keep dimensions and scalar indices squeeze them. Contiguous views
+    retain pointer offsets; strided/guarded views map flattened logical indices
+    to the original allocation, keeping its bounds predicate intact. Positive
+    static slice strides are supported; arbitrary gathers are not.
     """
     strides = _element_strides(indexer.shape)
-    terms: list[str] = []
+    terms: list[CExpr] = []
     kept: list[tuple[int, int]] = []
+    steps: dict[int, int] = {}
     align = ref.align
     for d, (idx, stride) in enumerate(zip(indexer.indices, strides, strict=True)):
         if isinstance(idx, pl.Slice):
-            if idx.stride != 1:
-                raise EmitError(
-                    f"ref access dim {d}: stride {idx.stride} != 1 is unimplemented"
-                )
+            if idx.stride < 1:
+                raise EmitError(f"ref access dim {d}: stride must be positive")
+            steps[d] = idx.stride
             # pl.Slice.size is always static, and a dynamic start
             # is always a jaxpr atom (Var/Literal), never a live Array.
             kept.append((d, cast(int, idx.size)))
             start = idx.start
-            expr = (
-                str(start)
-                if isinstance(start, int)
-                else env.val(cast(Atom, start)).expr
-            )
+            expr = str(start) if isinstance(start, int) else env.val(cast(Atom, start)).expr
         else:
             # A non-Slice index here is always a jaxpr atom.
             expr = env.val(cast(Atom, idx)).expr
         if expr != "0":
-            terms.append(f"{expr} * {stride}")
+            terms.append(CExpr.mul(CExpr.raw(expr), CExpr.raw(stride)))
             # A dynamic index contributes its stride as the provable
             # multiple; a literal index contributes its exact offset.
             lit = expr.lstrip("-").isdigit()
             align = math.gcd(align, int(expr) * stride if lit else stride)
 
-    for d, size in kept[1:]:
-        if size != indexer.shape[d]:
-            raise EmitError(
-                f"ref access dim {d}: a partial Slice must be the first "
-                "kept dim; non-contiguous access is unimplemented"
-            )
-
     # Squeezed trailing dimensions can make even full slices strided:
     # x[:, 1] is a column, not a contiguous span starting at x[0, 1].
     kept_strides = _element_strides(tuple(size for _, size in kept))
-    if any(
-        size > 1 and strides[d] != expected
+    noncontiguous = any(
+        size > 1 and strides[d] * steps[d] != expected
         for (d, size), expected in zip(kept, kept_strides, strict=True)
-    ):
-        raise EmitError("ref access is non-contiguous; strided views are unimplemented")
+    )
 
-    offset = " + ".join(terms) or "0"
+    offset = CExpr.add(*terms).render()
+    if noncontiguous or ref.index_map is not None:
+        coordinates = [f"(($i / {s}) % {size})" for (_, size), s in zip(kept, kept_strides)]
+        flat = f"({offset}) + " + _flat_index(
+            [(c, strides[d] * steps[d]) for c, (d, _) in zip(coordinates, kept)]
+        )
+        address = flat if ref.index_map is None else ref.index_map.replace("$i", f"({flat})")
+        valid = None if ref.valid is None else ref.valid.replace("$i", f"({flat})")
+        return dataclasses.replace(
+            ref, shape=tuple(size for _, size in kept), index_map=address, valid=valid, align=1
+        )
     if not kept:
         return CVal(
             expr=f"{ref.expr}[{offset}]",
@@ -729,8 +822,6 @@ ELEMENTWISE: dict[str, str] = {
     "sub": "({a} - {b})",
     "mul": "({a} * {b})",
     "div": "({a} / {b})",
-    "min": "fmin({a}, {b})",
-    "max": "fmax({a}, {b})",
     "pow": "pow({a}, {b})",
     # unary
     "neg": "-{a}",
@@ -751,17 +842,14 @@ ELEMENTWISE: dict[str, str] = {
     "ge": "({b} <= {a})",
     "eq": "({a} == {b})",
     "ne": "({a} != {b})",
-    # bitwise, uint operands only.
+    # bitwise, integer/bool operands.
     "and": "({a} & {b})",
     "or": "({a} | {b})",
     "xor": "({a} ^ {b})",
-    "shift_right_logical": "({a} >> {b})",
 }
 
 
-def _block_offset(
-    env: Environment, cursor: Cursor, spec: KernelSpec, info: BlockInfo
-) -> str:
+def _block_offset(env: Environment, cursor: Cursor, spec: KernelSpec, info: BlockInfo) -> str:
     """Element offset of this program instance's block, as a C expression.
 
     The index map is a jaxpr over grid indices (bound to _pid components),
@@ -774,29 +862,4 @@ def _block_offset(
     """
     pid_vals = [CVal(f"(int){_PID[k]}", (), "int") for k in range(len(spec.grid))]
     out_vals = emit_jaxpr(env, cursor, info.index_map_jaxpr.jaxpr, pid_vals)
-    block_shape = _full_block_shape(info)
-    strides = _element_strides(info.array_shape)
-
-    offsets = []
-    for val, shape, stride in zip(out_vals, block_shape, strides, strict=True):
-        if val.expr == "0":
-            continue
-        offsets.append(f"{val.expr} * {shape * stride}")
-
-    return " + ".join(offsets) or "0"
-
-
-def _block_offset_align(spec: KernelSpec, info: BlockInfo) -> int:
-    """Guaranteed element alignment of this operand's per-instance block
-    offset, whatever the grid indices are: the gcd of every offset term's
-    provable multiple (exact for constant index maps). Feeds `CVal.align`
-    for the ref; 0 means exactly aligned."""
-    off = _constant_offset(info)
-    if off is not None:
-        return int(off)
-    block_shape = _full_block_shape(info)
-    strides = _element_strides(info.array_shape)
-    align = 0
-    for b, s in zip(block_shape, strides, strict=True):
-        align = math.gcd(align, b * s)
-    return align
+    return BlockLayout.from_info(info).offset([val.expr for val in out_vals])

@@ -3,7 +3,6 @@
 One-thread-per-instance rules (`rules`), lowered over shared machinery (`core`).
 """
 
-from palladium.emit import rules as _rules
 from palladium.emit.core import (
     RULES,
     Cursor,
@@ -16,6 +15,8 @@ from palladium.emit.core import (
     emit_msl_stats,
     rule,
 )
+
+from . import rules as _rules
 
 __all__ = [
     "RULES",
