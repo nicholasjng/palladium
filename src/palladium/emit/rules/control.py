@@ -42,7 +42,7 @@ def _rule_barrier(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     nothing to bind -- the primitive carries a JAX effect purely to
     survive DCE on the way here.
     """
-    cursor.emit("threadgroup_barrier(mem_flags::mem_threadgroup);")
+    cursor.barrier()
 
 
 @rule("palladium_thread_index")

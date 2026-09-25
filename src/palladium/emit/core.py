@@ -285,6 +285,31 @@ class Cursor:
         else:
             self.thread_bytes += nbytes
 
+    def allocate(
+        self,
+        ctype: str,
+        shape: tuple[int, ...],
+        *,
+        name: str | None = None,
+        space: str = "thread",
+        prefix: str = "t",
+    ) -> CVal:
+        """Declare typed local storage, account for it, and return its CVal."""
+        if ctype not in CTYPE_BYTES:
+            raise EmitError(f"cannot allocate unsupported C type {ctype!r}")
+        if space not in ("thread", "threadgroup"):
+            raise EmitError(f"cannot allocate local storage in {space!r} space")
+        if any(size <= 0 for size in shape):
+            raise EmitError("local storage dimensions must be positive")
+        name = name or self.fresh(prefix)
+        count = math.prod(shape)
+        self.account(ctype, count, space)
+        qualifier = "threadgroup " if space == "threadgroup" else ""
+        declaration = f"{qualifier}{ctype} {name}"
+        declaration += f"[{count}]" if shape else ""
+        self.emit(declaration + ";")
+        return CVal(name, shape, ctype, space=space)
+
     def emit(self, line: str) -> None:
         """Append one MSL line at the current indentation."""
         self.lines.append("    " * self.indent + line)
@@ -324,6 +349,25 @@ class Cursor:
             header = f"for (uint {idx} = 0; {idx} < {count}; ++{idx})"
         with self.block(header):
             yield idx
+
+    @contextlib.contextmanager
+    def strided_loop(
+        self,
+        start: str,
+        stop: str,
+        step: str,
+        *,
+        name: str | None = None,
+        prefix: str = "_i",
+    ) -> Iterator[str]:
+        """Emit `for (uint i = start; i < stop; i += step)` for cooperative work."""
+        idx = name or self.fresh(prefix)
+        with self.block(f"for (uint {idx} = {start}; {idx} < {stop}; {idx} += {step})"):
+            yield idx
+
+    def barrier(self) -> None:
+        """Emit a barrier covering threadgroup memory."""
+        self.emit("threadgroup_barrier(mem_flags::mem_threadgroup);")
 
     def copy(self, dst: CVal, src: CVal, count: int) -> None:
         """Emit `count` element assignments dst[i] = src[i] as a loop."""
@@ -421,11 +465,7 @@ def declare(env: Environment, cursor: Cursor, var: Var) -> CVal:
     aval = shaped(var.aval)
     ctype = CTYPES[str(aval.dtype)]
     shape = tuple(int(d) for d in aval.shape)
-    name = cursor.fresh()
-    size = math.prod(shape)
-    cursor.account(ctype, size)
-    cursor.emit(f"{ctype} {name}[{size}];" if shape else f"{ctype} {name};")
-    cval = CVal(expr=name, shape=shape, ctype=ctype)
+    cval = cursor.allocate(ctype, shape)
     env.bind(var, cval)
     return cval
 
