@@ -13,14 +13,15 @@ consume ``MpsDispatchDescriptor.to_json()`` as its backend_config.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import threading
 from collections.abc import Callable
-from typing import Any
+from typing import Any, overload
 
 import jax
 import numpy as np
-from jax._src import core as jax_core
+from jax._src import core as jax_core, dispatch as jax_dispatch
 from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
 
@@ -144,23 +145,28 @@ _mps_dispatch_p.multiple_results = True
 def _abstract_eval(*_, descriptor: MpsDispatchDescriptor, **__) -> tuple[Any, ...]:
     return tuple(
         jax_core.ShapedArray(shape, np.dtype(dtype))
-        for shape, dtype in zip(
-            descriptor.output_shapes, descriptor.output_dtypes, strict=True
-        )
+        for shape, dtype in zip(descriptor.output_shapes, descriptor.output_dtypes, strict=True)
     )
 
 
 _mps_dispatch_p.def_abstract_eval(_abstract_eval)
-_mps_dispatch_p.def_impl(lambda *args, fallback, **_: _as_tuple(fallback(*args)))
+_mps_dispatch_p.def_impl(functools.partial(jax_dispatch.apply_primitive, _mps_dispatch_p))
 
 
-def _fallback_lowering(ctx, *args, fallback, **_):
+def _fallback_lowering(ctx, *args, fallback, allow_fallback=True, cooperative=False, **_):
+    if not allow_fallback:
+        raise ValueError(
+            "MPS backend required (fallback='error'); this computation is being lowered for another platform"
+        )
+    if cooperative:
+        raise ValueError(
+            "cooperative kernel cannot use the Pallas interpreter fallback: "
+            "it models threadgroups of one; select MPS or use metal_call_jit"
+        )
     # A portable fallback is essential: callers can retain one JAX program
     # across CPU, CUDA, and mps, and it makes the custom call testable before
     # jax-mps is present.
-    return mlir.lower_fun(lambda *xs: _as_tuple(fallback(*xs)), multiple_results=True)(
-        ctx, *args
-    )
+    return mlir.lower_fun(lambda *xs: _as_tuple(fallback(*xs)), multiple_results=True)(ctx, *args)
 
 
 def _mps_lowering(ctx, *args, descriptor: MpsDispatchDescriptor, **_):
@@ -224,7 +230,11 @@ class MpsCallable:
         math_mode: Any,
         threadgroup: int | tuple[int, ...] | None,
         cache_size: int,
+        fallback: str = "interpret",
     ) -> None:
+        if fallback not in ("interpret", "error"):
+            raise ValueError("fallback must be 'interpret' or 'error'")
+        self._allow_fallback = fallback == "interpret"
         # FfiCallable owns the well-tested trace/emit cache.  Its public call
         # path is never invoked here.
         self._staged = FfiCallable(
@@ -236,14 +246,39 @@ class MpsCallable:
             cache_size=cache_size,
         )
         self.interpret = self._staged.interpret
+        self._staged._execution_path = "mps-or-pallas-interpret (selected at lowering)"
 
     @property
     def _cache(self):
         """Expose the specialization cache for diagnostics and tests."""
         return self._staged._cache
 
-    def explain(self, *args):
-        return self._staged.explain(*args)
+    def explain(self, *args, platform: str | None = None):
+        """Report the expected path; explicit JIT placement can override inference.
+
+        Pass platform= when explaining a computation intended for a specific
+        JIT target. Actual fallback policy is enforced during lowering.
+        """
+        if platform is None:
+            platforms = {
+                d.platform
+                for a in args
+                if isinstance(a, jax.Array) and a.committed
+                for d in a.devices()
+            }
+            device = jax.config.jax_default_device
+            platform = (
+                next(iter(platforms))
+                if len(platforms) == 1
+                else device.platform
+                if device is not None
+                else jax.default_backend()
+            )
+        diagnostics = self._staged.explain(*args)
+        path = "mps-custom-call" if platform == "mps" else f"pallas-interpret:{platform}"
+        if platform != "mps" and (not self._allow_fallback or diagnostics.cooperative):
+            path = f"rejected:{platform} (requires mps)"
+        return dataclasses.replace(diagnostics, execution_path=path)
 
     def verify(
         self,
@@ -316,9 +351,7 @@ class MpsCallable:
             return self(*args), args
 
         def backward(residual, cotangents):
-            input_cotangents = _as_tuple(
-                backward_call(*residual, *_as_tuple(cotangents))
-            )
+            input_cotangents = _as_tuple(backward_call(*residual, *_as_tuple(cotangents)))
             if len(input_cotangents) != len(residual):
                 raise TypeError(
                     "Palladium VJP returned "
@@ -330,9 +363,7 @@ class MpsCallable:
         differentiated.defvjp(forward, backward)
         return differentiated
 
-    def with_auxiliary_vjp(
-        self, backward_call: Callable, output_count: int
-    ) -> Callable:
+    def with_auxiliary_vjp(self, backward_call: Callable, output_count: int) -> Callable:
         """Attach a VJP while retaining trailing forward outputs as residuals.
 
         The first ``output_count`` outputs are the public primal result. Any
@@ -363,9 +394,7 @@ class MpsCallable:
             return public, (*args, *auxiliaries)
 
         def backward(residual, cotangents):
-            input_cotangents = _as_tuple(
-                backward_call(*residual, *_as_tuple(cotangents))
-            )
+            input_cotangents = _as_tuple(backward_call(*residual, *_as_tuple(cotangents)))
             # The custom-VJP protocol validates the returned pytree against
             # the primal arguments. Keep this method agnostic about the number
             # of auxiliary arrays, which is encoded in backward_call's ABI.
@@ -395,13 +424,33 @@ class MpsCallable:
             math_mode=self._staged._math_mode,
         )
         outputs = _mps_dispatch_p.bind(
-            *args, descriptor=descriptor, fallback=self.interpret
+            *args,
+            descriptor=descriptor,
+            fallback=self.interpret,
+            allow_fallback=self._allow_fallback,
+            cooperative=spec.uses_threadgroup,
         )
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
 
+@overload
 def mps_call_jit(
-    kernel: Callable, *, vjp_reference: Callable | None = None, **pallas_kwargs
+    kernel: Callable, *, vjp_reference: None = None, fallback: str = "interpret", **pallas_kwargs
+) -> MpsCallable: ...
+
+
+@overload
+def mps_call_jit(
+    kernel: Callable, *, vjp_reference: Callable, fallback: str = "interpret", **pallas_kwargs
+) -> Callable: ...
+
+
+def mps_call_jit(
+    kernel: Callable,
+    *,
+    vjp_reference: Callable | None = None,
+    fallback: str = "interpret",
+    **pallas_kwargs,
 ) -> MpsCallable | Callable:
     """Create a Pallas call that lowers to a jax-mps Metal custom call.
 
@@ -409,6 +458,11 @@ def mps_call_jit(
     @palladium.dispatch``.  Other platforms execute Pallas's interpreter as a
     portable fallback.  The jax-mps native handler is responsible for zero-copy
     buffer wrapping and command-stream ordering.
+
+    Pass ``fallback="error"`` to require MPS at lowering time, including
+    eager calls. Cooperative kernels always reject the interpreter fallback
+    because it models groups of one. ``explain`` reports the expected path;
+    explicit JIT placement can override its platform inference.
 
     ``vmap`` is deliberately unsupported in v1; place an independent batch
     dimension directly in the Pallas grid so one invocation is one dispatch.
@@ -428,5 +482,5 @@ def mps_call_jit(
             "mps_call_jit does not batch a custom call in v1; put the batch "
             "dimension in the Pallas grid so the whole batch is one dispatch"
         )
-    call = MpsCallable(kernel, pallas_kwargs, math_mode, threadgroup, cache_size)
+    call = MpsCallable(kernel, pallas_kwargs, math_mode, threadgroup, cache_size, fallback)
     return call if vjp_reference is None else call.with_reference_vjp(vjp_reference)

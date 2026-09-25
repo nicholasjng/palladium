@@ -70,13 +70,10 @@ def _as_tuple(outs: Any) -> tuple[np.ndarray, ...]:
     return (np.asarray(outs),)
 
 
-def _report(
-    got: np.ndarray, want: np.ndarray, index: int, rtol: float, atol: float
-) -> None:
+def _report(got: np.ndarray, want: np.ndarray, index: int, rtol: float, atol: float) -> None:
     if got.shape != want.shape:
         raise VerificationError(
-            f"output {index}: shape {got.shape} from the GPU, {want.shape} "
-            "from the reference",
+            f"output {index}: shape {got.shape} from the GPU, {want.shape} from the reference",
             output_index=index,
         )
     close = np.isclose(got, want, rtol=rtol, atol=atol, equal_nan=True)
@@ -125,7 +122,7 @@ def verify_against(
     if reference is None:
         if uses_threadgroup:
             raise VerificationError(
-                "this kernel uses palladium.threadgroup_memory, so the "
+                "this kernel uses cooperative instructions or palladium.threadgroup_memory, so the "
                 "interpret oracle cannot validate it: interpret runs program "
                 "instances sequentially with no threadgroup, reporting "
                 "thread_index() == 0 and threads_per_threadgroup() == 1, so a "

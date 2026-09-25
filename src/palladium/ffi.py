@@ -7,6 +7,7 @@ composable with jax.jit, through metal-runtime's C API (`native/ffi/`).
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import importlib.resources
 import math
 import os
@@ -24,12 +25,12 @@ import numpy as np
 
 from palladium.diagnostics import (
     KernelDiagnostics,
+    check_threadgroup,
     explain_spec,
     log_compile,
     normalize_threadgroup,
 )
 from palladium.emit import emit_msl
-from palladium.errors import EmitError
 from palladium.trace import KernelSpec, trace
 from palladium.verify import DEFAULT_ATOL, DEFAULT_RTOL, verify_against
 
@@ -91,14 +92,9 @@ def _register() -> None:
         _registered = True
 
 
-# Batching methods palladium can honor. The grid is baked per unbatched
-# shape, so jax.ffi's whole-batch methods (expand_dims, broadcast_all)
-# would dispatch it over batched buffers; they stay rejected. The
-# sequential ones re-invoke the target once per element, each a full
-# blocking dispatch. 'pipelined' (palladium's own, via custom_vmap) makes
-# one FFI call whose native handler loops the batch with several
-# dispatches in flight, and is the default; nested vmap falls back to
-# 'sequential' for the outer levels.
+# Supported batching methods. Whole-batch methods conflict with the
+# shape-specialized grid; pipelined batches in one FFI call, nested levels
+# run sequentially.
 _SAFE_VMAP_METHODS = (None, "sequential", "sequential_unrolled", "pipelined")
 
 
@@ -143,20 +139,16 @@ class FfiCallable:
         self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
         # MathMode is a StrEnum, so members index the dict as their value.
         self._math_mode = _MATH_MODE_ORDINALS[math_mode]
+        self._execution_path = "cpu-ffi-to-metal"
         self._vmap_method = vmap_method
         self._threadgroup = normalize_threadgroup(threadgroup)
-        # LRU over (spec, MSL) per shape, bounded like the native pipeline
-        # cache. Re-inserted on hit, so popping the first item evicts it.
+        # Bounded LRU of traced specs and emitted MSL.
         self._cache: OrderedDict[tuple, tuple[KernelSpec, str]] = OrderedDict()
         self._cache_size = cache_size
-        # Guards trace/emit on a cache miss, mirroring MetalCallable.
+        # Serialize cache misses.
         self._lock = threading.Lock()
-        # None is wrapped too: its rule refuses batching in palladium's
-        # terms instead of deferring to jax.ffi's NotImplementedError,
-        # which recommends the whole-batch methods rejected above.
-        self._pipelined = (
-            self._build_pipelined() if vmap_method in ("pipelined", None) else None
-        )
+        # Wrap None so its batching error uses Palladium's API terminology.
+        self._pipelined = self._build_pipelined() if vmap_method in ("pipelined", None) else None
 
     def explain(self, *args) -> KernelDiagnostics:
         """Report launch geometry and emitted MSL size for these inputs.
@@ -169,7 +161,10 @@ class FfiCallable:
             data is read.
         """
         shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
-        return explain_spec(trace(self._staged, *shapes), self._threadgroup)
+        return dataclasses.replace(
+            explain_spec(trace(self._staged, *shapes), self._threadgroup),
+            execution_path=self._execution_path,
+        )
 
     def verify(
         self,
@@ -212,27 +207,20 @@ class FfiCallable:
 
     def _spec_and_msl(self, args: tuple[Any, ...]) -> tuple[KernelSpec, str]:
         key = tuple((a.shape, np.dtype(a.dtype).str) for a in args)
-        entry = self._cache.get(key)
-        if entry is not None:
-            self._cache.move_to_end(key)
+        # Keep lookup and LRU promotion together; another specialization
+        # can evict this entry while a concurrent call is touching it.
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is not None:
+                self._cache.move_to_end(key)
         if entry is None:
             with self._lock:
                 entry = self._cache.get(key)
                 if entry is None:
                     shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
                     spec = trace(self._staged, *shapes)
-                    log_compile(spec)
-                    if spec.uses_threadgroup and self._threadgroup is None:
-                        raise EmitError(
-                            f"kernel {spec.name!r} declares threadgroup_memory "
-                            "scratch, so it must be dispatched with an explicit "
-                            "threadgroup= size; metal_call_jit otherwise launches "
-                            "with a runtime-chosen one (commonly far larger than "
-                            "the declared extent), and a thread_index() past that "
-                            "extent writes out of bounds with no error. Pass "
-                            "metal_call_jit(..., threadgroup=N). Mirrors the same "
-                            "check in palladium.bind for the eager path."
-                        )
+                    check_threadgroup(spec, self._threadgroup)
+                    log_compile(spec, self._threadgroup, execution_path=self._execution_path)
                     entry = (spec, emit_msl(spec))
                     self._cache[key] = entry
                     while self._cache_size and len(self._cache) > self._cache_size:
@@ -313,8 +301,7 @@ class FfiCallable:
             for u, b in zip(unbatched, batched, strict=True)
         ]
         out_strides = [
-            np.dtype(info.dtype).itemsize * math.prod(info.array_shape)
-            for info in spec.outputs
+            np.dtype(info.dtype).itemsize * math.prod(info.array_shape) for info in spec.outputs
         ]
         lead = () if axis_size is None else (int(axis_size),)
         out_structs = [
@@ -380,6 +367,4 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
     vmap_method = pallas_kwargs.pop("vmap_method", "pipelined")
     threadgroup = pallas_kwargs.pop("threadgroup", None)
     cache_size = pallas_kwargs.pop("cache_size", 256)
-    return FfiCallable(
-        kernel, pallas_kwargs, math_mode, vmap_method, threadgroup, cache_size
-    )
+    return FfiCallable(kernel, pallas_kwargs, math_mode, vmap_method, threadgroup, cache_size)

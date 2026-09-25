@@ -8,6 +8,8 @@ per newly compiled kernel.
 from __future__ import annotations
 
 import dataclasses
+import math
+import operator
 import os
 import sys
 from typing import Any, Literal
@@ -59,9 +61,12 @@ class KernelDiagnostics:
     thread_bytes: int = 0
     threadgroup_bytes: int = 0
     threadgroup_limit: int | None = None
+    execution_path: str = "metal"
+    cooperative: bool = False
 
     def __str__(self) -> str:
         parts = [f"palladium kernel {self.name}: grid={self.grid}"]
+        parts.append(f"execution={self.execution_path}")
         if self.threadgroup is not None:
             parts.append(f"threadgroup={self.threadgroup}")
         parts.append(f"stack~{_human(self.thread_bytes)}/thread")
@@ -114,9 +119,16 @@ def normalize_threadgroup(
         return None
     if threadgroup == "simdgroup":
         return (simdgroup_width(),)
-    if isinstance(threadgroup, int):
-        return (int(threadgroup),)
-    return tuple(int(t) for t in threadgroup)
+    if isinstance(threadgroup, str):
+        raise ValueError("unknown threadgroup policy; expected 'simdgroup'")  # noqa: TRY004
+    try:
+        values = (threadgroup,) if isinstance(threadgroup, int) else tuple(threadgroup)
+        result = tuple(operator.index(t) for t in values)
+    except TypeError as exc:
+        raise ValueError("threadgroup dimensions must be integers") from exc
+    if not 1 <= len(result) <= 3 or any(t <= 0 for t in result):
+        raise ValueError("threadgroup must have 1 to 3 positive dimensions")
+    return result
 
 
 def simdgroup_width() -> int:
@@ -128,22 +140,23 @@ def simdgroup_width() -> int:
 def check_threadgroup(spec: KernelSpec, threadgroup: tuple[int, ...] | None) -> None:
     """Validate a cooperative kernel's launch geometry against the device.
 
-    Checks threadgroup-space storage against the device budget (Metal
-    otherwise rejects the pipeline with a vaguer message) and the group
-    size against the device maximum. Kernels with no threadgroup storage
-    are unaffected.
+    Checks cooperative requirements even without a device, direct lane-indexed
+    scratch bounds, and device resource limits when available. Explicit group
+    sizes are validated for independent kernels too.
     """
-    if not spec.uses_threadgroup:
-        return
-    limits = device_limits()
-    if not limits:  # pragma: no cover - no device to validate against
-        return
-
-    _, stats = emit_msl_stats(spec)
-    budget = limits.get("max_threadgroup_memory_length")
-    if budget and stats.threadgroup_bytes > budget:
+    if spec.uses_threadgroup and threadgroup is None:
         raise EmitError(
-            f"kernel {spec.name!r} declares {stats.threadgroup_bytes} bytes of "
+            f"kernel {spec.name!r} uses cooperative instructions or shared scratch; "
+            "pass an explicit threadgroup= size"
+        )
+    limits = device_limits()
+    shared_bytes = sum(
+        math.prod(s.shape) * s.dtype.itemsize for s in spec.scratch if s.space == "threadgroup"
+    )
+    budget = limits.get("max_threadgroup_memory_length")
+    if budget and shared_bytes > budget:
+        raise EmitError(
+            f"kernel {spec.name!r} declares {shared_bytes} bytes of "
             f"threadgroup_memory, over this device's "
             f"max_threadgroup_memory_length of {budget}. Shrink the "
             "threadgroup_memory request, or split the reduction across "
@@ -161,7 +174,19 @@ def check_threadgroup(spec: KernelSpec, threadgroup: tuple[int, ...] | None) -> 
                 f"device's max_threads_per_threadgroup of {max_threads}"
             )
 
-    if not limits.get("supports_non_uniform_threadgroups", True):
+    if threadgroup:
+        actual = math.prod(
+            min(g, t)
+            for g, t in zip(
+                spec.grid + (1,) * (3 - len(spec.grid)), threadgroup + (1,) * (3 - len(threadgroup))
+            )
+        )
+        if any(actual > extent for extent in spec.lane_scratch_extents):
+            raise EmitError(
+                f"threadgroup has up to {actual} lanes but a directly lane-indexed "
+                f"scratch dimension is smaller: {spec.lane_scratch_extents}"
+            )
+    if spec.uses_threadgroup and not limits.get("supports_non_uniform_threadgroups", True):
         raise EmitError(  # pragma: no cover - all Apple silicon supports this
             f"kernel {spec.name!r} uses threads_per_threadgroup() to bound a "
             "cooperative loop, which is only correct when the device "
@@ -177,6 +202,7 @@ def explain_spec(
     msl, stats = emit_msl_stats(spec)
     grid = tuple(int(g) for g in spec.grid)
     tg = normalize_threadgroup(threadgroup)
+    check_threadgroup(spec, tg)
     limits = device_limits()
     return KernelDiagnostics(
         name=spec.name,
@@ -186,6 +212,7 @@ def explain_spec(
         thread_bytes=stats.thread_bytes,
         threadgroup_bytes=stats.threadgroup_bytes,
         threadgroup_limit=limits.get("max_threadgroup_memory_length"),
+        cooperative=spec.uses_threadgroup,
     )
 
 
@@ -194,11 +221,17 @@ def _explain_enabled() -> bool:
 
 
 def log_compile(
-    spec: KernelSpec, threadgroup: int | tuple[int, ...] | None = None
+    spec: KernelSpec,
+    threadgroup: int | tuple[int, ...] | None = None,
+    *,
+    execution_path: str = "metal",
 ) -> None:
     """One stderr line per compiled kernel when PALLADIUM_EXPLAIN is set.
 
     Called on the cache-miss path, so cached shapes stay silent.
     """
     if _explain_enabled():
-        print(explain_spec(spec, threadgroup), file=sys.stderr)
+        print(
+            dataclasses.replace(explain_spec(spec, threadgroup), execution_path=execution_path),
+            file=sys.stderr,
+        )
