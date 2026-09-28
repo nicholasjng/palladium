@@ -150,7 +150,7 @@ def test_tensorops_attention_rejects_same_primitives_with_wrong_probability_wiri
         return eqns
 
     malformed = _replace_scan_body(spec, swap_probability_operands)
-    with pytest.raises(EmitError, match="TensorOps attention"):
+    with pytest.raises(EmitError, match="softmax probabilities"):
         palladium.emit_msl(malformed, dot_general="tensorops")
 
 

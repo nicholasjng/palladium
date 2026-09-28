@@ -13,6 +13,7 @@ _NO_GPU_MODULES = {
     "test_typed_arithmetic",
     "test_tensorops_dot",
     "test_tensorops_flash_attention",
+    "test_tensorops_pipeline",
     "test_cursor",
     "test_views",
     "test_pallas_flash_attention",
