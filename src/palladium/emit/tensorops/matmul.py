@@ -1,582 +1,535 @@
-"""Recognition and emission for tiled TensorOps matrix products."""
+"""Compositional cooperative lowering for a tiled matrix product."""
 
 from __future__ import annotations
 
 import dataclasses
+import string
 
-from jax.extend.core import JaxprEqn, Literal, Var
+from jax.extend.core import Literal, Var
 
-from palladium.emit.cooperative import CooperativeValue, emit_elementwise_store
-from palladium.emit.core import Cursor, CVal, Environment
+from palladium.emit.core import CTYPES, ELEMENTWISE, Cursor, CVal, Environment, _block_offset
+from palladium.emit.numeric import typed_expression
 from palladium.errors import EmitError
-from palladium.trace import KernelSpec
 
 from ._shared import (
     _index_map_is,
-    _is_empty_get,
     _kernel_source,
-    _shape,
     _TensorOpsMatmul,
     _TensorView,
 )
+from .ir import KernelIR
+from .plan import Distribution, ProgramScope
+
+_K_TILE = 128
 
 
-@dataclasses.dataclass(frozen=True)
-class _MatmulPlan:
-    """Validated shapes, views, and epilogue for one tiled matmul."""
+def lower_matmul_ir(kernel: KernelIR, kernel_name: str | None = None) -> tuple[str, int]:
+    """Lower a tiled rank-2 or batched dot and its epilogue from tensorops IR.
 
-    spec: KernelSpec
-    epilogue: JaxprEqn | None
-    epilogue_input: Var | Literal | None
-    epilogue_side_input: Var | Literal | None
-    side_layout: str | None
-    n: int
-    k: int
-    tm: int
-    tn: int
-    transpose_lhs: bool
-    transpose_rhs: bool
-    a_offset: str
-    b_offset: str
-    c_offset: str
-    a_extents: tuple[int, int]
-    a_strides: tuple[int, int]
-    b_extents: tuple[int, int]
-    b_strides: tuple[int, int]
-
-
-def _check_zero_max(eqn: JaxprEqn, value: Var | Literal, shape: tuple[int, ...]) -> None:
-    """Require a full-tile maximum against literal zero."""
+    The dot, epilogue, and output store are selected from the imported
+    operation graph and validated against Pallas block maps.
+    """
+    plan = kernel.plan
+    spec = plan.spec
+    if plan.scope is not ProgramScope.THREADGROUP:
+        raise EmitError("tensorops cooperative matmul requires threadgroup program scope")
     if (
-        eqn.primitive.name != "max"
-        or sum(atom is value for atom in eqn.invars) != 1
-        or _shape(eqn.outvars[0]) != shape
-    ):
-        raise EmitError("dot_general='tensorops' max epilogue must consume the full dot tile")
-    other = next(atom for atom in eqn.invars if atom is not value)
-    if not isinstance(other, Literal) or float(other.val) != 0.0:
-        raise EmitError("dot_general='tensorops' max epilogue currently requires scalar zero")
-
-
-def _producer_map(eqns: list[JaxprEqn]) -> dict[Var, JaxprEqn]:
-    return {var: eqn for eqn in eqns for var in eqn.outvars if isinstance(var, Var)}
-
-
-def _producer(atom, producers: dict[Var, JaxprEqn], primitive: str) -> JaxprEqn:
-    eqn = producers.get(atom) if isinstance(atom, Var) else None
-    if eqn is None or eqn.primitive.name != primitive:
-        raise EmitError(f"dot_general='tensorops' expected a {primitive} producer")
-    return eqn
-
-
-def _operand_from(eqn: JaxprEqn, producers: dict[Var, JaxprEqn], primitive: str):
-    matches = [
-        atom
-        for atom in eqn.invars
-        if isinstance(atom, Var)
-        and atom in producers
-        and producers[atom].primitive.name == primitive
-    ]
-    if len(matches) != 1:
-        raise EmitError(f"dot_general='tensorops' expected one {primitive} operand")
-    return matches[0]
-
-
-def _mark(used: set[int], *eqns: JaxprEqn) -> None:
-    used.update(map(id, eqns))
-
-
-def _require_all_eqns(eqns: list[JaxprEqn], used: set[int]) -> None:
-    if len(eqns) != len(used):
-        raise EmitError("dot_general='tensorops' jaxpr contains unsupported extra operations")
-
-
-def _matrix_read(atom, producers: dict[Var, JaxprEqn], ref: Var):
-    """Resolve a rank-2 dot operand to its full-block read and transpose flag."""
-    producer = producers.get(atom) if isinstance(atom, Var) else None
-    transposed = producer is not None and producer.primitive.name == "transpose"
-    if transposed:
-        if tuple(producer.params["permutation"]) != (1, 0):
-            raise EmitError("dot_general='tensorops' only supports matrix transposes")
-        atom = producer.invars[0]
-    get = _producer(atom, producers, "get")
-    if not _is_empty_get(get, ref):
-        raise EmitError("dot_general='tensorops' requires full-block input reads")
-    return get, transposed
-
-
-def _recognize_tensorops_matmul(spec: KernelSpec) -> _MatmulPlan:
-    """Match a supported tiled matmul and return its checked layout plan."""
-    eqns = spec.jaxpr.eqns
-    if (
-        len(spec.inputs) not in (2, 3)
+        len(spec.inputs) < 2
         or len(spec.outputs) != 1
         or spec.scratch
         or spec.aliases
         or len(spec.grid) not in (2, 3)
+        or len(spec.jaxpr.constvars) != 0
         or len(spec.jaxpr.invars) != len(spec.inputs) + 1
     ):
-        raise EmitError(
-            "dot_general='tensorops' requires one full-block matmul whose result is "
-            "stored directly to one output"
-        )
+        raise EmitError("tensorops matmul requires a full-block matmul with one output")
 
-    lhs_ref, rhs_ref = spec.jaxpr.invars[:2]
-    out_ref = spec.jaxpr.invars[-1]
-    epilogue = None
-    epilogue_input = None
-    epilogue_side_input = None
-    side_layout = None
-    expand_input = None
-    transpose_lhs = transpose_rhs = False
-    producers = _producer_map(eqns)
-    stores = [
-        eqn
-        for eqn in eqns
-        if eqn.primitive.name == "swap" and eqn.invars and eqn.invars[0] is out_ref
-    ]
-    if len(stores) != 1 or len(stores[0].invars) != 2:
-        raise EmitError("dot_general='tensorops' requires one direct output store")
-    store = stores[0]
-    used: set[int] = set()
-    _mark(used, store)
-    if len(spec.grid) == 2:
-        rank2_value = store.invars[1]
-        final_producer = producers.get(rank2_value) if isinstance(rank2_value, Var) else None
-        if final_producer is not None and final_producer.primitive.name == "max":
-            epilogue = final_producer
-            dot_value = _operand_from(epilogue, producers, "dot_general")
-            dot = _producer(dot_value, producers, "dot_general")
-            epilogue_input = dot.outvars[0]
-            _check_zero_max(epilogue, epilogue_input, _shape(epilogue_input))
-            stored_value = epilogue.outvars[0]
-            _mark(used, epilogue, dot)
-        elif final_producer is not None and final_producer.primitive.name == "add":
-            epilogue = final_producer
-            dot_operands = [
-                atom
-                for atom in epilogue.invars
-                if isinstance(atom, Var)
-                and atom in producers
-                and producers[atom].primitive.name == "dot_general"
-            ]
-            if len(dot_operands) == 1:
-                dot_value = dot_operands[0]
-                dot = _producer(dot_value, producers, "dot_general")
-                side_value = next(atom for atom in epilogue.invars if atom is not dot_value)
-                side_producer = producers.get(side_value) if isinstance(side_value, Var) else None
-                if side_producer is not None and side_producer.primitive.name == "get":
-                    if len(spec.inputs) != 3 or not _is_empty_get(
-                        side_producer, spec.jaxpr.invars[2]
-                    ):
-                        raise EmitError(
-                            "dot_general='tensorops' residual must be a full-block read"
-                        )
-                    epilogue_input = dot_value
-                    epilogue_side_input = side_value
-                    side_layout = "matrix"
-                    _mark(used, side_producer)
-                elif (
-                    side_producer is not None and side_producer.primitive.name == "broadcast_in_dim"
-                ):
-                    bias_broadcast = side_producer
-                    bias_get = _producer(bias_broadcast.invars[0], producers, "get")
-                    if len(spec.inputs) != 3 or not _is_empty_get(bias_get, spec.jaxpr.invars[2]):
-                        raise EmitError(
-                            "dot_general='tensorops' column bias must be a full-block read"
-                        )
-                    if (
-                        tuple(bias_broadcast.params["broadcast_dimensions"]) != (1,)
-                        or next(iter(bias_broadcast.params["shape"])) != 1
-                    ):
-                        raise EmitError(
-                            "dot_general='tensorops' column bias must broadcast over matrix rows"
-                        )
-                    epilogue_input = dot_value
-                    epilogue_side_input = side_value
-                    side_layout = "column_bias"
-                    _mark(used, bias_get, bias_broadcast)
-                else:
-                    raise EmitError("dot_general='tensorops' add requires a supported side input")
-                if _shape(epilogue.outvars[0]) != _shape(dot_value):
-                    raise EmitError("dot_general='tensorops' add must combine matching tiles")
-                stored_value = epilogue.outvars[0]
-                _mark(used, epilogue, dot)
-            else:
-                raise EmitError("dot_general='tensorops' add must consume one dot result")
-        elif final_producer is not None and final_producer.primitive.name == "dot_general":
-            dot = final_producer
-            stored_value = rank2_value
-            _mark(used, dot)
-        else:
-            raise EmitError("dot_general='tensorops' requires a supported matmul epilogue")
-        if len(spec.grid) == 2:
-            lhs_get, transpose_lhs = _matrix_read(dot.invars[0], producers, lhs_ref)
-            rhs_get, transpose_rhs = _matrix_read(dot.invars[1], producers, rhs_ref)
-            _mark(used, lhs_get, rhs_get)
-            for atom in dot.invars:
-                producer = producers.get(atom) if isinstance(atom, Var) else None
-                if producer is not None and producer.primitive.name == "transpose":
-                    _mark(used, producer)
-        else:
-            lhs_get = _producer(dot.invars[0], producers, "get")
-            rhs_get = _producer(dot.invars[1], producers, "get")
-            _mark(used, lhs_get, rhs_get)
-            if not _is_empty_get(lhs_get, lhs_ref) or not _is_empty_get(rhs_get, rhs_ref):
-                raise EmitError("dot_general='tensorops' requires full-block input reads")
-            if dot.invars[0] is not lhs_get.outvars[0] or dot.invars[1] is not rhs_get.outvars[0]:
-                raise EmitError("dot_general='tensorops' does not support transformed dot operands")
-            transpose_lhs = transpose_rhs = False
-        _require_all_eqns(eqns, used)
-        if store.invars[0] is not out_ref or store.invars[1] is not stored_value:
-            raise EmitError("dot_general='tensorops' requires a direct full-block output store")
-    else:
-        rank3_value = store.invars[1]
-        final_producer = producers.get(rank3_value) if isinstance(rank3_value, Var) else None
-        if final_producer is not None and final_producer.primitive.name == "max":
-            epilogue = final_producer
-            expanded_value = _operand_from(epilogue, producers, "broadcast_in_dim")
-            expand = _producer(expanded_value, producers, "broadcast_in_dim")
-            expand_input = expand.invars[0]
-            epilogue_input = expand.outvars[0]
-            dot = _producer(expand_input, producers, "dot_general")
-            _check_zero_max(epilogue, epilogue_input, _shape(epilogue_input))
-            stored_value = epilogue.outvars[0]
-            _mark(used, epilogue, expand, dot)
-        elif final_producer is not None and final_producer.primitive.name == "add":
-            epilogue = final_producer
-            side_values = [
-                atom
-                for atom in epilogue.invars
-                if isinstance(atom, Var)
-                and atom in producers
-                and producers[atom].primitive.name == "get"
-            ]
-            if len(spec.inputs) != 3 or len(side_values) != 1:
-                raise EmitError("dot_general='tensorops' batched residual requires one side input")
-            epilogue_side_input = side_values[0]
-            residual_get = _producer(epilogue_side_input, producers, "get")
-            if not _is_empty_get(residual_get, spec.jaxpr.invars[2]):
-                raise EmitError(
-                    "dot_general='tensorops' batched residual must be a full-block read"
-                )
-            expanded_values = [atom for atom in epilogue.invars if atom is not epilogue_side_input]
-            if len(expanded_values) != 1:
-                raise EmitError("dot_general='tensorops' batched add must consume one matmul tile")
-            expand = _producer(expanded_values[0], producers, "broadcast_in_dim")
-            expand_input = expand.invars[0]
-            dot = _producer(expand_input, producers, "dot_general")
-            epilogue_input = expand.outvars[0]
-            if _shape(epilogue.outvars[0]) != _shape(epilogue_input):
-                raise EmitError("dot_general='tensorops' batched residual must match the dot tile")
-            side_layout = "batched_matrix"
-            stored_value = epilogue.outvars[0]
-            _mark(used, epilogue, residual_get, expand, dot)
-        elif final_producer is not None and final_producer.primitive.name == "broadcast_in_dim":
-            expand = final_producer
-            expand_input = expand.invars[0]
-            upstream = producers.get(expand_input) if isinstance(expand_input, Var) else None
-            if upstream is not None and upstream.primitive.name == "max":
-                epilogue = upstream
-                dot_value = _operand_from(epilogue, producers, "dot_general")
-                dot = _producer(dot_value, producers, "dot_general")
-                epilogue_input = dot.outvars[0]
-                _check_zero_max(epilogue, epilogue_input, _shape(epilogue_input))
-                _mark(used, epilogue)
-            else:
-                dot = _producer(expand_input, producers, "dot_general")
-            stored_value = expand.outvars[0]
-            _mark(used, expand, dot)
-        else:
-            raise EmitError(
-                "dot_general='tensorops' batched form requires a supported matmul epilogue"
-            )
-        lhs_squeeze = _producer(dot.invars[0], producers, "squeeze")
-        rhs_squeeze = _producer(dot.invars[1], producers, "squeeze")
-        lhs_get = _producer(lhs_squeeze.invars[0], producers, "get")
-        rhs_get = _producer(rhs_squeeze.invars[0], producers, "get")
-        _mark(used, lhs_get, rhs_get, lhs_squeeze, rhs_squeeze)
-        _require_all_eqns(eqns, used)
-        if not _is_empty_get(lhs_get, lhs_ref) or not _is_empty_get(rhs_get, rhs_ref):
-            raise EmitError("dot_general='tensorops' requires full-block input reads")
-        if (
-            tuple(lhs_squeeze.params["dimensions"]) != (0,)
-            or tuple(rhs_squeeze.params["dimensions"]) != (0,)
-            or dot.invars[0] is not lhs_squeeze.outvars[0]
-            or dot.invars[1] is not rhs_squeeze.outvars[0]
-        ):
-            raise EmitError("dot_general='tensorops' requires one leading singleton batch tile")
-        if (
-            expand.invars[0] is not expand_input
-            or tuple(expand.params["broadcast_dimensions"]) != (1, 2)
-            or store.invars[0] is not out_ref
-            or store.invars[1] is not stored_value
-        ):
-            raise EmitError("dot_general='tensorops' requires a direct batched output store")
-    if side_layout is None and len(spec.inputs) != 2:
-        raise EmitError("dot_general='tensorops' standalone matmul accepts exactly two inputs")
-    if store.params["tree"].flatten_up_to(()) != []:
-        raise EmitError("dot_general='tensorops' requires a full-block output store")
-    (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = dot.params["dimension_numbers"]
+    operations = kernel.body.operations
+    dots = [op for op in operations if op.name == "dot_general"]
+    stores = [op for op in operations if op.name == "swap"]
+    if len(dots) != 1 or len(stores) != 1:
+        raise EmitError("tensorops matmul requires one dot and one output store")
+    dot_op, store_op = dots[0], stores[0]
+    dot = dot_op.equation
+    store = store_op.equation
+    if len(store.invars) != 2 or store.params["tree"].flatten_up_to(()) != []:
+        raise EmitError("tensorops matmul currently supports only a full-block output store")
+    if store.invars[0] is not spec.jaxpr.invars[-1]:
+        raise EmitError("tensorops matmul store must target its output ref")
+    if (
+        dot_op.results[0].layout is None
+        or dot_op.results[0].layout.distribution is not Distribution.TENSOROPS
+    ):
+        raise EmitError("tensorops layout assignment did not give the dot TensorOps ownership")
 
-    a, b = spec.inputs[:2]
-    c = spec.outputs[0]
-    if any(info.dtype.name != "float32" for info in (*spec.inputs, c)):
-        raise EmitError("dot_general='tensorops' currently supports float32 only")
-    rank = len(a.array_shape)
+    producers = {
+        variable: eqn
+        for eqn in spec.jaxpr.eqns
+        for variable in eqn.outvars
+        if isinstance(variable, Var)
+    }
+    lhs_get, transpose_lhs, lhs_squeeze = _matrix_get(
+        dot.invars[0], producers, spec.jaxpr.invars[0]
+    )
+    rhs_get, transpose_rhs, rhs_squeeze = _matrix_get(
+        dot.invars[1], producers, spec.jaxpr.invars[1]
+    )
+
+    lhs_info, rhs_info = spec.inputs[:2]
+    output_info = spec.outputs[0]
+    matmul_dtype = lhs_info.dtype.name
+    if matmul_dtype not in ("float32", "float16", "bfloat16") or any(
+        info.dtype.name != matmul_dtype for info in (*spec.inputs, output_info)
+    ):
+        raise EmitError("TensorOps matmul requires matching float32, float16, or bfloat16 types")
+    rank = len(output_info.array_shape)
+    if rank not in (2, 3) or any(
+        len(info.array_shape) != rank or len(info.block_shape) != rank
+        for info in (lhs_info, rhs_info, output_info)
+    ):
+        raise EmitError("TensorOps matmul supports rank-2 matrices and rank-3 batches")
+    if any(info.full_block_shape != info.block_shape for info in (lhs_info, rhs_info, output_info)):
+        raise EmitError("TensorOps matmul requires complete matrix blocks")
+
     if rank == 2:
-        if len(b.array_shape) != 2 or len(c.array_shape) != 2:
-            raise EmitError("dot_general='tensorops' requires rank-2 matrices")
-        if any(len(info.block_shape) != 2 for info in (a, b, c)):
-            raise EmitError("dot_general='tensorops' requires rank-2 matrix blocks")
-        if lhs_batch or rhs_batch or tuple(lhs_contract) != (1,) or tuple(rhs_contract) != (0,):
-            raise EmitError("dot_general='tensorops' rank-2 form requires unbatched A @ B")
-        if transpose_lhs:
-            k, m = a.array_shape
-        else:
-            m, k = a.array_shape
-        if transpose_rhs:
-            n, kb = b.array_shape
-        else:
-            kb, n = b.array_shape
-        if k != kb or c.array_shape != (m, n):
-            raise EmitError("dot_general='tensorops' matrix dimensions do not match")
-        tm, tn = c.block_shape
-        ka = a.block_shape[0 if transpose_lhs else 1]
-        if (
-            k != ka
-            or (not transpose_lhs and a.array_shape != (m, k))
-            or (transpose_lhs and a.array_shape != (k, m))
-            or (not transpose_rhs and b.array_shape != (k, n))
-            or (transpose_rhs and b.array_shape != (n, k))
-            or (not transpose_lhs and a.block_shape != (tm, k))
-            or (transpose_lhs and a.block_shape != (k, tm))
-            or (not transpose_rhs and b.block_shape != (k, tn))
-            or (transpose_rhs and b.block_shape != (tn, k))
-            or c.block_shape != (tm, tn)
-            or spec.grid != (m // tm, n // tn)
-        ):
-            raise EmitError("dot_general='tensorops' requires full-K, row-major matrix tiles")
-        maps_match = (
-            _index_map_is(a, (None, 0) if transpose_lhs else (0, None))
-            and _index_map_is(b, (1, None) if transpose_rhs else (None, 1))
-            and _index_map_is(c, (0, 1))
-        )
-        a_offset = f"_pid.x * {tm}" if transpose_lhs else f"_pid.x * {tm * k}"
-        b_offset = f"_pid.y * {tn * k}" if transpose_rhs else f"_pid.y * {tn}"
-        c_offset = f"_pid.x * {tm * n} + _pid.y * {tn}"
-        a_extents = (m, k) if transpose_lhs else (k, tm)
-        a_strides = (1, m) if transpose_lhs else (1, k)
-        b_extents = (k, tn) if transpose_rhs else (tn, k)
-        b_strides = (1, k) if transpose_rhs else (1, n)
-    elif rank == 3:
+        m, k = lhs_info.array_shape[::-1] if transpose_lhs else lhs_info.array_shape
+        kb, n = rhs_info.array_shape[::-1] if transpose_rhs else rhs_info.array_shape
+        tm, tn = output_info.block_shape
+        batch = 1
+    else:
         if transpose_lhs or transpose_rhs:
             raise EmitError(
-                "dot_general='tensorops' batched form does not support transposed operands"
+                "tensorops batched TensorOps matmul does not support transposed operands"
             )
-        if len(b.array_shape) != 3 or len(c.array_shape) != 3:
-            raise EmitError("dot_general='tensorops' batched form requires rank-3 arrays")
-        if any(len(info.block_shape) != 3 for info in (a, b, c)):
-            raise EmitError("dot_general='tensorops' requires rank-3 batch blocks")
-        if lhs_batch or rhs_batch or tuple(lhs_contract) != (1,) or tuple(rhs_contract) != (0,):
-            raise EmitError("dot_general='tensorops' batched tiles require unbatched local matmuls")
-        batch, m, k = a.array_shape
-        batch_b, kb, n = b.array_shape
-        if batch != batch_b or k != kb or c.array_shape != (batch, m, n):
-            raise EmitError("dot_general='tensorops' batched matrix dimensions do not match")
-        ba, tm, ka = a.block_shape
-        bb, kb_tile, tn = b.block_shape
-        bc, cm, cn = c.block_shape
-        expected_blocks = ((1, tm, ka), (1, kb_tile, tn), (1, cm, cn))
-        a_full = a.full_block_shape
-        b_full = b.full_block_shape
-        c_full = c.full_block_shape
-        if a_full is None or b_full is None or c_full is None:
-            raise EmitError("dot_general='tensorops' requires explicit full-K block mappings")
-        if (
-            (ba, bb, bc) != (1, 1, 1)
-            or tuple(a_full) != expected_blocks[0]
-            or tuple(b_full) != expected_blocks[1]
-            or tuple(c_full) != expected_blocks[2]
-            or ka != k
-            or kb_tile != k
-            or (cm, cn) != (tm, tn)
-            or spec.grid != (batch, m // tm, n // tn)
-        ):
-            raise EmitError("dot_general='tensorops' requires full-K batch-local row-major tiles")
-        maps_match = (
-            _index_map_is(a, (0, 1, None))
-            and _index_map_is(b, (0, None, 2))
-            and _index_map_is(c, (0, 1, 2))
+        batch, m, k = lhs_info.array_shape
+        batch_rhs, kb, n = rhs_info.array_shape
+        if batch != batch_rhs:
+            raise EmitError("tensorops batched TensorOps operands must have matching batch sizes")
+        _, tm, tn = output_info.block_shape
+    if (
+        k != kb
+        or output_info.array_shape != ((m, n) if rank == 2 else (batch, m, n))
+        or lhs_info.block_shape[-2:] != ((k, tm) if transpose_lhs else (tm, k))
+        or rhs_info.block_shape[-2:] != ((tn, kb) if transpose_rhs else (kb, tn))
+        or (
+            rank == 3
+            and (lhs_info.block_shape[0], rhs_info.block_shape[0], output_info.block_shape[0])
+            != (1, 1, 1)
         )
-        a_offset = f"_pid.x * {m * k} + _pid.y * {tm * k}"
-        b_offset = f"_pid.x * {k * n} + _pid.z * {tn}"
-        c_offset = f"_pid.x * {m * n} + _pid.y * {tm * n} + _pid.z * {tn}"
-        a_extents, a_strides = (k, tm), (1, k)
-        b_extents, b_strides = (tn, k), (1, n)
-    else:
-        raise EmitError("dot_general='tensorops' supports rank-2 and batched rank-3 arrays")
+        or spec.grid
+        != (
+            ((m + tm - 1) // tm, (n + tn - 1) // tn)
+            if rank == 2
+            else (batch, (m + tm - 1) // tm, (n + tn - 1) // tn)
+        )
+        or k <= 0
+        or m <= 0
+        or n <= 0
+        or tm % 16
+        or tn % 16
+    ):
+        raise EmitError("TensorOps matmul requires full-K, evenly tiled matrix operands")
+    if not (
+        _index_map_is(
+            lhs_info, (None, 0) if transpose_lhs else ((0, None) if rank == 2 else (0, 1, None))
+        )
+        and _index_map_is(
+            rhs_info, (1, None) if transpose_rhs else ((None, 1) if rank == 2 else (0, None, 2))
+        )
+        and _index_map_is(output_info, (0, 1) if rank == 2 else (0, 1, 2))
+    ):
+        raise EmitError("TensorOps matmul requires standard row-major block maps")
 
-    if k != kb:
-        raise EmitError("dot_general='tensorops' requires matching full-K blocks")
-    if rank == 2 and any(info.full_block_shape != info.block_shape for info in (a, b, c)):
-        raise EmitError("dot_general='tensorops' requires complete matrix blocks")
-    if m % tm or n % tn:
-        raise EmitError("dot_general='tensorops' requires evenly tiled M and N dimensions")
-    expected_grid = (m // tm, n // tn) if rank == 2 else (batch, m // tm, n // tn)
-    if spec.grid != expected_grid:
-        raise EmitError("dot_general='tensorops' grid does not match its matrix tiles")
-    if not maps_match:
-        raise EmitError("dot_general='tensorops' requires standard row-major matrix grid maps")
+    if (
+        _shape(lhs_get.outvars[0]) != lhs_info.block_shape
+        or _shape(rhs_get.outvars[0]) != rhs_info.block_shape
+    ):
+        raise EmitError("tensorops dot operands must be full matrix tiles")
 
-    if side_layout is not None:
-        if len(spec.inputs) != 3:
-            raise EmitError("dot_general='tensorops' side-input fusion requires three inputs")
-        residual = spec.inputs[2]
-        if side_layout == "matrix":
-            valid_side_map = (
-                rank == 2
-                and residual.array_shape == (m, n)
-                and residual.block_shape == (tm, tn)
-                and _index_map_is(residual, (0, 1))
-            )
-        elif side_layout == "column_bias":
-            valid_side_map = (
-                rank == 2
-                and residual.array_shape == (n,)
-                and residual.block_shape == (tn,)
-                and _index_map_is(residual, (1,))
-            )
-        else:
-            valid_side_map = (
-                rank == 3
-                and residual.array_shape == (batch, m, n)
-                and residual.block_shape == (1, tm, tn)
-                and _index_map_is(residual, (0, 1, 2))
-            )
-        if not valid_side_map or residual.full_block_shape != residual.block_shape:
-            raise EmitError("dot_general='tensorops' side input must match a supported tile map")
+    store_value = store.invars[1]
+    result_broadcast = None
+    if rank == 3:
+        broadcast = producers.get(store_value) if isinstance(store_value, Var) else None
+        if broadcast is not None and broadcast.primitive.name == "broadcast_in_dim":
+            if tuple(broadcast.params["broadcast_dimensions"]) != (1, 2):
+                raise EmitError(
+                    "tensorops batched matmul store requires a leading singleton broadcast"
+                )
+            result_broadcast = broadcast
+            store_value = broadcast.invars[0]
+    elementwise_eqns, used = _epilogue_path(store_value, dot.outvars[0], producers)
+    if not elementwise_eqns and store_value is not dot.outvars[0]:
+        raise EmitError("tensorops matmul store value must be the dot result or its epilogue")
+    used.update((id(dot), id(store), id(lhs_get), id(rhs_get)))
+    if result_broadcast is not None:
+        used.add(id(result_broadcast))
+    used.update(id(eqn) for eqn in (lhs_squeeze, rhs_squeeze) if eqn is not None)
+    for atom, transposed in ((dot.invars[0], transpose_lhs), (dot.invars[1], transpose_rhs)):
+        if transposed:
+            if not isinstance(atom, Var) or atom not in producers:
+                raise EmitError("tensorops matmul transpose producer was not imported")
+            used.add(id(producers[atom]))
+    all_gets = [eqn for eqn in spec.jaxpr.eqns if eqn.primitive.name == "get"]
+    if not set(map(id, all_gets)).issubset(used) or len(used) != len(spec.jaxpr.eqns):
+        raise EmitError("tensorops matmul jaxpr has operations outside the dot epilogue path")
 
-    return _MatmulPlan(
-        spec=spec,
-        epilogue=epilogue,
-        epilogue_input=epilogue_input,
-        epilogue_side_input=epilogue_side_input,
-        side_layout=side_layout,
-        n=n,
-        k=k,
-        tm=tm,
-        tn=tn,
-        transpose_lhs=transpose_lhs,
-        transpose_rhs=transpose_rhs,
-        a_offset=a_offset,
-        b_offset=b_offset,
-        c_offset=c_offset,
-        a_extents=a_extents,
-        a_strides=a_strides,
-        b_extents=b_extents,
-        b_strides=b_strides,
-    )
-
-
-def emit_tensorops_matmul(spec: KernelSpec, kernel_name: str | None = None) -> str:
-    """Emit a group-cooperative MSL kernel for a tiled matrix product."""
-    return lower_tensorops_matmul(spec, kernel_name)[0]
-
-
-def lower_tensorops_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str, int]:
-    """Emit a matmul kernel and return its threadgroup-memory requirement."""
-    plan = _recognize_tensorops_matmul(spec)
-    return _emit_tensorops_matmul(plan, kernel_name)
-
-
-def _emit_tensorops_matmul(plan: _MatmulPlan, kernel_name: str | None) -> tuple[str, int]:
-    """Lower a validated matmul plan to MSL."""
-    spec = plan.spec
-    epilogue = plan.epilogue
-    epilogue_input = plan.epilogue_input
-    epilogue_side_input = plan.epilogue_side_input
-    side_layout = plan.side_layout
-    n, k, tm, tn = plan.n, plan.k, plan.tm, plan.tn
-    transpose_lhs, transpose_rhs = plan.transpose_lhs, plan.transpose_rhs
-    a_offset, b_offset, c_offset = plan.a_offset, plan.b_offset, plan.c_offset
-    a_extents, a_strides = plan.a_extents, plan.a_strides
-    b_extents, b_strides = plan.b_extents, plan.b_strides
-    name = kernel_name or spec.name
-    output_arg = f"arg{len(spec.inputs)}"
-    params = tuple(
-        f"device float* arg{index} [[buffer({index})]]" for index in range(len(spec.inputs) + 1)
-    ) + ("uint3 _pid [[threadgroup_position_in_grid]]",)
     cursor = Cursor()
-    if epilogue is not None:
-        cursor.emit(
-            "const uint THREADS = threads_per_group.x * threads_per_group.y * threads_per_group.z;"
-        )
-        output_storage = cursor.allocate("float", (tm, tn), name="dot_result", space="threadgroup")
-    else:
-        output_storage = CVal(f"({output_arg} + {c_offset})", (tm, tn), "float", space="device")
-
-    operation = _TensorOpsMatmul(
-        name="op",
-        descriptor="desc",
-        m=tm,
-        n=tn,
-        k=k,
-        transpose_lhs=transpose_lhs,
-        transpose_rhs=transpose_rhs,
-        accumulate=False,
-    )
-    operation.emit_declaration(cursor)
-    lhs = _TensorView(
-        CVal(f"(arg0 + {a_offset})", (tm, k), "float", space="device", readonly=True),
-        (tm, k),
-        a_extents,
-        a_strides,
-    ).emit(cursor, "a")
-    rhs = _TensorView(
-        CVal(f"(arg1 + {b_offset})", (k, tn), "float", space="device", readonly=True),
-        (k, tn),
-        b_extents,
-        b_strides,
-    ).emit(cursor, "b")
-    output_extents = (tn, tm)
-    output_strides = (1, tn) if epilogue is not None else (1, n)
-    output = _TensorView(output_storage, (tm, tn), output_extents, output_strides).emit(cursor, "c")
-    operation.emit_run(cursor, lhs, rhs, output)
-
-    if epilogue is not None:
-        cursor.barrier()
-        env = Environment()
-        if epilogue_input is None:
-            raise EmitError("TensorOps epilogue is missing its matrix input")
-        residual_storage = None
-        if side_layout == "matrix":
-            residual_storage = CVal(
-                f"(arg2 + {c_offset})", (tm, tn), "float", space="device", readonly=True
-            )
-        elif side_layout == "column_bias":
-            residual_storage = CVal(
-                f"(arg2 + _pid.y * {tn})", (tn,), "float", space="device", readonly=True
-            )
-        elif side_layout == "batched_matrix":
-            residual_storage = CVal(
-                f"(arg2 + {c_offset})", (1, tm, tn), "float", space="device", readonly=True
-            )
-        operands = tuple(
-            CooperativeValue(output_storage, "tensorops")
-            if atom is epilogue_input
-            else residual_storage
-            if atom is epilogue_side_input and residual_storage is not None
-            else env.val(atom)
-            for atom in epilogue.invars
-        )
-        output_tile = CVal(f"({output_arg} + {c_offset})", (tm, tn), "float", space="device")
-        emit_elementwise_store(cursor, epilogue, operands, output_tile, thread_count="THREADS")
-
-    if epilogue is not None:
+    params = tuple(
+        f"device {CTYPES[info.dtype.name]}* arg{index} [[buffer({index})]]"
+        for index, info in enumerate((*spec.inputs, output_info))
+    ) + ("uint3 _pid [[threadgroup_position_in_grid]]",)
+    has_epilogue = bool(elementwise_eqns)
+    has_edge_tiles = m % tm != 0 or n % tn != 0
+    available_epilogue_values = {dot.outvars[0]}
+    cooperative_epilogue = has_epilogue
+    for eqn in elementwise_eqns:
+        if any(
+            not isinstance(atom, Literal) and atom not in available_epilogue_values
+            for atom in eqn.invars
+        ):
+            cooperative_epilogue = False
+        available_epilogue_values.update(eqn.outvars)
+    threadgroup_epilogue = has_epilogue and not cooperative_epilogue
+    needs_lane_loop = threadgroup_epilogue or has_edge_tiles
+    if needs_lane_loop:
         params += (
             "uint tid [[thread_index_in_threadgroup]]",
             "uint3 threads_per_group [[threads_per_threadgroup]]",
         )
-    source = _kernel_source(name, params, cursor.lines)
+        cursor.emit(
+            "const uint THREADS = threads_per_group.x * threads_per_group.y * threads_per_group.z;"
+        )
+
+    env = Environment()
+    infos = (*spec.inputs, output_info)
+    ref_values: dict[Var, CVal] = {}
+    offsets = tuple(_block_offset(env, cursor, spec, info) for info in infos)
+    for index, (ref, info, offset) in enumerate(
+        zip(spec.jaxpr.invars, infos, offsets, strict=True)
+    ):
+        pointer = f"arg{index}" if offset == "0" else f"(arg{index} + {offset})"
+        ref_values[ref] = CVal(
+            pointer,
+            info.block_shape,
+            CTYPES[info.dtype.name],
+            space="device",
+            readonly=index < len(spec.inputs),
+        )
+
+    values: dict[Var, CVal] = {}
+    for eqn in all_gets:
+        if len(eqn.invars) != 1 or eqn.invars[0] not in ref_values:
+            raise EmitError("tensorops matmul reads must be full-block ref gets")
+        if tuple(eqn.params["tree"].flatten_up_to(())):
+            raise EmitError("tensorops matmul does not support indexed ref gets yet")
+        ref_value = ref_values[eqn.invars[0]]
+        if _shape(eqn.outvars[0]) != ref_value.shape:
+            raise EmitError("tensorops matmul get shape does not match its input block")
+        ref_index = spec.jaxpr.invars.index(eqn.invars[0])
+        if ref_index >= len(spec.inputs):
+            raise EmitError("tensorops matmul cannot read from its output ref")
+        expected_side = (tm, tn) if rank == 2 else (1, tm, tn)
+        side_map = (0, 1) if rank == 2 else (0, 1, 2)
+        column_bias = (
+            rank == 2 and ref_value.shape == (tn,) and _index_map_is(spec.inputs[ref_index], (1,))
+        )
+        if ref_index >= 2 and (
+            not column_bias
+            and (
+                ref_value.shape != expected_side
+                or not _index_map_is(spec.inputs[ref_index], side_map)
+            )
+        ):
+            raise EmitError("tensorops matmul epilogue reads must match the output tile layout")
+        if ref_index >= 2 and not column_bias:
+            full_row_stride = spec.inputs[ref_index].array_shape[-1]
+            ref_value = dataclasses.replace(
+                ref_value,
+                shape=(tm, tn),
+                index_map=f"(($i / {tn}) * {full_row_stride} + ($i % {tn}))",
+            )
+        values[eqn.outvars[0]] = ref_value
+
+    output_ctype = CTYPES[output_info.dtype.name]
+    output_storage = (
+        cursor.allocate(output_ctype, (tm, tn), name="dot_result", space="threadgroup")
+        if threadgroup_epilogue
+        else ref_values[spec.jaxpr.invars[-1]]
+    )
+    k_tile = min(_K_TILE, ((k + 15) // 16) * 16)
+    operation = _TensorOpsMatmul.from_eqn(dot, producers, name="op", accumulate=True)
+    operation = _TensorOpsMatmul(
+        name=operation.name,
+        descriptor="desc",
+        m=operation.m,
+        n=operation.n,
+        k=k_tile,
+        transpose_lhs=operation.transpose_lhs,
+        transpose_rhs=operation.transpose_rhs,
+        accumulate=True,
+    )
+    operation.emit_declaration(cursor)
+
+    a_offset, b_offset, c_offset = offsets[:2] + (offsets[-1],)
+    m_pid, n_pid = ("x", "y") if rank == 2 else ("y", "z")
+    valid_m = str(tm) if m % tm == 0 else f"min({tm}, {m} - (int)_pid.{m_pid} * {tm})"
+    valid_n = str(tn) if n % tn == 0 else f"min({tn}, {n} - (int)_pid.{n_pid} * {tn})"
+    lhs_tensor = _TensorView(
+        CVal(
+            f"(arg0 + {a_offset})",
+            (tm, k),
+            CTYPES[lhs_info.dtype.name],
+            space="device",
+            readonly=True,
+        ),
+        (tm, k),
+        (m, valid_m) if transpose_lhs else (k, valid_m),
+        (1, m) if transpose_lhs else (1, k),
+    ).emit(cursor, "a")
+    rhs_tensor = _TensorView(
+        CVal(
+            f"(arg1 + {b_offset})",
+            (k, tn),
+            CTYPES[rhs_info.dtype.name],
+            space="device",
+            readonly=True,
+        ),
+        (k, tn),
+        (k, valid_n) if transpose_rhs else (valid_n, k),
+        (1, k) if transpose_rhs else (1, n),
+    ).emit(cursor, "b")
+    output_extents = (tn, tm) if threadgroup_epilogue else (valid_n, valid_m)
+    output_strides = (1, tn) if threadgroup_epilogue else (1, n)
+    output_tensor = _TensorView(
+        output_storage,
+        (tm, tn),
+        output_extents,
+        output_strides,
+    ).emit(cursor, "c")
+    edge_storage = None
+    edge_tensor = None
+    if has_edge_tiles and not threadgroup_epilogue:
+        edge_storage = cursor.allocate(
+            output_ctype, (tm, tn), name="edge_result", space="threadgroup"
+        )
+        edge_tensor = _TensorView(edge_storage, (tm, tn), (tn, tm), (1, tn)).emit(cursor, "c_edge")
+    cooperative_result = operation.emit_cooperative_destination(
+        cursor, lhs_tensor, rhs_tensor, element_type=output_ctype
+    )
+    with cursor.loop("cTc.get_capacity()", "init") as index:
+        cursor.emit(f"cTc[{index}] = {output_ctype}(0.0f);")
+    with cursor.block(f"for (int k_start = 0; k_start < {k}; k_start += {k_tile})"):
+        chunk_k = f"min({k_tile}, {k} - k_start)"
+        lhs_chunk = _TensorView(
+            CVal(
+                f"(arg0 + {a_offset} + k_start * {m if transpose_lhs else 1})",
+                (tm, k_tile),
+                CTYPES[lhs_info.dtype.name],
+                space="device",
+                readonly=True,
+            ),
+            (tm, k_tile),
+            (m, valid_m) if transpose_lhs else (chunk_k, valid_m),
+            (1, m) if transpose_lhs else (1, k),
+        ).emit(cursor, "a_k")
+        rhs_chunk = _TensorView(
+            CVal(
+                f"(arg1 + {b_offset} + k_start * {1 if transpose_rhs else n})",
+                (k_tile, tn),
+                CTYPES[rhs_info.dtype.name],
+                space="device",
+                readonly=True,
+            ),
+            (k_tile, tn),
+            (chunk_k, valid_n) if transpose_rhs else (valid_n, chunk_k),
+            (1, k) if transpose_rhs else (1, n),
+        ).emit(cursor, "b_k")
+        operation.emit_run(cursor, lhs_chunk, rhs_chunk, cooperative_result)
+    values[dot.outvars[0]] = CVal("cTc", (tm, tn), output_ctype, space="thread")
+
+    output_ref = CVal(
+        f"(arg{len(spec.inputs)} + {c_offset})", (tm, tn), output_ctype, space="device"
+    )
+    if cooperative_epilogue:
+        with cursor.loop("cTc.get_capacity()", "element") as index:
+            scalar_values = {dot.outvars[0]: f"cTc[{index}]"}
+            for eqn in elementwise_eqns:
+                operands = tuple(
+                    _scalar_value(atom, scalar_values, values, env, index, (tm, tn))
+                    for atom in eqn.invars
+                )
+                result_type = CTYPES[eqn.outvars[0].aval.dtype.name]
+                expression = _elementwise_expression(eqn, result_type, operands)
+                result_name = cursor.fresh("tensorops_epilogue")
+                cursor.emit(f"{result_type} {result_name} = {expression};")
+                scalar_values[eqn.outvars[0]] = result_name
+            try:
+                expression = scalar_values[store_value]
+            except KeyError as error:
+                raise EmitError("tensorops matmul store value was not lowered") from error
+            cursor.emit(f"cTc[{index}] = {expression};")
+    if threadgroup_epilogue:
+        cursor.emit(f"{cooperative_result.expr}.store({output_tensor.expr});")
+        cursor.barrier()
+        with cursor.strided_loop("tid", str(output_ref.size), "THREADS", name="element") as index:
+            cursor.emit(f"const uint row = {index} / {tn};")
+            cursor.emit(f"const uint column = {index} % {tn};")
+            with cursor.block(f"if (row < {valid_m} && column < {valid_n})"):
+                scalar_values = {dot.outvars[0]: output_storage.at(index)}
+                for eqn in elementwise_eqns:
+                    if not _is_tile_shape(_shape(eqn.outvars[0]), rank, tm, tn) and not (
+                        eqn.primitive.name == "broadcast_in_dim"
+                        and _shape(eqn.outvars[0]) == (1, tn)
+                    ):
+                        raise EmitError(
+                            "tensorops matmul epilogue operations must preserve the output tile shape"
+                        )
+                    operands = tuple(
+                        _scalar_value(atom, scalar_values, values, env, index, (tm, tn))
+                        for atom in eqn.invars
+                    )
+                    result_type = CTYPES[eqn.outvars[0].aval.dtype.name]
+                    expression = _elementwise_expression(eqn, result_type, operands)
+                    result_name = cursor.fresh("tensorops_epilogue")
+                    cursor.emit(f"{result_type} {result_name} = {expression};")
+                    scalar_values[eqn.outvars[0]] = result_name
+                try:
+                    expression = scalar_values[store_value]
+                except KeyError as error:
+                    raise EmitError("tensorops matmul store value was not lowered") from error
+                cursor.emit(f"{output_ref.expr}[row * {n} + column] = {expression};")
+    else:
+        if has_edge_tiles:
+            if edge_tensor is None or edge_storage is None:
+                raise EmitError("tensorops edge tile storage was not allocated")
+            with cursor.block(f"if ({valid_m} == {tm} && {valid_n} == {tn})"):
+                cursor.emit(f"{cooperative_result.expr}.store({output_tensor.expr});")
+            cursor.emit("else {")
+            cursor.indent += 1
+            cursor.emit(f"{cooperative_result.expr}.store({edge_tensor.expr});")
+            cursor.barrier()
+            with cursor.strided_loop("tid", str(tm * tn), "THREADS", name="edge") as index:
+                cursor.emit(f"const uint row = {index} / {tn};")
+                cursor.emit(f"const uint column = {index} % {tn};")
+                with cursor.block(f"if (row < {valid_m} && column < {valid_n})"):
+                    cursor.emit(
+                        f"{output_ref.expr}[row * {n} + column] = {edge_storage.at(index)};"
+                    )
+            cursor.indent -= 1
+            cursor.emit("}")
+        else:
+            cursor.emit(f"{cooperative_result.expr}.store({output_tensor.expr});")
+
+    source = _kernel_source(kernel_name or spec.name, params, cursor.lines)
     return source, cursor.threadgroup_bytes
+
+
+def _shape(atom) -> tuple[int, ...]:
+    return tuple(int(size) for size in getattr(atom.aval, "shape", ()))
+
+
+def _full_get(eqn, ref: Var):
+    if (
+        eqn is None
+        or eqn.primitive.name != "get"
+        or len(eqn.invars) != 1
+        or eqn.invars[0] is not ref
+    ):
+        raise EmitError("tensorops dot operands must be full-block reads of the first two refs")
+    return eqn
+
+
+def _matrix_get(atom, producers, ref: Var):
+    """Resolve a matrix operand read, retaining a lazy 2D transpose."""
+    eqn = producers.get(atom) if isinstance(atom, Var) else None
+    squeezed = None
+    if eqn is not None and eqn.primitive.name == "squeeze":
+        if tuple(eqn.params["dimensions"]) != (0,):
+            raise EmitError("tensorops batched matmul requires a leading singleton squeeze")
+        squeezed = eqn
+        atom = eqn.invars[0]
+        eqn = producers.get(atom) if isinstance(atom, Var) else None
+    transpose = eqn is not None and eqn.primitive.name == "transpose"
+    if transpose:
+        if tuple(eqn.params["permutation"]) != (1, 0):
+            raise EmitError("TensorOps matmul supports only matrix transposes")
+        atom = eqn.invars[0]
+        eqn = producers.get(atom) if isinstance(atom, Var) else None
+    return _full_get(eqn, ref), transpose, squeezed
+
+
+def _epilogue_path(value, dot_value, producers) -> tuple[list, set[int]]:
+    """Collect the supported elementwise producer chain feeding one store."""
+    ordered = []
+    used: set[int] = set()
+    allowed = set(ELEMENTWISE)
+    allowed.update(("max", "broadcast_in_dim"))
+
+    def visit(atom):
+        if atom is dot_value or isinstance(atom, Literal):
+            return
+        producer = producers.get(atom) if isinstance(atom, Var) else None
+        if producer is None:
+            raise EmitError("tensorops matmul epilogue has an unbound operand")
+        if id(producer) in used:
+            return
+        if producer.primitive.name == "get":
+            used.add(id(producer))
+            return
+        if producer.primitive.name not in allowed and not typed_expression(
+            producer.primitive.name, "float"
+        ):
+            raise EmitError(
+                f"tensorops matmul epilogue primitive {producer.primitive.name!r} is unsupported"
+            )
+        for operand in producer.invars:
+            visit(operand)
+        used.add(id(producer))
+        ordered.append(producer)
+
+    visit(value)
+    return ordered, used
+
+
+def _scalar_value(atom, scalar_values, values, env, index: str, shape: tuple[int, ...]) -> str:
+    """Resolve one epilogue operand for the current output element."""
+    if isinstance(atom, Var) and atom in scalar_values:
+        return scalar_values[atom]
+    if isinstance(atom, Literal):
+        literal = env.val(atom)
+        if literal.shape:
+            raise EmitError("tensorops matmul epilogue literals must be scalar")
+        return literal.expr
+    try:
+        value = values[atom]
+    except KeyError as error:
+        raise EmitError(f"tensorops matmul epilogue operand {atom} has no lowered value") from error
+    if value.shape == (shape[-1],) and len(shape) == 2:
+        return value.at(f"({index} % {shape[-1]})")
+    if value.shape not in ((), shape):
+        raise EmitError(
+            "tensorops matmul epilogue operands must be scalar or match the output tile"
+        )
+    return value.at(index)
+
+
+def _elementwise_expression(eqn, ctype: str, operands: tuple[str, ...]) -> str:
+    """Format one supported scalar equation for the current output element."""
+    if eqn.primitive.name == "broadcast_in_dim":
+        if len(operands) != 1 or tuple(eqn.params["broadcast_dimensions"]) not in ((1,), (1, 2)):
+            raise EmitError("tensorops matmul only supports column and singleton-batch broadcasts")
+        return operands[0]
+    template = typed_expression(eqn.primitive.name, ctype) or ELEMENTWISE.get(eqn.primitive.name)
+    if template is None:
+        raise EmitError(
+            f"tensorops matmul epilogue primitive {eqn.primitive.name!r} is unsupported"
+        )
+    names = string.ascii_lowercase[: len(operands)]
+    fields = {field for _, field, _, _ in string.Formatter().parse(template) if field}
+    if len(names) != len(eqn.invars) or fields != set(names):
+        raise EmitError(f"{eqn.primitive.name} epilogue has unsupported arity")
+    return template.format(**dict(zip(names, operands, strict=True)))
+
+
+def _is_tile_shape(shape: tuple[int, ...], rank: int, tm: int, tn: int) -> bool:
+    return shape == (tm, tn) or (rank == 3 and shape == (1, tm, tn))

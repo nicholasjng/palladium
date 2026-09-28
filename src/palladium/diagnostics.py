@@ -199,7 +199,7 @@ def explain_spec(
     spec: KernelSpec,
     threadgroup: int | tuple[int, ...] | None = None,
     *,
-    dot_general: str = "default",
+    dot_general: str = "auto",
 ) -> KernelDiagnostics:
     """Diagnostics for a traced spec: emits MSL, compiles nothing."""
     msl, stats = emit_msl_stats(spec, dot_general=dot_general)
@@ -211,7 +211,7 @@ def explain_spec(
         required = (simdgroup_width() * SIMDGROUPS, 1, 1)
         provided = (tg + (1, 1, 1))[:3] if tg is not None else None
         if provided is not None and provided != required:
-            raise EmitError(f"TensorOps dot requires threadgroup={required}, got {tg}")
+            raise EmitError(f"cooperative lowering requires threadgroup={required}, got {tg}")
         tg = required
         padded_grid = (tuple(int(g) for g in spec.grid) + (1, 1, 1))[:3]
         grid = tuple(g * t for g, t in zip(padded_grid, tg, strict=True))
@@ -240,7 +240,7 @@ def log_compile(
     threadgroup: int | tuple[int, ...] | None = None,
     *,
     execution_path: str = "metal",
-    dot_general: str = "default",
+    dot_general: str = "auto",
 ) -> None:
     """One stderr line per compiled kernel when PALLADIUM_EXPLAIN is set.
 

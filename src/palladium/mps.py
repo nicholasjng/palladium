@@ -244,6 +244,7 @@ class MpsCallable:
             vmap_method=None,
             threadgroup=threadgroup,
             cache_size=cache_size,
+            dot_general="default",
         )
         self.interpret = self._staged.interpret
         self._staged._execution_path = "mps-or-pallas-interpret (selected at lowering)"

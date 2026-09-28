@@ -133,9 +133,9 @@ class BoundKernel:
     kernel: mr.Kernel
     msl_source: str
     threadgroup: int | tuple[int, ...] | None = None
-    # Nonzero only for the TensorOps dot lowering, which launches one
-    # cooperative threadgroup per Pallas program instance.
-    tensorops_simdgroups: int = 0
+    # Nonzero for cooperative lowerings, which launch one threadgroup per
+    # Pallas program instance and scale the physical grid accordingly.
+    cooperative_simdgroups: int = 0
     # Max launches in flight. Each needs its own input buffers, so this
     # bounds memory too: depth x input bytes, allocated only on overlap.
     pipeline_depth: int = 8
@@ -272,7 +272,7 @@ class BoundKernel:
     def _dispatch(self, in_bufs: list[mr.Buffer], out_bufs: list[mr.Buffer]) -> PendingResult:
         """Encode, commit, and track one dispatch on prepared buffers."""
         grid = tuple(int(g) for g in self.spec.grid)
-        if self.tensorops_simdgroups:
+        if self.cooperative_simdgroups:
             if isinstance(self.threadgroup, int):
                 tg = (self.threadgroup, 1, 1, 1)
             else:
@@ -332,7 +332,7 @@ def bind(
     *,
     math_mode: mr.MathMode = mr.MathMode.FAST,
     threadgroup: int | tuple[int, ...] | None = None,
-    dot_general: str = "default",
+    dot_general: str = "auto",
     pipeline_depth: int = 8,
 ) -> BoundKernel:
     """Compile emitted MSL into a dispatchable kernel.
@@ -368,12 +368,11 @@ def bind(
     """
     if pipeline_depth < 1:
         raise ValueError(f"pipeline_depth must be >= 1, got {pipeline_depth}")
-    if dot_general not in ("default", "tensorops"):
-        raise ValueError("dot_general must be 'default' or 'tensorops'")
+    if dot_general not in ("auto", "default", "tensorops"):
+        raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
     # Resolve sentinels and int shorthand once: what BoundKernel stores
     # goes straight to mr.Batch.add, which takes only ints and sequences.
     threadgroup = normalize_threadgroup(threadgroup)
-    check_threadgroup(spec, threadgroup)
     _dump_msl(spec.name, msl_source)
     try:
         kernel = mr.Kernel(msl_source, spec.name, math_mode=math_mode)
@@ -382,7 +381,7 @@ def bind(
             # Metal rejects kernels whose thread-local arrays overflow the
             # per-thread stack. Re-emit to recover the byte count: wasted
             # work only on this already-failing path.
-            measured = emit_msl_stats(spec)[1].thread_bytes
+            measured = emit_msl_stats(spec, dot_general=dot_general)[1].thread_bytes
             raise StackOverflowError(
                 f"{e}\n\nEvery loaded block and intermediate value lives in "
                 f"thread-local memory, and this kernel declares about "
@@ -403,23 +402,26 @@ def bind(
     simdgroups = 0
     from palladium.emit.tensorops import SIMDGROUPS, uses_tensorops
 
-    if uses_tensorops(spec, dot_general):
+    cooperative_source = "threadgroup_position_in_grid" in msl_source
+    if uses_tensorops(spec, dot_general) or cooperative_source:
         simdgroups = SIMDGROUPS
         required = (kernel.thread_execution_width * simdgroups, 1, 1)
         provided = (tuple(threadgroup) + (1, 1, 1))[:3] if threadgroup is not None else None
         if provided is not None and provided != required:
-            raise EmitError(f"TensorOps dot requires threadgroup={required}, got {threadgroup}")
+            label = "TensorOps dot" if uses_tensorops(spec, dot_general) else "cooperative kernel"
+            raise EmitError(f"{label} requires threadgroup={required}, got {threadgroup}")
         if required[0] > kernel.max_threads_per_threadgroup:
             raise EmitError(
-                f"TensorOps dot requires {required[0]} threads per threadgroup, "
+                f"cooperative lowering requires {required[0]} threads per threadgroup, "
                 f"but the pipeline limit is {kernel.max_threads_per_threadgroup}"
             )
         threadgroup = required
+    check_threadgroup(spec, threadgroup)
     return BoundKernel(
         spec=spec,
         kernel=kernel,
         msl_source=msl_source,
         threadgroup=threadgroup,
-        tensorops_simdgroups=simdgroups,
+        cooperative_simdgroups=simdgroups,
         pipeline_depth=pipeline_depth,
     )
