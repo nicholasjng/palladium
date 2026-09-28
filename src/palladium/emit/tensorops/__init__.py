@@ -1,30 +1,27 @@
-"""Opt-in Metal TensorOps lowerings for matrix products and attention."""
-
-from __future__ import annotations
-
-from palladium.errors import EmitError
-from palladium.trace import KernelSpec
+"""Pallas-to-MSL lowering built around Metal 4 TensorOps."""
 
 from ._shared import SIMDGROUPS, has_dot_general, uses_tensorops
-from .attention import emit_tensorops_attention
-from .matmul import emit_tensorops_matmul, lower_tensorops_matmul
-
-
-def emit_tensorops(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str, int]:
-    """Dispatch to the supported standalone matmul or fused attention lowering."""
-    if any(eqn.primitive.name == "dot_general" for eqn in spec.jaxpr.eqns):
-        return lower_tensorops_matmul(spec, kernel_name)
-    if any(eqn.primitive.name == "scan" for eqn in spec.jaxpr.eqns):
-        return emit_tensorops_attention(spec, kernel_name)
-    raise EmitError("TensorOps lowering could not find a supported matmul or attention pattern")
-
+from .compile import Compilation, compile_kernel
+from .ir import IROperation, IRRegion, IRValue, KernelIR, import_kernel
+from .layout import assign_layouts
+from .plan import AddressSpace, Distribution, KernelPlan, ProgramScope, ValueLayout, plan_kernel
 
 __all__ = [
     "SIMDGROUPS",
-    "emit_tensorops",
-    "emit_tensorops_attention",
-    "emit_tensorops_matmul",
+    "AddressSpace",
+    "Compilation",
+    "Distribution",
+    "IROperation",
+    "IRRegion",
+    "IRValue",
+    "KernelIR",
+    "KernelPlan",
+    "ProgramScope",
+    "ValueLayout",
+    "assign_layouts",
+    "compile_kernel",
     "has_dot_general",
-    "lower_tensorops_matmul",
+    "import_kernel",
+    "plan_kernel",
     "uses_tensorops",
 ]

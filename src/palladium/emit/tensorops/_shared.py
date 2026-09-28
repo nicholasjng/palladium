@@ -41,6 +41,14 @@ def _shape(value: Var | Literal) -> tuple[int, ...]:
     return tuple(int(dim) for dim in aval.shape)
 
 
+def _dtype_name(value: Var | Literal) -> str:
+    """Return a shaped jaxpr atom's dtype name or reject unsupported avals."""
+    aval = value.aval
+    if not isinstance(aval, ShapedArray):
+        raise EmitError(f"TensorOps requires a statically typed value, got {aval}")
+    return aval.dtype.name
+
+
 @dataclasses.dataclass(frozen=True)
 class _TensorHandle:
     """MPP tensor expression emitted from a typed backing-buffer view."""
@@ -161,6 +169,21 @@ class _TensorOpsMatmul:
         """Emit the operation call for typed tensor handles."""
         cursor.emit(f"{self.name}.run({lhs.expr}, {rhs.expr}, {out.expr});")
 
+    def emit_cooperative_destination(
+        self,
+        cursor: Cursor,
+        lhs: _TensorHandle,
+        rhs: _TensorHandle,
+        name: str = "cTc",
+        element_type: str = "float",
+    ) -> _TensorHandle:
+        """Create the MPP-owned destination layout used for fused epilogues."""
+        cursor.emit(
+            f"auto {name} = {self.name}.get_destination_cooperative_tensor<"
+            f"decltype({lhs.expr}), decltype({rhs.expr}), {element_type}>();"
+        )
+        return _TensorHandle(name, (self.m, self.n), element_type, "thread")
+
 
 def _index_map_is(info: BlockInfo, axes: tuple[int | None, ...]) -> bool:
     """Whether the map returns the named grid axes or integer literals."""
@@ -186,8 +209,10 @@ def has_dot_general(jaxpr: Jaxpr) -> bool:
 
 
 def uses_tensorops(spec: KernelSpec, dot_general: str) -> bool:
-    """Whether the requested lowering applies to this kernel."""
-    return dot_general == "tensorops" and has_dot_general(spec.jaxpr)
+    """Whether this kernel's requested policy selects cooperative TensorOps."""
+    if not has_dot_general(spec.jaxpr):
+        return False
+    return dot_general == "tensorops" or (dot_general == "auto" and len(spec.grid) in (2, 3))
 
 
 def _is_empty_get(eqn, ref: Var) -> bool:

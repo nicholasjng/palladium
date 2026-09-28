@@ -605,7 +605,7 @@ def emit_msl_stats(
     spec: KernelSpec,
     kernel_name: str | None = None,
     *,
-    dot_general: str = "default",
+    dot_general: str = "auto",
 ) -> tuple[str, EmitStats]:
     """Assemble the full MSL source for a KernelSpec, with its storage stats.
 
@@ -634,14 +634,20 @@ def emit_msl_stats(
     UnsupportedPrimitiveError
         If the kernel stages a primitive with no registered rule.
     """
-    if dot_general not in ("default", "tensorops"):
-        raise ValueError("dot_general must be 'default' or 'tensorops'")
-    if dot_general == "tensorops":
-        from palladium.emit.tensorops import emit_tensorops, uses_tensorops
+    if dot_general not in ("auto", "default", "tensorops"):
+        raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
+    if dot_general != "default":
+        from palladium.emit.tensorops import has_dot_general, uses_tensorops
 
-        if uses_tensorops(spec, dot_general):
-            source, shared_bytes = emit_tensorops(spec, kernel_name)
-            return source, EmitStats(thread_bytes=0, threadgroup_bytes=shared_bytes)
+        if has_dot_general(spec.jaxpr) and uses_tensorops(spec, dot_general):
+            from palladium.emit.tensorops import ProgramScope, compile_kernel
+
+            compilation = compile_kernel(
+                spec, kernel_name, scope=ProgramScope.THREADGROUP, dot_general=dot_general
+            )
+            return compilation.source, EmitStats(
+                thread_bytes=0, threadgroup_bytes=compilation.threadgroup_bytes
+            )
 
     name = kernel_name or spec.name
     if len(spec.grid) > 3:
@@ -780,7 +786,7 @@ def emit_msl(
     spec: KernelSpec,
     kernel_name: str | None = None,
     *,
-    dot_general: str = "default",
+    dot_general: str = "auto",
 ) -> str:
     """Assemble the full MSL source for a KernelSpec.
 

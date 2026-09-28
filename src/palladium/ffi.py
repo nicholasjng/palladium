@@ -123,7 +123,7 @@ class FfiCallable:
         vmap_method: str | None = "pipelined",
         threadgroup: int | tuple[int, ...] | None = None,
         cache_size: int = 256,
-        dot_general: str = "default",
+        dot_general: str = "auto",
     ) -> None:
         import jax.experimental.pallas as pl
 
@@ -144,8 +144,8 @@ class FfiCallable:
         self._execution_path = "cpu-ffi-to-metal"
         self._vmap_method = vmap_method
         self._threadgroup = normalize_threadgroup(threadgroup)
-        if dot_general not in ("default", "tensorops"):
-            raise ValueError("dot_general must be 'default' or 'tensorops'")
+        if dot_general not in ("auto", "default", "tensorops"):
+            raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
         self._dot_general = dot_general
         # Bounded LRU of traced specs and emitted MSL.
         self._cache: OrderedDict[tuple, tuple[KernelSpec, str]] = OrderedDict()
@@ -235,7 +235,10 @@ class FfiCallable:
                         execution_path=self._execution_path,
                         dot_general=self._dot_general,
                     )
-                    entry = (spec, emit_msl(spec, dot_general=self._dot_general))
+                    entry = (
+                        spec,
+                        emit_msl(spec, dot_general=self._dot_general),
+                    )
                     self._cache[key] = entry
                     while self._cache_size and len(self._cache) > self._cache_size:
                         self._cache.popitem(last=False)
@@ -379,8 +382,10 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
         'pipelined' handles the whole batch in one FFI call and is the
         fastest vmap path; a batch dimension in the Pallas grid still
         beats it (one dispatch total). `threadgroup` (int or tuple; None
-        lets the runtime choose) and `dot_general="tensorops"` select
-        Metal execution details.
+        lets the runtime choose), and `dot_general="default"` to force the
+        general primitive path or `dot_general="tensorops"` to require
+        TensorOps. Tiled matmuls and supported attention use TensorOps by
+        default.
 
     Returns
     -------
@@ -398,9 +403,15 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
     vmap_method = pallas_kwargs.pop("vmap_method", "pipelined")
     threadgroup = pallas_kwargs.pop("threadgroup", None)
     cache_size = pallas_kwargs.pop("cache_size", 256)
-    dot_general = pallas_kwargs.pop("dot_general", "default")
-    if dot_general not in ("default", "tensorops"):
-        raise ValueError("dot_general must be 'default' or 'tensorops'")
+    dot_general = pallas_kwargs.pop("dot_general", "auto")
+    if dot_general not in ("auto", "default", "tensorops"):
+        raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
     return FfiCallable(
-        kernel, pallas_kwargs, math_mode, vmap_method, threadgroup, cache_size, dot_general
+        kernel,
+        pallas_kwargs,
+        math_mode,
+        vmap_method,
+        threadgroup,
+        cache_size,
+        dot_general,
     )

@@ -1,4 +1,4 @@
-"""Target-independent execution and value-layout plans for the v2 emitter.
+"""Target-independent execution and value-layout plans for the tensorops emitter.
 
 This is the boundary between a traced Pallas kernel and target lowering. It
 keeps the Pallas program grid distinct from the Metal execution scope: a
@@ -60,7 +60,7 @@ class ValueLayout:
 
 @dataclasses.dataclass(frozen=True)
 class KernelPlan:
-    """Initial v2 plan retaining Pallas semantics for target-specific passes."""
+    """Initial tensorops plan retaining Pallas semantics for target-specific passes."""
 
     spec: KernelSpec
     scope: ProgramScope
@@ -90,7 +90,7 @@ def plan_kernel(
     scope: ProgramScope | None = None,
     simdgroups: int = 4,
 ) -> KernelPlan:
-    """Build the v2 frontend plan without selecting physical value layouts.
+    """Build the tensorops frontend plan without selecting physical value layouts.
 
     Kernels that explicitly use thread indices, threadgroup size, barriers, or
     threadgroup scratch require group execution. Other kernels retain the
