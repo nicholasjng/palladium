@@ -209,45 +209,41 @@ def _blocked_batched_residual_dot():
 
 
 def test_tensorops_dot_uses_one_threadgroup_per_pallas_program():
-    msl = palladium.emit_msl(_blocked_dot(), dot_general="tensorops")
+    msl = palladium.emit_msl(_blocked_dot())
 
     assert "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>" in msl
     assert "uint3 _pid [[threadgroup_position_in_grid]]" in msl
     assert "execution_simdgroups<4>" in msl
     assert "matmul2d_descriptor desc(16, 32, 16" in msl
-    assert "arg0 + _pid.x * 256" in msl
-    assert "arg1 + _pid.y * 32" in msl
-    assert "arg2 + _pid.x * 1024 + _pid.y * 32" in msl
-    assert "for (uint" not in msl
+    assert "arg0 + (int)_pid.x * 256" in msl
+    assert "arg1 + (int)_pid.y * 32" in msl
+    assert "arg2 + (int)_pid.x * 1024 + (int)_pid.y * 32" in msl
 
 
-def test_tensorops_dot_fuses_relu_epilogue_into_threadgroup_result():
+def test_tensorops_dot_fuses_relu_epilogue_in_cooperative_tensor():
     msl, stats = palladium.emit.emit_msl_stats(_blocked_relu_dot(), dot_general="tensorops")
 
-    assert "threadgroup float dot_result[512];" in msl
-    assert "auto c = tensor<threadgroup float" in msl
-    assert "op.run(a, b, c);" in msl
-    assert "threadgroup_barrier(mem_flags::mem_threadgroup);" in msl
-    assert "arg2 + _pid.x * 1024 + _pid.y * 32" in msl
-    assert "(arg2 + _pid.x * 1024 + _pid.y * 32)[element]" in msl
-    assert "fmax" in msl
-    assert stats.threadgroup_bytes == 16 * 32 * 4
+    assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in msl
+    assert "op.run(a_k, b_k, cTc);" in msl
+    assert "fmax(float(cTc[element" in msl
+    assert "cTc.store(c);" in msl
+    assert stats.threadgroup_bytes == 0
 
 
 def test_tensorops_dot_supports_transposed_rhs_tiles():
     msl = palladium.emit_msl(_blocked_dot_rhs_transposed(), dot_general="tensorops")
 
-    assert "matmul2d_descriptor desc(16, 32, 16, false, true, false)" in msl
-    assert "arg1 + _pid.y * 512" in msl
-    assert "dextents<int, 2>(16, 32)" in msl
+    assert "matmul2d_descriptor desc(16, 32, 16, false, true, false," in msl
+    assert "arg1 + (int)_pid.y * 512" in msl
+    assert "dextents<int, 2>(32, 16)" in msl
     assert "array<int, 2>{1, 16}" in msl
 
 
 def test_tensorops_dot_supports_transposed_lhs_tiles():
     msl = palladium.emit_msl(_blocked_dot_lhs_transposed(), dot_general="tensorops")
 
-    assert "matmul2d_descriptor desc(16, 32, 16, true, false, false)" in msl
-    assert "arg0 + _pid.x * 16" in msl
+    assert "matmul2d_descriptor desc(16, 32, 16, true, false, false," in msl
+    assert "arg0 + (int)_pid.x * 16" in msl
     assert "dextents<int, 2>(32, 16)" in msl
     assert "array<int, 2>{1, 32}" in msl
 
@@ -257,8 +253,8 @@ def test_tensorops_dot_fuses_matrix_residual_add():
 
     assert "device float* arg2 [[buffer(2)]]" in msl
     assert "device float* arg3 [[buffer(3)]]" in msl
-    assert "(arg2 + _pid.x * 1024 + _pid.y * 32)[element]" in msl
-    assert "(arg3 + _pid.x * 1024 + _pid.y * 32)[element]" in msl
+    assert "arg2 + (int)_pid.x * 1024 + (int)_pid.y * 32" in msl
+    assert "(arg3 + (int)_pid.x * 1024 + (int)_pid.y * 32)[row * 64 + column]" in msl
     assert "dot_result[element]" in msl
     assert stats.threadgroup_bytes == 16 * 32 * 4
 
@@ -283,8 +279,9 @@ def test_tensorops_dot_fuses_column_bias():
 
     assert "device float* arg2 [[buffer(2)]]" in msl
     assert "device float* arg3 [[buffer(3)]]" in msl
-    assert "(arg2 + _pid.y * 32)[element % 32]" in msl
-    assert "(arg3 + _pid.x * 1024 + _pid.y * 32)[element]" in msl
+    assert "arg2 + (int)_pid.y * 32" in msl
+    assert "element % 32" in msl
+    assert "(arg3 + (int)_pid.x * 1024 + (int)_pid.y * 32)[row * 64 + column]" in msl
     assert stats.threadgroup_bytes == 16 * 32 * 4
     assert palladium.emit_msl(reordered, dot_general="tensorops") == msl
 
@@ -295,9 +292,9 @@ def test_tensorops_batched_dot_maps_batch_and_output_tiles_to_threadgroups():
 
     assert "uint3 _pid [[threadgroup_position_in_grid]]" in msl
     assert "matmul2d_descriptor desc(16, 32, 16" in msl
-    assert "arg0 + _pid.x * 512 + _pid.y * 256" in msl
-    assert "arg1 + _pid.x * 1024 + _pid.z * 32" in msl
-    assert "arg2 + _pid.x * 2048 + _pid.y * 1024 + _pid.z * 32" in msl
+    assert "arg0 + (int)_pid.x * 512 + (int)_pid.y * 256" in msl
+    assert "arg1 + (int)_pid.x * 1024 + (int)_pid.z * 32" in msl
+    assert "arg2 + (int)_pid.x * 2048 + (int)_pid.y * 1024 + (int)_pid.z * 32" in msl
     assert "MetalPerformancePrimitives" not in ordinary
     assert "thread_position_in_grid" in ordinary
 
@@ -305,10 +302,10 @@ def test_tensorops_batched_dot_maps_batch_and_output_tiles_to_threadgroups():
 def test_tensorops_batched_dot_fuses_max_epilogue():
     msl, stats = palladium.emit.emit_msl_stats(_blocked_batched_relu_dot(), dot_general="tensorops")
 
-    assert "threadgroup float dot_result[512];" in msl
-    assert "arg2 + _pid.x * 2048 + _pid.y * 1024 + _pid.z * 32" in msl
-    assert "fmax" in msl
-    assert stats.threadgroup_bytes == 16 * 32 * 4
+    assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in msl
+    assert "arg2 + (int)_pid.x * 2048 + (int)_pid.y * 1024 + (int)_pid.z * 32" in msl
+    assert "fmax(" in msl and "float(0.0f)" in msl
+    assert stats.threadgroup_bytes == 0
 
 
 def test_tensorops_batched_dot_fuses_matrix_residual_add():
@@ -317,8 +314,11 @@ def test_tensorops_batched_dot_fuses_matrix_residual_add():
     )
 
     assert "device float* arg3 [[buffer(3)]]" in msl
-    assert "(arg2 + _pid.x * 2048 + _pid.y * 1024 + _pid.z * 32)[element]" in msl
-    assert "(arg3 + _pid.x * 2048 + _pid.y * 1024 + _pid.z * 32)[element]" in msl
+    assert "arg2 + (int)_pid.x * 2048 + (int)_pid.y * 1024 + (int)_pid.z * 32" in msl
+    assert (
+        "(arg3 + (int)_pid.x * 2048 + (int)_pid.y * 1024 + (int)_pid.z * 32)[row * 64 + column]"
+        in msl
+    )
     assert stats.threadgroup_bytes == 16 * 32 * 4
 
 
