@@ -79,8 +79,9 @@ vmap_method="pipelined" handles the batch in one FFI call; nested batch
 levels and the sequential methods dispatch one element at a time. Put a
 batch axis in the Pallas grid when possible.
 
-mps_call_jit supports jax.jit; jax.vmap over its custom call is not
-supported. Neither custom-call path derives gradients from emitted MSL. Pair
+mps_call_jit supports jax.jit; jax.vmap over its custom call runs one
+dispatch per batch element. Neither custom-call path derives gradients from
+emitted MSL. Pair
 forward and backward calls with jax.custom_vjp, or provide a pure-JAX
 reference VJP where supported. See the [supported functionality](supported-jax.md)
 for details.
