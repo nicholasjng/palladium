@@ -204,17 +204,15 @@ def explain_spec(
     """Diagnostics for a traced spec: emits MSL, compiles nothing."""
     msl, stats = emit_msl_stats(spec, dot_general=dot_general)
     tg = normalize_threadgroup(threadgroup)
-    from palladium.emit.tensorops import SIMDGROUPS, uses_tensorops as _uses_tensorops
+    from palladium.emit.tensorops import cooperative_launch, emits_cooperative
 
-    tensorops_kernel = _uses_tensorops(spec, dot_general)
+    tensorops_kernel = emits_cooperative(msl)
     if tensorops_kernel:
-        required = (simdgroup_width() * SIMDGROUPS, 1, 1)
+        required, grid = cooperative_launch(spec.grid, simdgroup_width())
         provided = (tg + (1, 1, 1))[:3] if tg is not None else None
         if provided is not None and provided != required:
             raise EmitError(f"cooperative lowering requires threadgroup={required}, got {tg}")
         tg = required
-        padded_grid = (tuple(int(g) for g in spec.grid) + (1, 1, 1))[:3]
-        grid = tuple(g * t for g, t in zip(padded_grid, tg, strict=True))
     else:
         grid = tuple(int(g) for g in spec.grid)
     check_threadgroup(spec, tg)

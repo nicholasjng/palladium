@@ -311,21 +311,17 @@ class FfiCallable:
         grid = (tuple(spec.grid) + (1, 1, 1))[:3]
         # (0, 0, 0) lets the runtime choose (c_api.cpp); a cooperative
         # kernel never reaches here with None, per the check above.
-        from palladium.emit.tensorops import uses_tensorops as _uses_tensorops
+        from palladium.emit.tensorops import cooperative_launch, emits_cooperative
 
-        uses_tensorops = _uses_tensorops(spec, self._dot_general)
-        if uses_tensorops:
-            from palladium.emit.tensorops import SIMDGROUPS
-
-            required = (simdgroup_width() * SIMDGROUPS, 1, 1)
+        if emits_cooperative(msl_source):
+            required, grid = cooperative_launch(spec.grid, simdgroup_width())
             provided = (
                 (self._threadgroup + (1, 1, 1))[:3] if self._threadgroup is not None else None
             )
             if provided is not None and provided != required:
                 raise ValueError(
-                    f"TensorOps dot requires threadgroup={required}, got {self._threadgroup}"
+                    f"cooperative kernel requires threadgroup={required}, got {self._threadgroup}"
                 )
-            grid = tuple(g * t for g, t in zip(grid, required, strict=True))
             threadgroup = required
         else:
             tg = self._threadgroup or (0,)

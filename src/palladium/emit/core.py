@@ -637,17 +637,24 @@ def emit_msl_stats(
     if dot_general not in ("auto", "default", "tensorops"):
         raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
     if dot_general != "default":
-        from palladium.emit.tensorops import has_dot_general, uses_tensorops
+        from palladium.emit.tensorops import uses_tensorops
 
-        if has_dot_general(spec.jaxpr) and uses_tensorops(spec, dot_general):
+        if uses_tensorops(spec, dot_general):
             from palladium.emit.tensorops import ProgramScope, compile_kernel
 
-            compilation = compile_kernel(
-                spec, kernel_name, scope=ProgramScope.THREADGROUP, dot_general=dot_general
-            )
-            return compilation.source, EmitStats(
-                thread_bytes=0, threadgroup_bytes=compilation.threadgroup_bytes
-            )
+            try:
+                compilation = compile_kernel(
+                    spec, kernel_name, scope=ProgramScope.THREADGROUP, dot_general=dot_general
+                )
+            except EmitError:
+                # "auto" only takes dots the cooperative lowering recognizes;
+                # anything else keeps the one-thread-per-program emitter.
+                if dot_general != "auto":
+                    raise
+            else:
+                return compilation.source, EmitStats(
+                    thread_bytes=0, threadgroup_bytes=compilation.threadgroup_bytes
+                )
 
     name = kernel_name or spec.name
     if len(spec.grid) > 3:

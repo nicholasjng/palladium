@@ -373,6 +373,9 @@ def bind(
     # Resolve sentinels and int shorthand once: what BoundKernel stores
     # goes straight to mr.Batch.add, which takes only ints and sequences.
     threadgroup = normalize_threadgroup(threadgroup)
+    # Device limits first: Metal's own pipeline error for an oversized
+    # threadgroup allocation names neither the kernel nor the budget.
+    check_threadgroup(spec, threadgroup)
     _dump_msl(spec.name, msl_source)
     try:
         kernel = mr.Kernel(msl_source, spec.name, math_mode=math_mode)
@@ -400,16 +403,16 @@ def bind(
             f"{e}\n\npalladium-emitted source:\n{_numbered(msl_source)}"
         ) from None
     simdgroups = 0
-    from palladium.emit.tensorops import SIMDGROUPS, uses_tensorops
+    from palladium.emit.tensorops import SIMDGROUPS, cooperative_launch, emits_cooperative
 
-    cooperative_source = "threadgroup_position_in_grid" in msl_source
-    if uses_tensorops(spec, dot_general) or cooperative_source:
+    if emits_cooperative(msl_source):
         simdgroups = SIMDGROUPS
-        required = (kernel.thread_execution_width * simdgroups, 1, 1)
+        required, _ = cooperative_launch(spec.grid, kernel.thread_execution_width)
         provided = (tuple(threadgroup) + (1, 1, 1))[:3] if threadgroup is not None else None
         if provided is not None and provided != required:
-            label = "TensorOps dot" if uses_tensorops(spec, dot_general) else "cooperative kernel"
-            raise EmitError(f"{label} requires threadgroup={required}, got {threadgroup}")
+            raise EmitError(
+                f"cooperative kernel requires threadgroup={required}, got {threadgroup}"
+            )
         if required[0] > kernel.max_threads_per_threadgroup:
             raise EmitError(
                 f"cooperative lowering requires {required[0]} threads per threadgroup, "

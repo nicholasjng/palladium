@@ -208,17 +208,40 @@ def has_dot_general(jaxpr: Jaxpr) -> bool:
     )
 
 
+COOPERATIVE_MARKER = "threadgroup_position_in_grid"
+
+
+def emits_cooperative(msl_source: str) -> bool:
+    """Whether emitted MSL runs one threadgroup per Pallas program.
+
+    Only the TensorOps lowerings address programs by threadgroup position,
+    so the source itself, not the selection policy, decides the launch
+    geometry.
+    """
+    return COOPERATIVE_MARKER in msl_source
+
+
+def cooperative_launch(
+    grid: tuple[int, ...], simd_width: int
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """The (threadgroup, grid) Metal launch for a cooperative kernel.
+
+    One threadgroup of `SIMDGROUPS` SIMD groups per program, so the thread
+    grid is the Pallas grid scaled by the threadgroup along x.
+    """
+    threadgroup = (simd_width * SIMDGROUPS, 1, 1)
+    padded = (tuple(int(g) for g in grid) + (1, 1, 1))[:3]
+    scaled = tuple(g * t for g, t in zip(padded, threadgroup, strict=True))
+    return threadgroup, (scaled[0], scaled[1], scaled[2])
+
+
 def uses_tensorops(spec: KernelSpec, dot_general: str) -> bool:
-    """Whether this kernel's requested policy selects cooperative TensorOps."""
-    if not has_dot_general(spec.jaxpr):
+    """Whether this kernel's requested policy selects cooperative TensorOps.
+
+    "tensorops" requires it, "default" never selects it, and "auto" selects
+    it for dots on a 2D or 3D grid. Hand-written kernels bound without a
+    jaxpr never use it.
+    """
+    if spec.jaxpr is None or not has_dot_general(spec.jaxpr):
         return False
     return dot_general == "tensorops" or (dot_general == "auto" and len(spec.grid) in (2, 3))
-
-
-def _is_empty_get(eqn, ref: Var) -> bool:
-    return (
-        eqn.primitive.name == "get"
-        and len(eqn.invars) == 1
-        and eqn.invars[0] is ref
-        and not eqn.params["tree"].flatten_up_to(())
-    )
