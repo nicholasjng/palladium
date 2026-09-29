@@ -1,8 +1,7 @@
 """Kernel diagnostics: launch geometry and MSL size for a traced kernel.
 
-`MetalCallable.explain` / `FfiCallable.explain` return a
-KernelDiagnostics; setting PALLADIUM_EXPLAIN=1 prints one stderr line
-per newly compiled kernel.
+`explain` on a palladium call returns a KernelDiagnostics; setting
+PALLADIUM_EXPLAIN=1 prints one stderr line per newly compiled kernel.
 """
 
 from __future__ import annotations

@@ -112,15 +112,9 @@ def test_descriptor_round_trip_is_stable():
         header="#include <metal_stdlib>\nusing namespace metal;\n",
         prologue="const device float* arg0 = (const device float*)arg0_base;",
         body="arg1[_pid.x] = arg0[_pid.x];",
-        function_name="add",
         grid=(8, 1, 1),
         threadgroup=None,
         math_mode=2,
-        input_shapes=((8,),),
-        input_dtypes=("<f4",),
-        output_shapes=((8,),),
-        output_dtypes=("<f4",),
-        aliases=(),
     )
     assert palladium.MpsDispatchDescriptor.from_json(descriptor.to_json()) == descriptor
 

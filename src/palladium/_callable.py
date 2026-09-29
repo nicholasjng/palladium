@@ -208,7 +208,7 @@ class PallasCallable:
         return unwrap(
             verify_against(
                 self.__call__,
-                None if reference is not None else self.interpret,
+                self.interpret,
                 self._spec_and_msl(tuple(args))[0].uses_threadgroup,
                 args,
                 reference,

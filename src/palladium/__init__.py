@@ -8,6 +8,7 @@ the intermediate text.
 
 from __future__ import annotations
 
+import importlib.metadata as _metadata
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
@@ -74,7 +75,10 @@ __all__ = [
     "with_vjp",
 ]
 
-__version__ = "0.2.0"
+try:
+    __version__ = _metadata.version("palladium")
+except _metadata.PackageNotFoundError:  # pragma: no cover - source tree without install
+    __version__ = "0+unknown"
 
 # Plain pl.pallas_call lowered for the mps platform runs through Palladium.
 _install_pallas_backend()

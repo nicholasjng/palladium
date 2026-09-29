@@ -107,7 +107,7 @@ def _report(got: np.ndarray, want: np.ndarray, index: int, rtol: float, atol: fl
 
 def verify_against(
     gpu_fn: Callable[..., Any],
-    oracle: Callable[..., Any] | None,
+    oracle: Callable[..., Any],
     uses_threadgroup: bool,
     args: tuple,
     reference: Callable[..., Any] | None,
@@ -116,8 +116,9 @@ def verify_against(
 ) -> tuple[np.ndarray, ...]:
     """Run `gpu_fn` and a reference over `args`; raise on disagreement.
 
-    Backs `MetalCallable.verify` and `FfiCallable.verify`, which document
-    the user-facing contract.
+    `reference` defaults to `oracle` (the interpret path), except for
+    cooperative kernels, which the interpreter cannot model. Backs
+    `PallasCallable.verify`, which documents the user-facing contract.
     """
     if reference is None:
         if uses_threadgroup:
@@ -130,8 +131,6 @@ def verify_against(
                 "there. Pass reference=<callable> with an implementation that "
                 "models the real threadgroup semantics."
             )
-        if oracle is None:  # pragma: no cover - both paths supply one
-            raise VerificationError("no reference and no interpret oracle")
         reference = oracle
 
     got = _as_tuple(gpu_fn(*args))
