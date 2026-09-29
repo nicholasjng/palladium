@@ -109,20 +109,10 @@ def _emit_permuted_copy(cursor: Cursor, src: CVal, dst: CVal, perm: tuple[int, .
     src_strides = _element_strides(src.shape)
     dst_strides = _element_strides(perm_shape)
     rank = len(src.shape)
-    idx_vars = [cursor.fresh(f"_t{d}") for d in range(rank)]
-
-    def emit_loops(d: int) -> None:
-        if d == rank:
-            src_idx = _flat_index([(idx_vars[dd], src_strides[perm[dd]]) for dd in range(rank)])
-            dst_idx = _flat_index([(idx_vars[dd], dst_strides[dd]) for dd in range(rank)])
-            cursor.emit(f"{dst.at(dst_idx)} = {src.at(src_idx)};")
-            return
-        with cursor.block(
-            f"for (uint {idx_vars[d]} = 0; {idx_vars[d]} < {perm_shape[d]}; ++{idx_vars[d]})"
-        ):
-            emit_loops(d + 1)
-
-    emit_loops(0)
+    with cursor.loop_nest(tuple(perm_shape), "_t") as idx_vars:
+        src_idx = _flat_index([(idx_vars[dd], src_strides[perm[dd]]) for dd in range(rank)])
+        dst_idx = _flat_index([(idx_vars[dd], dst_strides[dd]) for dd in range(rank)])
+        cursor.emit(f"{dst.at(dst_idx)} = {src.at(src_idx)};")
 
 
 @rule("select_n")
@@ -180,24 +170,13 @@ def _rule_broadcast_in_dim(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> N
     bcast_dims: tuple[int, ...] = eqn.params["broadcast_dimensions"]
     src_strides = _element_strides(src.shape)
     dst_strides = _element_strides(dst.shape)
-    rank = len(dst.shape)
-    idx_vars = [cursor.fresh(f"_b{d}") for d in range(rank)]
-
-    def emit_loops(d: int) -> None:
-        if d == rank:
-            src_idx = _flat_index(
-                [
-                    (idx_vars[od], src_strides[sd])
-                    for sd, od in enumerate(bcast_dims)
-                    if src.shape[sd] != 1
-                ]
-            )
-            dst_idx = _flat_index(list(zip(idx_vars, dst_strides)))
-            cursor.emit(f"{dst.at(dst_idx)} = {src.at(src_idx)};")
-            return
-        with cursor.block(
-            f"for (uint {idx_vars[d]} = 0; {idx_vars[d]} < {dst.shape[d]}; ++{idx_vars[d]})"
-        ):
-            emit_loops(d + 1)
-
-    emit_loops(0)
+    with cursor.loop_nest(dst.shape, "_b") as idx_vars:
+        src_idx = _flat_index(
+            [
+                (idx_vars[od], src_strides[sd])
+                for sd, od in enumerate(bcast_dims)
+                if src.shape[sd] != 1
+            ]
+        )
+        dst_idx = _flat_index(list(zip(idx_vars, dst_strides)))
+        cursor.emit(f"{dst.at(dst_idx)} = {src.at(src_idx)};")
