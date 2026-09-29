@@ -20,6 +20,86 @@ from palladium.emit.core import (
 )
 from palladium.emit.numeric import typed_expression
 
+# MSL has no erf, erfinv, expm1, or log1p; these are float32 helpers emitted
+# once per kernel on first use. erf: Abramowitz and Stegun 7.1.26 (abs error
+# 1.5e-7). erfinv: Giles, "Approximating the erfinv function" (2010), the
+# single-precision branch. expm1 and log1p switch to short series below
+# |x| = 0.25, where the builtin exp and log would cancel.
+HELPERS: dict[str, tuple[str, str]] = {
+    "erf": (
+        "pd_erf",
+        """inline float pd_erf(float x) {
+    float a = fabs(x);
+    float t = 1.0f / fma(0.3275911f, a, 1.0f);
+    float poly = fma(fma(fma(fma(1.061405429f, t, -1.453152027f), t, 1.421413741f), t,
+                         -0.284496736f), t, 0.254829592f) * t;
+    float y = 1.0f - poly * exp(-a * a);
+    return x < 0.0f ? -y : y;
+}""",
+    ),
+    "erf_inv": (
+        "pd_erfinv",
+        """inline float pd_erfinv(float x) {
+    float w = -log((1.0f - x) * (1.0f + x));
+    float p;
+    if (w < 5.0f) {
+        w = w - 2.5f;
+        p = 2.81022636e-08f;
+        p = fma(p, w, 3.43273939e-07f);
+        p = fma(p, w, -3.5233877e-06f);
+        p = fma(p, w, -4.39150654e-06f);
+        p = fma(p, w, 0.00021858087f);
+        p = fma(p, w, -0.00125372503f);
+        p = fma(p, w, -0.00417768164f);
+        p = fma(p, w, 0.246640727f);
+        p = fma(p, w, 1.50140941f);
+    } else {
+        w = sqrt(w) - 3.0f;
+        p = -0.000200214257f;
+        p = fma(p, w, 0.000100950558f);
+        p = fma(p, w, 0.00134934322f);
+        p = fma(p, w, -0.00367342844f);
+        p = fma(p, w, 0.00573950773f);
+        p = fma(p, w, -0.0076224613f);
+        p = fma(p, w, 0.00943887047f);
+        p = fma(p, w, 1.00167406f);
+        p = fma(p, w, 2.83297682f);
+    }
+    return p * x;
+}""",
+    ),
+    "expm1": (
+        "pd_expm1",
+        """inline float pd_expm1(float x) {
+    if (fabs(x) >= 0.25f) {
+        return exp(x) - 1.0f;
+    }
+    float p = fma(x, 1.0f / 7.0f, 1.0f);
+    p = fma(x / 6.0f, p, 1.0f);
+    p = fma(x / 5.0f, p, 1.0f);
+    p = fma(x / 4.0f, p, 1.0f);
+    p = fma(x / 3.0f, p, 1.0f);
+    p = fma(x / 2.0f, p, 1.0f);
+    return x * p;
+}""",
+    ),
+    "log1p": (
+        "pd_log1p",
+        """inline float pd_log1p(float x) {
+    if (fabs(x) >= 0.25f) {
+        return log(1.0f + x);
+    }
+    float s = x / (2.0f + x);
+    float s2 = s * s;
+    float p = fma(s2, 1.0f / 9.0f, 1.0f / 7.0f);
+    p = fma(s2, p, 1.0f / 5.0f);
+    p = fma(s2, p, 1.0f / 3.0f);
+    p = fma(s2, p, 1.0f);
+    return 2.0f * s * p;
+}""",
+    ),
+}
+
 
 def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """One rule for every pure elementwise primitive.
@@ -60,6 +140,13 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
             return
         body = " * ".join(["{a}"] * abs(exp))
         template = f"({body})" if exp > 0 else f"(1.0f / ({body}))"
+    elif opname in HELPERS:
+        function, source = HELPERS[opname]
+        cursor.require(function, source)
+        template = f"{dst.ctype}({function}(float({{a}})))"
+    elif opname == "round":
+        # 0 rounds half away from zero (MSL round), 1 half to even (rint).
+        template = "round({a})" if eqn.params["rounding_method"] == 0 else "rint({a})"
     elif opname == "convert_element_type":
         template = f"(({dst.ctype}){{a}})"
     elif opname == "bitcast_convert_type":
@@ -115,6 +202,8 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 
 for _name in [
     *ELEMENTWISE,
+    *HELPERS,
+    "round",
     "integer_pow",
     "convert_element_type",
     "bitcast_convert_type",
