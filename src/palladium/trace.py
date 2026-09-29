@@ -16,7 +16,7 @@ from typing import Any, Literal as TLiteral
 import jax
 import jax.experimental.pallas as pl
 import numpy as np
-from jax.extend.core import ClosedJaxpr, Jaxpr, Literal, Var, subjaxprs
+from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var, subjaxprs
 
 from palladium import effects
 from palladium.errors import TraceError
@@ -147,8 +147,6 @@ class KernelSpec:
         Operand descriptions in jaxpr order.
     scratch: tuple of ScratchInfo
         Scratch buffer descriptions, in jaxpr order after the operands.
-    raw_params : dict
-        Full, unprocessed pallas_call params.
     aliases : tuple of (int, int)
         Validated `input_output_aliases` pairs (input index, output index):
         the two refs share one buffer, so the kernel updates in place.
@@ -160,7 +158,6 @@ class KernelSpec:
     inputs: tuple[BlockInfo, ...]
     outputs: tuple[BlockInfo, ...]
     scratch: tuple[ScratchInfo, ...]
-    raw_params: dict[str, Any]
     aliases: tuple[tuple[int, int], ...] = ()
 
     @property
@@ -413,7 +410,7 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
         effects palladium cannot perform on the GPU (debug prints, callbacks).
     """
     closed = jax.make_jaxpr(pallas_fn)(*example_args)
-    eqns = [e for e in closed.jaxpr.eqns if e.primitive.name == "pallas_call"]
+    eqns = _pallas_call_eqns(closed.jaxpr)
     if not eqns:
         raise TraceError(
             "no pallas_call equation found; pass the callable returned by "
@@ -429,9 +426,6 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
     grid_mapping = params["grid_mapping"]
 
     kernel_jaxpr = params["jaxpr"]
-    if hasattr(kernel_jaxpr, "jaxpr"):
-        # ClosedJaxpr on some JAX versions, bare Jaxpr on others.
-        kernel_jaxpr = kernel_jaxpr.jaxpr
 
     foreign = effects.foreign_effects(kernel_jaxpr)
     if foreign:
@@ -470,6 +464,16 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
         inputs=inputs,
         outputs=outputs,
         scratch=tuple(_scratch_infos(scratch_bufs)),
-        raw_params=params,
         aliases=aliases,
     )
+
+
+def _pallas_call_eqns(jaxpr: Jaxpr) -> list[JaxprEqn]:
+    """pallas_call equations in `jaxpr`, looking through jit wrappers."""
+    found = []
+    for eqn in jaxpr.eqns:
+        if eqn.primitive.name == "pallas_call":
+            found.append(eqn)
+        elif eqn.primitive.name == "jit":
+            found.extend(_pallas_call_eqns(eqn.params["jaxpr"].jaxpr))
+    return found

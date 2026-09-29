@@ -106,3 +106,16 @@ def test_non_blocked_dims_rejected():
     )
     with pytest.raises(TraceError, match="Element"):
         trace(call, jax.ShapeDtypeStruct((16,), jnp.float32))
+
+
+def test_trace_looks_through_a_jit_wrapper(rng):
+    def kernel(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 2.0
+
+    call = pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32))
+    x = jax.ShapeDtypeStruct((8,), jnp.float32)
+    direct = trace(call, x)
+    wrapped = trace(jax.jit(call), x)
+    assert wrapped.grid == direct.grid
+    assert wrapped.inputs == direct.inputs
+    assert wrapped.outputs == direct.outputs
