@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import itertools
 import math
 import string
@@ -30,8 +31,9 @@ MAX_PRIMITIVE_ARITY = 6
 PRIMITIVE_INVARS = string.ascii_lowercase[:MAX_PRIMITIVE_ARITY]
 
 
-def _template_fields(template: str) -> set[str]:
-    return {f for _, f, _, _ in string.Formatter().parse(template) if f}
+@functools.cache
+def _template_fields(template: str) -> frozenset[str]:
+    return frozenset(f for _, f, _, _ in string.Formatter().parse(template) if f)
 
 
 def _unwrapped(expr: str) -> str:
@@ -276,6 +278,14 @@ class Cursor:
         # conservative, so this over-counts exactly where Metal does.
         self.thread_bytes = 0
         self.threadgroup_bytes = 0
+        # MSL functions the body calls, by name, emitted once above the
+        # kernel in first-use order.
+        self.helpers: dict[str, str] = {}
+
+    def require(self, name: str, source: str) -> str:
+        """Register helper function `source` under `name`; returns `name`."""
+        self.helpers.setdefault(name, source)
+        return name
 
     def account(self, ctype: str, count: int, space: str = "thread") -> None:
         """Record `count` elements of `ctype` declared in `space`."""
@@ -777,6 +787,7 @@ def emit_msl_stats(
             "#include <metal_stdlib>",
             "using namespace metal;",
             "",
+            *cursor.helpers.values(),
             head,
             *cursor.lines,
             "}",
@@ -912,7 +923,24 @@ ELEMENTWISE: dict[str, str] = {
     "sin": "sin({a})",
     "cos": "cos({a})",
     "sqrt": "sqrt({a})",
+    "rsqrt": "rsqrt({a})",
     "tanh": "tanh({a})",
+    "exp2": "exp2({a})",
+    "tan": "tan({a})",
+    "asin": "asin({a})",
+    "acos": "acos({a})",
+    "atan": "atan({a})",
+    "sinh": "sinh({a})",
+    "cosh": "cosh({a})",
+    "asinh": "asinh({a})",
+    "acosh": "acosh({a})",
+    "atanh": "atanh({a})",
+    "atan2": "atan2({a}, {b})",
+    "floor": "floor({a})",
+    "ceil": "ceil({a})",
+    "square": "({a} * {a})",
+    "logistic": "(1.0f / (1.0f + exp(-{a})))",
+    "is_finite": "isfinite({a})",
     # ternary
     "select_n": "({a} ? {c} : {b})",  # a: predicate (bool), c when true, b when false
     "clamp": "clamp({b}, {a}, {c})",  # jaxpr order (min, x, max) -> metal (x, min, max)

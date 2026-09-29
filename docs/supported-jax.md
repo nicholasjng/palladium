@@ -25,8 +25,12 @@ read snapshots are preserved across later writes.
 ## JAX operations in kernels
 
 - **Elementwise:** add/subtract/multiply/divide, power, abs/negation,
-  exp/log/log2/sin/cos/sqrt/tanh, sign/remainder/clamp, min/max, comparisons,
+  exp/exp2/expm1/log/log2/log1p, sqrt/rsqrt, sin/cos/tan and their inverses,
+  sinh/cosh/tanh and their inverses, atan2, erf/erf_inv, logistic, square,
+  floor/ceil/round, is_finite, sign/remainder/clamp, min/max, comparisons,
   casts, bitcasts, logical and bitwise operations, shifts, and broadcasting.
+  erf, erf_inv, expm1, and log1p are float32 helper functions emitted with
+  the kernel; the rest map onto MSL builtins.
 - **Array structure:** reshape, permuted reshape, transpose, and selection via
   `select_n`.
 - **Reductions:** sum, min, and max over supported axis subsets, including

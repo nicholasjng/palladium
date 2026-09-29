@@ -124,3 +124,79 @@ def test_column_vector_broadcasts_against_matrix_matches_numpy(rng):
     f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((4, 32), jnp.float32))
     got = f(x, col)
     np.testing.assert_allclose(got, x + col, rtol=1e-5, atol=1e-6)
+
+
+def test_transcendental_zoo_matches_the_oracle(rng):
+    """Ops that map onto MSL builtins directly."""
+
+    def kernel(x_ref, o_ref):
+        x = x_ref[...]
+        o_ref[...] = (
+            jax.lax.rsqrt(x * x + 1.0)
+            + jax.nn.sigmoid(x)
+            + jnp.exp2(x)
+            + jnp.square(x)
+            + jnp.floor(x)
+            + jnp.ceil(x)
+            + jnp.arctan2(x, 1.5)
+            + jnp.tan(x * 0.5)
+            + jnp.arcsin(jnp.tanh(x))
+            + jnp.arccos(jnp.tanh(x))
+            + jnp.arctan(x)
+            + jnp.sinh(x)
+            + jnp.cosh(x)
+            + jnp.arcsinh(x)
+            + jnp.arctanh(0.5 * jnp.tanh(x))
+            + jnp.isfinite(x).astype(x.dtype)
+        )
+
+    x = rng.standard_normal(256, dtype=np.float32)
+    _check_against_oracle(
+        kernel, (x,), out_shape=jax.ShapeDtypeStruct((256,), jnp.float32), rtol=1e-4
+    )
+
+
+def test_rounding_modes_match_the_oracle():
+    def kernel(x_ref, o_ref):
+        x = x_ref[...]
+        o_ref[...] = jnp.round(x) * 4.0 + jax.lax.round(x)
+
+    x = np.array([-2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 0.49, -0.51], dtype=np.float32)
+    _check_against_oracle(kernel, (x,), out_shape=jax.ShapeDtypeStruct((8,), jnp.float32))
+
+
+def test_helper_backed_ops_match_the_oracle(rng):
+    """erf, erf_inv, expm1, and log1p have no MSL builtin; they are
+    emitted once as helper functions above the kernel."""
+
+    def kernel(x_ref, o_ref):
+        x = x_ref[...]
+        u = 0.9 * jnp.tanh(x)
+        o_ref[...] = jax.lax.erf(x) + jax.lax.erf_inv(u) + jnp.expm1(0.1 * x) + jnp.log1p(x * x)
+
+    x = rng.standard_normal(256, dtype=np.float32)
+    _check_against_oracle(
+        kernel, (x,), out_shape=jax.ShapeDtypeStruct((256,), jnp.float32), rtol=1e-4, atol=1e-5
+    )
+    msl = palladium.debug_msl(
+        kernel,
+        jax.ShapeDtypeStruct((256,), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((256,), jnp.float32),
+    )
+    assert msl.count("inline float pd_erf(") == 1
+    assert msl.index("inline float pd_erf(") < msl.index("kernel void")
+
+
+def test_expm1_and_log1p_keep_precision_near_zero():
+    def kernel(x_ref, o_ref):
+        x = x_ref[...]
+        o_ref[...] = jnp.expm1(x) + jnp.log1p(x)
+
+    x = np.array([1e-8, -1e-8, 1e-5, -1e-5, 1e-3], dtype=np.float32)
+    import metal_runtime as mr
+
+    call = palladium.metal_call(
+        kernel, out_shape=jax.ShapeDtypeStruct((5,), jnp.float32), math_mode=mr.MathMode.SAFE
+    )
+    want = np.expm1(x.astype(np.float64)) + np.log1p(x.astype(np.float64))
+    np.testing.assert_allclose(call(x), want.astype(np.float32), rtol=1e-6)
