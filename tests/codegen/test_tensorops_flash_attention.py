@@ -1,6 +1,7 @@
 """Codegen contract for the supported Pallas online-softmax pattern."""
 
 import dataclasses
+import re
 
 import jax
 import jax.numpy as jnp
@@ -80,7 +81,7 @@ def test_tensorops_attention_fuses_both_dots_into_one_threadgroup(causal):
 
     assert source.count(".run(") == 2
     assert "score_op.run(q_tile, k_tile, score_tile)" in source
-    assert "value_op.run(probability_tile, value_tile, output_tile)" in source
+    assert "value_op.run(score_tile, value_tile, acc)" in source
     assert "16, 16, 64, false, true, false);" in source
     assert "16, 64, 16, false, false, false," in source
     assert "uint3 group [[threadgroup_position_in_grid]]" in source
@@ -89,24 +90,29 @@ def test_tensorops_attention_fuses_both_dots_into_one_threadgroup(causal):
     assert "threadgroup float scores[256];" in source
     assert "array<int, 2>{1, 128}" in source
     assert "array<int, 2>{{" not in source
-    assert "(output + q_base + q_start * 128)[row * 128 + i % D]" in source
+    assert "(output + q_base + q_start * 128)[row * 128 + column]" in source
     assert "group.z * BQ" in source
     assert "group.x;" in source and "group.y;" in source
-    assert "scores[row * 16 + _column" in source
+    # Rows belong to SIMD groups, lanes to columns; the accumulator is the
+    # value matmul's cooperative tensor, addressed by MPP coordinates.
+    assert "for (uint row = sg; row < 16; row += 4)" in source
+    assert "scores[row * 16 + lane]" in source
     assert " * 0.125f" in source
-    assert "float _score" in source
-    assert "= exp((scores[row * " in source
-    assert " - new_max));" in source
+    assert "simd_max(lane_max)" in source and "simd_sum(lane_sum)" in source
+    assert "= exp((s[0] - new_max));" in source
     assert "exp((new_max - new_max))" not in source
-    assert "= max(_reduce" in source
+    assert "if (lane == 0)" in source and "row_scale[row] = old_scale;" in source
+    assert "acc.get_multidimensional_index(" in source
+    assert "acc[_i1] = (row_scale[acc_row] * acc[_i1]);" in source
+    assert "threadgroup float accumulator" not in source
     assert source.count("threadgroup_barrier(mem_flags::mem_threadgroup)") == 4
     if causal:
         assert "k_start < (((q_start + BQ + BK - 1) / BK) * BK)" in source
     else:
         assert "k_start < 32" in source
-    assert ("if (!((k_start + _column" in source and "<= (q_start + row)))" in source) is causal
+    assert ("(k_start + lane) <= (q_start + row)" in source) is causal
     assert stats.thread_bytes == 0
-    assert stats.threadgroup_bytes == (16 * 16 + 16 * 64 + 2 * 16) * 4
+    assert stats.threadgroup_bytes == (16 * 16 + 3 * 16) * 4
 
 
 def test_tensorops_attention_supports_distinct_query_and_key_lengths():
@@ -177,7 +183,7 @@ def test_tensorops_attention_explain_scales_batch_axis_for_cooperative_groups():
 
     assert diagnostics.grid == (128, 2, 2)
     assert diagnostics.threadgroup == (128, 1, 1)
-    assert diagnostics.threadgroup_bytes == (16 * 16 + 16 * 64 + 2 * 16) * 4
+    assert diagnostics.threadgroup_bytes == (16 * 16 + 3 * 16) * 4
     assert diagnostics.cooperative
 
 
@@ -216,7 +222,7 @@ def test_tensorops_attention_emits_large_query_tile_with_bounded_shared_memory()
 
     assert "constexpr int BQ = 64;" in source
     assert "constexpr int BK = 32;" in source
-    assert stats.threadgroup_bytes == (64 * 32 + 64 * 64 + 2 * 64) * 4
+    assert stats.threadgroup_bytes == (64 * 32 + 3 * 64) * 4
 
 
 @pytest.mark.parametrize("head_dim", [16, 32, 48, 64])
@@ -226,10 +232,8 @@ def test_tensorops_attention_supports_multiples_of_sixteen_head_dimensions(head_
     assert f"constexpr int D = {head_dim};" in source
     assert f"16, 16, {head_dim}, false, true, false);" in source
     assert f"16, {head_dim}, 16, false, false, false," in source
-    scale_line = next(
-        line for line in source.splitlines() if "scores[row * 16" in line and " = (" in line
-    )
-    scale = float(scale_line.rsplit("* ", maxsplit=1)[1].removesuffix("f);"))
+    scale_line = next(line for line in source.splitlines() if "scores[row * 16 + lane] *" in line)
+    scale = float(re.search(r"\* ([0-9.e-]+)f\)", scale_line).group(1))
     assert scale == pytest.approx(head_dim**-0.5, rel=1e-6)
 
 
