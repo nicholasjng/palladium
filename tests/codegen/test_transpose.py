@@ -1,9 +1,7 @@
 """`transpose` -> a materialized, permuted copy.
 
-Verified against a real jaxpr before implementing (see
-`_rule_transpose`'s docstring): `a.T` inside a dot product stages as its
-own `transpose` equation, so `dot_general` never needs widening for a
-dense layer's backward pass, `transpose` is the actual missing piece.
+`a.T` inside a dot product stages as its own `transpose` equation, so
+`dot_general` needs no widening for a dense layer's backward pass.
 """
 
 import jax
@@ -34,8 +32,7 @@ def test_square_transpose_matches_numpy(rng):
 
 
 def test_lhs_transposed_matmul_matches_numpy(rng):
-    """dL/dW = x.T @ dy: the actual backward-pass shape for a dense
-    layer's weight gradient."""
+    """dL/dW = x.T @ dy, the backward-pass shape for a dense layer's weight gradient."""
 
     def kernel(x_ref, dy_ref, o_ref):
         o_ref[...] = jnp.dot(x_ref[...].T, dy_ref[...])
@@ -48,8 +45,7 @@ def test_lhs_transposed_matmul_matches_numpy(rng):
 
 
 def test_rhs_transposed_matmul_matches_numpy(rng):
-    """dL/dx = dy @ W.T: the actual backward-pass shape for a dense
-    layer's input gradient."""
+    """dL/dx = dy @ W.T, the backward-pass shape for a dense layer's input gradient."""
 
     def kernel(dy_ref, w_ref, o_ref):
         o_ref[...] = jnp.dot(dy_ref[...], w_ref[...].T)

@@ -1,32 +1,29 @@
-"""Example 6: long-horizon symplectic integration, and what limits it.
+"""Example 6: long-horizon symplectic integration and its error floors.
 
 Docs: math modes, docs/performance.md (math mode).
 The Kepler two-body problem, q'' = -q/|q|^3, integrated for millions of
-steps. Initial conditions are set at perihelion of a unit-semi-major-axis
-orbit, so the invariants are known in closed form -- E = -1/2 and
-L = sqrt(1 - e^2), for every member of the ensemble. Accuracy therefore
-needs no reference integration: the exact answer is a constant.
+steps. Initial conditions sit at perihelion of a unit-semi-major-axis
+orbit, so the invariants are known in closed form: E = -1/2 and
+L = sqrt(1 - e^2) for every member of the ensemble. Accuracy needs no
+reference integration; the exact answer is a constant.
 
-Two questions, in order.
+Part A (CPU, float64): integrator vs integrator. A symplectic integrator
+conserves a modified Hamiltonian exactly, so its energy error oscillates
+inside a bound fixed by the step size at any horizon. A non-symplectic
+method of the same order drifts secularly. Velocity-Verlet vs Heun (both
+order 2), plus a Yoshida triple-jump composition of Verlet (order 4,
+still symplectic), which lowers the bound without changing the
+behaviour in time.
 
-Part A (CPU, float64): why symplectic. A symplectic integrator conserves
-a *modified* Hamiltonian exactly, so its energy error oscillates inside a
-bound fixed by the step size and never walks away, at any horizon. A
-non-symplectic method of the same order drifts secularly. Velocity-Verlet
-vs Heun (both order 2), plus a Yoshida triple-jump composition of Verlet
-(order 4, still symplectic) to show the bound falling without the
-qualitative behaviour changing.
-
-Part B (GPU): what is left once truncation error is bounded. Nothing in
-Part A's symplectic column drifts in exact arithmetic, so whatever drift
-survives is round-off: each step commits an O(eps) rounding error to the
-state, and those accumulate as a random walk, error ~ eps * sqrt(steps).
-Verlet in float32 (FAST and SAFE) against Verlet in df32 (float32x2
-compensated arithmetic, hand-written MSL: the Pallas/jnp frontend has no
-df32 dtype to trace through). The float32 lines leave the truncation
-floor and climb with slope 1/2; the df32 line stays on it. That is the
-point of the example: the compensated variant is limited by the
-integrator, the plain one by the hardware.
+Part B (GPU): precision vs precision. Nothing in Part A's symplectic
+column drifts in exact arithmetic, so any drift that remains is
+round-off: each step commits an O(eps) rounding error to the state, and
+those accumulate as a random walk, error ~ eps * sqrt(steps). Verlet in
+float32 (FAST and SAFE) against Verlet in df32 (float32x2 compensated
+arithmetic, hand-written MSL: the Pallas/jnp frontend has no df32 dtype
+to trace through). The float32 lines leave the truncation floor and
+climb with slope 1/2; the df32 line stays on it. The compensated variant
+is limited by the integrator, the plain one by the hardware.
 """
 
 import time
@@ -45,10 +42,10 @@ N = 1024  # ensemble members, one Metal thread each
 
 # Long runs are cut into chunks so no single dispatch trips the macOS GPU
 # watchdog (a multi-second kernel is killed as "impacting interactivity").
-# Chunking is free of accuracy consequences only because the state round
-# trips exactly: float32 state is float32 on the way out, and the df32
-# kernel hands back both limbs rather than collapsing to float32, which
-# would throw away precisely the compensation being measured.
+# Chunking has no accuracy consequences because the state round-trips
+# exactly: float32 state is float32 on the way out, and the df32 kernel
+# hands back both limbs rather than collapsing to float32, which would
+# discard the compensation being measured.
 CHUNK = 50_000
 CHUNKS = 100  # 5e6 steps, ~1600 orbits
 MARKS = (1, 2, 5, 10, 20, 50, 100)  # chunk indices to print a row for
@@ -163,9 +160,8 @@ def yoshida4_step(q, p, h):
 def envelope(step_fn, h, orbits):
     """Per-orbit max |E - E_exact| for one e=0.3 orbit in float64.
 
-    The envelope, not a point sample: "bounded" is a statement about how
-    large the oscillation gets, and a sample at one instant can land
-    anywhere inside it.
+    The envelope, not a point sample: a sample at one instant can land
+    anywhere inside the oscillation.
     """
     q = np.array([[0.7], [0.0]])
     p = np.array([[0.0], [np.sqrt(1.3 / 0.7)]])
@@ -302,9 +298,8 @@ def part_b():
     print(f"  wall clock: FAST {t_fast:.1f} s, SAFE {t_safe:.1f} s, df32 {t_df32:.1f} s")
     print()
 
-    # Fit over the last decade only: below it the float32 lines are still
-    # sitting on the truncation floor, where round-off is not what is
-    # being measured.
+    # Fit over the last decade only: below it the float32 lines still sit
+    # on the truncation floor, where round-off is not being measured.
     lo = CHUNKS // 10
     n = np.log(np.arange(lo, CHUNKS) + 1.0)
     slopes = {k: float(np.polyfit(n, np.log(v[lo:]), 1)[0]) for k, v in rows.items()}

@@ -1,8 +1,4 @@
-"""The ELEMENTWISE table and `_rule_elementwise` (emit/rules/elementwise.py).
-
-Primitives these kernels stage (check with test_01's jaxpr printing if a
-name surprises you): add, sub, mul, div, max, min, exp, sin, cos, sqrt,
-tanh, neg, integer_pow, convert_element_type.
+"""The ELEMENTWISE table and `_rule_elementwise`.
 
 Tolerances are float32-honest: kernels compile with MathMode.FAST, so
 transcendentals need not be bit-identical to the CPU oracle.
@@ -72,7 +68,7 @@ def test_integer_pow_and_sqrt(rng):
 
 
 def test_lotka_volterra_rhs(rng):
-    """The capstone's right-hand side, one evaluation, no loop yet."""
+    """One evaluation of the Lotka-Volterra right-hand side."""
 
     def kernel(x_ref, y_ref, o1_ref, o2_ref):
         x, y = x_ref[...], y_ref[...]
@@ -95,12 +91,7 @@ def test_lotka_volterra_rhs(rng):
 
 
 def test_row_vector_broadcasts_against_matrix_matches_numpy(rng):
-    """A dense layer's bias add: `x @ w + b`, `b` shape (32,) broadcasting
-    against a (4, 32) matmul result. Verified against a real jaxpr before
-    fixing: `b` stages `broadcast_in_dim` to (1, 32), then `add` between
-    (4, 32) and (1, 32), not same-shape operands throughout, so
-    `_rule_elementwise` has to broadcast per operand, not assume every
-    operand matches `dst`'s shape."""
+    """A (32,) bias stages `broadcast_in_dim` to (1, 32) before the add, so the elementwise rule must broadcast per operand."""
 
     def kernel(x_ref, w_ref, b_ref, o_ref):
         o_ref[...] = jnp.dot(x_ref[...], w_ref[...]) + b_ref[...]

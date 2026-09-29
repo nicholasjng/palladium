@@ -1,9 +1,6 @@
-"""What the three call paths share: option parsing, the per-shape cache of
-traced specs and emitted MSL, diagnostics, verification, and VJP attachment.
-
-`metal_call` (eager) and `metal_call_jit` (CPU FFI) differ only in how a
-compiled kernel is dispatched;
-everything up to the MSL text is this module.
+"""What the call paths share: option parsing, the per-shape cache of traced
+specs and emitted MSL, diagnostics, verification, and VJP attachment.
+`metal_call` (eager) and `metal_call_jit` (CPU FFI) differ only in dispatch.
 """
 
 from __future__ import annotations
@@ -118,7 +115,6 @@ class PallasCallable:
         # Serialize cache misses: concurrent first calls compile once.
         self._lock = threading.Lock()
 
-    # Backwards-compatible views of the options.
     @property
     def _math_mode(self):
         return self._options.math_mode
@@ -142,8 +138,8 @@ class PallasCallable:
         caches key on instead of the source itself.
         """
         key = tuple((a.shape, np.dtype(a.dtype).str) for a in args)
-        # Keep lookup and LRU promotion together; another specialization
-        # can evict this entry while a concurrent call is touching it.
+        # Lookup and LRU promotion under one lock: a concurrent miss can
+        # evict this entry between the two.
         with self._lock:
             entry = self._cache.get(key)
             if entry is not None:
@@ -199,11 +195,11 @@ class PallasCallable:
         """Run on the GPU and diff against a reference; return the output.
 
         The reference defaults to this kernel's `interpret=True` oracle.
-        Kernels using `palladium.threadgroup_memory` need an explicit
-        `reference=`: interpret models each instance as a threadgroup of
-        one, so it computes something else, and `verify` refuses rather
-        than pass silently. Raises `VerificationError` on disagreement,
-        naming the worst element and its index.
+        Cooperative kernels (threadgroup_memory, thread_index, barrier)
+        need an explicit `reference=`: interpret models each instance as
+        a threadgroup of one, so `verify` refuses the oracle for them.
+        Raises `VerificationError` on disagreement, naming the worst
+        element and its index.
         """
         return unwrap(
             verify_against(
@@ -219,10 +215,6 @@ class PallasCallable:
 
     def __call__(self, *args):  # pragma: no cover - subclasses dispatch
         raise NotImplementedError
-
-    # -- gradients ------------------------------------------------------
-    # None of the paths derives a derivative from emitted MSL; these pair
-    # this call with a backward implementation (see palladium.vjp).
 
     def with_reference_vjp(self, reference: Callable) -> Callable:
         """`palladium.with_reference_vjp(self, reference)`."""

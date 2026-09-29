@@ -1,4 +1,4 @@
-"""Lowerings for one part of the MSL execution model."""
+"""Ref loads and stores, jit inlining, and random key wrapping."""
 
 from __future__ import annotations
 
@@ -21,15 +21,13 @@ from palladium.emit.core import (
 
 @rule("get")
 def _rule_get(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """Load from a Ref: `y = x_ref[...]` (full block) or an indexed access
-    like `y = x_ref[i, :]` (non-Slice dims squeeze into the offset, Slice
-    dims are kept in the loaded shape).
+    """Load from a Ref, full block or indexed (`x_ref[i, :]`; non-Slice
+    dims squeeze, Slice dims are kept).
 
-    An indexed load from a read-only (input) ref binds the pointer view
-    instead of copying: nothing can write through a `const device` ref,
-    so the view has snapshot semantics. Full-block loads copy, since
-    those blocks are re-read many times -- except a block consumed only
-    as scan xs, read once per element, which binds the ref directly.
+    An indexed load from a read-only ref binds the pointer view instead
+    of copying, since nothing writes through a `const device` ref.
+    Full-block loads copy, except a block consumed only as scan xs,
+    which binds the ref directly.
     """
     indexer_args = eqn.params["tree"].unflatten(eqn.invars[1:])
     src = env.val(eqn.invars[0])
@@ -115,14 +113,11 @@ def _inline_jit(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 
 @rule("random_wrap")
 def _rule_random_wrap(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """`jax.random.wrap_key_data`: pure type-level wrap (uint32[2] array
-    to a `key<fry>[]`-typed value), no MSL. Alias, like `program_id`."""
+    """`jax.random.wrap_key_data`: a type-level wrap of uint32[2] key data; pure alias."""
     env.bind(eqn.outvars[0], env.val(eqn.invars[0]))
 
 
 @rule("random_unwrap")
 def _rule_random_unwrap(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """`jax.random.key_data`: the inverse of `random_wrap`, equally pure
-    aliasing (a `key<fry>[]`-typed value is a uint32[2] array underneath
-    the whole time; nothing to convert)."""
+    """`jax.random.key_data`: the inverse of `random_wrap`; pure alias."""
     env.bind(eqn.outvars[0], env.val(eqn.invars[0]))

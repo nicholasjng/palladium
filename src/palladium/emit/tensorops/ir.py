@@ -48,7 +48,7 @@ class IRRegion:
 
 @dataclasses.dataclass(frozen=True)
 class KernelIR:
-    """Imported Pallas kernel plus its still-unmodified structured jaxpr."""
+    """Imported Pallas kernel and its structured jaxpr."""
 
     plan: KernelPlan
     body: IRRegion
@@ -57,11 +57,8 @@ class KernelIR:
 def import_kernel(plan: KernelPlan) -> KernelIR:
     """Import a Pallas kernel into nested regions and typed SSA values.
 
-    The importer preserves source equations and their parameters so target
-    passes can inspect primitive-specific metadata without losing JAX
-    semantics. Pallas refs at the top level receive the layouts established
-    by `KernelPlan`; ordinary intermediate values begin with unassigned
-    ownership for the layout pass.
+    Equations keep their parameters for target passes. Top-level refs take
+    the layouts from `KernelPlan`; intermediate values start unassigned.
     """
 
     jaxpr = plan.spec.jaxpr

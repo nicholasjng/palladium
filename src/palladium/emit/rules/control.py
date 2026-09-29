@@ -1,4 +1,5 @@
-"""Lowerings for one part of the MSL execution model."""
+"""Control flow and thread-coordinate primitives: program_id, barriers,
+scan, while, and cond."""
 
 from __future__ import annotations
 
@@ -37,20 +38,17 @@ def _rule_program_id(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 def _rule_barrier(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """`palladium.barrier()` -> `threadgroup_barrier(mem_flags::mem_threadgroup)`.
 
-    Emitted verbatim wherever the author placed it; palladium never
-    infers barrier placement from a hazard analysis. Zero outputs, so
-    nothing to bind -- the primitive carries a JAX effect purely to
-    survive DCE on the way here.
+    Emitted where the kernel placed it; no barrier placement is inferred.
+    The primitive carries a JAX effect so DCE keeps it.
     """
     cursor.barrier()
 
 
 @rule("palladium_thread_index")
 def _rule_thread_index(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """Linearize the actual threadgroup coordinates, x fastest, as int32.
+    """Linearize the threadgroup coordinates, x fastest, as int32.
 
-    Pure aliasing, same as `program_id`. The (int) cast keeps index
-    arithmetic signed.
+    Pure aliasing; the (int) cast keeps index arithmetic signed.
     """
     env.bind(eqn.outvars[0], CVal(f"(int){_TID}", (), "int"))
 
@@ -59,10 +57,8 @@ def _rule_thread_index(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 def _rule_threads_per_threadgroup(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """Product of the actual threadgroup dimensions, as int32.
 
-    Reports the *actual* size of this threadgroup, which for the final
-    group of a non-uniform dispatch is smaller than the requested size.
-    That is the whole reason cooperative loops bound themselves with this
-    instead of a compile-time constant.
+    For the final group of a non-uniform dispatch this is smaller than
+    the requested size, so cooperative loops bound themselves with it.
     """
     env.bind(eqn.outvars[0], CVal(f"(int){_TPT}", (), "int"))
 
@@ -208,8 +204,8 @@ def _split_scan_operands(eqn: JaxprEqn, body: Jaxpr, length: int) -> ScanShape:
 
 
 def _xs_slice(xs: CVal, body_invar: Var, idx: str) -> CVal:
-    """This iteration's x: a strided view into the stacked xs value
-    (an immutable SSA value, so no copy is needed)."""
+    """This iteration's x: a view into the stacked xs value, which is
+    immutable, so no copy is needed."""
     aval = shaped(body_invar.aval)
     shape = tuple(int(d) for d in aval.shape)
     if not shape:
@@ -282,21 +278,17 @@ def _copy_back_carries(cursor: Cursor, outs: list[CVal], carries: list[CVal]) ->
     """Write loop-body outputs back into their carry storage.
 
     All carries update simultaneously, so every source element is read
-    into a scalar before any carry element is written: one fused loop
-    per element count (grouping by size is safe because an output that
-    aliases a carry has that carry's aval, so aliasing never crosses
-    sizes). Self-forwards are skipped. Shared by the scan and while
-    lowerings. Pure text emission, no bindings: takes a Cursor, not an
-    Environment.
+    into a scalar before any carry element is written, in one fused loop
+    per element count. An output that aliases a carry has that carry's
+    aval, so aliasing never crosses sizes. Self-forwards are skipped.
 
-    Carry permutations (an output that IS another carry) additionally
-    read and write through volatile pointers, working around a Metal
-    compiler bug: with three or more thread-local array temporaries live
-    in the loop, the optimizer forwards a permuted carry's read across
-    the write it must precede, producing wrong results on M-series GPUs.
-    Snapshot arrays, fused loops, and hoisted declarations all still
-    miscompile; volatile on the hazard endpoints is the narrowest fix
-    that survives. The permutation-free path stays non-volatile.
+    Carry permutations (an output that is another carry) read and write
+    through volatile pointers to work around a Metal compiler bug: with
+    three or more thread-local array temporaries live in the loop, the
+    optimizer forwards a permuted carry's read across the write it must
+    precede, producing wrong results on M-series GPUs. Volatile on the
+    hazard endpoints is the narrowest workaround found; the
+    permutation-free path stays non-volatile.
     """
     updates = [
         (out, carry) for out, carry in zip(outs, carries, strict=True) if out.expr != carry.expr
@@ -307,9 +299,8 @@ def _copy_back_carries(cursor: Cursor, outs: list[CVal], carries: list[CVal]) ->
         hazard = any(out.expr in carry_exprs for out, _ in group)
 
         def read(out: CVal, carry: CVal) -> str:
-            # Only carry storage is read volatile; fresh SSA values and
-            # literals are not part of the hazard (and a literal has no
-            # address to cast).
+            # Only carry storage is read volatile; fresh values and
+            # literals are outside the hazard, and a literal has no address.
             if not (hazard and out.expr in carry_exprs):
                 return out.at(index)
             if carry.shape and not carry.scalar_storage:
@@ -348,8 +339,7 @@ def _rule_while(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """`lax.while_loop` -> `while (true) { cond; if (!p) break; body; }`.
 
     Carries follow the scan discipline (declared once, two-phase
-    copy-back). The trip count is data-dependent, so threads diverge
-    freely; that is fine in the one-thread-per-instance model.
+    copy-back). Threads may diverge on the data-dependent trip count.
     """
     cond_nconsts: int = eqn.params["cond_nconsts"]
     body_nconsts: int = eqn.params["body_nconsts"]
@@ -382,8 +372,8 @@ def _rule_cond(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     lax.switch semantics the index clamps to the valid range, so the
     first branch takes `<= 0` and the last takes the trailing `else`.
     Each branch emits into its own block and copies its results into
-    storage declared ahead of the chain. Branches may diverge across
-    threads; that is fine in the one-thread-per-instance model.
+    storage declared ahead of the chain. Threads may diverge across
+    branches.
     """
     branches = eqn.params["branches"]
     index = env.val(eqn.invars[0])

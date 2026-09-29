@@ -1,13 +1,13 @@
-"""Example 5: does compensated arithmetic (df32) buy real accuracy here.
+"""Example 5: compensated arithmetic (df32) accuracy vs plain float32.
 
 Docs: math modes, docs/performance.md (math mode).
-Same RK4 Lotka-Volterra capstone as example 1, three ways:
-FAST (the default), SAFE (same float32 kernel, reassociation off), and
-DF32 (the palladium.experimental.df32 prelude: float32x2 compensated arithmetic,
-hand-written MSL since the Pallas/jnp frontend has no df32 dtype to trace
-through). All three measured against a true float64 NumPy RK4 reference,
-not against each other: the question this answers is "how far off is
-each variant from what actually happened," not "does GPU match CPU."
+Same RK4 Lotka-Volterra ensemble as example 1, three ways: FAST (the
+default), SAFE (same float32 kernel, reassociation off), and DF32 (the
+palladium.experimental.df32 prelude: float32x2 compensated arithmetic,
+hand-written MSL since the Pallas/jnp frontend has no df32 dtype to
+trace through). Each variant is measured against a float64 NumPy RK4
+reference, not against the others. The output lists wall-clock time and
+max abs error vs float64 per variant.
 """
 
 import time

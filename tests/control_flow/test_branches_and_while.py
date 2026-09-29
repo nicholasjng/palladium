@@ -81,7 +81,7 @@ def test_while_loop_trip_count_diverges_per_thread(rng):
     x = rng.uniform(1.0, 100.0, size=(512, 1)).astype(np.float32)
     got, want = _per_row(kernel, 512, x, n_in=1)
     np.testing.assert_allclose(got, want, atol=1e-5)
-    # trip counts must actually differ across threads for this to test anything
+    # Trip counts must differ across threads.
     assert len(np.unique(np.floor(got))) > 3
 
 

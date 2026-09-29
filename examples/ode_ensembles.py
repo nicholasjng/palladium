@@ -2,11 +2,12 @@
 
 Docs: the classic execution model in docs/supported-jax.md.
 One Metal thread integrates one Lotka-Volterra system (RK4, fixed step)
-with its own parameters; the grid is the ensemble. The Diffrax baseline is
-the same ensemble under jit(vmap(diffeqsolve)) on the CPU backend; on
-macOS that IS the practical Diffrax deployment (jax-metal is stale and
-cannot run it).
-
+with its own parameters; the grid is the ensemble. The Diffrax baseline
+is the same ensemble under jit(vmap(diffeqsolve)) on the CPU backend,
+the practical Diffrax deployment on macOS (jax-metal is stale and cannot
+run it). The output lists both wall-clock times and the max abs
+deviation between the two, which reflects fixed- vs adaptive-step f32
+integration.
 """
 
 import time

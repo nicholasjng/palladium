@@ -1,4 +1,4 @@
-"""Fixed-step Lotka–Volterra training workload and explicit Pallas VJPs.
+"""Fixed-step Lotka-Volterra training workload and explicit Pallas VJPs.
 
 This is an experimental workload, not a general-purpose ODE solver.
 """
@@ -117,11 +117,8 @@ def make_solver(n, *, steps=100, dt=0.01, interval=10, variant="reverse", interp
     ):
         """VJP through the discrete RK4 update via six forward sensitivities.
 
-        This is a fused tangent-transpose kernel: it recomputes each RK4 stage
-        and propagates the state tangent for each input direction. It is a
-        useful correctness and ABI milestone for this six-input problem. A
-        reverse-time/checkpointed adjoint is the scalable replacement when the
-        state or parameter dimension grows.
+        Cost scales with the number of inputs; the checkpointed reverse
+        variant is the scalable choice for larger state or parameter counts.
         """
 
         a, b, c, d = a_ref[...], b_ref[...], c_ref[...], d_ref[...]

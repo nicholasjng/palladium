@@ -1,4 +1,4 @@
-"""Lowerings for one part of the MSL execution model."""
+"""dot_general and reductions."""
 
 from __future__ import annotations
 
@@ -31,14 +31,11 @@ def _rule_dot_general(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     matvec, vecmat, and vecvec. Batch dims, higher rank, and other
     contraction axes are unimplemented.
 
-    `preferred_element_type` is honored through the output aval (JAX
-    computes the output dtype from it): accumulation runs in the output
-    ctype, and mixed-precision products are cast to it before the
-    multiply. The vectorized paths require f32 end to end.
-
-    The scalar path keeps `i, j` outer with `k` innermost: an `i, k, j`
-    reorder turns the single per-`(i, j)` write into `k`
-    read-modify-writes of `dst` per `j`, and measures slower.
+    `preferred_element_type` is honored through the output aval:
+    accumulation runs in the output ctype, and mixed-precision products
+    are cast to it before the multiply. The vectorized paths require
+    f32 end to end. The scalar path keeps `k` innermost; an `i, k, j`
+    order measured slower.
     """
     (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = eqn.params["dimension_numbers"]
     if lhs_batch or rhs_batch:
@@ -89,9 +86,8 @@ def _rule_dot_general(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
             rhs_idx = f"{j} * {k} + {kk}" if rhs.transposed else f"{kk} * {n} + {j}"
             a_elem = lhs.at(lhs_idx)
             if lhs.ctype != dst.ctype:
-                # Mixed precision (preferred_element_type wider than the
-                # operands): promote before the multiply so the product
-                # accumulates in the output ctype.
+                # Promote before the multiply so the product accumulates
+                # in the output ctype.
                 a_elem = f"(({dst.ctype}){a_elem})"
             cursor.emit(f"{acc} += {a_elem} * {rhs.at(rhs_idx)};")
         cursor.emit(f"{dst.at(f'{i} * {n} + {j}')} = {acc};")
@@ -109,17 +105,11 @@ def _emit_dot_general_m1_vectorized(
 ) -> None:
     """`(1, k) @ (k, n) -> (1, n)`, `n % 4 == 0`, `n <= _M1_VECTORIZE_MAX_N`.
 
-    `k` outer / `j` inner, vectorized over `j` in float4 lanes, with the
-    `n/4`-wide accumulator held in registers for the whole `k` sweep.
-    Valid only while the accumulator stays register-resident, hence the
-    cutoff.
-
-    `dst` is always an emitter-declared thread-local array; `rhs` may be
+    `k` outer, `j` inner in float4 lanes, with the `n/4`-wide accumulator
+    held in registers for the whole `k` sweep; the cutoff keeps it
+    register-resident. `dst` is a thread-local array; `rhs` may be
     thread-local or a device view, so its float4 cast is qualified by
-    `rhs.space` and gated on 4-element alignment at the call site. A
-    mis-qualified or misaligned pointer cast is invalid MSL.
-
-    Pure text emission, no bindings: takes a Cursor, not an Environment.
+    `rhs.space` and 4-element alignment is checked at the call site.
     """
     n4 = n // 4
     rspace = rhs.space
@@ -147,18 +137,11 @@ def _emit_dot_general_rowdot_vectorized(
 ) -> None:
     """`(m, k) @ (k, n)` with a lazy-transposed rhs.
 
-    Element `(kk, j)` of the rhs lives at `[j * k + kk]` of the
-    untransposed storage, so lhs row `i` and rhs column `j` are both
-    unit-stride in the contraction index: each output element is a dot
-    of two contiguous rows, emitted as float4 multiply-accumulates over
-    `k/4` lanes with one horizontal sum. `k % 4 == 0` checked at the
-    call site.
-
-    Either operand may live in `thread` or `device` space; casts are
-    qualified accordingly and both operands' alignment is checked at
-    the call site.
-
-    Pure text emission, no bindings: takes a Cursor, not an Environment.
+    Element `(kk, j)` of the rhs lives at `[j * k + kk]`, so lhs row `i`
+    and rhs column `j` are both unit-stride in the contraction index:
+    each output element is a float4 dot of two contiguous rows with one
+    horizontal sum. `k % 4 == 0`, address spaces, and alignment are
+    handled at the call site.
     """
     k4 = k // 4
     acc, arow, brow = (
@@ -189,10 +172,9 @@ def _emit_reduce(
     init: str,
     combine: Callable[[str, str], str],
 ) -> None:
-    """Shared shape for `reduce_sum`/`reduce_max`: nested loops, one per
-    kept dim, each accumulating over the reduced dims via `combine`
-    starting from `init`. `axes` may be any subset of dims, not just
-    "reduce to a scalar"."""
+    """Nested loops, one per kept dim, each accumulating over the reduced
+    dims via `combine` starting from `init`. `axes` may be any subset
+    of dims."""
     axes = set(eqn.params["axes"])
     src = env.val(eqn.invars[0])
     rank = len(src.shape)
@@ -232,13 +214,7 @@ def _emit_reduce(
 
 @rule("reduce_sum")
 def _rule_reduce_sum(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """`jnp.sum(x, axis=...)` -> nested loops, one per kept dim, each
-    accumulating over the reduced dims.
-
-    Verified against a real jaxpr before implementing: `jnp.sum` and
-    `jnp.mean` both stage as `reduce_sum[axes=...]` (mean adds a plain
-    `div` after, already emittable via ELEMENTWISE).
-    """
+    """`jnp.sum(x, axis=...)`; `jnp.mean` stages as reduce_sum plus a `div`."""
     _emit_reduce(env, cursor, eqn, "0", lambda acc, x: f"{acc} + {x}")
 
 

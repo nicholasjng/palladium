@@ -68,9 +68,7 @@ def rk4_step(state, parameters, time, dt):
 def reference_flow(states, parameters, *, steps=16, reverse=True):
     """Vectorized JAX baseline, independent of the scalar Pallas step code.
 
-    Per-example augmented states (n,3) and weights (n,p). Array operations
-    evaluate all hidden units together rather than expanding scalar arithmetic
-    into many JAX operations.
+    Per-example augmented states (n,3) and weights (n,p).
     """
     dt = (-1.0 if reverse else 1.0) / steps
     start = 1.0 if reverse else 0.0
@@ -166,7 +164,6 @@ def make_flow(
                 return rk4_step(z, params, start + (chunk * interval + local) * dt, dt)
 
             state = jax.lax.fori_loop(0, local_step, replay, state)
-            # This VJP is staged as scalar arithmetic into the Metal kernel.
             _, pullback = jax.vjp(
                 lambda z, p: rk4_step(z, p, start + step_index * dt, dt), state, params
             )

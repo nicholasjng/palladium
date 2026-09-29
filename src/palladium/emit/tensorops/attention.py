@@ -50,7 +50,7 @@ class _IRAttentionPlan:
 
 
 def lower_attention_ir(kernel: KernelIR, kernel_name: str | None = None) -> tuple[str, int]:
-    """Lower a supported scan by analyzing its imported IR, without the legacy matcher."""
+    """Lower a supported online-softmax scan from its imported IR."""
     if kernel.plan.scope is not ProgramScope.THREADGROUP:
         raise EmitError("tensorops attention lowering requires threadgroup program scope")
     spec = kernel.plan.spec
@@ -512,10 +512,9 @@ def _emit(plan: _IRAttentionPlan, spec: KernelSpec, kernel_name: str | None):
         ("D", "BK"),
         (1, heads * dim),
     ).emit(cursor, "value_view")
-    # The output accumulator is the value matmul's cooperative tensor,
-    # spread over the threadgroup's registers for the whole key loop. MPP
-    # exposes each element's (column, row) coordinate, which the rescale
-    # and the final store use.
+    # The accumulator is the value matmul's cooperative tensor, held in
+    # threadgroup registers for the whole key loop. MPP reports each element's
+    # coordinate as (column, row); the rescale and final store rely on it.
     acc = value_op.emit_cooperative_destination(
         cursor, score_tile, value_view, name="acc", element_type="float"
     )

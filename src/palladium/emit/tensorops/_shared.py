@@ -34,7 +34,7 @@ def _kernel_source(name: str, parameters: tuple[str, ...], body: list[str]) -> s
 
 
 def _shape(value: Var | Literal) -> tuple[int, ...]:
-    """Return a static shaped aval's dimensions or reject it clearly."""
+    """Return a statically shaped aval's dimensions."""
     aval = value.aval
     if not isinstance(aval, ShapedArray):
         raise EmitError(f"TensorOps requires a statically shaped value, got {aval}")
@@ -42,7 +42,7 @@ def _shape(value: Var | Literal) -> tuple[int, ...]:
 
 
 def _dtype_name(value: Var | Literal) -> str:
-    """Return a shaped jaxpr atom's dtype name or reject unsupported avals."""
+    """Return a statically shaped aval's dtype name."""
     aval = value.aval
     if not isinstance(aval, ShapedArray):
         raise EmitError(f"TensorOps requires a statically typed value, got {aval}")

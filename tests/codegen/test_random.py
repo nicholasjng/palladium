@@ -1,16 +1,10 @@
 """Counter-based RNG (`jax.random` inside a kernel).
 
-`jax.random.uniform(key, shape)` inside a kernel stages as `random_wrap`
-(pure type wrap of a uint32[2] array, no MSL), `random_bits` (the real
-generator), then ordinary ops the emitter already had except three:
-`shift_right_logical`, `or`, `bitcast_convert_type`. `random_fold_in`
-(per-thread/per-step key derivation) is the same hash again, seeded with
-(0, data) instead of a counter. All verified against real jaxprs before
-implementing, and every rule here is checked bit-for-bit against JAX's
-own output (`jax.random.bits`, `jax.random.uniform`, `jax.random.fold_in`
-key data), not just "close enough": Threefry-2x32-20 is a specific,
-well-defined algorithm, and this reproduces it exactly rather than
-substituting a different hash validated only statistically.
+`jax.random.uniform` stages as `random_wrap`, `random_bits`, then
+`shift_right_logical`, `or`, `bitcast_convert_type` and ordinary arithmetic;
+`random_fold_in` is the same hash seeded with (0, data). Threefry-2x32-20 is
+a well-defined algorithm, so every rule is checked bit-for-bit against JAX's
+own output.
 """
 
 import jax
@@ -55,8 +49,7 @@ def test_uniform_matches_jax_exactly():
 
 
 def test_fold_in_matches_jax_exactly():
-    """`fold_in` derives a fresh key; check the derived key's own bits,
-    not just a downstream float that could hide a wrong key."""
+    """fold_in's derived key data matches JAX bit-for-bit."""
 
     def kernel(k_ref, d_ref, ko_ref):
         key = jax.random.wrap_key_data(k_ref[...], impl="threefry2x32")
@@ -76,9 +69,7 @@ def test_fold_in_matches_jax_exactly():
 
 
 def test_per_thread_independent_streams():
-    """The point: folding `program_id` into the key per thread gives each
-    lane a distinct stream, not a copy of lane 0's. `example 3`'s
-    hand-written MSL flags the same requirement for its own RNG."""
+    """Folding program_id into the key gives each lane a distinct stream rather than a copy of lane 0's."""
 
     def kernel(k_ref, o_ref):
         base = jax.random.wrap_key_data(k_ref[...], impl="threefry2x32")
@@ -101,5 +92,5 @@ def test_per_thread_independent_streams():
     )
     got = got.reshape(8, 4)
     np.testing.assert_array_equal(got, want)
-    # Every lane's stream is genuinely different, not silently identical.
+    # Every lane's stream is distinct.
     assert len({tuple(row) for row in got}) == 8

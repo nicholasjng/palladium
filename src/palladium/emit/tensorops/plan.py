@@ -43,11 +43,10 @@ class Distribution(enum.Enum):
 
 @dataclasses.dataclass(frozen=True)
 class ValueLayout:
-    """Logical tensor type plus its eventual storage and cooperative owner.
+    """Logical tensor type plus its storage and cooperative owner.
 
-    `UNASSIGNED` is intentional at the frontend boundary. Layout assignment
-    passes can choose an ownership policy later without changing the Pallas
-    jaxpr or pretending that every value is already a per-thread array.
+    Values start `UNASSIGNED`; the layout pass picks an ownership policy
+    without changing the Pallas jaxpr.
     """
 
     shape: tuple[int, ...]
@@ -87,12 +86,11 @@ class KernelPlan:
 
 
 def plan_kernel(spec: KernelSpec, *, scope: ProgramScope | None = None) -> KernelPlan:
-    """Build the tensorops frontend plan without selecting physical value layouts.
+    """Build the tensorops plan without selecting physical value layouts.
 
-    Kernels that explicitly use thread indices, threadgroup size, barriers, or
-    threadgroup scratch require group execution. Other kernels retain the
-    existing one-thread-per-program default. TensorOps-specific callers may
-    request group execution explicitly.
+    Kernels that use thread indices, threadgroup size, barriers, or threadgroup
+    scratch require threadgroup scope; other kernels default to one thread per
+    program unless `scope` overrides it.
     """
 
     if len(spec.grid) > 3:

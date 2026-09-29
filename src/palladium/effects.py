@@ -1,14 +1,9 @@
 """Jaxpr effect helpers: per-equation Ref read/write queries, and the gate
 against effects palladium cannot perform on the GPU.
 
-State effects (`Read`/`Write`/`Accum`, each keyed to a Ref var)
-aggregate per jaxpr and through control flow: a `swap` inside a `scan`
-body surfaces in the outer equation's effects.
-
-Palladium's cooperative primitives carry effects for a different
-reason: a zero-output primitive with no declared effect is dead code
-that JAX's DCE deletes before the emitter sees it. Those subclass
-`GpuNativeEffect`, which the gate lets through.
+Ref state effects aggregate through control flow: a `swap` inside a `scan`
+body surfaces in the outer equation's effects. Cooperative primitives carry
+a `GpuNativeEffect` so JAX's DCE keeps them; the gate lets those through.
 """
 
 from __future__ import annotations
@@ -26,22 +21,15 @@ __all__ = [
 
 
 class GpuNativeEffect(Effect):
-    """Base for effects palladium lowers to real GPU instructions.
-
-    Subclass this for a primitive that must survive DCE but has no Ref
-    read/write to declare (`barrier()`, the thread-position builtins).
-    Any other non-Ref effect (host callbacks, debug prints) is rejected
-    at trace time.
-    """
+    """Base for effects palladium lowers to GPU instructions. Subclass it for
+    a primitive that must survive DCE but has no Ref effect to declare
+    (`barrier()`, thread-position builtins); any other non-Ref effect is
+    rejected at trace time."""
 
 
 def foreign_effects(jaxpr: Jaxpr) -> list[Effect]:
-    """Effects in `jaxpr` that palladium cannot perform on the GPU, in a
-    deterministic order.
-
-    Ref state effects lower to loads and stores and `GpuNativeEffect`
-    subclasses to their own rules; everything else is host-side.
-    """
+    """Effects in `jaxpr` that palladium cannot perform on the GPU (anything
+    but Ref state effects and `GpuNativeEffect`), in a deterministic order."""
     return sorted(
         (e for e in jaxpr.effects if not isinstance(e, (RefEffect, GpuNativeEffect))),
         key=lambda e: (type(e).__name__, str(e)),

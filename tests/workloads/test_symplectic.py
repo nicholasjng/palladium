@@ -1,17 +1,10 @@
 """Velocity-Verlet on the Kepler problem: a structure-preserving kernel.
 
-No new emitter rules -- it composes load/store, elementwise, sqrt, grids
-and fori_loop -- but it is the one kernel whose correctness has a check
-sharper than "matches the oracle": the exact invariants of the continuous
-problem. Initial conditions are set at perihelion of a unit-semi-major-axis
-orbit, where E = -1/2 and L = sqrt(1 - e^2) hold in closed form for every
-member. Velocity-Verlet conserves L exactly for a central force (up to
-round-off) and holds E inside an O(h^2) bound forever, so a lowering bug
-that a loose float32 oracle tolerance would wave through -- a dropped
-carry copy-back, a sign flip in the second kick -- breaks an invariant by
-orders of magnitude.
-
-This is the kernel examples/symplectic_longrun.py measures.
+Initial conditions sit at perihelion of a unit-semi-major-axis orbit, where
+E = -1/2 and L = sqrt(1 - e^2) hold in closed form for every member.
+Velocity-Verlet conserves L exactly for a central force (up to round-off)
+and holds E inside an O(h^2) bound, so a lowering bug that a loose float32
+oracle tolerance would pass breaks an invariant by orders of magnitude.
 """
 
 import jax
@@ -89,20 +82,15 @@ def test_matches_interpret_oracle():
     *args, _ = _ensemble(n)
     got = f(*args)
     want = f.interpret(*args)
-    # 20k Verlet steps of f32: the GPU and the CPU oracle diverge in phase
-    # along the orbit long before they diverge in the invariants, so this
-    # is a loose positional bar by construction. The invariant tests below
-    # are the sharp ones.
+    # Over 20k f32 Verlet steps the GPU and the CPU oracle diverge in phase
+    # along the orbit long before they diverge in the invariants, hence the
+    # loose positional bar.
     for g, w in zip(got, want):
         np.testing.assert_allclose(g, np.asarray(w), rtol=2e-2, atol=2e-2)
 
 
 def test_conserves_angular_momentum():
-    """Exact for a central force under Verlet, so the only budget here is
-    round-off over 20k float32 steps: eps*sqrt(steps) ~ 1e-5, times a
-    small constant, and FAST math reassociates on top of that. 1e-4 is
-    the honest bar and still four orders below any structural bug.
-    """
+    """L is exact for a central force under Verlet, so the budget is round-off over 20k float32 steps (eps*sqrt(steps) ~ 1e-5) plus FAST-math reassociation; 1e-4 is still four orders below any structural bug."""
     n = 256
     f = make_solver(n)
     *args, e = _ensemble(n)
@@ -111,11 +99,10 @@ def test_conserves_angular_momentum():
 
 
 def test_energy_error_stays_inside_the_step_size_bound():
-    """The symplectic property: the error is set by h, not by the horizon.
+    """The energy error is set by h, not by the horizon.
 
     At h=0.002 the modified-Hamiltonian bound for these orbits is ~1e-6;
-    5e-5 leaves room for the float32 round-off walk over 20k steps and
-    still fails loudly if the kernel is not conserving anything.
+    5e-5 leaves room for the float32 round-off walk over 20k steps.
     """
     n = 256
     f = make_solver(n)
@@ -126,12 +113,7 @@ def test_energy_error_stays_inside_the_step_size_bound():
 
 
 def test_energy_bound_tracks_step_size_not_horizon():
-    """Double the horizon at fixed h: the bound must not double with it.
-
-    A method that drifted secularly (or a kernel that had quietly stopped
-    integrating a Hamiltonian) would show the error scaling with the step
-    count. Round-off contributes its own sqrt(2) at most.
-    """
+    """Doubling the horizon at fixed h does not double the energy error; round-off contributes at most sqrt(2)."""
     n = 256
     *args, _ = _ensemble(n)
     start = _energy(*args)
@@ -142,8 +124,7 @@ def test_energy_bound_tracks_step_size_not_horizon():
 
 @pytest.mark.parametrize("steps", [1, 2, 64])
 def test_short_horizons_match_a_numpy_reference(steps):
-    """Bit-level-ish agreement while round-off has not accumulated: this
-    is what catches an off-by-one in the loop or a mis-sequenced kick."""
+    """Agreement before round-off accumulates catches an off-by-one in the loop or a mis-sequenced kick."""
     n = 64
     *args, _ = _ensemble(n)
     q = np.stack(args[:2]).astype(np.float64)

@@ -86,10 +86,7 @@ def _human(nbytes: int) -> str:
 
 def device_limits() -> dict[str, Any]:
     """`metal_runtime.device_info()`, or an empty dict with no device.
-
-    Diagnostics work without a GPU, as the emitter and tracer do, so
-    consumers treat a missing device as unknown limits, not an error.
-    """
+    Callers treat a missing device as unknown limits, not an error."""
     try:
         import metal_runtime as mr
     except ImportError:  # pragma: no cover - metal_runtime is a hard dep
@@ -103,17 +100,10 @@ def device_limits() -> dict[str, Any]:
 def normalize_threadgroup(
     threadgroup: int | tuple[int, ...] | Literal["simdgroup", "threadgroup"] | None,
 ) -> tuple[int, ...] | None:
-    """The one place `threadgroup=` becomes a tuple of ints.
-
-    The knob is `int | tuple[int, ...] | None` at every entry point
-    (`metal_call`, `metal_call_jit`, `bind`, `explain`); None means "let
-    the runtime choose". Shared so the eager and jax.ffi paths cannot
-    normalize it differently.
-
-    Also accepts `"simdgroup"`, resolving to the device's SIMD width: a
-    reduction over exactly one SIMD group is the common case and pays no
-    cross-simdgroup latency.
-    """
+    """Normalize a `threadgroup=` argument to a tuple of ints, shared by every
+    entry point. None means the runtime chooses; `"simdgroup"` resolves to
+    the device's SIMD width (a reduction over one SIMD group pays no
+    cross-simdgroup latency)."""
     if threadgroup is None:
         return None
     if threadgroup == "simdgroup":
@@ -137,12 +127,9 @@ def simdgroup_width() -> int:
 
 
 def check_threadgroup(spec: KernelSpec, threadgroup: tuple[int, ...] | None) -> None:
-    """Validate a cooperative kernel's launch geometry against the device.
-
-    Checks cooperative requirements even without a device, direct lane-indexed
-    scratch bounds, and device resource limits when available. Explicit group
-    sizes are validated for independent kernels too.
-    """
+    """Validate launch geometry: cooperative requirements and lane-indexed
+    scratch bounds always, device resource limits when a device is present.
+    Explicit group sizes are checked for independent kernels too."""
     if spec.uses_threadgroup and threadgroup is None:
         raise EmitError(
             f"kernel {spec.name!r} uses cooperative instructions or shared scratch; "
@@ -239,10 +226,8 @@ def log_compile(
     execution_path: str = "metal",
     dot_general: str = "auto",
 ) -> None:
-    """One stderr line per compiled kernel when PALLADIUM_EXPLAIN is set.
-
-    Called on the cache-miss path, so cached shapes stay silent.
-    """
+    """One stderr line per compiled kernel when PALLADIUM_EXPLAIN is set;
+    called on the cache-miss path only."""
     if _explain_enabled():
         print(
             dataclasses.replace(

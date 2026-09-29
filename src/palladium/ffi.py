@@ -28,8 +28,7 @@ _TARGET_NAME = "palladium_dispatch"
 _LIBRARY_NAME = "libpalladium_ffi.dylib"
 
 # MRMathMode ordinals from metal-runtime's c_api.h; metal_runtime.MathMode
-# is a StrEnum, not the C API's int, so this is the one place that needs
-# to know both.
+# is a StrEnum.
 _MATH_MODE_ORDINALS = {"safe": 0, "relaxed": 1, "fast": 2}
 
 
@@ -37,10 +36,8 @@ def _library_path() -> Path:
     override = os.environ.get("PALLADIUM_FFI_LIBRARY")
     if override:
         return Path(override)
-    # `palladium`'s __path__ can span multiple roots (editable install:
-    # source tree + CMake build dir), so join-and-check resolves to
-    # whichever root actually has the file, same as
-    # metal_runtime.c_api's own include_dir()/library_dir().
+    # An editable install spans two roots (source tree and CMake build
+    # dir); joinpath resolves to whichever root has the file.
     candidate = importlib.resources.files("palladium").joinpath(_LIBRARY_NAME)
     if not candidate.is_file():
         raise FileNotFoundError(
@@ -57,11 +54,8 @@ _registered = False
 
 
 def _register() -> None:
-    """Loads the native handler and registers it, once per process.
-
-    Locked, not `functools.cache`: concurrent first calls must not both
-    run the registration body.
-    """
+    """Load the native handler and register it, once per process. Locked
+    so concurrent first calls do not both run the registration body."""
     global _registered
     if _registered:
         return
@@ -74,22 +68,16 @@ def _register() -> None:
         _registered = True
 
 
-# Supported batching methods. Whole-batch methods conflict with the
-# shape-specialized grid; pipelined batches in one FFI call, nested levels
-# run sequentially.
+# Whole-batch methods conflict with the shape-specialized grid. pipelined
+# batches in one FFI call; nested vmap levels run sequentially.
 _SAFE_VMAP_METHODS = (None, "sequential", "sequential_unrolled", "pipelined")
 
 
 class FfiCallable(PallasCallable):
-    """A palladium kernel registered as a jax.ffi target: jax.jit-composable.
-
-    Unlike `MetalCallable` (NumPy in, NumPy out, eager), dispatch happens
-    inside XLA's execution, so a call composes inside `jax.jit` next to
-    `jnp` ops. Tracing and MSL emission are cached per input shape/dtype.
-
-    Not differentiable by itself: `ffi_call` has no JVP/transpose rule.
-    Pair a forward and a backward kernel through `with_vjp`.
-    """
+    """A palladium kernel registered as a jax.ffi target, dispatched inside
+    XLA's execution so it composes under `jax.jit`. Tracing and MSL emission
+    are cached per input shape/dtype. Not differentiable by itself (`ffi_call`
+    has no JVP/transpose rule); pair with a backward kernel via `with_vjp`."""
 
     execution_path = "cpu-ffi-to-metal"
 
@@ -105,21 +93,16 @@ class FfiCallable(PallasCallable):
                 "in the Pallas grid instead."
             )
         super().__init__(kernel, pallas_kwargs, options)
-        # MathMode is a StrEnum, so members index the dict as their value.
         self._math_mode_ordinal = _MATH_MODE_ORDINALS[options.math_mode]
         self._vmap_method = options.vmap_method
-        # Wrap None so its batching error uses Palladium's API terminology.
+        # None is wrapped too, so its batching error names Palladium's options.
         self._pipelined = (
             self._build_pipelined() if options.vmap_method in ("pipelined", None) else None
         )
 
     def pin(self, *args) -> Callable[[], Any]:
-        """Not available on the jax.ffi path; use `metal_call(...).pin`.
-
-        Pinning requires owning the upload, and under `jax.jit` XLA owns
-        the operand buffers. Keep inputs as device arrays and let `jit`
-        reuse or donate them instead.
-        """
+        """Not available: under `jax.jit` XLA owns the operand buffers. Use
+        `metal_call(...).pin`, or keep inputs as device arrays."""
         raise NotImplementedError(
             "FfiCallable.pin is not available: under jax.jit, XLA owns "
             "operand buffers, so there is nothing for palladium to pin "
@@ -135,11 +118,9 @@ class FfiCallable(PallasCallable):
         return self._ffi_dispatch(args, vmap_method=self._vmap_method)
 
     def _build_pipelined(self):
-        """The 'pipelined' batching rule: under jax.vmap, one FFI call
-        handling the whole batch natively; unvmapped calls take the
-        ordinary single-dispatch path. With `vmap_method=None` the rule
-        rejects the batch instead of dispatching it.
-        """
+        """The 'pipelined' batching rule: under jax.vmap, one FFI call over
+        the whole batch; unvmapped calls dispatch once. With
+        `vmap_method=None` the rule rejects the batch."""
         import jax.custom_batching
 
         batching_disabled = self._vmap_method is None
@@ -160,8 +141,8 @@ class FfiCallable(PallasCallable):
                     "(expand_dims, broadcast_all) are not usable here: the "
                     "launch grid is baked per unbatched shape."
                 )
-            # 'sequential', not None, handles an *outer* vmap: this rule
-            # takes one level, an enclosing one batches the ffi_call itself.
+            # 'sequential', not None: this rule takes one vmap level, an
+            # enclosing one batches the ffi_call itself.
             out = self._ffi_dispatch(
                 args,
                 vmap_method="sequential",
@@ -181,19 +162,17 @@ class FfiCallable(PallasCallable):
         axis_size: int | None = None,
     ):
         """Build and invoke the ffi_call. With `axis_size`/`in_batched`
-        (batched args carry the batch at axis 0, unbatched ones ride
-        along at stride 0), the native handler loops over the batch;
-        without them, one plain dispatch."""
+        (batched args carry the batch at axis 0, unbatched ones use stride
+        0), the native handler loops over the batch."""
         batched = in_batched if in_batched is not None else [False] * len(args)
         unbatched = [
             jax.ShapeDtypeStruct(a.shape[1:] if b else a.shape, a.dtype)
             for a, b in zip(args, batched, strict=True)
         ]
         spec, msl_source, source_id = self._spec_and_msl(tuple(unbatched))
-        # MRLaunchDesc always wants 3 grid dims; palladium grids are 1-3D.
+        # MRLaunchDesc takes 3 grid dims; (0, 0, 0) threadgroup lets the
+        # runtime choose.
         grid = (tuple(spec.grid) + (1, 1, 1))[:3]
-        # (0, 0, 0) lets the runtime choose (c_api.cpp); a cooperative
-        # kernel never reaches here with None, per the check above.
         from palladium.emit.tensorops import cooperative_launch, emits_cooperative
 
         if emits_cooperative(msl_source):
@@ -226,8 +205,7 @@ class FfiCallable(PallasCallable):
             _TARGET_NAME,
             result_shape_dtypes=result_shape_dtypes,
             vmap_method=vmap_method,
-            # In-place pairs from pallas input_output_aliases,
-            # XLA may then donate the input buffer.
+            # XLA may donate the input buffer for aliased pairs.
             input_output_aliases=dict(spec.aliases) or None,
         )(
             *args,
@@ -255,27 +233,20 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
         A Pallas kernel function (operates on Refs).
     **pallas_kwargs
         The usual `pl.pallas_call` keywords (out_shape, grid, in_specs,
-        out_specs, ...), plus `math_mode` (`metal_runtime.MathMode`,
-        FAST by default; SAFE for df32-prelude kernels) and
-        `vmap_method` ('pipelined', the default, or 'sequential',
-        'sequential_unrolled'; None rejects `jax.vmap`).
-        'pipelined' handles the whole batch in one FFI call and is the
-        fastest vmap path; a batch dimension in the Pallas grid still
-        beats it (one dispatch total). `threadgroup` (int or tuple; None
-        lets the runtime choose), and `dot_general="default"` to force the
-        general primitive path or `dot_general="tensorops"` to require
-        TensorOps. Tiled matmuls and supported attention use TensorOps by
-        default.
+        out_specs, ...), plus `math_mode` (`metal_runtime.MathMode`, FAST
+        by default; SAFE for compensated arithmetic), `threadgroup` (int
+        or tuple; None lets the runtime choose), `cache_size` (256 by
+        default), `dot_general` ("auto", "default", or "tensorops"; see
+        `metal_call`), and `vmap_method`: 'pipelined' (the default) runs
+        the whole batch in one FFI call, 'sequential' and
+        'sequential_unrolled' dispatch per element, None rejects
+        `jax.vmap`. A batch dimension in the Pallas grid is one dispatch
+        total and beats all of them.
 
     Returns
     -------
     FfiCallable
-        Traceable, jittable; composes with surrounding `jnp` code.
-
-    Examples
-    --------
-    >>> add_one = metal_call_jit(kernel, out_shape=...)  # doctest: +SKIP
-    >>> jax.jit(lambda x: jnp.sum(add_one(x) ** 2))(x)  # doctest: +SKIP
+        Traceable and jittable.
     """
     return FfiCallable(
         kernel, pallas_kwargs, CallOptions.split(pallas_kwargs, vmap_method="pipelined")

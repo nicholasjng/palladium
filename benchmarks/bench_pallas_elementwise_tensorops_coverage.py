@@ -2,6 +2,8 @@
 
 Run on Apple Silicon with an MSL 4 capable GPU using
 ``JAX_PLATFORMS=mps,cpu uv run mew run benchmarks/bench_pallas_elementwise_tensorops_coverage.py``.
+The single case applies ReLU, a scale, a row-broadcast bias and a scalar
+bias over a 65x97 array with edge tiles, checked against NumPy before timing.
 """
 
 from __future__ import annotations

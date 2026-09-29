@@ -1,12 +1,7 @@
 """Exception hierarchy: everything palladium raises derives from
-PalladiumError, split by pipeline stage (trace, emit, dispatch).
-
-TraceError also subclasses ValueError, DispatchError TypeError.
-
-Errors worth branching on carry the deciding value as an attribute, so
-handlers need not match on message text:
-`UnsupportedPrimitiveError.primitive` and
-`StackOverflowError.stack_bytes`/`.limit`.
+PalladiumError, split by stage (trace, emit, dispatch). TraceError also
+subclasses ValueError, DispatchError TypeError. `UnsupportedPrimitiveError.primitive`
+and `StackOverflowError.stack_bytes`/`.limit` carry the deciding value.
 """
 
 from __future__ import annotations
@@ -37,10 +32,9 @@ class EmitError(PalladiumError):
 
 
 class UnsupportedPrimitiveError(EmitError, NotImplementedError):
-    """The kernel stages a primitive with no registered lowering rule.
-
-    Distinct from EmitError proper: the primitive itself is missing, not
-    an unsupported case of an existing rule. Extensible via `rule`.
+    """The kernel stages a primitive with no registered lowering rule (the
+    primitive is missing, not an unsupported case of an existing rule).
+    Extensible via `rule`.
 
     Attributes
     ----------
@@ -56,10 +50,9 @@ class UnsupportedPrimitiveError(EmitError, NotImplementedError):
 class StackOverflowError(EmitError):
     """Per-instance thread-local storage exceeds the per-thread stack.
 
-    Every loaded block and intermediate lives in thread-local memory, so
-    a kernel's live arrays are bounded by a few KB. Raised either
-    pre-flight from `emit_msl`'s own accounting or by translating
-    Metal's opaque pipeline-creation failure.
+    Every loaded block and intermediate lives in thread-local memory, so a
+    kernel's live arrays are bounded by a few KB. Raised from `emit_msl`'s
+    accounting or by translating Metal's pipeline-creation failure.
 
     Attributes
     ----------

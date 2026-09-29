@@ -37,7 +37,7 @@ forward call with a backward one through `palladium.with_vjp`,
 
 ## Install
 
-Palladium currently requires macOS on Apple silicon, Python 3.12+, CMake, Ninja,
+Palladium requires macOS on Apple silicon, Python 3.12+, CMake, Ninja,
 and the sibling [metal-runtime](https://github.com/nicholasjng/metal-runtime)
 checkout for its eager and CPU-FFI paths. In development, check the repositories
 out side by side and run:

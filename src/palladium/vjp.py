@@ -1,10 +1,7 @@
-"""Gradients for Palladium calls: none of the paths derives a derivative
-from emitted MSL, so a forward call is paired with a backward
-implementation through `jax.custom_vjp`.
-
-The forward and backward callables are ordinary JAX callables: a plain
-`pl.pallas_call` (lowered by Palladium on mps), `metal_call_jit`, or any
-JAX function.
+"""Gradients for Palladium calls. No path derives a derivative from emitted
+MSL, so a forward call is paired with a backward implementation through
+`jax.custom_vjp`. Forward and backward are ordinary JAX callables: a plain
+`pl.pallas_call`, `metal_call_jit`, or any JAX function.
 """
 
 from __future__ import annotations
@@ -26,14 +23,9 @@ def _unwrap(outs):
 
 
 def with_reference_vjp(forward: Callable, reference: Callable) -> Callable:
-    """Pair `forward` with the VJP JAX derives from `reference`.
-
-    The primal stays `forward`; the pullback is JAX's VJP of `reference`,
-    which must have the same inputs, outputs, and differentiable
-    semantics. Useful for putting a fused forward solve into a training
-    loop while a Pallas adjoint kernel is developed; it is not a
-    performance solution.
-    """
+    """Pair `forward` with the VJP JAX derives from `reference`, which must
+    have the same inputs, outputs, and differentiable semantics. A stopgap
+    until a backward kernel exists, not a performance path."""
 
     @jax.custom_vjp
     def differentiated(*args):
@@ -51,11 +43,9 @@ def with_reference_vjp(forward: Callable, reference: Callable) -> Callable:
 
 
 def with_vjp(forward: Callable, backward: Callable) -> Callable:
-    """Pair `forward` with an explicit backward callable.
-
-    `backward` receives the forward primals followed by one cotangent per
-    forward output and returns one cotangent per primal, in order.
-    """
+    """Pair `forward` with an explicit backward callable. `backward` receives
+    the forward primals followed by one cotangent per forward output and
+    returns one cotangent per primal, in order."""
 
     @jax.custom_vjp
     def differentiated(*args):
@@ -78,15 +68,10 @@ def with_vjp(forward: Callable, backward: Callable) -> Callable:
 
 
 def with_auxiliary_vjp(forward: Callable, backward: Callable, output_count: int) -> Callable:
-    """Pair `forward` with `backward` while keeping trailing forward outputs
-    as residuals.
-
-    The first `output_count` outputs are the public primal result; the
-    trailing outputs (checkpoints) are saved and passed to `backward` after
-    the primals and before the output cotangents. One fused forward
-    dispatch can so return its final state and an internal checkpoint
-    buffer consumed by one fused backward dispatch.
-    """
+    """Pair `forward` with `backward`, keeping trailing forward outputs as
+    residuals. The first `output_count` outputs are the primal result; the
+    rest are passed to `backward` after the primals and before the output
+    cotangents."""
     if output_count < 1:
         raise ValueError("output_count must be positive")
 
@@ -106,8 +91,7 @@ def with_auxiliary_vjp(forward: Callable, backward: Callable, output_count: int)
         return public, (*args, *auxiliaries)
 
     def bwd(residual, cotangents):
-        # The custom-VJP protocol validates the returned pytree against the
-        # primal arguments; the auxiliary count is backward's ABI.
+        # custom_vjp validates the returned pytree against the primals.
         return _as_tuple(backward(*residual, *_as_tuple(cotangents)))
 
     differentiated.defvjp(fwd, bwd)

@@ -1,11 +1,6 @@
 """`reduce_sum`/`reduce_max` -> nested loops, one per kept dim.
 
-`axes` may be any subset of dims (verified against a real jaxpr before
-implementing): full reduction to a scalar, and partial reduction along
-one axis of a 2D array, are both real cases, not just the scalar one.
-`jnp.mean` is `reduce_sum` plus a plain `div`, already emittable, so no
-separate rule needed for it. `reduce_max` shares `_emit_reduce`'s loop
-shape with `reduce_sum`.
+`axes` may be any subset of dims; `jnp.mean` is `reduce_sum` plus a `div`.
 """
 
 import jax
@@ -56,7 +51,7 @@ def test_mean_matches_numpy(rng):
 
 
 def test_mse_loss_matches_numpy(rng):
-    """The actual motivating case: mean((pred - target) ** 2)."""
+    """mean((pred - target) ** 2) matches numpy."""
 
     def kernel(pred_ref, target_ref, o_ref):
         diff = pred_ref[...] - target_ref[...]
@@ -91,8 +86,7 @@ def test_max_along_last_axis_matches_numpy(rng):
 
 
 def test_softmax_stability_matches_numpy(rng):
-    """The actual motivating case: subtract the row max before exp, so
-    large-magnitude scores don't overflow exp()."""
+    """A max-subtracted softmax matches numpy on scores large enough to overflow a raw exp."""
 
     def kernel(x_ref, o_ref):
         x = x_ref[...]

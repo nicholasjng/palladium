@@ -1,12 +1,8 @@
-"""Pre-flight for the adaptive controller: comparisons, select_n, inf/nan literals.
+"""Comparisons, select_n, and inf/nan literals.
 
-These are the emitter features an adaptive step controller stages; each
-test isolates one, and the last composes them into a controller-shaped
-loop. The inf/nan tests run under MathMode.SAFE on purpose: FAST permits
-Metal to assume infinities and NaNs never occur, so sentinel semantics
-are only well-defined under SAFE or RELAXED (see metal-runtime's
-MathMode docs). The controller itself should prefer a finfo-max sentinel
-and keep FAST; these tests pin the literal formatting regardless.
+The inf/nan tests run under MathMode.SAFE: FAST permits Metal to assume
+infinities and NaNs never occur, so sentinel semantics are only well-defined
+under SAFE or RELAXED.
 """
 
 import jax
@@ -140,8 +136,7 @@ def test_nan_literal_propagates(rng):
 
 
 def test_conditional_accumulation_in_loop(rng):
-    """The controller shape in miniature: per-element accept/reject inside
-    a fori_loop, composing comparisons, select_n, consts, and carries."""
+    """Per-element accept/reject inside a fori_loop composes comparisons, select_n, consts, and carries."""
 
     def kernel(y0_ref, r_ref, o_ref):
         r = r_ref[...]

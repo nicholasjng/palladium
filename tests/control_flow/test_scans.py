@@ -1,6 +1,8 @@
-"""lax.scan with scanned xs and stacked ys: the dense-output stepper
-idiom. Every lowering is diffed against the interpret oracle; the
-streaming-store fusion is additionally pinned by MSL text assertions."""
+"""lax.scan with scanned xs and stacked ys.
+
+Every lowering is diffed against the interpret oracle; the streaming-store
+fusion is additionally pinned by MSL text assertions.
+"""
 
 import jax
 import jax.numpy as jnp
@@ -53,9 +55,7 @@ def test_stacked_ys_without_xs(rng):
 
 
 def test_dense_output_scan_streams_to_the_ref(rng):
-    """The headline idiom: scan over save times, stack the states, write
-    the trajectory. The stacked ys must stream straight to the output
-    ref: no thread-local trajectory array, no final copy loop."""
+    """Stacked ys stream straight to the output ref, with no thread-local trajectory array or final copy loop."""
 
     def kernel(y0_ref, ts_ref, o_ref):
         def step(y, t):
@@ -74,8 +74,7 @@ def test_dense_output_scan_streams_to_the_ref(rng):
 
 
 def test_dense_output_survives_the_stack_ceiling(rng):
-    """A trajectory too large for the per-thread stack: only the
-    streaming path can lower and run this."""
+    """A trajectory too large for the per-thread stack lowers and runs through the streaming path."""
     n_save, dim = 4096, 8
 
     def kernel(y0_ref, o_ref):
@@ -152,9 +151,7 @@ def test_matrix_valued_xs_slices(rng):
 
 
 def test_aliased_output_is_not_a_streaming_target(rng):
-    """input_output_aliases shares the buffer with the input ref, whose
-    reads this level cannot see; the ys must take the thread-local path
-    and stay correct."""
+    """An aliased output shares its buffer with the input ref, so the ys take the thread-local path and stay correct."""
 
     def kernel(x_ref, o_ref):
         def step(acc, x):
@@ -174,8 +171,7 @@ def test_aliased_output_is_not_a_streaming_target(rng):
 
 
 def test_grid_blocked_dense_output(rng):
-    """One trajectory per program instance: the ensemble dense-output
-    shape, with the ys streaming into each instance's output block."""
+    """One trajectory per program instance streams its ys into that instance's output block."""
     import jax.experimental.pallas as pl
 
     n_traj, n_save = 8, 16
@@ -206,9 +202,7 @@ def test_grid_blocked_dense_output(rng):
 
 
 def test_full_block_xs_reads_the_ref_without_a_stack_copy(rng):
-    """A save-time grid consumed only as scan xs must not be copied to
-    the per-thread stack first; at this size only the aliased read can
-    lower and run."""
+    """A block consumed only as scan xs is read through the ref without a per-thread stack copy."""
     n_ts = 16384  # 64KB as f32: alone past the per-thread stack
 
     def kernel(ts_ref, o_ref):
@@ -228,8 +222,7 @@ def test_full_block_xs_reads_the_ref_without_a_stack_copy(rng):
 
 
 def test_scan_const_blocks_keep_their_thread_local_copy(rng):
-    """A block closed over by the scan body (a const) is re-read every
-    iteration: the cache copy must stay."""
+    """A block closed over by the scan body keeps its thread-local cache copy."""
 
     def kernel(w_ref, ts_ref, o_ref):
         w = w_ref[...]  # const inside the body: copied
@@ -249,8 +242,7 @@ def test_scan_const_blocks_keep_their_thread_local_copy(rng):
 
 
 def test_block_used_as_both_xs_and_const_still_copies(rng):
-    """One value feeding the same scan in two positions disqualifies the
-    alias; correctness first."""
+    """One value feeding the same scan as both xs and const disqualifies the alias."""
 
     def kernel(ts_ref, o_ref):
         ts = ts_ref[...]

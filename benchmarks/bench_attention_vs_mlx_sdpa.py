@@ -1,12 +1,12 @@
 """Palladium's Pallas attention against MLX's fused SDPA, both under jax.jit on MPS.
 
 jax-mps routes ``jax.nn.dot_product_attention`` to MLX's fused
-scaled-dot-product kernel, so this is the bar Palladium's cooperative
-attention has to clear to be worth using from JAX. Each case runs one
-candidate as an ordinary jitted JAX function on the ``mps`` device with
-resident inputs: Palladium as the Pallas backend for mps, MLX's fused SDPA, and a
-plain ``jnp`` softmax attention to show what XLA fusion alone gets. Every
-candidate is checked against the NumPy reference before timing.
+scaled-dot-product kernel; that is the bar for Palladium's cooperative
+attention from JAX. Each case runs one candidate as a jitted JAX
+function on the ``mps`` device with resident inputs: Palladium as the
+Pallas backend for mps, MLX's fused SDPA, and a plain ``jnp`` softmax
+attention as the XLA-fusion-only baseline. Every candidate is checked
+against the NumPy reference before timing.
 
 Run on a Metal 4 machine with the jax-mps ``palladium-dispatch`` handler:
 

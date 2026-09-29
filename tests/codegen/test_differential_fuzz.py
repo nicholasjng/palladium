@@ -1,28 +1,18 @@
 """Differential fuzzing: random kernels, Metal vs the interpret oracle.
 
 Hypothesis composes kernels from the emitter's own vocabulary (expression
-trees over refs and literals; fori_loops with consts, tuple carries, and
+trees over refs and literals; loops with consts, tuple carries, and
 pass-through/permuted outputs) and asserts the Metal result matches
-`interpret=True`. Emitter bugs are feature *interactions* (the paren bug
-hid behind an untested cast, the carry-permutation bug behind an untested
-pass-through), and random composition explores exactly the programs nobody
-thought to write.
+`interpret=True`.
 
-Design decisions, deliberate:
-
-- Kernels compile under MathMode.SAFE: we are testing the emitter, not
-  Metal's fast math, so reassociation is removed from the comparison.
-  Tolerances (1e-4) still absorb libm implementation differences between
-  Metal and CPU transcendentals; emitter bugs are catastrophically wrong,
-  not ulp-wrong.
+- Kernels compile under MathMode.SAFE so reassociation is removed from the
+  comparison. Tolerances (1e-4) absorb libm differences between Metal and
+  CPU transcendentals; emitter bugs are catastrophically wrong, not ulp-wrong.
 - Generated ops are numerically tamed by construction (exp only as
   exp(-|x|), division by |b|+1, loop bodies wrapped in tanh, inputs in
-  [-2, 2]) so failures mean wrong code, not overflow; false-positive
-  discipline is what keeps a fuzzer worth running.
+  [-2, 2]) so failures mean wrong code, not overflow.
 - GPU-bound and slow, so opt-in: `uv run pytest -m fuzz`. Scale with
-  PALLADIUM_FUZZ_EXAMPLES (default 100 per test). On failure Hypothesis
-  shrinks to a minimal kernel and prints a @reproduce_failure blob; turn
-  the shrunk case into a named regression test, like test_carry_permutation.
+  PALLADIUM_FUZZ_EXAMPLES (default 100 per test).
 """
 
 import dataclasses
@@ -50,9 +40,9 @@ UNARY = {
     "sin": jnp.sin,
     "cos": jnp.cos,
     "tanh": jnp.tanh,
-    # The offset bounds the derivative (<= 1): bare sqrt(|x|) has an
-    # infinite slope at 0 and amplifies sub-tolerance backend
-    # differences when iterated (Metal's tanh flushes |x| < ~2^-25 to 0).
+    # The offset bounds the derivative (<= 1): bare sqrt(|x|) has an infinite
+    # slope at 0 and amplifies sub-tolerance backend differences when
+    # iterated (Metal's tanh flushes |x| < ~2^-25 to 0).
     "sqrt_abs": lambda a: jnp.sqrt(jnp.abs(a) + 0.25),
     "exp_negabs": lambda a: jnp.exp(-jnp.abs(a)),  # bounded (0, 1]
 }
@@ -64,11 +54,9 @@ BINARY = {
     "min": jnp.minimum,
     "max": jnp.maximum,
 }
-# Comparisons appear only inside where-nodes, and only over *leaves*: raw
+# Comparisons appear only inside where-nodes, and only over leaves: raw
 # inputs and literals are bit-identical on both backends, so the predicate
-# cannot flip on ulp noise between Metal and CPU libm. Computed comparison
-# operands would turn last-ulp differences into branch divergence, a false
-# positive no tolerance absorbs.
+# cannot flip on ulp noise between Metal and CPU libm.
 COMPARE = {
     "lt": lambda a, b: a < b,
     "le": lambda a, b: a <= b,
@@ -106,11 +94,10 @@ def trees(n_inputs: int, compare_refs: range | None = None):
     )
     refs = st.integers(0, n_inputs - 1).map(lambda i: Leaf(ref=i, lit=None))
     leaves = st.one_of(refs, literals)
-    # Comparison operands must be bit-identical on both backends (see
-    # COMPARE). In loop bodies the tree's ref leaves are *carries*, i.e.
-    # computed values after the first iteration, so callers there pass
-    # compare_refs restricted to the loop consts; a comparison against a
-    # carry once flipped a branch on a 1-ulp tanh difference.
+    # In loop bodies the tree's ref leaves are carries, computed values after
+    # the first iteration, so callers there restrict compare_refs to the loop
+    # consts; a comparison against a carry can flip a branch on a 1-ulp tanh
+    # difference.
     if compare_refs is None:
         cmp_leaves = leaves
     elif len(compare_refs) > 0:
@@ -125,8 +112,7 @@ def trees(n_inputs: int, compare_refs: range | None = None):
             st.tuples(st.sampled_from(sorted(BINARY)), kids, kids).map(
                 lambda t: Node(t[0], (t[1], t[2]))
             ),
-            # Conditionals: comparison over stable leaves only, general
-            # branches. Every instance crosses jit-inlining + select_n.
+            # Conditionals: comparison over stable leaves only, general branches.
             st.tuples(st.sampled_from(sorted(COMPARE)), cmp_leaves, cmp_leaves, kids, kids).map(
                 lambda t: Node(f"where_{t[0]}", (t[1], t[2], t[3], t[4]))
             ),
@@ -165,8 +151,8 @@ def make_elementwise_kernel(tree, n_inputs):
         vals = [r[...] for r in ins]
         res = eval_tree(tree, vals)
         if jnp.shape(res) != jnp.shape(vals[0]):
-            # Literal-only tree folded to a scalar: anchor it to an input's
-            # shape so the store sees a block (stages mul/add, both covered).
+            # A literal-only tree folds to a scalar; anchor it to an input's
+            # shape so the store sees a block.
             res = res + 0.0 * vals[0]
         out[...] = res
 
@@ -194,9 +180,8 @@ def loop_cases(draw):
     n_carry = draw(st.integers(1, 3))
     n_consts = draw(st.integers(0, 2))
     length = draw(st.integers(1, 7))
-    # Per carry: either pass another carry through unchanged (the aliasing
-    # cases: self-forward and permutation) or compute a tamed expression
-    # over all carries and consts.
+    # Per carry: either pass another carry through unchanged (self-forward
+    # and permutation) or compute a tamed expression over carries and consts.
     plans = draw(
         st.tuples(
             *[
@@ -228,9 +213,7 @@ def make_loop_kernel(n_carry, n_consts, length, plans):
                 if isinstance(plan, int):
                     new.append(carry[plan])
                 else:
-                    # tanh bounds the carry so `length` iterations cannot
-                    # overflow: divergence then means wrong code, not
-                    # accumulated extremes.
+                    # tanh bounds the carry so `length` iterations cannot overflow.
                     new.append(jnp.tanh(eval_tree(plan, vals) + 0.0 * carry[0]))
             return tuple(new)
 
@@ -256,10 +239,7 @@ def test_fuzz_loops(case):
 
 @st.composite
 def scan_cases(draw):
-    """lax.scan with scanned xs and stacked ys: slices of raw input data
-    scan per step, carries evolve tamed trees, and each stacked ys is
-    either swap-consumed directly (the streaming path) or nudged through
-    an add first (the thread-local path)."""
+    """lax.scan cases with scanned xs and stacked ys, each ys either stored directly (streaming path) or through an add (thread-local path)."""
     n_carry = draw(st.integers(1, 2))
     n_consts = draw(st.integers(0, 1))
     n_xs = draw(st.integers(0, 2))
@@ -385,11 +365,10 @@ def switch_cases(draw):
 
 
 def make_switch_kernel(branches, n_inputs):
-    # The branch index derives from abs+scale+cast, all exact float ops,
-    # so it is bit-identical on both backends (same reasoning as COMPARE:
-    # no computed float compare may sit under control flow). Indexed off
-    # the ref, not the loaded array: value-level indexing stages `slice`,
-    # which the emitter does not lower.
+    # The branch index derives from abs+scale+cast, all exact float ops, so
+    # it is bit-identical on both backends. It indexes the ref, not the
+    # loaded array: value-level indexing stages `slice`, which the emitter
+    # does not lower.
     def kernel(*refs):
         *ins, out = refs
         vals = [r[...] for r in ins]
@@ -406,9 +385,7 @@ def make_switch_kernel(branches, n_inputs):
 @settings(max_examples=MAX_EXAMPLES, deadline=None)
 @given(switch_cases())
 def test_fuzz_cond(case):
-    """`lax.cond`/`lax.switch`: divergent branch selection per program
-    instance (blocked grids give each block its own index), clamped
-    switch semantics, branch bodies from the same tree grammar."""
+    """lax.switch with per-instance branch selection and clamped index semantics matches the oracle."""
     n_inputs, branches, blocked, args = case
     kwargs: dict = {"out_shape": jax.ShapeDtypeStruct((N,), jnp.float32)}
     if blocked:
@@ -446,11 +423,9 @@ def while_cases(draw):
 
 
 def make_while_kernel(n_carry, n_consts, plans):
-    # Trip count 0..4 derives from exact float ops on input element 0, so
-    # every instance's count is bit-identical on both backends while
-    # *differing across instances* under a blocked grid: divergent
-    # while-loop trip counts are exactly what the classic model must
-    # support.
+    # Trip count 0..4 derives from exact float ops on input element 0, so it
+    # is bit-identical on both backends while differing across instances
+    # under a blocked grid.
     def kernel(*refs):
         ins, outs = refs[: n_carry + n_consts], refs[n_carry + n_consts :]
         init = tuple(r[...] for r in ins[:n_carry])
