@@ -7,41 +7,21 @@ composable with jax.jit, through metal-runtime's C API (`native/ffi/`).
 from __future__ import annotations
 
 import ctypes
-import dataclasses
-import hashlib
 import importlib.resources
 import math
 import os
 import threading
-from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from metal_runtime import MathMode
+from typing import Any
 
 import jax
 import numpy as np
 
-from palladium.diagnostics import (
-    KernelDiagnostics,
-    check_threadgroup,
-    explain_spec,
-    log_compile,
-    normalize_threadgroup,
-    simdgroup_width,
-)
-from palladium.emit import emit_msl
-from palladium.trace import KernelSpec, trace
-from palladium.verify import DEFAULT_ATOL, DEFAULT_RTOL, verify_against
+from palladium._callable import CallOptions, PallasCallable
+from palladium.diagnostics import simdgroup_width
 
 __all__ = ["FfiCallable", "metal_call_jit"]
-
-
-def _unwrap(outs):
-    """Match `__call__`'s convention: a bare array for single-output."""
-    return outs[0] if len(outs) == 1 else outs
 
 
 _TARGET_NAME = "palladium_dispatch"
@@ -100,7 +80,7 @@ def _register() -> None:
 _SAFE_VMAP_METHODS = (None, "sequential", "sequential_unrolled", "pipelined")
 
 
-class FfiCallable:
+class FfiCallable(PallasCallable):
     """A palladium kernel registered as a jax.ffi target: jax.jit-composable.
 
     Unlike `MetalCallable` (NumPy in, NumPy out, eager), dispatch happens
@@ -108,29 +88,15 @@ class FfiCallable:
     `jnp` ops. Tracing and MSL emission are cached per input shape/dtype.
 
     Not differentiable by itself: `ffi_call` has no JVP/transpose rule.
-    Pair a forward and a backward kernel through `jax.custom_vjp`.
-
-    Attributes
-    ----------
-    interpret : callable
-        The same pallas_call with `interpret=True`: the CPU oracle.
+    Pair a forward and a backward kernel through `with_vjp`.
     """
 
-    def __init__(
-        self,
-        kernel: Callable,
-        pallas_kwargs: dict[str, Any],
-        math_mode: MathMode | str,
-        vmap_method: str | None = "pipelined",
-        threadgroup: int | tuple[int, ...] | None = None,
-        cache_size: int = 256,
-        dot_general: str = "auto",
-    ) -> None:
-        import jax.experimental.pallas as pl
+    execution_path = "cpu-ffi-to-metal"
 
-        if vmap_method not in _SAFE_VMAP_METHODS:
+    def __init__(self, kernel: Callable, pallas_kwargs: dict[str, Any], options: CallOptions):
+        if options.vmap_method not in _SAFE_VMAP_METHODS:
             raise ValueError(
-                f"vmap_method {vmap_method!r} is not supported: the launch "
+                f"vmap_method {options.vmap_method!r} is not supported: the launch "
                 "grid is baked per unbatched shape, so whole-batch methods "
                 "would dispatch it over batched buffers. Use 'pipelined' "
                 "(the default: one FFI call, the native handler loops the "
@@ -138,67 +104,13 @@ class FfiCallable:
                 "dispatch per batch element), or put the batch dimension "
                 "in the Pallas grid instead."
             )
-        self._staged = pl.pallas_call(kernel, **pallas_kwargs)
-        self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
+        super().__init__(kernel, pallas_kwargs, options)
         # MathMode is a StrEnum, so members index the dict as their value.
-        self._math_mode = _MATH_MODE_ORDINALS[math_mode]
-        self._execution_path = "cpu-ffi-to-metal"
-        self._vmap_method = vmap_method
-        self._threadgroup = normalize_threadgroup(threadgroup)
-        if dot_general not in ("auto", "default", "tensorops"):
-            raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
-        self._dot_general = dot_general
-        # Bounded LRU of traced specs and emitted MSL.
-        self._cache: OrderedDict[tuple, tuple[KernelSpec, str, str]] = OrderedDict()
-        self._cache_size = cache_size
-        # Serialize cache misses.
-        self._lock = threading.Lock()
+        self._math_mode_ordinal = _MATH_MODE_ORDINALS[options.math_mode]
+        self._vmap_method = options.vmap_method
         # Wrap None so its batching error uses Palladium's API terminology.
-        self._pipelined = self._build_pipelined() if vmap_method in ("pipelined", None) else None
-
-    def explain(self, *args) -> KernelDiagnostics:
-        """Report launch geometry and emitted MSL size for these inputs.
-        Emits MSL; compiles and dispatches nothing.
-
-        Parameters
-        ----------
-        *args
-            Arrays or `jax.ShapeDtypeStruct`s fixing input shapes; no
-            data is read.
-        """
-        shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
-        return dataclasses.replace(
-            explain_spec(
-                trace(self._staged, *shapes),
-                self._threadgroup,
-                dot_general=self._dot_general,
-            ),
-            execution_path=self._execution_path,
-        )
-
-    def verify(
-        self,
-        *args,
-        reference=None,
-        rtol: float = DEFAULT_RTOL,
-        atol: float = DEFAULT_ATOL,
-    ):
-        """Run through jax.ffi and diff against a reference.
-
-        Mirrors `MetalCallable.verify`. Arguments reach the GPU as JAX
-        arrays here, so a `reference=` callable receives what you pass in.
-        """
-        shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
-        return _unwrap(
-            verify_against(
-                self.__call__,
-                None if reference is not None else self.interpret,
-                trace(self._staged, *shapes).uses_threadgroup,
-                args,
-                reference,
-                rtol,
-                atol,
-            )
+        self._pipelined = (
+            self._build_pipelined() if options.vmap_method in ("pipelined", None) else None
         )
 
     def pin(self, *args) -> Callable[[], Any]:
@@ -214,36 +126,6 @@ class FfiCallable:
             "across calls. Use palladium.metal_call(...).pin for the eager "
             "path, or keep inputs as device arrays and let jit reuse them."
         )
-
-    def _spec_and_msl(self, args: tuple[Any, ...]) -> tuple[KernelSpec, str, str]:
-        key = tuple((a.shape, np.dtype(a.dtype).str) for a in args)
-        # Keep lookup and LRU promotion together; another specialization
-        # can evict this entry while a concurrent call is touching it.
-        with self._lock:
-            entry = self._cache.get(key)
-            if entry is not None:
-                self._cache.move_to_end(key)
-        if entry is None:
-            with self._lock:
-                entry = self._cache.get(key)
-                if entry is None:
-                    shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
-                    spec = trace(self._staged, *shapes)
-                    check_threadgroup(spec, self._threadgroup)
-                    log_compile(
-                        spec,
-                        self._threadgroup,
-                        execution_path=self._execution_path,
-                        dot_general=self._dot_general,
-                    )
-                    msl = emit_msl(spec, dot_general=self._dot_general)
-                    # Content digest: the native kernel cache keys on it
-                    # instead of copying and hashing the source per call.
-                    entry = (spec, msl, hashlib.sha256(msl.encode()).hexdigest())
-                    self._cache[key] = entry
-                    while self._cache_size and len(self._cache) > self._cache_size:
-                        self._cache.popitem(last=False)
-        return entry
 
     def __call__(self, *args):
         """Dispatch via jax.ffi; traceable and jittable."""
@@ -358,7 +240,7 @@ class FfiCallable:
             threadgroup_x=int(threadgroup[0]),
             threadgroup_y=int(threadgroup[1]),
             threadgroup_z=int(threadgroup[2]),
-            math_mode=self._math_mode,
+            math_mode=self._math_mode_ordinal,
             batch_size=1 if axis_size is None else int(axis_size),
             elem_strides=np.asarray(in_strides + out_strides, dtype=np.int64),
         )
@@ -395,21 +277,6 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
     >>> add_one = metal_call_jit(kernel, out_shape=...)  # doctest: +SKIP
     >>> jax.jit(lambda x: jnp.sum(add_one(x) ** 2))(x)  # doctest: +SKIP
     """
-    from metal_runtime import MathMode
-
-    math_mode = pallas_kwargs.pop("math_mode", MathMode.FAST)
-    vmap_method = pallas_kwargs.pop("vmap_method", "pipelined")
-    threadgroup = pallas_kwargs.pop("threadgroup", None)
-    cache_size = pallas_kwargs.pop("cache_size", 256)
-    dot_general = pallas_kwargs.pop("dot_general", "auto")
-    if dot_general not in ("auto", "default", "tensorops"):
-        raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
     return FfiCallable(
-        kernel,
-        pallas_kwargs,
-        math_mode,
-        vmap_method,
-        threadgroup,
-        cache_size,
-        dot_general,
+        kernel, pallas_kwargs, CallOptions.split(pallas_kwargs, vmap_method="pipelined")
     )
