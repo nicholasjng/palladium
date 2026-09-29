@@ -215,7 +215,7 @@ def test_tensorops_matmul_accumulates_k_in_tensorops_tiles_and_handles_tail():
     assert "for (int k_start = 0; k_start < 144; k_start += 128)" in compilation.source
     assert "min(128, 144 - k_start)" in compilation.source
     assert "op.run(a_k, b_k, cTc);" in compilation.source
-    assert "cTc[init0] = float(0.0f);" in compilation.source
+    assert "cTc[init0] = 0.0f;" in compilation.source
 
 
 def test_tensorops_matmul_masks_partial_output_tiles():
@@ -247,9 +247,12 @@ def test_tensorops_matmul_accepts_half_precision_buffer_types(dtype, metal_type)
 
     assert f"device {metal_type}* arg0 [[buffer(0)]]" in compilation.source
     assert f"device {metal_type}* arg2 [[buffer(2)]]" in compilation.source
-    assert f"get_destination_cooperative_tensor<decltype(a), decltype(b), {metal_type}>()" in (
+    # Products accumulate in float and narrow on the per-element store.
+    assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in (
         compilation.source
     )
+    assert "threadgroup float dot_result[512];" in compilation.source
+    assert f"= {metal_type}(dot_result[element]);" in compilation.source
 
 
 def test_tensorops_matmul_lowering_composes_relu_and_residual_epilogues():
