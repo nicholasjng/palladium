@@ -183,12 +183,13 @@ def test_bfloat16_dispatches_through_ffi():
 
 
 def test_stack_overflow_names_the_fix():
-    # A gridless kernel copies its whole 4096-element block into a
-    # thread-local array, overflowing the per-thread stack. The opaque
+    # A gridless kernel copies its whole 65536-element block into
+    # thread-local arrays, overflowing the per-thread stack. The opaque
     # Metal pipeline error must arrive wrapped with the actual fix.
     def kernel(x_ref, y_ref, o_ref):
         o_ref[...] = 2.0 * x_ref[...] + y_ref[...]
 
-    call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((4096,), jnp.float32))
+    n = 65536
+    call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((n,), jnp.float32))
     with pytest.raises(EmitError, match="grid and BlockSpecs"):
-        call(np.zeros(4096, dtype=np.float32), np.zeros(4096, dtype=np.float32))
+        call(np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32))
