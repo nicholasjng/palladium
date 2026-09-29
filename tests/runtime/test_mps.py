@@ -367,3 +367,40 @@ def test_mps_call_composes_with_jax_mps_when_available():
         got = composed(x, y)
     assert got.device.platform == "mps"
     assert float(got) == pytest.approx(1496.0)
+
+
+def test_cooperative_tensorops_matmul_runs_under_jit_on_mps_when_available():
+    """A cooperative kernel through jax-mps: descriptor v2 carries the MPP
+    header, the threadgroup-position prologue, and the scaled launch."""
+    try:
+        device = jax.devices("mps")[0]
+    except (RuntimeError, IndexError):
+        pytest.skip("requires the jax-mps plugin")
+
+    def dot(a_ref, b_ref, o_ref):
+        o_ref[...] = jnp.dot(a_ref[...], b_ref[...])
+
+    call = palladium.mps_call_jit(
+        dot,
+        grid=(2, 2),
+        in_specs=[
+            pl.BlockSpec((16, 16), lambda i, j: (i, 0)),
+            pl.BlockSpec((16, 32), lambda i, j: (0, j)),
+        ],
+        out_specs=pl.BlockSpec((16, 32), lambda i, j: (i, j)),
+        out_shape=jax.ShapeDtypeStruct((32, 64), jnp.float32),
+        dot_general="tensorops",
+        fallback="error",
+    )
+
+    @jax.jit
+    def composed(a, b):
+        return call(a, b) + 1.0
+
+    rng = np.random.default_rng(3)
+    a_np = rng.standard_normal((32, 16), dtype=np.float32)
+    b_np = rng.standard_normal((16, 64), dtype=np.float32)
+    with jax.default_device(device):
+        got = composed(jnp.asarray(a_np), jnp.asarray(b_np))
+    assert got.device.platform == "mps"
+    np.testing.assert_allclose(np.asarray(got), a_np @ b_np + 1.0, rtol=1e-4, atol=1e-4)
