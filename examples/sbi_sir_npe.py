@@ -6,10 +6,11 @@ estimator on the (theta, x) pairs, then sample it at the observation.
 The GPU touches only the first stage. This example measures two things:
 
 1. Interchangeability of GPU- and CPU-simulated data. sbi's NPE is
-   trained on the same number of draws from the Palladium simulator and
-   from a per-draw SciPy solver; both posteriors are sampled at one
-   observation and compared with the classifier two-sample test (C2ST;
-   0.5 means indistinguishable).
+   trained on the same draws from three simulators: Palladium, the same
+   RK4 scheme vectorized in NumPy (the strong CPU baseline), and a
+   per-draw SciPy solver (the pattern sbi's own tutorials use). Each
+   posterior is sampled at one observation and compared with Palladium's
+   by the classifier two-sample test (C2ST; 0.5 means indistinguishable).
 2. The split of wall clock between simulation and training for the
    full-size Palladium dataset.
 
@@ -37,9 +38,16 @@ from sbi_sir import (
     PRIOR_LOC,
     PRIOR_SCALE,
     as_sbi_simulator,
+    numpy_simulator,
     observe,
     palladium_simulator,
     scipy_simulator,
+)
+
+SIMULATORS = (
+    ("palladium", palladium_simulator),
+    ("numpy", numpy_simulator),
+    ("scipy", scipy_simulator),
 )
 
 
@@ -102,53 +110,57 @@ def main() -> None:
     x_o = torch.as_tensor(observation(theta_true))
     print(f"observation from theta={theta_true.tolist()}: {x_o.to(torch.int64).tolist()}")
 
-    # 1. Interchangeability: same draws, two simulators, one observation.
+    # 1. Interchangeability: same draws, three simulators, one observation.
     # The observation model quantizes I/N into counts of 1000, so simulators
     # that agree to a few 1e-6 in the fraction usually produce bit-identical
     # datasets and identical estimators. C2ST is reported only when the
     # datasets differ; the metric misbehaves on identical sample sets.
     print(f"\ninterchangeability at {args.compare_n} draws per simulator")
     datasets, posteriors = {}, {}
-    for name, fractions in (("palladium", palladium_simulator), ("scipy", scipy_simulator)):
-        theta, x, t_sim = simulate(prior, fractions, args.compare_n, args.seed)
-        datasets[name] = (theta, x, t_sim)
+    for name, fractions in SIMULATORS:
+        datasets[name] = simulate(prior, fractions, args.compare_n, args.seed)
     theta_p, x_p, _ = datasets["palladium"]
-    theta_s, x_s, _ = datasets["scipy"]
-    assert torch.equal(theta_p, theta_s), "seeded proposals must match"
-    fraction_gap = np.max(
-        np.abs(palladium_simulator(theta_p.numpy()) - scipy_simulator(theta_s.numpy()))
-    )
-    differing = int((x_p != x_s).sum())
-    print(
-        f"  max |I/N| deviation between simulators {fraction_gap:.2e}; "
-        f"{differing} of {x_p.numel()} observed counts differ"
-    )
-    for name in ("palladium", "scipy"):
+    fractions_p = palladium_simulator(theta_p.numpy())
+    for name, fractions in SIMULATORS[1:]:
+        theta, x, _ = datasets[name]
+        assert torch.equal(theta_p, theta), "seeded proposals must match"
+        gap = np.max(np.abs(fractions_p - fractions(theta.numpy())))
+        differing = int((x_p != x).sum())
+        print(
+            f"  palladium vs {name:6s} max |I/N| deviation {gap:.2e}; "
+            f"{differing} of {x_p.numel()} observed counts differ"
+        )
+    for name, _ in SIMULATORS:
         theta, x, t_sim = datasets[name]
         posterior, t_train = train_npe(prior, theta, x, seed=args.seed, max_epochs=args.max_epochs)
         samples = posterior.sample((args.posterior_samples,), x=x_o, show_progress_bars=False)
         posteriors[name] = samples
         mean, std = samples.mean(0).tolist(), samples.std(0).tolist()
         print(
-            f"  {name:10s} simulate {t_sim:7.2f} s  train {t_train:7.1f} s  "
+            f"  {name:10s} simulate {t_sim:7.3f} s  train {t_train:7.1f} s  "
             f"posterior mean {mean[0]:.4f} {mean[1]:.4f}  std {std[0]:.4f} {std[1]:.4f}"
         )
-    if differing == 0:
-        print(
-            "  datasets are identical, so the estimators and posteriors are identical by construction"
-        )
-    else:
-        score = float(c2st(posteriors["palladium"], posteriors["scipy"]))
-        print(f"  C2ST(palladium, scipy) = {score:.3f}  (0.5 = indistinguishable)")
+    for name, _ in SIMULATORS[1:]:
+        if torch.equal(x_p, datasets[name][1]):
+            print(
+                f"  palladium and {name} datasets are identical, posteriors identical by construction"
+            )
+        else:
+            score = float(c2st(posteriors["palladium"], posteriors[name]))
+            print(f"  C2ST(palladium, {name}) = {score:.3f}  (0.5 = indistinguishable)")
 
     # 2. Where the time goes at full size.
     print(f"\nfull run, {args.n} Palladium draws")
     theta, x, t_sim = simulate(prior, palladium_simulator, args.n, args.seed)
+    _, _, t_numpy = simulate(prior, numpy_simulator, args.n, args.seed)
     posterior, t_train = train_npe(prior, theta, x, seed=args.seed, max_epochs=args.max_epochs)
     samples = posterior.sample((args.posterior_samples,), x=x_o, show_progress_bars=False)
     lo, hi = np.quantile(samples.numpy(), [0.025, 0.975], axis=0)
     covered = bool(np.all((lo <= theta_true) & (theta_true <= hi)))
-    print(f"  simulate {t_sim:.3f} s, train {t_train:.1f} s, sample {args.posterior_samples}")
+    print(
+        f"  simulate {t_sim:.3f} s (numpy {t_numpy:.3f} s), train {t_train:.1f} s, "
+        f"sample {args.posterior_samples}"
+    )
     print(
         f"  posterior mean {samples.mean(0).tolist()}  95% interval {lo.tolist()} .. {hi.tolist()}"
     )
