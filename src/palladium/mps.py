@@ -21,6 +21,7 @@ from collections.abc import Callable
 from typing import Any, overload
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax._src import core as jax_core, dispatch as jax_dispatch
 from jax._src.interpreters import mlir
@@ -223,6 +224,39 @@ def _abstract_eval(*_, descriptor: MpsDispatchDescriptor, **__) -> tuple[Any, ..
 
 _mps_dispatch_p.def_abstract_eval(_abstract_eval)
 _mps_dispatch_p.def_impl(functools.partial(jax_dispatch.apply_primitive, _mps_dispatch_p))
+
+
+def _batching(batched_args, batch_dims, **params):
+    """`jax.vmap` over the custom call: one dispatch per batch element.
+
+    The launch grid is baked into the descriptor for the unbatched shape,
+    so the batch cannot be folded into it after tracing; `lax.map` runs the
+    elements sequentially instead. A batch axis in the Pallas grid is one
+    dispatch total and is the faster choice when the kernel allows it.
+    """
+    # Batch dims are ints for mapped operands and None for unmapped ones.
+    mapped = [d is not None for d in batch_dims]
+    size = next(a.shape[d] for a, d in zip(batched_args, batch_dims, strict=True) if d is not None)
+    moved = [
+        a if d is None else jnp.moveaxis(a, d, 0)
+        for a, d in zip(batched_args, batch_dims, strict=True)
+    ]
+
+    def element(index):
+        args = [a[index] if m else a for a, m in zip(moved, mapped, strict=True)]
+        return tuple(_mps_dispatch_p.bind(*args, **params))
+
+    outs = jax.lax.map(element, jnp.arange(size))
+    return tuple(outs), (0,) * len(outs)
+
+
+def _register_batching() -> None:
+    from jax._src.interpreters import batching
+
+    batching.primitive_batchers[_mps_dispatch_p] = _batching
+
+
+_register_batching()
 
 
 def _fallback_lowering(ctx, *args, fallback, allow_fallback=True, cooperative=False, **_):
@@ -538,8 +572,9 @@ def mps_call_jit(
     because it models groups of one. ``explain`` reports the expected path;
     explicit JIT placement can override its platform inference.
 
-    ``vmap`` is deliberately unsupported in v1; place an independent batch
-    dimension directly in the Pallas grid so one invocation is one dispatch.
+    ``jax.vmap`` runs one dispatch per batch element through ``lax.map``;
+    a batch dimension in the Pallas grid is one dispatch in total and is
+    preferable when the kernel allows it.
     Pass ``vjp_reference`` to opt into a correctness-first custom VJP: the
     forward pass is the MPS custom call and the backward pass is generated from
     the matching pure-JAX reference.  A Pallas discrete-adjoint kernel remains
@@ -553,11 +588,13 @@ def mps_call_jit(
     dot_general = pallas_kwargs.pop("dot_general", "auto")
     if dot_general not in ("auto", "default", "tensorops"):
         raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
-    vmap_method = pallas_kwargs.pop("vmap_method", None)
-    if vmap_method is not None:
+    vmap_method = pallas_kwargs.pop("vmap_method", "sequential")
+    if vmap_method not in (None, "sequential"):
         raise ValueError(
-            "mps_call_jit does not batch a custom call in v1; put the batch "
-            "dimension in the Pallas grid so the whole batch is one dispatch"
+            "mps_call_jit batches jax.vmap sequentially (one dispatch per "
+            "element through lax.map); other vmap methods are not available "
+            "because the launch grid is baked per unbatched shape. Put the "
+            "batch dimension in the Pallas grid for one dispatch in total."
         )
     call = MpsCallable(
         kernel, pallas_kwargs, math_mode, threadgroup, cache_size, fallback, dot_general

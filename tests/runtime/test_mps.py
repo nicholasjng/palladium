@@ -257,12 +257,26 @@ def test_mps_call_has_a_portable_cpu_fallback():
     np.testing.assert_array_equal(np.asarray(call.verify(x, y)), np.asarray(x + y))
 
 
-def test_mps_call_requires_batch_in_the_grid():
-    with pytest.raises(ValueError, match="batch dimension in the Pallas grid"):
+def test_mps_call_vmaps_one_dispatch_per_element():
+    """jax.vmap over the custom call runs sequentially through lax.map; here on
+    the interpreter fallback, on MPS as one custom call per element. An
+    unbatched operand is shared across elements."""
+    call = palladium.mps_call_jit(_add_kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32))
+    xs = jnp.arange(24, dtype=jnp.float32).reshape(3, 8)
+    y = jnp.ones(8, dtype=jnp.float32)
+    got = jax.jit(jax.vmap(call, in_axes=(0, None)))(xs, y)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(xs + y))
+    # Batch axis in a non-leading position, both operands batched.
+    got = jax.vmap(call, in_axes=(1, 0))(xs.T, xs * 2.0)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(xs + xs * 2.0))
+
+
+def test_mps_call_rejects_whole_batch_vmap_methods():
+    with pytest.raises(ValueError, match="batches jax.vmap sequentially"):
         palladium.mps_call_jit(
             _add_kernel,
             out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
-            vmap_method="sequential",
+            vmap_method="broadcast_all",
         )
 
 

@@ -110,7 +110,7 @@ reference instead.
 
 | Path | JIT | vmap | Gradients |
 |---|---|---|---|
-| `mps_call_jit` | Yes, through jax-mps | Unsupported | Pair forward/backward calls with `custom_vjp`, or supply a pure-JAX reference VJP |
+| `mps_call_jit` | Yes, through jax-mps | Sequential: one dispatch per element through `lax.map` | Pair forward/backward calls with `custom_vjp`, or supply a pure-JAX reference VJP |
 | `metal_call_jit` | Yes, through CPU FFI to Metal | Pipelined by default; sequential methods also available | Pair with `custom_vjp` |
 | `metal_call` | Eager NumPy interface | Not a JAX transformation | No automatic differentiation |
 
