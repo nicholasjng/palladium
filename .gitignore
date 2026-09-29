@@ -6,3 +6,6 @@ __pycache__/
 /build/
 /.cache/clangd/
 compile_commands.json
+
+# sbi writes TensorBoard summaries next to the caller (examples/sbi_sir_npe.py)
+sbi-logs/
