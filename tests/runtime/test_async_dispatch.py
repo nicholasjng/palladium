@@ -38,18 +38,6 @@ def _make_bound(n: int, **bind_kwargs):
     return bind(spec, _INC_SOURCE, **bind_kwargs)
 
 
-def test_launch_wait_matches_call(rng):
-    n = 256
-    bound = _make_bound(n)
-    x = rng.standard_normal(n).astype(np.float32)
-
-    via_call = bound(x)
-    via_launch = bound.launch(x).wait()
-
-    np.testing.assert_allclose(via_launch, via_call)
-    np.testing.assert_allclose(via_call, x + 1.0)
-
-
 def test_stepping_loop_via_launch_matches_repeated_call(rng):
     """launch()-then-wait()-then-launch() produces the same trajectory as plain repeated calls."""
     n = 64

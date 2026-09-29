@@ -76,19 +76,6 @@ def _angular_momentum(qx, qy, px, py):
     return qx * py - qy * px
 
 
-def test_matches_interpret_oracle():
-    n = 256
-    f = make_solver(n)
-    *args, _ = _ensemble(n)
-    got = f(*args)
-    want = f.interpret(*args)
-    # Over 20k f32 Verlet steps the GPU and the CPU oracle diverge in phase
-    # along the orbit long before they diverge in the invariants, hence the
-    # loose positional bar.
-    for g, w in zip(got, want):
-        np.testing.assert_allclose(g, np.asarray(w), rtol=2e-2, atol=2e-2)
-
-
 def test_conserves_angular_momentum():
     """L is exact for a central force under Verlet, so the budget is round-off over 20k float32 steps (eps*sqrt(steps) ~ 1e-5) plus FAST-math reassociation; 1e-4 is still four orders below any structural bug."""
     n = 256

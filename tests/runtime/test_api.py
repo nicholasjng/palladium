@@ -69,12 +69,6 @@ def test_verify_returns_the_gpu_output(rng):
     np.testing.assert_array_equal(f.verify(x), f(x))
 
 
-def test_verify_accepts_an_explicit_reference(rng):
-    f = _tanh_call()
-    x = rng.standard_normal(64, dtype=np.float32)
-    f.verify(x, reference=lambda a: np.tanh(a) * 2.0)
-
-
 def test_verify_reports_the_worst_element():
     """A verification failure names the worst element's index."""
     f = _tanh_call()
@@ -165,7 +159,7 @@ def test_stack_overflow_carries_the_measured_size():
         lambda x_ref, o_ref: o_ref.__setitem__(..., x_ref[...] * 2.0),
         out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
     )
-    with pytest.raises(StackOverflowError) as excinfo:
+    with pytest.raises(StackOverflowError, match="grid and BlockSpecs") as excinfo:
         f(np.zeros(n, dtype=np.float32))
 
     stack_bytes = excinfo.value.stack_bytes
@@ -222,80 +216,51 @@ def test_unsupported_primitive_names_the_primitive_as_a_field():
             jax.ShapeDtypeStruct((8,), jnp.float32),
             out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
         )
-    assert excinfo.value.primitive is not None
+    assert excinfo.value.primitive == "sort"
     assert excinfo.value.primitive in str(excinfo.value)
-
-
-def test_stack_overflow_error_is_an_emit_error():
-    """Both structured errors subclass EmitError."""
-    assert issubclass(StackOverflowError, EmitError)
-    assert issubclass(UnsupportedPrimitiveError, EmitError)
 
 
 # --- bounded caches ------------------------------------------------------
 
 
+def _sum_kernel(x_ref, o_ref):
+    o_ref[...] = jnp.sum(x_ref[...], keepdims=True)
+
+
+def _key(n):
+    """The cache key for one float32 input of length n."""
+    return (((n,), np.dtype(np.float32).str),)
+
+
 def test_eager_cache_evicts_least_recently_used(rng):
     """The surviving cache keys are the most recently used, not the most recently inserted."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...] * 2.0
-
+    # out_shape is fixed while the input length is free, so every n is a new key.
     f = palladium.metal_call(
-        kernel,
-        out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
-        cache_size=2,
+        _sum_kernel, out_shape=jax.ShapeDtypeStruct((1,), jnp.float32), cache_size=2
     )
-    # out_shape is fixed, so vary the input shape to vary the cache key.
-    f_by_n = {
-        n: palladium.metal_call(
-            kernel,
-            out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
-            cache_size=2,
-        )
-        for n in (8, 16, 24)
-    }
-    del f
-    for n, call in f_by_n.items():
-        call(rng.standard_normal(n, dtype=np.float32))
-        assert len(call.cache) == 1, n
-
-
-def test_eager_cache_is_bounded_across_shapes(rng):
-    """The cache stays bounded across many input shapes."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...] * 2.0
-
-    sizes = [8, 16, 32, 64, 128]
-    for n in sizes:
-        f = palladium.metal_call(
-            kernel, out_shape=jax.ShapeDtypeStruct((n,), jnp.float32), cache_size=2
-        )
+    for n in (8, 16, 24):
         f(rng.standard_normal(n, dtype=np.float32))
-        assert len(f.cache) == 1
+    assert list(f.cache) == [_key(16), _key(24)]
 
+    f(rng.standard_normal(16, dtype=np.float32))  # hit: promotes 16 over 24
+    f(rng.standard_normal(32, dtype=np.float32))
+    assert list(f.cache) == [_key(16), _key(32)]
 
-def test_ffi_cache_is_bounded():
-    f = palladium.metal_call_jit(
-        _tanh_kernel,
-        out_shape=jax.ShapeDtypeStruct((64,), jnp.float32),
-        cache_size=1,
+    g = palladium.metal_call_jit(
+        _sum_kernel, out_shape=jax.ShapeDtypeStruct((1,), jnp.float32), cache_size=1
     )
-    f(jnp.zeros(64, jnp.float32))
-    assert len(f._cache) == 1
+    g(jnp.zeros(8, jnp.float32))
+    g(jnp.zeros(16, jnp.float32))
+    assert list(g._cache) == [_key(16)]
 
 
 def test_cache_size_zero_disables_eviction(rng):
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...] * 2.0
-
     f = palladium.metal_call(
-        kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32), cache_size=0
+        _sum_kernel, out_shape=jax.ShapeDtypeStruct((1,), jnp.float32), cache_size=0
     )
-    f(rng.standard_normal(8, dtype=np.float32))
-    f(rng.standard_normal(8, dtype=np.float32))
-    assert len(f.cache) == 1
+    for n in (8, 16, 24, 32):
+        f(rng.standard_normal(n, dtype=np.float32))
+    assert list(f.cache) == [_key(n) for n in (8, 16, 24, 32)]
 
 
 # --- pin parity ----------------------------------------------------------

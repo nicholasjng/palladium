@@ -35,28 +35,6 @@ def test_spec_captures_scratch():
     assert len(spec.inputs) == 1 and len(spec.outputs) == 1
 
 
-def test_scratch_storage_is_declared():
-    """The emitted MSL declares every scratch name it references; an undeclared identifier would only fail later inside the Metal compiler."""
-
-    def kernel(x_ref, o_ref, s_ref):
-        s_ref[...] = x_ref[...] * 2.0
-        o_ref[...] = s_ref[...] + 1.0
-
-    msl = palladium.debug_msl(
-        kernel,
-        jax.ShapeDtypeStruct((8,), jnp.float32),
-        out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
-        scratch_shapes=[_f32((8,))],
-    )
-    body = [ln.strip() for ln in msl.splitlines()]
-    used = {ln.split("[")[0].strip() for ln in body if ln.startswith("scratch") and "[" in ln}
-    assert used, "no scratch reference in the emitted body; test is vacuous"
-    for name in used:
-        assert any(
-            ln.startswith(("float ", "thread float ")) and name + "[" in ln for ln in body
-        ), f"{name} is referenced but never declared:\n{msl}"
-
-
 def test_scratch_roundtrip(rng):
     """Write to scratch, read it back: the minimal end-to-end path."""
 

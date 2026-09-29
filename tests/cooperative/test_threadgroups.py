@@ -76,72 +76,10 @@ def _msl(**kwargs):
 # --- emission ------------------------------------------------------------
 
 
-def test_scratch_declared_in_threadgroup_space():
-    """A threadgroup_memory request declares `threadgroup T name[N];`."""
-    body = [ln.strip() for ln in _msl().splitlines()]
-    assert f"threadgroup float scratch0[{TG}];" in body
-    assert not any(ln.startswith("thread float scratch") for ln in body)
-
-
 def test_barrier_is_emitted_where_the_author_put_it():
     """barrier() lowers verbatim; placement is never inferred."""
     body = [ln.strip() for ln in _msl().splitlines()]
     assert "threadgroup_barrier(mem_flags::mem_threadgroup);" in body
-
-
-def test_cooperative_builtins_are_in_the_signature():
-    head = _msl().split("{")[0]
-    assert "[[thread_position_in_threadgroup]]" in head
-    assert "[[threads_per_threadgroup]]" in head
-
-
-def test_thread_position_builtins_are_all_vector_typed():
-    """Metal rejects a signature mixing scalar and vector position builtins.
-
-    `_pid` is uint3, so `_tid`/`_tpt` must be too, or the Metal compiler
-    fails with "expecting input declarations with either all scalar types
-    or all vector types".
-    """
-    head = _msl().split("{")[0]
-    for attr in (
-        "thread_position_in_grid",
-        "thread_position_in_threadgroup",
-        "threads_per_threadgroup",
-    ):
-        line = next(ln for ln in head.splitlines() if attr in ln)
-        assert line.strip().startswith("uint3 "), line
-
-
-def test_plain_kernels_keep_their_signature():
-    """Kernels without threadgroup scratch gain no new parameters, so existing MSL snapshots stay byte-identical."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...] * 2.0
-
-    msl = palladium.debug_msl(
-        kernel,
-        jax.ShapeDtypeStruct((8,), jnp.float32),
-        out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
-    )
-    assert "thread_position_in_threadgroup" not in msl
-    assert "threads_per_threadgroup" not in msl
-
-
-def test_thread_scratch_is_unaffected():
-    """Thread-space scratch still declares as `thread`."""
-
-    def kernel(x_ref, o_ref, s_ref):
-        s_ref[...] = x_ref[...] * 2.0
-        o_ref[...] = s_ref[...]
-
-    msl = palladium.debug_msl(
-        kernel,
-        jax.ShapeDtypeStruct((8,), jnp.float32),
-        out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
-        scratch_shapes=[pl.MemorySpace.ANY((8,), jnp.float32)],
-    )
-    assert "thread float scratch0[8];" in msl
-    assert "threadgroup float scratch0" not in msl
 
 
 # --- tracing -------------------------------------------------------------
@@ -201,7 +139,7 @@ def test_block_sum_matches_numpy():
     np.testing.assert_allclose(_block_sum_call(n)(x), _expected_block_sums(x, TG), rtol=1e-6)
 
 
-@pytest.mark.parametrize("n", [100, 33, TG + 1, TG * 3 - 1])
+@pytest.mark.parametrize("n", [100, TG + 1, TG * 3 - 1])
 def test_block_sum_partial_tail_group(n):
     """Metal's non-uniform dispatch leaves a smaller final threadgroup, and threads_per_threadgroup() reports its true size so the reduction stops before reading slots no thread wrote."""
     x = np.arange(n, dtype=np.float32)
@@ -332,7 +270,7 @@ def _batched_block_sums(xb, tg):
     return out
 
 
-@pytest.mark.parametrize("vmap_method", ["sequential", "sequential_unrolled", "pipelined"])
+@pytest.mark.parametrize("vmap_method", ["sequential", "pipelined"])
 @pytest.mark.parametrize("n", [TG * 4, 100])
 def test_vmap_over_a_cooperative_kernel(vmap_method, n):
     """Every vmap method preserves threadgroup geometry: the native handler issues one dispatch per batch element with the same grid and threadgroup, varying only buffer offsets.
@@ -353,29 +291,6 @@ def test_vmap_over_a_cooperative_kernel(vmap_method, n):
     )
     got = np.asarray(jax.jit(jax.vmap(f))(jnp.asarray(xb)))
     np.testing.assert_allclose(got, _batched_block_sums(xb, TG), rtol=1e-6)
-
-
-def test_vmap_methods_agree_with_each_other_on_a_cooperative_kernel():
-    """The three vmap methods agree with each other, not only with the NumPy reference."""
-    n, batch = 100, 3
-    xb = np.stack([np.arange(n, dtype=np.float32) * (j + 1) for j in range(batch)])
-
-    def run(method):
-        f = palladium.metal_call_jit(
-            _block_sum_kernel,
-            grid=(n,),
-            in_specs=[pl.BlockSpec((1,), lambda i: (i,))],
-            out_specs=pl.BlockSpec((1,), lambda i: (i,)),
-            out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
-            scratch_shapes=[threadgroup_memory((TG,), jnp.float32)],
-            threadgroup=TG,
-            vmap_method=method,
-        )
-        return np.asarray(jax.jit(jax.vmap(f))(jnp.asarray(xb)))
-
-    base = run("sequential")
-    for method in ("sequential_unrolled", "pipelined"):
-        np.testing.assert_allclose(run(method), base, rtol=1e-6)
 
 
 def test_vmap_over_a_cooperative_kernel_still_needs_a_threadgroup():

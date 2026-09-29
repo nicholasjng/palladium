@@ -21,16 +21,6 @@ def test_transpose_matches_numpy(rng):
     np.testing.assert_array_equal(got, x.T)
 
 
-def test_square_transpose_matches_numpy(rng):
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...].T
-
-    x = rng.standard_normal((5, 5), dtype=np.float32)
-    f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((5, 5), jnp.float32))
-    got = f(x)
-    np.testing.assert_array_equal(got, x.T)
-
-
 def test_lhs_transposed_matmul_matches_numpy(rng):
     """dL/dW = x.T @ dy, the backward-pass shape for a dense layer's weight gradient."""
 

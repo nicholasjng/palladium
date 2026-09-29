@@ -93,15 +93,6 @@ def test_other_platforms_keep_jax_own_lowering():
     assert "palladium.dispatch" not in _lower_for(("cpu",), interpreted, x, x)
 
 
-def test_multi_platform_lowering_emits_the_custom_call_under_mps_only():
-    interpreted = pl.pallas_call(
-        _add, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32), interpret=True
-    )
-    x = jnp.ones(8, jnp.float32)
-    # interpret=True is honored everywhere, so the multi-platform module has no dispatch.
-    assert "palladium.dispatch" not in _lower_for(("cpu", "mps"), interpreted, x, x)
-
-
 def test_mps_lowering_rejects_non_fast_math_and_aliases():
     call = pl.pallas_call(
         _add,

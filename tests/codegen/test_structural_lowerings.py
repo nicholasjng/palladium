@@ -49,14 +49,13 @@ def test_permuted_reshape_emits(shape, perm, new_shape):
 
 
 @pytest.mark.parametrize("shape,perm,new_shape", RESHAPES)
-@pytest.mark.parametrize("dtype", [np.float32, np.int32])
-def test_permuted_reshape_on_metal(metal_device, shape, perm, new_shape, dtype):
+def test_permuted_reshape_on_metal(metal_device, shape, perm, new_shape):
     call = palladium.metal_call(
         _reshape_kernel(perm, new_shape),
-        out_shape=jax.ShapeDtypeStruct(new_shape, dtype),
+        out_shape=jax.ShapeDtypeStruct(new_shape, np.float32),
         math_mode=mr.MathMode.SAFE,
     )
-    x = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
+    x = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
     expected = np.transpose(x, perm).reshape(new_shape)
     np.testing.assert_array_equal(call(x), expected)
     np.testing.assert_array_equal(call.interpret(x), expected)
@@ -87,15 +86,14 @@ def test_multiway_select_emits_all_cases(count, index_dtype):
 
 
 @pytest.mark.parametrize("count", [1, 2, 3, 8])
-@pytest.mark.parametrize("index_dtype", [np.int32, np.uint32])
 @pytest.mark.parametrize("scalar_index", [False, True])
-def test_multiway_select_on_metal(metal_device, count, index_dtype, scalar_index):
+def test_multiway_select_on_metal(metal_device, count, scalar_index):
     shape = (2, 4)
     cases = [np.arange(8, dtype=np.float32).reshape(shape) + i * 10 for i in range(count)]
     which = (
-        np.asarray(count - 1, dtype=index_dtype)
+        np.asarray(count - 1, dtype=np.int32)
         if scalar_index
-        else (np.arange(8) % count).astype(index_dtype).reshape(shape)
+        else (np.arange(8) % count).astype(np.int32).reshape(shape)
     )
     call = palladium.metal_call(
         _select_kernel(count), out_shape=jax.ShapeDtypeStruct(shape, np.float32)

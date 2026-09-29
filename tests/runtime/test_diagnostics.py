@@ -7,6 +7,7 @@ import pytest
 
 import palladium
 from palladium import DispatchError, EmitError, TraceError, UnsupportedPrimitiveError
+from palladium.errors import StackOverflowError
 
 F32 = jnp.float32
 
@@ -64,14 +65,19 @@ def test_all_errors_are_palladium_errors():
     assert issubclass(TraceError, ValueError)
     assert issubclass(DispatchError, TypeError)
     assert issubclass(UnsupportedPrimitiveError, NotImplementedError)
+    assert issubclass(StackOverflowError, EmitError)
+    assert issubclass(UnsupportedPrimitiveError, EmitError)
 
 
-def test_unsupported_primitive_names_it():
-    def kernel(x_ref, o_ref):
-        o_ref[...] = jnp.sort(x_ref[...])
+def test_backend_diagnostics_name_their_dispatch_route():
+    def copy_kernel(x, out):
+        out[...] = x[...] * 2
 
-    with pytest.raises(UnsupportedPrimitiveError, match="sort"):
-        palladium.debug_msl(kernel, _shaped(8), out_shape=_shaped(8))
+    arg = _shaped(4)
+    eager = palladium.metal_call(copy_kernel, out_shape=arg)
+    ffi = palladium.metal_call_jit(copy_kernel, out_shape=arg)
+    assert eager.explain(arg).execution_path == "metal"
+    assert ffi.explain(arg).execution_path == "cpu-ffi-to-metal"
 
 
 def test_multiple_pallas_calls_rejected():

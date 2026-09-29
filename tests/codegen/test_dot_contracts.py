@@ -96,3 +96,36 @@ def test_preferred_element_type_f16_to_f32(rng):
     assert got.dtype == np.float32
     want = a.astype(np.float32) @ b.astype(np.float32)
     np.testing.assert_allclose(got, want, rtol=2e-3, atol=2e-3)
+
+
+def _matmul_kernel(a_ref, b_ref, o_ref):
+    o_ref[...] = jnp.dot(a_ref[...], b_ref[...])
+
+
+def test_rectangular_matmul_matches_interpret(rng):
+    a = rng.standard_normal((4, 6), dtype=np.float32)
+    b = rng.standard_normal((6, 10), dtype=np.float32)
+    f = palladium.metal_call(_matmul_kernel, out_shape=_shaped(4, 10))
+    got = f(a, b)
+    want = np.asarray(f.interpret(a, b))
+    np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(got, a @ b, rtol=1e-4, atol=1e-4)
+
+
+def test_non_square_inner_dim_matches_numpy(rng):
+    """Inner dim 1, a degenerate but legal matmul (outer product shape)."""
+    a = rng.standard_normal((5, 1), dtype=np.float32)
+    b = rng.standard_normal((1, 3), dtype=np.float32)
+    f = palladium.metal_call(_matmul_kernel, out_shape=_shaped(5, 3))
+    got = f(a, b)
+    np.testing.assert_allclose(got, a @ b, rtol=1e-4, atol=1e-4)
+
+
+def test_non_standard_contraction_is_rejected():
+    """Contracting lhs dim 0 (a transposed-lhs matmul) is rejected as a non-standard contraction."""
+
+    def kernel(a_ref, b_ref, o_ref):
+        o_ref[...] = jax.lax.dot_general(a_ref[...], b_ref[...], (((0,), (0,)), ((), ())))
+
+    with pytest.raises(EmitError, match="standard matmul contraction"):
+        palladium.debug_msl(kernel, _shaped(4, 4), _shaped(4, 4), out_shape=_shaped(4, 4))

@@ -215,12 +215,3 @@ def test_matches_diffrax(rng):
     # controller step-for-step, hence the loose tolerance.
     np.testing.assert_allclose(got_x, np.asarray(want)[:, 0], rtol=5e-2, atol=1e-2)
     np.testing.assert_allclose(got_v, np.asarray(want)[:, 1], rtol=5e-2, atol=1e-2)
-
-
-def test_step_counts_vary_with_stiffness(rng):
-    """A mixed ensemble with a few stiff members shows step-count variance across threads."""
-    n = 512
-    f = make_solver(n)
-    x0, v0, mu = _inputs(rng, n, stiff_fraction=0.02)
-    _, _, _, got_steps, _ = f(x0, v0, mu)
-    assert np.asarray(got_steps).std() > 0

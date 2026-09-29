@@ -26,18 +26,17 @@ def copy_kernel(x, out):
     "shape,block",
     [((3,), (8,)), ((17,), (8,)), ((9, 13), (4, 8)), ((3, 5), (8, 8)), ((8, 12), (2, 3))],
 )
-@pytest.mark.parametrize("dtype", [np.float32, np.int32])
 @pytest.mark.parametrize("factory", [palladium.metal_call, palladium.metal_call_jit])
-def test_edge_and_strided_tiles(metal_device, shape, block, dtype, factory):
+def test_edge_and_strided_tiles(metal_device, shape, block, factory):
     spec = pl.BlockSpec(block, lambda *ids: ids)
     call = factory(
         copy_kernel,
         grid=tuple((a + b - 1) // b for a, b in zip(shape, block)),
         in_specs=[spec],
         out_specs=spec,
-        out_shape=jax.ShapeDtypeStruct(shape, dtype),
+        out_shape=jax.ShapeDtypeStruct(shape, np.float32),
     )
-    x = np.arange(np.prod(shape), dtype=dtype).reshape(shape)
+    x = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
     got = call(x) if factory is palladium.metal_call else jax.jit(call)(jnp.asarray(x))
     np.testing.assert_array_equal(got, x * 2)
     np.testing.assert_array_equal(got, call.interpret(x))

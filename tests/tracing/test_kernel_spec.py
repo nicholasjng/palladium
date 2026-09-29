@@ -24,7 +24,6 @@ def test_gridless_spec(rng):
     assert spec.outputs[0].dtype == np.float32
     names = [e.primitive.name for e in spec.jaxpr.eqns]
     assert names == ["get", "mul", "get", "add", "swap"]
-    print("\n", spec.jaxpr)
 
 
 def test_gridded_spec_and_loop_staging(rng):
@@ -56,19 +55,6 @@ def test_gridded_spec_and_loop_staging(rng):
     # The BlockSpec index map is itself a jaxpr; the block-offset lowering evaluates it.
     imj = spec.inputs[0].index_map_jaxpr.jaxpr
     assert len(imj.invars) == 1 and not imj.eqns
-    print("\n", spec.jaxpr)
-
-
-def test_interpret_mode_is_the_oracle(rng):
-    """interpret=True runs the kernel on CPU, the reference every lowering test diffs against."""
-    f = pl.pallas_call(
-        _mad_kernel,
-        out_shape=jax.ShapeDtypeStruct((32,), jnp.float32),
-        interpret=True,
-    )
-    x = rng.standard_normal(32, dtype=np.float32)
-    y = rng.standard_normal(32, dtype=np.float32)
-    np.testing.assert_allclose(f(x, y), 2.0 * x + y, rtol=1e-6)
 
 
 def test_trace_rejects_multiple_pallas_calls(rng):

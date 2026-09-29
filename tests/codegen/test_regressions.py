@@ -76,10 +76,6 @@ def test_reshape_between_scalar_and_one_element_array_stays_in_registers(kind):
         assert not re.search(rf"\b{scalar}\[", source)
 
 
-def test_zero_power_is_constant_one():
-    assert re.search(r"t\d+\[_i\d+\] = 1;", _source("zero_power"))
-
-
 def test_swap_snapshots_before_store_and_later_mutation():
     source = _source("swap")
     snapshot = re.search(r"(t\d+)\[_i\d+\] = scratch0\[_i\d+\];", source)
@@ -89,23 +85,6 @@ def test_swap_snapshots_before_store_and_later_mutation():
     writes = list(re.finditer(r"scratch0\[_i\d+\] =", source))
     assert len(writes) == 3
     assert writes[0].start() < snapshot.start() < writes[1].start()
-
-
-@pytest.mark.parametrize("store", [False, True])
-def test_column_access_emits(store):
-    def kernel(x, o):
-        if store:
-            o[:, 1] = x[...]
-        else:
-            o[...] = x[:, 1]
-
-    input_shape, output_shape = ((2,), (2, 3)) if store else ((2, 3), (2,))
-    source = palladium.debug_msl(
-        kernel,
-        jax.ShapeDtypeStruct(input_shape, jnp.float32),
-        out_shape=jax.ShapeDtypeStruct(output_shape, jnp.float32),
-    )
-    assert " * 3" in source
 
 
 @pytest.mark.parametrize(

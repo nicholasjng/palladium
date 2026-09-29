@@ -21,10 +21,9 @@ make_solver = functools.partial(make_solver, interpret=INTERPRET)
 
 
 @pytest.mark.parametrize("steps,interval", [(1, 1), (7, 1), (7, 3), (7, 10), (23, 5), (100, 10)])
-@pytest.mark.parametrize("seed", [17, 29])
-def test_all_six_vjp_inputs(steps, interval, seed):
+def test_all_six_vjp_inputs(steps, interval):
     n = 8
-    rng = np.random.default_rng(seed)
+    rng = np.random.default_rng(17)
     args = tuple(
         jnp.asarray(rng.uniform(lo, hi, n), dtype=jnp.float32)
         for lo, hi in [

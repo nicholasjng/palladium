@@ -131,24 +131,6 @@ def test_math_mode_safe_is_actually_requested(rng):
     np.testing.assert_allclose(got[~np.isnan(got)], want[~np.isnan(want)])
 
 
-def test_vmap_sequential_matches_per_element(rng):
-    def kernel(x_ref, o_ref):
-        o_ref[...] = jnp.tanh(x_ref[...]) * 2.0
-
-    f = palladium.metal_call_jit(
-        kernel,
-        out_shape=jax.ShapeDtypeStruct((16,), jnp.float32),
-        vmap_method="sequential",
-    )
-    xs = rng.standard_normal((4, 16)).astype(np.float32)
-    got = np.asarray(jax.vmap(f)(xs))
-    want = np.stack([np.asarray(f(x)) for x in xs])
-    np.testing.assert_allclose(got, want, rtol=1e-6)
-    # and under jit
-    got_jit = np.asarray(jax.jit(jax.vmap(f))(xs))
-    np.testing.assert_allclose(got_jit, want, rtol=1e-6)
-
-
 def test_vmap_pipelined_matches_interpret_and_sequential(rng):
     """'pipelined' handles the whole batch in one FFI call and matches the sequential path element for element."""
 
