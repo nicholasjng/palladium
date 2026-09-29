@@ -33,6 +33,7 @@ from palladium.mps import (
     MpsDispatchDescriptor,
     mps_call_jit,
 )
+from palladium.pallas_backend import CompilerParams, install as _install_pallas_backend
 from palladium.threadgroup import (
     barrier,
     thread_index,
@@ -46,6 +47,7 @@ __all__ = [
     "MPS_CUSTOM_CALL_TARGET",
     "BlockInfo",
     "BoundKernel",
+    "CompilerParams",
     "DispatchError",
     "EmitError",
     "FfiCallable",
@@ -76,6 +78,9 @@ __all__ = [
 ]
 
 __version__ = "0.2.0"
+
+# Plain pl.pallas_call lowered for the mps platform runs through Palladium.
+_install_pallas_backend()
 
 CacheKey = tuple[tuple[tuple[int, ...], str], ...]
 

@@ -10,7 +10,7 @@ version-sensitive (see `_block_infos`).
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal as TLiteral
 
 import jax
@@ -21,7 +21,13 @@ from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var, subjaxpr
 from palladium import effects
 from palladium.errors import TraceError
 
-__all__ = ["BlockInfo", "KernelSpec", "ScratchInfo", "trace"]
+__all__ = [
+    "BlockInfo",
+    "KernelSpec",
+    "ScratchInfo",
+    "spec_from_params",
+    "trace",
+]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -421,8 +427,16 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
             f"found {len(eqns)} pallas_call equations; palladium handles one "
             "kernel at a time, trace them separately"
         )
-    eqn = eqns[0]
-    params = dict(eqn.params)
+    return spec_from_params(eqns[0].params)
+
+
+def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
+    """Build a KernelSpec from a pallas_call equation's parameters.
+
+    `trace` finds the equation; a lowering rule for the pallas_call
+    primitive receives the same parameters directly.
+    """
+    params = dict(pallas_params)
     grid_mapping = params["grid_mapping"]
 
     kernel_jaxpr = params["jaxpr"]

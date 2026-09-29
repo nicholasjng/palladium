@@ -446,3 +446,22 @@ def test_cooperative_tensorops_matmul_runs_under_jit_on_mps_when_available():
         got = composed(jnp.asarray(a_np), jnp.asarray(b_np))
     assert got.device.platform == "mps"
     np.testing.assert_allclose(np.asarray(got), a_np @ b_np + 1.0, rtol=1e-4, atol=1e-4)
+
+
+def test_plain_pallas_call_runs_through_palladium_on_mps_when_available():
+    """The registered Pallas backend: no wrapper, just pl.pallas_call under jit."""
+    try:
+        device = jax.devices("mps")[0]
+    except (RuntimeError, IndexError):
+        pytest.skip("requires the jax-mps plugin")
+
+    call = pl.pallas_call(_add_kernel, out_shape=jax.ShapeDtypeStruct((16,), jnp.float32))
+
+    @jax.jit
+    def composed(x, y):
+        return jnp.sum(call(x, y) ** 2)
+
+    with jax.default_device(device):
+        got = composed(jnp.arange(16, dtype=jnp.float32), jnp.ones(16, dtype=jnp.float32))
+    assert got.device.platform == "mps"
+    assert float(got) == pytest.approx(1496.0)

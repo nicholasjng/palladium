@@ -33,6 +33,11 @@ result = jax.jit(call)(x, y)  # x and y are float32 arrays on MPS
 kernels may use Pallas's interpreter on other platforms. Cooperative kernels
 always require MPS execution.
 
+With jax-mps selected, a plain `pl.pallas_call` under `jax.jit` also runs
+through Palladium: importing the package registers it as the Pallas backend
+for the `mps` platform, and `compiler_params=palladium.CompilerParams(...)`
+carries the Metal-side options.
+
 ## Install
 
 Palladium currently requires macOS on Apple silicon, Python 3.12+, CMake, Ninja,

@@ -63,6 +63,26 @@ the reference.
 size, and expected execution path. It traces and emits source but does not
 compile or dispatch. palladium.debug_msl returns the generated MSL directly.
 
+## Plain Pallas on jax-mps
+
+Importing palladium registers it as the Pallas backend for the mps platform:
+a plain `pl.pallas_call` inside `jax.jit` on a jax-mps device lowers to the
+same Metal kernel `mps_call_jit` builds, with no wrapper call. Metal-side
+options travel as `compiler_params`:
+
+~~~python
+call = pl.pallas_call(
+    kernel,
+    out_shape=...,
+    compiler_params=palladium.CompilerParams(dot_general="tensorops", threadgroup=128),
+)
+jax.jit(call)(x)  # palladium.dispatch on mps; JAX's own lowering elsewhere
+~~~
+
+Other platforms keep JAX's behavior (interpret=True, or an error), and
+`interpret=True` is honored everywhere. `mps_call_jit` remains for the
+interpreter fallback on non-mps platforms and the VJP helpers.
+
 ## Iterating on the device
 
 A kernel that advances a state needs one dispatch per step, because a
