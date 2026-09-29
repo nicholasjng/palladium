@@ -479,7 +479,7 @@ class MpsCallable:
 
     def __call__(self, *args):
         _register_mps_lowering()
-        spec, msl_source = self._staged._spec_and_msl(args)
+        spec, msl_source, _ = self._staged._spec_and_msl(args)
         if spec.aliases:
             raise ValueError(
                 "mps_call_jit does not yet support input_output_aliases: "

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import ctypes
 import dataclasses
+import hashlib
 import importlib.resources
 import math
 import os
@@ -148,7 +149,7 @@ class FfiCallable:
             raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
         self._dot_general = dot_general
         # Bounded LRU of traced specs and emitted MSL.
-        self._cache: OrderedDict[tuple, tuple[KernelSpec, str]] = OrderedDict()
+        self._cache: OrderedDict[tuple, tuple[KernelSpec, str, str]] = OrderedDict()
         self._cache_size = cache_size
         # Serialize cache misses.
         self._lock = threading.Lock()
@@ -214,7 +215,7 @@ class FfiCallable:
             "path, or keep inputs as device arrays and let jit reuse them."
         )
 
-    def _spec_and_msl(self, args: tuple[Any, ...]) -> tuple[KernelSpec, str]:
+    def _spec_and_msl(self, args: tuple[Any, ...]) -> tuple[KernelSpec, str, str]:
         key = tuple((a.shape, np.dtype(a.dtype).str) for a in args)
         # Keep lookup and LRU promotion together; another specialization
         # can evict this entry while a concurrent call is touching it.
@@ -235,10 +236,10 @@ class FfiCallable:
                         execution_path=self._execution_path,
                         dot_general=self._dot_general,
                     )
-                    entry = (
-                        spec,
-                        emit_msl(spec, dot_general=self._dot_general),
-                    )
+                    msl = emit_msl(spec, dot_general=self._dot_general)
+                    # Content digest: the native kernel cache keys on it
+                    # instead of copying and hashing the source per call.
+                    entry = (spec, msl, hashlib.sha256(msl.encode()).hexdigest())
                     self._cache[key] = entry
                     while self._cache_size and len(self._cache) > self._cache_size:
                         self._cache.popitem(last=False)
@@ -306,7 +307,7 @@ class FfiCallable:
             jax.ShapeDtypeStruct(a.shape[1:] if b else a.shape, a.dtype)
             for a, b in zip(args, batched, strict=True)
         ]
-        spec, msl_source = self._spec_and_msl(tuple(unbatched))
+        spec, msl_source, source_id = self._spec_and_msl(tuple(unbatched))
         # MRLaunchDesc always wants 3 grid dims; palladium grids are 1-3D.
         grid = (tuple(spec.grid) + (1, 1, 1))[:3]
         # (0, 0, 0) lets the runtime choose (c_api.cpp); a cooperative
@@ -348,6 +349,7 @@ class FfiCallable:
             input_output_aliases=dict(spec.aliases) or None,
         )(
             *args,
+            source_id=source_id,
             msl_source=msl_source,
             function_name=spec.name,
             grid_x=int(grid[0]),

@@ -8,7 +8,6 @@
 // thread pool with no opt-out trait, so KernelCache below is
 // mutex-guarded the same way metal-runtime's own caches are.
 
-#include <algorithm>
 #include <cstdlib>
 #include <list>
 #include <mutex>
@@ -52,13 +51,16 @@ public:
     return cache;
   }
 
-  // Returns {nullptr, nullptr} and fills `error` on failure.
+  // Returns {nullptr, nullptr} and fills `error` on failure. `source_id`
+  // is palladium's content digest of `msl_source`, computed once at trace
+  // time, so the per-call key never copies or hashes the source itself.
   std::pair<MRLibrary *, MRPipeline *>
-  get_or_compile(std::string_view msl_source, std::string_view function_name,
-                 MRMathMode math_mode, std::string *error) {
+  get_or_compile(std::string_view source_id, std::string_view msl_source,
+                 std::string_view function_name, MRMathMode math_mode,
+                 std::string *error) {
     std::string key;
-    key.reserve(msl_source.size() + function_name.size() + 2);
-    key.append(msl_source);
+    key.reserve(source_id.size() + function_name.size() + 2);
+    key.append(source_id);
     key.push_back('\0');
     key.append(function_name);
     key.push_back('\0');
@@ -163,7 +165,8 @@ bool wrap_one(xla::ffi::AnyBuffer buf, std::vector<MRBuffer *> &wrapped,
   return true;
 }
 
-xla::ffi::Error PalladiumDispatch(std::string_view msl_source,
+xla::ffi::Error PalladiumDispatch(std::string_view source_id,
+                                  std::string_view msl_source,
                                   std::string_view function_name,
                                   int64_t grid_x, int64_t grid_y,
                                   int64_t grid_z, int64_t threadgroup_x,
@@ -182,7 +185,7 @@ xla::ffi::Error PalladiumDispatch(std::string_view msl_source,
   }
   std::string error;
   auto [library, pipeline] = KernelCache::instance().get_or_compile(
-      msl_source, function_name, (MRMathMode)math_mode, &error);
+      source_id, msl_source, function_name, (MRMathMode)math_mode, &error);
   if (!pipeline)
     return xla::ffi::Error::Internal(error);
   (void)library; // kept alive by the cache; not needed past pipeline lookup
@@ -231,69 +234,42 @@ xla::ffi::Error PalladiumDispatch(std::string_view msl_source,
   desc.threadgroup_z = (size_t)threadgroup_z;
 
   // One grid dispatch per batch element, offset elem_strides[i] * element
-  // bytes into each buffer (stride 0 = shared across elements), with up to
-  // kMaxInFlight command buffers on the queue at once: the ~130us fixed
-  // dispatch cost is queue latency that overlaps across in-flight batches
-  // (metal-runtime's devlog measures ~4x at depth 8), which is the entire
-  // point of looping here instead of letting jax.vmap re-enter per element.
-  constexpr size_t kMaxInFlight = 8;
-  std::vector<MRBatch *> in_flight;
-  in_flight.reserve(std::min<size_t>((size_t)batch_size, kMaxInFlight + 1));
-  size_t head = 0;
+  // bytes into each buffer (stride 0 = shared across elements), all
+  // encoded into one command buffer: the ~130us fixed dispatch cost is
+  // paid once per FFI call instead of once per element, and the GPU runs
+  // the elements back to back. mr_batch_add copies the descriptor, so the
+  // offsets array is rewritten in place between adds.
   char *err = nullptr;
-
-  auto abandon = [&](xla::ffi::Error e) {
-    // Outstanding batches must finish before the buffers they read are
-    // released; their own errors are moot once we're failing anyway.
-    for (size_t i = head; i < in_flight.size(); ++i) {
+  MRBatch *batch = nullptr;
+  auto fail = [&](const char *what) {
+    xla::ffi::Error e = xla::ffi::Error::Internal(err ? err : what);
+    if (err)
+      mr_free_error_message(err);
+    if (batch) {
       char *werr = nullptr;
-      mr_batch_wait(in_flight[i], &werr);
+      mr_batch_wait(batch, &werr);
       if (werr)
         mr_free_error_message(werr);
-      mr_release_batch(in_flight[i]);
+      mr_release_batch(batch);
     }
     for (auto *b : wrapped)
       mr_release_buffer(b);
     return e;
   };
-
+  if (mr_batch_create(&batch, &err) != MR_OK)
+    return fail("mr_batch_create failed");
   for (int64_t element = 0; element < batch_size; ++element) {
     for (size_t i = 0; i < wrapped.size(); ++i)
       offsets[i] = (size_t)(element * elem_strides[i]);
-    if (in_flight.size() - head == kMaxInFlight) {
-      MRStatus status = mr_batch_wait(in_flight[head], &err);
-      mr_release_batch(in_flight[head]);
-      ++head;
-      if (status != MR_OK) {
-        xla::ffi::Error e =
-            xla::ffi::Error::Internal(err ? err : "mr_batch_wait failed");
-        if (err)
-          mr_free_error_message(err);
-        return abandon(std::move(e));
-      }
-    }
-    MRBatch *batch = nullptr;
-    if (mr_dispatch_async(&desc, &batch, &err) != MR_OK) {
-      xla::ffi::Error e =
-          xla::ffi::Error::Internal(err ? err : "mr_dispatch_async failed");
-      if (err)
-        mr_free_error_message(err);
-      return abandon(std::move(e));
-    }
-    in_flight.push_back(batch);
+    if (mr_batch_add(batch, &desc, &err) != MR_OK)
+      return fail("mr_batch_add failed");
   }
-  for (; head < in_flight.size(); ++head) {
-    MRStatus status = mr_batch_wait(in_flight[head], &err);
-    mr_release_batch(in_flight[head]);
-    if (status != MR_OK) {
-      xla::ffi::Error e =
-          xla::ffi::Error::Internal(err ? err : "mr_batch_wait failed");
-      if (err)
-        mr_free_error_message(err);
-      ++head;
-      return abandon(std::move(e));
-    }
-  }
+  if (mr_batch_commit(batch, &err) != MR_OK)
+    return fail("mr_batch_commit failed");
+  if (mr_batch_wait(batch, &err) != MR_OK)
+    return fail("mr_batch_wait failed");
+  mr_release_batch(batch);
+  batch = nullptr;
 
   // Only outputs need flushing back (no-op on the zero-copy path).
   // Inputs are read-only to the kernel. One flush per whole buffer, after
@@ -319,6 +295,7 @@ xla::ffi::Error PalladiumDispatch(std::string_view msl_source,
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(palladium_dispatch, PalladiumDispatch,
                               xla::ffi::Ffi::Bind()
+                                  .Attr<std::string_view>("source_id")
                                   .Attr<std::string_view>("msl_source")
                                   .Attr<std::string_view>("function_name")
                                   .Attr<int64_t>("grid_x")

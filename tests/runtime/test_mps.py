@@ -126,7 +126,7 @@ def test_descriptor_round_trip_is_stable():
 
 
 def _descriptor_for(call, *shapes):
-    spec, msl = call._staged._spec_and_msl(tuple(shapes))
+    spec, msl, _ = call._staged._spec_and_msl(tuple(shapes))
     return msl, palladium.MpsDispatchDescriptor.from_spec(
         spec, msl, threadgroup=call._staged._threadgroup, math_mode=2
     )
