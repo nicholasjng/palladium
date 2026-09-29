@@ -189,7 +189,12 @@ def lower_matmul_ir(kernel: KernelIR, kernel_name: str | None = None) -> tuple[s
         ):
             cooperative_epilogue = False
         available_epilogue_values.update(eqn.outvars)
-    threadgroup_epilogue = has_epilogue and not cooperative_epilogue
+    output_ctype = CTYPES[output_info.dtype.name]
+    # Half and bfloat products accumulate in float, then narrow on the
+    # per-element store; the cooperative tensor cannot narrow on `store`.
+    acc_ctype = "float"
+    narrowing = acc_ctype != output_ctype
+    threadgroup_epilogue = (has_epilogue and not cooperative_epilogue) or narrowing
     needs_lane_loop = threadgroup_epilogue or has_edge_tiles
     if needs_lane_loop:
         params += (
@@ -250,9 +255,8 @@ def lower_matmul_ir(kernel: KernelIR, kernel_name: str | None = None) -> tuple[s
             )
         values[eqn.outvars[0]] = ref_value
 
-    output_ctype = CTYPES[output_info.dtype.name]
     output_storage = (
-        cursor.allocate(output_ctype, (tm, tn), name="dot_result", space="threadgroup")
+        cursor.allocate(acc_ctype, (tm, tn), name="dot_result", space="threadgroup")
         if threadgroup_epilogue
         else ref_values[spec.jaxpr.invars[-1]]
     )
@@ -314,10 +318,10 @@ def lower_matmul_ir(kernel: KernelIR, kernel_name: str | None = None) -> tuple[s
         )
         edge_tensor = _TensorView(edge_storage, (tm, tn), (tn, tm), (1, tn)).emit(cursor, "c_edge")
     cooperative_result = operation.emit_cooperative_destination(
-        cursor, lhs_tensor, rhs_tensor, element_type=output_ctype
+        cursor, lhs_tensor, rhs_tensor, element_type=acc_ctype
     )
     with cursor.loop("cTc.get_capacity()", "init") as index:
-        cursor.emit(f"cTc[{index}] = {output_ctype}(0.0f);")
+        cursor.emit(f"cTc[{index}] = 0.0f;")
     with cursor.block(f"for (int k_start = 0; k_start < {k}; k_start += {k_tile})"):
         chunk_k = f"min({k_tile}, {k} - k_start)"
         lhs_chunk = _TensorView(
@@ -345,7 +349,7 @@ def lower_matmul_ir(kernel: KernelIR, kernel_name: str | None = None) -> tuple[s
             (1, k) if transpose_rhs else (1, n),
         ).emit(cursor, "b_k")
         operation.emit_run(cursor, lhs_chunk, rhs_chunk, cooperative_result)
-    values[dot.outvars[0]] = CVal("cTc", (tm, tn), output_ctype, space="thread")
+    values[dot.outvars[0]] = CVal("cTc", (tm, tn), acc_ctype, space="thread")
 
     output_ref = CVal(
         f"(arg{len(spec.inputs)} + {c_offset})", (tm, tn), output_ctype, space="device"
@@ -375,7 +379,10 @@ def lower_matmul_ir(kernel: KernelIR, kernel_name: str | None = None) -> tuple[s
             cursor.emit(f"const uint row = {index} / {tn};")
             cursor.emit(f"const uint column = {index} % {tn};")
             with cursor.block(f"if (row < {valid_m} && column < {valid_n})"):
-                scalar_values = {dot.outvars[0]: output_storage.at(index)}
+                product = output_storage.at(index)
+                scalar_values = {
+                    dot.outvars[0]: f"{output_ctype}({product})" if narrowing else product
+                }
                 for eqn in elementwise_eqns:
                     if not _is_tile_shape(_shape(eqn.outvars[0]), rank, tm, tn) and not (
                         eqn.primitive.name == "broadcast_in_dim"
