@@ -68,7 +68,9 @@ sizes and head dimensions must be multiples of 16, and both sequence lengths
 must divide evenly into their tiles. Short query sequences need padding and
 output cropping. Unsupported jaxpr forms and layouts raise `EmitError`.
 `mps_call_jit` follows the same policy: cooperative kernels are sent to jax-mps with
-their scaled thread grid and required threadgroup.
+their scaled thread grid and required threadgroup, and run under `jax.jit` on the
+`mps` platform (verified on an M1 Pro with JAX 0.11.2 and the jax-mps
+`palladium-dispatch` handler).
 
 The backend supports float32, float16, bfloat16, int32, uint32, and bool, with
 operation-specific limits:
