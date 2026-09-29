@@ -130,6 +130,8 @@ def main() -> None:
             f"  palladium vs {name:6s} max |I/N| deviation {gap:.2e}; "
             f"{differing} of {x_p.numel()} observed counts differ"
         )
+    # torch's first training run pays ~0.5 s of one-time initialization.
+    train_npe(prior, theta_p[:64], x_p[:64], seed=args.seed, max_epochs=1)
     for name, _ in SIMULATORS:
         theta, x, t_sim = datasets[name]
         posterior, t_train = train_npe(prior, theta, x, seed=args.seed, max_epochs=args.max_epochs)
