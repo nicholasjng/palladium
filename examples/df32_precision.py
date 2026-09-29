@@ -3,7 +3,7 @@
 Docs: math modes, docs/performance.md (math mode).
 Same RK4 Lotka-Volterra capstone as example 1, three ways:
 FAST (the default), SAFE (same float32 kernel, reassociation off), and
-DF32 (metal-runtime's df32 prelude: float32x2 compensated arithmetic,
+DF32 (the palladium.experimental.df32 prelude: float32x2 compensated arithmetic,
 hand-written MSL since the Pallas/jnp frontend has no df32 dtype to trace
 through). All three measured against a true float64 NumPy RK4 reference,
 not against each other: the question this answers is "how far off is
@@ -15,11 +15,11 @@ import time
 import jax
 import jax.numpy as jnp
 import metal_runtime as mr
-import metal_runtime.df32 as mrdf32
 import numpy as np
 from jax.experimental import pallas as pl
 
 import palladium
+from palladium.experimental import df32 as mrdf32
 
 DT, STEPS = 0.01, 500
 N = 100_000

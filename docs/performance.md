@@ -83,7 +83,8 @@ overlapping CPU activity, so treat the values as rough scaling data.
 
 The symplectic example measures numerical behavior rather than throughput. Over
 5,000,000 Kepler Verlet steps, float32 energy error grows with a fitted log-log
-slope of +0.50, consistent with accumulated round-off. Compensated df32 stays
+slope of +0.50, consistent with accumulated round-off. Compensated df32
+(`palladium.experimental.df32`, float32 pairs in hand-written MSL) stays
 near the integrator's step-size error bound. Run
 [the example](../examples/symplectic_longrun.py) on Metal to reproduce it.
 

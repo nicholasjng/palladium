@@ -34,11 +34,11 @@ import time
 import jax
 import jax.numpy as jnp
 import metal_runtime as mr
-import metal_runtime.df32 as mrdf32
 import numpy as np
 from jax.experimental import pallas as pl
 
 import palladium
+from palladium.experimental import df32 as mrdf32
 
 H = 0.002  # ~3140 steps per orbit; the truncation floor is O(H^2)
 N = 1024  # ensemble members, one Metal thread each
