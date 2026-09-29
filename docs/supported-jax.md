@@ -111,6 +111,7 @@ reference instead.
 | Path | JIT | vmap | Gradients |
 |---|---|---|---|
 | `mps_call_jit` | Yes, through jax-mps | Sequential: one dispatch per element through `lax.map` | Pair forward/backward calls with `custom_vjp`, or supply a pure-JAX reference VJP |
+| plain `pl.pallas_call` on `mps` | Yes: palladium is the registered Pallas backend for the platform (`palladium.CompilerParams` for options) | JAX's own `pallas_call` batching | As above, through `jax.custom_vjp` |
 | `metal_call_jit` | Yes, through CPU FFI to Metal | Pipelined by default; sequential methods also available | Pair with `custom_vjp` |
 | `metal_call` | Eager NumPy interface | Not a JAX transformation | No automatic differentiation |
 
