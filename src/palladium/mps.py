@@ -14,7 +14,6 @@ import dataclasses
 import json
 import re
 
-import numpy as np
 from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
 
@@ -112,22 +111,17 @@ class MpsDispatchDescriptor:
     directives, helper functions), ``prologue`` (declarations binding the
     emitter's parameter names to MLX's buffers and builtins), and ``body``.
     ``grid`` is in threads; cooperative kernels carry the scaled grid and
-    their required ``threadgroup``.
+    their required ``threadgroup``. Operand and result shapes are not part
+    of the contract: the handler reads them from the custom call's types.
     """
 
     version: int
     header: str
     prologue: str
     body: str
-    function_name: str
     grid: tuple[int, int, int]
     threadgroup: tuple[int, int, int] | None
     math_mode: int
-    input_shapes: tuple[tuple[int, ...], ...]
-    input_dtypes: tuple[str, ...]
-    output_shapes: tuple[tuple[int, ...], ...]
-    output_dtypes: tuple[str, ...]
-    aliases: tuple[tuple[int, int], ...]
 
     @classmethod
     def from_spec(
@@ -156,15 +150,9 @@ class MpsDispatchDescriptor:
             header=header,
             prologue=kernel_prologue(params),
             body=body,
-            function_name=spec.name,
             grid=grid3,
             threadgroup=tg3,
             math_mode=math_mode,
-            input_shapes=tuple(tuple(info.array_shape) for info in spec.inputs),
-            input_dtypes=tuple(np.dtype(info.dtype).str for info in spec.inputs),
-            output_shapes=tuple(tuple(info.array_shape) for info in spec.outputs),
-            output_dtypes=tuple(np.dtype(info.dtype).str for info in spec.outputs),
-            aliases=spec.aliases,
         )
 
     def to_json(self) -> str:
@@ -190,10 +178,6 @@ class MpsDispatchDescriptor:
             if raw.get(name) is not None:
                 raw[name] = tuple(raw[name])
         raw.setdefault("threadgroup", None)
-        for name in ("input_shapes", "output_shapes", "aliases"):
-            raw[name] = tuple(tuple(item) for item in raw[name])
-        raw["input_dtypes"] = tuple(raw["input_dtypes"])
-        raw["output_dtypes"] = tuple(raw["output_dtypes"])
         return cls(**raw)
 
 
@@ -208,7 +192,6 @@ def lower_dispatch(ctx, *args, descriptor: MpsDispatchDescriptor):
         operands=args,
         backend_config=descriptor.to_json(),
         api_version=2,
-        operand_output_aliases=dict(descriptor.aliases) or None,
         operand_layouts=operand_layouts,
         result_layouts=result_layouts,
     )
