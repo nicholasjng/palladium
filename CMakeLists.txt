@@ -67,7 +67,7 @@ target_include_directories(palladium_ffi PRIVATE
   "${JAX_FFI_INCLUDE_DIR}"
   "${METAL_RUNTIME_INCLUDE_DIR}"
 )
-find_library(METAL_RUNTIME_C_LIB metal_runtime_c PATHS "${METAL_RUNTIME_LIBRARY_DIR}" REQUIRED)
+find_library(METAL_RUNTIME_C_LIB metal_runtime PATHS "${METAL_RUNTIME_LIBRARY_DIR}" REQUIRED)
 target_link_libraries(palladium_ffi PRIVATE "${METAL_RUNTIME_C_LIB}")
 
 # Two rpath entries, both needed: the absolute one resolves in an
