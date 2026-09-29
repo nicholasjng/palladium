@@ -63,6 +63,15 @@ the reference.
 size, and expected execution path. It traces and emits source but does not
 compile or dispatch. palladium.debug_msl returns the generated MSL directly.
 
+## Iterating on the device
+
+A kernel that advances a state needs one dispatch per step, because a
+threadgroup barrier cannot synchronize the whole grid. `call.iterate(*arrays,
+steps=n)` encodes all `n` dispatches into one command buffer and feeds each
+step's outputs back into the next step's inputs without leaving the GPU
+(output j into input j by default, or explicit `feedback=[(output, input), ...]`
+pairs; inputs never fed back stay fixed). It returns the last step's outputs.
+
 ## JAX transformations
 
 metal_call_jit supports jax.jit and jax.vmap. Its default

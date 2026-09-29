@@ -12,7 +12,7 @@ import dataclasses
 import hashlib
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import metal_runtime as mr
@@ -288,6 +288,94 @@ class BoundKernel:
         batch.commit()
         copy_out = frozenset(j for _, j in self.spec.aliases)
         return PendingResult(batch, out_bufs, copy_out=copy_out)
+
+    def iterate(
+        self,
+        *arrays: np.ndarray,
+        steps: int,
+        feedback: Sequence[tuple[int, int]] | None = None,
+    ) -> np.ndarray | tuple[np.ndarray, ...]:
+        """Run `steps` dispatches on device-resident buffers, feeding outputs
+        back into inputs between steps, and return the final outputs.
+
+        For state-update kernels (stencils, PDE steps, agent models): the
+        whole loop is one command buffer, so the state never round-trips
+        through NumPy and dispatches execute in order on the GPU.
+
+        Parameters
+        ----------
+        *arrays : numpy.ndarray
+            Initial inputs, one per kernel input.
+        steps : int
+            Number of dispatches; at least 1.
+        feedback : sequence of (output index, input index), optional
+            Which output refills which input for the next step. The pair
+            must agree in shape and dtype. Defaults to output j feeding
+            input j for every output. Inputs never fed stay fixed, e.g.
+            parameters.
+        """
+        spec = self.spec
+        if steps < 1:
+            raise ValueError(f"steps must be >= 1, got {steps}")
+        if spec.aliases:
+            raise DispatchError(
+                "iterate does not support input_output_aliases; the kernel already updates in place"
+            )
+        if len(arrays) != len(spec.inputs):
+            raise DispatchError(f"kernel takes {len(spec.inputs)} arrays, got {len(arrays)}")
+        pairs = (
+            [(j, j) for j in range(len(spec.outputs))]
+            if feedback is None
+            else [tuple(p) for p in feedback]
+        )
+        if len({i for _, i in pairs}) != len(pairs) or len({j for j, _ in pairs}) != len(pairs):
+            raise DispatchError("feedback must pair each output and input at most once")
+        for j, i in pairs:
+            if not (0 <= j < len(spec.outputs) and 0 <= i < len(spec.inputs)):
+                raise DispatchError(f"feedback pair ({j}, {i}) is out of range")
+            out_info, in_info = spec.outputs[j], spec.inputs[i]
+            if out_info.array_shape != in_info.array_shape or out_info.dtype != in_info.dtype:
+                raise DispatchError(
+                    f"feedback pair ({j}, {i}): output {out_info.array_shape} {out_info.dtype} "
+                    f"cannot refill input {in_info.array_shape} {in_info.dtype}"
+                )
+        in_bufs = []
+        for i, (a, info) in enumerate(zip(arrays, spec.inputs, strict=True)):
+            arr = np.ascontiguousarray(np.asarray(a))
+            if arr.dtype != info.dtype or arr.shape != info.array_shape:
+                raise DispatchError(
+                    f"argument {i}: expected {info.array_shape} {info.dtype}, "
+                    f"got {arr.shape} {arr.dtype}"
+                )
+            native, relabel = _to_native(arr)
+            in_bufs.append(mr.Buffer(native, dtype=relabel))
+        out_bufs = [
+            mr.Buffer.empty(list(info.array_shape), dtype=info.dtype.name) for info in spec.outputs
+        ]
+        grid = tuple(int(g) for g in spec.grid)
+        if self.cooperative_simdgroups:
+            tg = (
+                (self.threadgroup,)
+                if isinstance(self.threadgroup, int)
+                else tuple(self.threadgroup or (1,))
+            )
+            grid = tuple(g * t for g, t in zip(grid, tg + (1, 1, 1), strict=False))
+        batch = mr.Batch()
+        for step in range(steps):
+            batch.add(
+                self.kernel,
+                grid=grid if len(grid) > 1 else grid[0],
+                threadgroup=self.threadgroup,
+                buffers=[*in_bufs, *out_bufs],
+            )
+            if step + 1 < steps:
+                # Ping-pong: the consumed input buffer becomes next step's output.
+                for j, i in pairs:
+                    in_bufs[i], out_bufs[j] = out_bufs[j], in_bufs[i]
+        batch.commit()
+        batch.wait()
+        outs = tuple(np.array(_read_buffer(b)) for b in out_bufs)
+        return outs[0] if len(outs) == 1 else outs
 
     def pinned(self, *arrays: np.ndarray) -> Callable[[], np.ndarray | tuple[np.ndarray, ...]]:
         """Upload `arrays` once; return a zero-argument callable that

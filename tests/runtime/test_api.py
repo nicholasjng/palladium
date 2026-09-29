@@ -16,6 +16,7 @@ from jax.experimental import pallas as pl
 import palladium
 from palladium.diagnostics import device_limits, normalize_threadgroup, simdgroup_width
 from palladium.errors import (
+    DispatchError,
     EmitError,
     StackOverflowError,
     UnsupportedPrimitiveError,
@@ -316,3 +317,63 @@ def test_ffi_pin_refuses_with_a_reason():
     f = palladium.metal_call_jit(_tanh_kernel, out_shape=jax.ShapeDtypeStruct((64,), jnp.float32))
     with pytest.raises(NotImplementedError, match="XLA owns"):
         f.pin(jnp.zeros(64, jnp.float32))
+
+
+# --- device-resident iteration ---------------------------------------------
+
+
+def _step_call(n):
+    def kernel(x_ref, y_ref, scale_ref, xo_ref, yo_ref):
+        x, y, scale = x_ref[...], y_ref[...], scale_ref[...]
+        xo_ref[...] = y * scale
+        yo_ref[...] = x + 1.0
+
+    point = pl.BlockSpec((1,), lambda i: (i,))
+    return palladium.metal_call(
+        kernel,
+        grid=(n,),
+        in_specs=[point, point, point],
+        out_specs=(point, point),
+        out_shape=(jax.ShapeDtypeStruct((n,), jnp.float32),) * 2,
+    )
+
+
+def test_iterate_matches_repeated_calls(rng):
+    n = 256
+    call = _step_call(n)
+    x = rng.standard_normal(n).astype(np.float32)
+    y = rng.standard_normal(n).astype(np.float32)
+    scale = np.full(n, 0.5, np.float32)
+    want_x, want_y = x, y
+    for _ in range(7):
+        want_x, want_y = call(want_x, want_y, scale)
+    got_x, got_y = call.iterate(x, y, scale, steps=7)
+    np.testing.assert_array_equal(got_x, want_x)
+    np.testing.assert_array_equal(got_y, want_y)
+
+
+def test_iterate_honors_explicit_feedback_pairs(rng):
+    """Feed output 1 into input 0 and output 0 into input 1; the scale
+    input is never refilled."""
+    n = 64
+    call = _step_call(n)
+    x = rng.standard_normal(n).astype(np.float32)
+    y = rng.standard_normal(n).astype(np.float32)
+    scale = np.full(n, 2.0, np.float32)
+    want_x, want_y = x, y
+    for _ in range(3):
+        out0, out1 = call(want_x, want_y, scale)
+        want_x, want_y = out1, out0
+    got = call.iterate(x, y, scale, steps=3, feedback=[(1, 0), (0, 1)])
+    # The last step is not swapped: outputs come back in kernel order.
+    np.testing.assert_array_equal(got[0], want_y)
+    np.testing.assert_array_equal(got[1], want_x)
+
+
+def test_iterate_rejects_a_mismatched_feedback_pair():
+    call = _step_call(16)
+    arrays = (np.zeros(16, np.float32),) * 3
+    with pytest.raises(DispatchError, match="feedback pair"):
+        call.iterate(*arrays, steps=2, feedback=[(0, 5)])
+    with pytest.raises(ValueError, match="steps"):
+        call.iterate(*arrays, steps=0)

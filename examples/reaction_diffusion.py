@@ -10,9 +10,10 @@ A PDE step depends on every thread's neighbours finishing the previous
 step first, which a single dispatch cannot guarantee across threadgroups
 (no device-wide barrier, only per-threadgroup). So this is one kernel
 launch per step with ping-pong buffers, not an in-kernel loop like the
-ODE/SDE examples: `metal_runtime.Buffer`/`Batch` used directly rather
-than through `metal_call`, so the grid stays device-resident across all
-`STEPS` launches instead of round-tripping through NumPy each step.
+ODE/SDE examples: `metal_call(...).iterate(u0, v0, steps=STEPS)` encodes
+all launches into one command buffer and feeds each step's outputs back
+into the next step's inputs on the device, so the grid never
+round-trips through NumPy.
 
 Threadgroup-memory tiling for the halo reads is a later, separate
 optimization; this is plain global-memory indexed access.
@@ -22,13 +23,10 @@ import time
 
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import numpy as np
 from jax.experimental import pallas as pl
 
-from palladium.dispatch import bind
-from palladium.emit import emit_msl
-from palladium.trace import trace
+import palladium
 
 SIZE = 128
 STEPS = 2000
@@ -70,7 +68,7 @@ def gray_scott_kernel(u_ref, v_ref, uo_ref, vo_ref):
 
 def run_metal(u0: np.ndarray, v0: np.ndarray):
     full = pl.BlockSpec((SIZE, SIZE), lambda i, j: (0, 0))
-    staged = pl.pallas_call(
+    step = palladium.metal_call(
         gray_scott_kernel,
         grid=(SIZE, SIZE),
         in_specs=[full, full],
@@ -80,27 +78,11 @@ def run_metal(u0: np.ndarray, v0: np.ndarray):
             jax.ShapeDtypeStruct((SIZE, SIZE), jnp.float32),
         ),
     )
-    spec = trace(staged, jnp.zeros((SIZE, SIZE), jnp.float32), jnp.zeros_like(u0))
-    bound = bind(spec, emit_msl(spec))
-
-    bufs = [
-        [mr.Buffer(np.ascontiguousarray(u0)), mr.Buffer(np.ascontiguousarray(v0))],
-        [
-            mr.Buffer.empty([SIZE, SIZE], dtype="float32"),
-            mr.Buffer.empty([SIZE, SIZE], dtype="float32"),
-        ],
-    ]
     t0 = time.perf_counter()
-    batch = mr.Batch()
-    src = 0
-    for _ in range(STEPS):
-        dst = 1 - src
-        batch.add(bound.kernel, grid=(SIZE, SIZE), buffers=[*bufs[src], *bufs[dst]])
-        src = dst
-    batch.commit()
-    batch.wait()
-    t_wall = time.perf_counter() - t0
-    return bufs[src][0].to_numpy(), bufs[src][1].to_numpy(), t_wall, batch.gpu_time
+    # One command buffer carries all STEPS dispatches; each step's (u, v)
+    # outputs refill the next step's inputs on the device.
+    u, v = step.iterate(u0, v0, steps=STEPS)
+    return u, v, time.perf_counter() - t0
 
 
 def initial_state(size, seed=11):
@@ -126,11 +108,8 @@ def main():
     print(f"  jax.jit + scan (CPU): {t_cpu:.3f} s, pattern energy {float(jnp.sum(v)):.1f}")
 
     run_metal(u0, v0)  # trace + emit + Metal compile outside the clock
-    _, got_v, t_wall, t_gpu = run_metal(u0, v0)
-    print(
-        f"  Metal stencil kernel: {t_wall:.3f} s wall ({t_gpu:.3f} s GPU-side), "
-        f"pattern energy {float(np.sum(got_v)):.1f}"
-    )
+    _, got_v, t_wall = run_metal(u0, v0)
+    print(f"  Metal stencil kernel: {t_wall:.3f} s wall, pattern energy {float(np.sum(got_v)):.1f}")
     err = np.max(np.abs(got_v - np.asarray(v)))
     print(f"  max abs deviation from CPU baseline: {err:.2e}")
 

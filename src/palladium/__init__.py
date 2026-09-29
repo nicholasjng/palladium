@@ -208,13 +208,27 @@ class MetalCallable:
         re-dispatches on the pinned device buffers. For repeated calls on
         unchanging inputs; later mutation of the arrays is not observed."""
         arrays = [np.asarray(a) for a in args]
-        self(*arrays)  # populate the shape cache (trace/emit/compile)
-        key: CacheKey = tuple((a.shape, a.dtype.str) for a in arrays)
-        return self.cache[key].pinned(*arrays)
+        return self._bound(arrays).pinned(*arrays)
+
+    def iterate(self, *args, steps: int, feedback=None) -> np.ndarray | tuple[np.ndarray, ...]:
+        """Run `steps` dispatches with the state resident on the device.
+
+        Each step's outputs refill the inputs for the next step (output j
+        into input j by default, or the given (output, input) pairs);
+        inputs never fed back stay fixed. One command buffer carries the
+        whole loop, so nothing round-trips through NumPy between steps.
+        Returns the outputs of the last step.
+        """
+        arrays = [np.asarray(a) for a in args]
+        return self._bound(arrays).iterate(*arrays, steps=steps, feedback=feedback)
 
     def __call__(self, *args) -> np.ndarray | tuple[np.ndarray, ...]:
         """Run the kernel on the GPU; NumPy in, NumPy out."""
         arrays = [np.asarray(a) for a in args]
+        return self._bound(arrays)(*arrays)
+
+    def _bound(self, arrays: list[np.ndarray]) -> BoundKernel:
+        """The compiled kernel for these argument shapes, from the cache."""
         key: CacheKey = tuple((a.shape, a.dtype.str) for a in arrays)
         # Keep the lookup and LRU promotion together: another thread may
         # evict this entry between `get` and `move_to_end`.
@@ -243,7 +257,7 @@ class MetalCallable:
                     self.cache[key] = bound
                     while self._cache_size and len(self.cache) > self._cache_size:
                         self.cache.popitem(last=False)
-        return bound(*arrays)
+        return bound
 
 
 def _unwrap(outs):
