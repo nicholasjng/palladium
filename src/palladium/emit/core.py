@@ -198,6 +198,11 @@ class CVal:
     # A ranked value of one element declared as a plain scalar variable, so
     # `at` never indexes it and no pointer to it may be formed.
     scalar_storage: bool = False
+    # An unmaterialized elementwise value: `at(i)` substitutes the flat
+    # element index for `$i` in this expression template instead of
+    # reading storage. Only bound when exactly one same-shape elementwise
+    # equation consumes the value, so each element is evaluated once.
+    lazy: str | None = None
 
     @property
     def size(self) -> int:
@@ -221,6 +226,8 @@ class CVal:
     def at(self, index: str) -> str:
         """`expr` for scalars, `expr[index]` for arrays: the only
         rank-0/rank-N absorption the emitter does."""
+        if self.lazy is not None:
+            return self.lazy.replace("$i", index if index.isidentifier() else f"({index})")
         if self.index_map is not None:
             return f"{self.expr}[{self.index_map.replace('$i', f'({index})')}]"
         if not self.shape or self.scalar_storage:
