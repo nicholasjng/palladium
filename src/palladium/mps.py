@@ -27,11 +27,11 @@ from jax._src import core as jax_core, dispatch as jax_dispatch
 from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
 
+from palladium._callable import CallOptions, PallasCallable
 from palladium.diagnostics import simdgroup_width
 from palladium.emit.tensorops import cooperative_launch, emits_cooperative
-from palladium.ffi import FfiCallable
+from palladium.ffi import _MATH_MODE_ORDINALS
 from palladium.trace import KernelSpec
-from palladium.verify import DEFAULT_ATOL, DEFAULT_RTOL, verify_against
 
 __all__ = [
     "MPS_CUSTOM_CALL_TARGET",
@@ -320,46 +320,21 @@ def _register_mps_lowering() -> None:
         _mps_lowering_registered = True
 
 
-class MpsCallable:
+class MpsCallable(PallasCallable):
     """A Pallas kernel that becomes ``palladium.dispatch`` on jax-mps.
 
-    This class intentionally reuses :class:`FfiCallable`'s tracing, MSL
-    emission, diagnostics, and bounded shape cache.  It does *not* use its
-    CPU FFI dispatch: MPS buffers belong to jax-mps, so only the descriptor
-    crosses this boundary.
+    Shares tracing, MSL emission, diagnostics, and the per-shape cache with
+    the other paths; only the descriptor crosses to jax-mps, which owns the
+    MPS buffers.
     """
 
-    def __init__(
-        self,
-        kernel: Callable,
-        pallas_kwargs: dict[str, Any],
-        math_mode: Any,
-        threadgroup: int | tuple[int, ...] | None,
-        cache_size: int,
-        fallback: str = "interpret",
-        dot_general: str = "auto",
-    ) -> None:
-        if fallback not in ("interpret", "error"):
-            raise ValueError("fallback must be 'interpret' or 'error'")
-        self._allow_fallback = fallback == "interpret"
-        # FfiCallable owns the well-tested trace/emit cache.  Its public call
-        # path is never invoked here.
-        self._staged = FfiCallable(
-            kernel,
-            pallas_kwargs,
-            math_mode,
-            vmap_method=None,
-            threadgroup=threadgroup,
-            cache_size=cache_size,
-            dot_general=dot_general,
-        )
-        self.interpret = self._staged.interpret
-        self._staged._execution_path = "mps-or-pallas-interpret (selected at lowering)"
+    execution_path = "mps-or-pallas-interpret (selected at lowering)"
 
-    @property
-    def _cache(self):
-        """Expose the specialization cache for diagnostics and tests."""
-        return self._staged._cache
+    def __init__(self, kernel: Callable, pallas_kwargs: dict[str, Any], options: CallOptions):
+        if options.fallback not in ("interpret", "error"):
+            raise ValueError("fallback must be 'interpret' or 'error'")
+        super().__init__(kernel, pallas_kwargs, options)
+        self._allow_fallback = options.fallback == "interpret"
 
     def explain(self, *args, platform: str | None = None):
         """Report the expected path; explicit JIT placement can override inference.
@@ -382,144 +357,22 @@ class MpsCallable:
                 if device is not None
                 else jax.default_backend()
             )
-        diagnostics = self._staged.explain(*args)
+        diagnostics = super().explain(*args)
         path = "mps-custom-call" if platform == "mps" else f"pallas-interpret:{platform}"
         if platform != "mps" and (not self._allow_fallback or diagnostics.cooperative):
             path = f"rejected:{platform} (requires mps)"
         return dataclasses.replace(diagnostics, execution_path=path)
 
-    def verify(
-        self,
-        *args,
-        reference=None,
-        rtol: float = DEFAULT_RTOL,
-        atol: float = DEFAULT_ATOL,
-    ):
-        """Run the selected platform path and compare it with a reference."""
-        shapes = [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
-        outputs = verify_against(
-            self,
-            None if reference is not None else self.interpret,
-            self._staged._spec_and_msl(tuple(shapes))[0].uses_threadgroup,
-            args,
-            reference,
-            rtol,
-            atol,
-        )
-        return outputs[0] if len(outputs) == 1 else outputs
-
-    def with_reference_vjp(self, reference: Callable) -> Callable:
-        """Attach a correctness-first VJP implemented by a JAX reference.
-
-        The primal executes this callable, and therefore remains one MPS
-        custom call on jax-mps.  The pullback is calculated by JAX from
-        ``reference``.  This is useful for bringing a fused forward solve into
-        an end-to-end training loop while a Pallas discrete-adjoint kernel is
-        being developed and validated.
-
-        ``reference`` must have the same inputs, outputs, and differentiable
-        semantics as this call.  Its VJP is intentionally *not* a performance
-        solution: a training-speed claim requires a native backward kernel.
-        """
-
-        @jax.custom_vjp
-        def differentiated(*args):
-            return self(*args)
-
-        def forward(*args):
-            return self(*args), args
-
-        def backward(residual, cotangents):
-            _, pullback = jax.vjp(reference, *residual)
-            return pullback(cotangents)
-
-        differentiated.defvjp(forward, backward)
-        return differentiated
-
-    def with_vjp(self, backward_call: Callable) -> Callable:
-        """Attach a Pallas custom VJP to this forward call.
-
-        ``backward_call`` receives the forward primals followed by one
-        cotangent per forward output. It must return one cotangent per primal,
-        in the same order. Both calls remain ordinary JAX callables, so the
-        backward computation can itself be an :class:`MpsCallable` and lower
-        to one ``palladium.dispatch`` on MPS.
-
-        This is the explicit-kernel route for a discrete adjoint (or a
-        tangent-transpose kernel).  It intentionally does not infer a
-        derivative from emitted MSL: numerical method semantics, storage, and
-        checkpointing must be selected by the kernel author.
-        """
-
-        @jax.custom_vjp
-        def differentiated(*args):
-            return self(*args)
-
-        def forward(*args):
-            return self(*args), args
-
-        def backward(residual, cotangents):
-            input_cotangents = _as_tuple(backward_call(*residual, *_as_tuple(cotangents)))
-            if len(input_cotangents) != len(residual):
-                raise TypeError(
-                    "Palladium VJP returned "
-                    f"{len(input_cotangents)} input cotangents for "
-                    f"{len(residual)} primals"
-                )
-            return input_cotangents
-
-        differentiated.defvjp(forward, backward)
-        return differentiated
-
-    def with_auxiliary_vjp(self, backward_call: Callable, output_count: int) -> Callable:
-        """Attach a VJP while retaining trailing forward outputs as residuals.
-
-        The first ``output_count`` outputs are the public primal result. Any
-        trailing outputs are saved for the backward call after the primals and
-        before the output cotangents. This supports checkpointed adjoints:
-        one fused forward dispatch can return both its visible final state and
-        an internal checkpoint buffer consumed by one fused backward dispatch.
-        """
-        if output_count < 1:
-            raise ValueError("output_count must be positive")
-
-        def split_outputs(raw_outputs):
-            values = _as_tuple(raw_outputs)
-            if output_count >= len(values):
-                raise ValueError(
-                    "with_auxiliary_vjp requires at least one trailing auxiliary output"
-                )
-            public = values[:output_count]
-            return (public[0] if len(public) == 1 else public), values[output_count:]
-
-        @jax.custom_vjp
-        def differentiated(*args):
-            public, _ = split_outputs(self(*args))
-            return public
-
-        def forward(*args):
-            public, auxiliaries = split_outputs(self(*args))
-            return public, (*args, *auxiliaries)
-
-        def backward(residual, cotangents):
-            input_cotangents = _as_tuple(backward_call(*residual, *_as_tuple(cotangents)))
-            # The custom-VJP protocol validates the returned pytree against
-            # the primal arguments. Keep this method agnostic about the number
-            # of auxiliary arrays, which is encoded in backward_call's ABI.
-            return input_cotangents
-
-        differentiated.defvjp(forward, backward)
-        return differentiated
-
     def __call__(self, *args):
         _register_mps_lowering()
-        spec, msl_source, _ = self._staged._spec_and_msl(args)
+        spec, msl_source, _ = self._spec_and_msl(args)
         if spec.aliases:
             raise ValueError(
                 "mps_call_jit does not yet support input_output_aliases: "
                 "jax-mps's MLX custom-kernel path allocates functional outputs"
             )
-        if self._staged._math_mode != 2:  # metal_runtime's FAST ordinal
+        math_mode = _MATH_MODE_ORDINALS[self._options.math_mode]
+        if math_mode != 2:  # metal_runtime's FAST ordinal
             raise ValueError(
                 "mps_call_jit currently supports math_mode=FAST only; "
                 "jax-mps's metal_kernel API does not expose Palladium's "
@@ -528,8 +381,8 @@ class MpsCallable:
         descriptor = MpsDispatchDescriptor.from_spec(
             spec,
             msl_source,
-            threadgroup=self._staged._threadgroup,
-            math_mode=self._staged._math_mode,
+            threadgroup=self._options.threadgroup,
+            math_mode=math_mode,
         )
         outputs = _mps_dispatch_p.bind(
             *args,
@@ -580,23 +433,13 @@ def mps_call_jit(
     the matching pure-JAX reference.  A Pallas discrete-adjoint kernel remains
     necessary for fused training performance.
     """
-    from metal_runtime import MathMode
-
-    math_mode = pallas_kwargs.pop("math_mode", MathMode.FAST)
-    threadgroup = pallas_kwargs.pop("threadgroup", None)
-    cache_size = pallas_kwargs.pop("cache_size", 256)
-    dot_general = pallas_kwargs.pop("dot_general", "auto")
-    if dot_general not in ("auto", "default", "tensorops"):
-        raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
-    vmap_method = pallas_kwargs.pop("vmap_method", "sequential")
-    if vmap_method not in (None, "sequential"):
+    options = CallOptions.split(pallas_kwargs, vmap_method="sequential", fallback=fallback)
+    if options.vmap_method not in (None, "sequential"):
         raise ValueError(
             "mps_call_jit batches jax.vmap sequentially (one dispatch per "
             "element through lax.map); other vmap methods are not available "
             "because the launch grid is baked per unbatched shape. Put the "
             "batch dimension in the Pallas grid for one dispatch in total."
         )
-    call = MpsCallable(
-        kernel, pallas_kwargs, math_mode, threadgroup, cache_size, fallback, dot_general
-    )
+    call = MpsCallable(kernel, pallas_kwargs, options)
     return call if vjp_reference is None else call.with_reference_vjp(vjp_reference)

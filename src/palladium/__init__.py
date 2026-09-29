@@ -8,17 +8,16 @@ the intermediate text.
 
 from __future__ import annotations
 
-import threading
 from collections import OrderedDict
 from collections.abc import Callable
 from typing import Any
 
 import numpy as np
 
-from palladium.diagnostics import KernelDiagnostics, explain_spec, log_compile
+from palladium._callable import CallOptions, PallasCallable, unwrap
+from palladium.diagnostics import KernelDiagnostics, explain_spec
 from palladium.dispatch import BoundKernel, bind
 from palladium.emit import emit_jaxpr, emit_msl, rule
-from palladium.emit.core import CTYPES as _CTYPES
 from palladium.errors import (
     DispatchError,
     EmitError,
@@ -41,12 +40,7 @@ from palladium.threadgroup import (
     threads_per_threadgroup,
 )
 from palladium.trace import BlockInfo, KernelSpec, ScratchInfo, trace
-from palladium.verify import (
-    DEFAULT_ATOL,
-    DEFAULT_RTOL,
-    VerificationError,
-    verify_against,
-)
+from palladium.verify import VerificationError
 
 __all__ = [
     "MPS_CUSTOM_CALL_TARGET",
@@ -86,25 +80,7 @@ __version__ = "0.2.0"
 CacheKey = tuple[tuple[tuple[int, ...], str], ...]
 
 
-def _check_dtypes(args: tuple) -> None:
-    """Reject unsupported dtypes before tracing; they otherwise surface
-    as a KeyError inside emit."""
-    for i, a in enumerate(args):
-        dtype = getattr(a, "dtype", None)
-        name = np.dtype(dtype if dtype is not None else np.asarray(a).dtype).name
-        if name not in _CTYPES:
-            hint = (
-                "; float64 usually means jax_enable_x64 is on, disable it or cast to float32"
-                if name == "float64"
-                else ""
-            )
-            raise DispatchError(
-                f"argument {i} has dtype {name}, which palladium cannot "
-                f"lower (supported: {', '.join(_CTYPES)}){hint}"
-            )
-
-
-class MetalCallable:
+class MetalCallable(PallasCallable):
     """The palladium pipeline behind a `pl.pallas_call`-shaped call.
 
     Retraces per input shape/dtype; identical shapes hit `cache`,
@@ -119,89 +95,12 @@ class MetalCallable:
         `cache[key].msl_source` is the emitted text for that shape.
     """
 
-    def __init__(
-        self,
-        kernel: Callable,
-        pallas_kwargs: dict[str, Any],
-        math_mode: Any,
-        threadgroup: int | tuple[int, ...] | None,
-        cache_size: int = 256,
-        dot_general: str = "auto",
-    ) -> None:
-        import jax.experimental.pallas as pl
+    execution_path = "metal"
 
-        self._staged = pl.pallas_call(kernel, **pallas_kwargs)
-        self._math_mode = math_mode
-        self._threadgroup = threadgroup
-        self._dot_general = dot_general
-        self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
-        # LRU: each entry holds a compiled Metal pipeline. Insertion-ordered
-        # and re-inserted on hit, so popping the first item evicts the LRU.
+    def __init__(self, kernel: Callable, pallas_kwargs: dict[str, Any], options: CallOptions):
+        super().__init__(kernel, pallas_kwargs, options)
+        # LRU of compiled Metal pipelines, one per input-shape signature.
         self.cache: OrderedDict[CacheKey, BoundKernel] = OrderedDict()
-        self._cache_size = cache_size
-        # Concurrent first calls on one shape must compile exactly once.
-        self._lock = threading.Lock()
-
-    def explain(self, *args) -> KernelDiagnostics:
-        """Report launch geometry and emitted MSL size for these inputs.
-        Emits MSL; compiles and dispatches nothing.
-
-        Parameters
-        ----------
-        *args
-            Arrays or `jax.ShapeDtypeStruct`s fixing input shapes; no
-            data is read.
-        """
-        _check_dtypes(args)
-        return explain_spec(
-            trace(self._staged, *args),
-            self._threadgroup,
-            dot_general=self._dot_general,
-        )
-
-    def verify(
-        self,
-        *args,
-        reference=None,
-        rtol: float = DEFAULT_RTOL,
-        atol: float = DEFAULT_ATOL,
-    ):
-        """Run on the GPU and diff against a reference; return the output.
-
-        The reference defaults to this kernel's `interpret=True` oracle.
-
-        Parameters
-        ----------
-        *args
-            Kernel inputs, same as `__call__`.
-        reference : callable, optional
-            Alternative reference taking the same arguments. Required
-            for kernels using `palladium.threadgroup_memory`: interpret
-            models each instance as a threadgroup of one, so it computes
-            something else; `verify` refuses rather than pass silently.
-        rtol, atol : float, optional
-            Tolerances, defaulting wide enough for FAST math.
-
-        Returns
-        -------
-        The GPU output.
-
-        Raises
-        ------
-        VerificationError
-            On disagreement, naming the worst element and its index.
-        """
-        return _unwrap(
-            verify_against(
-                self.__call__,
-                None if reference is not None else self.interpret,
-                trace(self._staged, *args).uses_threadgroup,
-                args,
-                reference,
-                rtol,
-                atol,
-            )
-        )
 
     def pin(self, *args) -> Callable[[], np.ndarray | tuple[np.ndarray, ...]]:
         """Upload the inputs once; return a zero-argument callable that
@@ -230,39 +129,31 @@ class MetalCallable:
     def _bound(self, arrays: list[np.ndarray]) -> BoundKernel:
         """The compiled kernel for these argument shapes, from the cache."""
         key: CacheKey = tuple((a.shape, a.dtype.str) for a in arrays)
-        # Keep the lookup and LRU promotion together: another thread may
-        # evict this entry between `get` and `move_to_end`.
         with self._lock:
             bound = self.cache.get(key)
             if bound is not None:
                 self.cache.move_to_end(key)
-        if bound is None:
-            with self._lock:
-                bound = self.cache.get(key)
-                if bound is None:
-                    _check_dtypes(tuple(arrays))
-                    spec = trace(self._staged, *arrays)
-                    log_compile(
-                        spec,
-                        self._threadgroup,
-                        dot_general=self._dot_general,
-                    )
-                    bound = bind(
-                        spec,
-                        emit_msl(spec, dot_general=self._dot_general),
-                        math_mode=self._math_mode,
-                        threadgroup=self._threadgroup,
-                        dot_general=self._dot_general,
-                    )
-                    self.cache[key] = bound
-                    while self._cache_size and len(self.cache) > self._cache_size:
-                        self.cache.popitem(last=False)
+        if bound is not None:
+            return bound
+        spec, msl, _ = self._spec_and_msl(tuple(arrays))
+        with self._lock:
+            bound = self.cache.get(key)
+            if bound is None:
+                bound = bind(
+                    spec,
+                    msl,
+                    math_mode=self._options.math_mode,
+                    threadgroup=self._options.threadgroup,
+                    dot_general=self._options.dot_general,
+                )
+                self.cache[key] = bound
+                size = self._options.cache_size
+                while size and len(self.cache) > size:
+                    self.cache.popitem(last=False)
         return bound
 
 
-def _unwrap(outs):
-    """Match `__call__`'s convention: a bare array for single-output."""
-    return outs[0] if len(outs) == 1 else outs
+_unwrap = unwrap
 
 
 def debug_msl(kernel: Callable, *example_args, **pallas_kwargs) -> str:
@@ -328,12 +219,4 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> MetalCallable:
         NumPy-in/NumPy-out callable with `.interpret` (the CPU oracle)
         and `.cache` (per-shape compiled kernels).
     """
-    from metal_runtime import MathMode
-
-    math_mode = pallas_kwargs.pop("math_mode", MathMode.FAST)
-    threadgroup = pallas_kwargs.pop("threadgroup", None)
-    cache_size = pallas_kwargs.pop("cache_size", 256)
-    dot_general = pallas_kwargs.pop("dot_general", "auto")
-    if dot_general not in ("auto", "default", "tensorops"):
-        raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
-    return MetalCallable(kernel, pallas_kwargs, math_mode, threadgroup, cache_size, dot_general)
+    return MetalCallable(kernel, pallas_kwargs, CallOptions.split(pallas_kwargs))
