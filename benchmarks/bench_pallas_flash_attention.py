@@ -47,7 +47,7 @@ BASE_CASES = [
     for causal in (False, True)
     for head_dim in HEAD_DIMS
 ]
-TILE_CONFIGS = ((16, 16), (16, 32), (16, 64), (32, 32), (64, 32))
+TILE_CONFIGS = ((16, 16), (16, 32), (16, 64), (16, 128), (32, 32), (32, 128), (64, 32), (64, 64))
 SWEEP_CASES = [
     {
         "sequence_length": 4096,

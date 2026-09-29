@@ -47,6 +47,29 @@ tiles measured:
 With 32×32 query/key tiles on the same M1 Pro (JAX 0.11.2), the noncausal
 4,096 case measured 4.96 ms, so the tile choice matters more than the mask.
 
+Those M1 Pro rows predate the current schedule. The attention lowering now
+owns each score row by one SIMD group (lanes across columns, `simd_max` and
+`simd_sum` for the row reductions, scores read once into registers) and keeps
+the output accumulator in the value matmul's cooperative tensor instead of
+threadgroup memory, addressed through MPP element coordinates. Threadgroup
+memory per group fell from `BQ×BK + BQ×D + 2·BQ` to `BQ×BK + 3·BQ` floats, which
+is what makes 128-wide key tiles affordable. On an M2 (8-core GPU) through
+metal-runtime, f32, `[1, 4096, 4, 64]`, medians of resident-buffer runs:
+
+| Tiles (q×k) | Before | After |
+|:---:|---:|---:|
+| 32×32, full | 16.6 ms | 13.8 ms |
+| 32×32, causal | 9.6 ms | 7.7 ms |
+| 32×64, full | 17.0 ms | 11.6 ms |
+| 32×128, full | n/a | 10.7 ms |
+| 16×128, full | n/a | 9.3 ms |
+| 32×128, causal | n/a | 6.0 ms |
+
+At `[1, 1024, 4, 64]` the 32×128 tiles measured 0.96 ms against 2.1 ms before.
+Wide key tiles amortize the three barriers per key step; 64×128 exceeds the
+32 KB threadgroup budget. Staging the query tile in threadgroup memory was
+measured and rejected: it costs 1.5x at 4,096 through lost occupancy.
+
 These are steady-state medians with resident inputs; the generated kernel
 passed the benchmark's NumPy correctness check for both mask modes. Causal and
 noncausal timings are within the variation between runs, with no consistent

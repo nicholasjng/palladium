@@ -7,17 +7,20 @@ import math
 
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var
 
+from palladium.diagnostics import simdgroup_width
 from palladium.emit.cooperative import (
     CooperativeValue,
     OnlineSoftmaxPlan,
+    accumulator_rescale_expression,
     elementwise_expression,
-    emit_online_softmax_rows,
+    emit_online_softmax_simd,
 )
 from palladium.emit.core import Cursor, CVal, Environment
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
 
 from ._shared import (
+    SIMDGROUPS,
     _index_map_is,
     _kernel_source,
     _TensorOpsMatmul,
@@ -455,6 +458,9 @@ def _emit(plan: _IRAttentionPlan, spec: KernelSpec, kernel_name: str | None):
     score_op, value_op = plan.score_op, plan.value_op
     online_softmax, final_div_eqn = plan.online_softmax, plan.final_div
     name = kernel_name or spec.name
+    lanes = simdgroup_width()
+    if tile_q % SIMDGROUPS:
+        raise EmitError(f"attention query tiles must be a multiple of {SIMDGROUPS} rows")
     cursor = Cursor()
     cursor.emit(f"constexpr int BQ = {tile_q};")
     cursor.emit(f"constexpr int BK = {tile_k};")
@@ -469,9 +475,9 @@ def _emit(plan: _IRAttentionPlan, spec: KernelSpec, kernel_name: str | None):
     cursor.emit(f"const uint kv_base = (batch * {key_length} * {heads} + head) * D;")
 
     scores = cursor.allocate("float", (tile_q, tile_k), name="scores", space="threadgroup")
-    accumulator = cursor.allocate("float", (tile_q, dim), name="accumulator", space="threadgroup")
     row_max = cursor.allocate("float", (tile_q,), name="row_max", space="threadgroup")
     row_sum = cursor.allocate("float", (tile_q,), name="row_sum", space="threadgroup")
+    row_scale = cursor.allocate("float", (tile_q,), name="row_scale", space="threadgroup")
     q_storage = CVal("query", (query_length * heads * dim,), "float", space="device", readonly=True)
     k_storage = CVal("key", (key_length * heads * dim,), "float", space="device", readonly=True)
     v_storage = CVal("value", (key_length * heads * dim,), "float", space="device", readonly=True)
@@ -482,82 +488,105 @@ def _emit(plan: _IRAttentionPlan, spec: KernelSpec, kernel_name: str | None):
         space="device",
     )
 
-    with cursor.strided_loop("tid", "BQ * D", "THREADS", name="i"):
-        cursor.emit(f"{accumulator.at('i')} = 0.0f;")
     with cursor.strided_loop("tid", "BQ", "THREADS", name="row"):
         cursor.emit(f"{row_max.at('row')} = -INFINITY;")
         cursor.emit(f"{row_sum.at('row')} = 0.0f;")
-    cursor.barrier()
     score_op.emit_declaration(cursor)
     value_op.emit_declaration(cursor)
+    # Q is read from device on every key step: staging it in threadgroup
+    # memory costs more occupancy than the reads cost bandwidth.
+    q_tile = _TensorView(
+        dataclasses.replace(q_storage, expr=f"query + q_base + q_start * {heads * dim}"),
+        (tile_q, dim),
+        ("D", "BQ"),
+        (1, heads * dim),
+    ).emit(cursor, "q_tile")
+    score_tile = _TensorView(scores, (tile_q, tile_k), ("BK", "BQ"), (1, "BK")).emit(
+        cursor, "score_tile"
+    )
+    # A view at the head base fixes the value operand's type for the
+    # destination; each key step builds its own view at k_start.
+    value_view = _TensorView(
+        dataclasses.replace(v_storage, expr="value + kv_base"),
+        (tile_k, dim),
+        ("D", "BK"),
+        (1, heads * dim),
+    ).emit(cursor, "value_view")
+    # The output accumulator is the value matmul's cooperative tensor,
+    # spread over the threadgroup's registers for the whole key loop. MPP
+    # exposes each element's (column, row) coordinate, which the rescale
+    # and the final store use.
+    acc = value_op.emit_cooperative_destination(
+        cursor, score_tile, value_view, name="acc", element_type="float"
+    )
+    with cursor.loop(f"{acc.expr}.get_capacity()", "_i") as i:
+        cursor.emit(f"{acc.expr}[{i}] = 0.0f;")
+    cursor.barrier()
+    scale_atom = next(
+        atom for atom in online_softmax.score_scale.invars if atom is not dots[0].outvars[0]
+    )
+    scale = Environment().val(scan.invars[online_softmax.body_invars.index(scale_atom)]).expr
 
     key_loop_stop = "(((q_start + BQ + BK - 1) / BK) * BK)" if causal else str(key_length)
     with cursor.strided_loop("0", key_loop_stop, "BK", name="k_start"):
-        q_tile = _TensorView(
-            dataclasses.replace(q_storage, expr=f"query + q_base + q_start * {heads * dim}"),
-            (tile_q, dim),
-            ("D", "BQ"),
-            (1, heads * dim),
-        ).emit(cursor, "q_tile")
         k_tile = _TensorView(
             dataclasses.replace(k_storage, expr=f"key + kv_base + k_start * {heads * dim}"),
             (tile_k, dim),
             ("D", "BK"),
             (1, heads * dim),
         ).emit(cursor, "k_tile")
-        score_tile = _TensorView(scores, (tile_q, tile_k), ("BK", "BQ"), (1, "BK")).emit(
-            cursor, "score_tile"
-        )
         score_op.emit_run(cursor, q_tile, k_tile, score_tile)
         cursor.barrier()
 
-        score_tensor = CooperativeValue(scores, "tensorops")
-        scale_operands = tuple(
-            score_tensor if atom is dots[0].outvars[0] else Environment().val(scan.invars[3])
-            for atom in online_softmax.score_scale.invars
-        )
-        emit_online_softmax_rows(
+        emit_online_softmax_simd(
             cursor,
             online_softmax,
-            score_tensor,
+            CooperativeValue(scores, "tensorops"),
             row_max,
             row_sum,
-            accumulator,
-            scale_operands,
+            row_scale,
+            scale,
             rows=tile_q,
             columns=tile_k,
-            width=dim,
-            thread_count="THREADS",
+            lanes=lanes,
+            simdgroups=SIMDGROUPS,
             causal_offsets=("k_start", "q_start") if causal else None,
         )
         cursor.barrier()
 
-        probability_tile = _TensorView(scores, (tile_q, tile_k), ("BK", "BQ"), (1, "BK")).emit(
-            cursor, "probability_tile"
-        )
+        with cursor.loop(f"{acc.expr}.get_capacity()", "_i") as i:
+            cursor.emit(f"const int acc_row = {acc.expr}.get_multidimensional_index({i})[1];")
+            rescaled = accumulator_rescale_expression(
+                online_softmax,
+                "float",
+                f"{acc.expr}[{i}]",
+                row_scale.at("acc_row"),
+                rows=tile_q,
+                width=dim,
+            )
+            cursor.emit(f"{acc.expr}[{i}] = {rescaled};")
         value_tile = _TensorView(
             dataclasses.replace(v_storage, expr=f"value + kv_base + k_start * {heads * dim}"),
             (tile_k, dim),
             ("D", "BK"),
             (1, heads * dim),
         ).emit(cursor, "value_tile")
-        output_tile = _TensorView(accumulator, (tile_q, dim), ("D", "BQ"), (1, "D")).emit(
-            cursor, "output_tile"
-        )
-        value_op.emit_run(cursor, probability_tile, value_tile, output_tile)
+        value_op.emit_run(cursor, score_tile, value_tile, acc)
         cursor.barrier()
 
-    with cursor.strided_loop("tid", "BQ * D", "THREADS", name="i"):
-        cursor.emit("const uint row = i / D;")
+    with cursor.loop(f"{acc.expr}.get_capacity()", "_i") as i:
+        cursor.emit(f"const auto acc_index = {acc.expr}.get_multidimensional_index({i});")
+        cursor.emit("const int row = acc_index[1];")
+        cursor.emit("const int column = acc_index[0];")
         normalized = elementwise_expression(
             final_div_eqn,
             "float",
             (
-                (final_div_eqn.invars[0], accumulator.at("i")),
+                (final_div_eqn.invars[0], f"{acc.expr}[{i}]"),
                 (final_div_eqn.invars[1], row_sum.at("row")),
             ),
         )
-        cursor.emit(f"{out_tile.at(f'row * {heads * dim} + i % D')} = {normalized};")
+        cursor.emit(f"{out_tile.at(f'row * {heads * dim} + column')} = {normalized};")
 
     params = (
         "device float* query [[buffer(0)]]",
@@ -566,6 +595,8 @@ def _emit(plan: _IRAttentionPlan, spec: KernelSpec, kernel_name: str | None):
         "device float* output [[buffer(3)]]",
         "uint3 group [[threadgroup_position_in_grid]]",
         "uint tid [[thread_index_in_threadgroup]]",
+        "uint lane [[thread_index_in_simdgroup]]",
+        "uint sg [[simdgroup_index_in_threadgroup]]",
         "uint3 threads_per_group [[threads_per_threadgroup]]",
     )
     source = _kernel_source(name, params, cursor.lines)

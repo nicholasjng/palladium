@@ -177,3 +177,33 @@ registries and cooperative scope models, but their rules emit MLIR for TPU or
 NVIDIA. They are architectural references, not drop-in MSL lowerings. No
 installed JAX API replaces the MPP descriptors/views or the MSL expression
 renderer.
+
+## Attention schedule, second version
+
+The first online-softmax lowering gave each score row to one lane: with 128
+lanes and 16 to 64 rows, most of the threadgroup idled through the softmax, and
+each row was walked serially over BK columns twice through threadgroup memory.
+The accumulator also lived in threadgroup memory and was rescaled by the same
+single lane per row.
+
+The current schedule keeps both MPP matmuls and changes what happens between
+them. SIMD group `sg` owns rows `sg, sg + 4, ...`; lane `l` owns columns
+`l, l + 32, ...`. Each lane reads its BK/32 scaled scores once into registers,
+`simd_max` gives the block max, probabilities are computed in registers and
+written back in place for the value matmul, `simd_sum` gives the block sum, and
+lane 0 commits the row carries plus the accumulator rescale factor to
+`row_scale`. Causal masking and partial key tiles (BK < 32) are lane guards on
+the same path.
+
+The output accumulator is the value matmul's destination cooperative tensor,
+declared before the key loop and held in registers throughout. MPP exposes each
+element's coordinates through `get_multidimensional_index`, which the probe on
+an M2 confirmed are exact and distributed over all 128 threads (16 elements per
+thread for a 32×64 tile, index order (column, row)). The per-step rescale and
+the final normalizing store use those coordinates, so the accumulator never
+touches threadgroup memory. Barriers stay at three per key step.
+
+Measured on the M2 (`[1, 4096, 4, 64]`, f32): 16.6 to 13.8 ms at 32×32, 17.0 to
+11.6 ms at 32×64, and 9.3 ms at 16×128, which the smaller footprint newly allows.
+Staging Q in threadgroup memory was tried and rejected (21.4 ms against 14.1 ms
+at 32×32) because the extra shared bytes cost occupancy.
