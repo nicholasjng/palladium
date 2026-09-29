@@ -41,6 +41,9 @@ tiles measured:
 | 4,096 | No | 11.29 ms |
 | 4,096 | Yes | 11.09 ms |
 
+With 32×32 query/key tiles on the same M1 Pro (JAX 0.11.2), the noncausal
+4,096 case measured 4.96 ms, so the tile choice matters more than the mask.
+
 These are steady-state medians with resident inputs; the generated kernel
 passed the benchmark's NumPy correctness check for both mask modes. Causal and
 noncausal timings are within the variation between runs, with no consistent
