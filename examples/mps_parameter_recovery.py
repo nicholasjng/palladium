@@ -1,7 +1,7 @@
 """Recover shared LV parameters with fully jitted loss, VJP, and Adam.
 
 Run in the modified jax-mps environment with JAX_PLATFORMS=mps,cpu.
-CPU uses the portable Pallas interpreter; choose --variant jax for CPU speed.
+On --device cpu the kernels run on the Pallas interpreter; choose --variant jax for CPU speed.
 """
 
 import argparse
@@ -40,6 +40,7 @@ def main():
             dt=args.dt,
             interval=args.interval,
             variant=args.variant,
+            interpret=args.device == "cpu",
         )
         update, loss = make_training_step(solve)
         state = initial_state()

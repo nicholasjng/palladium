@@ -33,8 +33,12 @@ def reference_solve(x0, y0, a, b, c, d, *, steps=100, dt=0.01):
     return jax.lax.fori_loop(0, steps, step, (x0, y0))
 
 
-def make_solver(n, *, steps=100, dt=0.01, interval=10, variant="reverse"):
+def make_solver(n, *, steps=100, dt=0.01, interval=10, variant="reverse", interpret=False):
     """Build a fixed-step solver. Interval 1 is the full-history reverse oracle.
+
+    Kernels are plain `pl.pallas_call`s: Palladium lowers them on the mps
+    platform; pass `interpret=True` to run them on the Pallas interpreter
+    elsewhere.
 
     Reverse recomputation uses O(steps * interval) work and
     2*n*ceil(steps/interval) float32 checkpoint elements.
@@ -324,8 +328,9 @@ def make_solver(n, *, steps=100, dt=0.01, interval=10, variant="reverse"):
 
     point = pl.BlockSpec((1,), lambda i: (i,))
     checkpoint_row = pl.BlockSpec((1, checkpoints), lambda i: (i, 0))
-    forward = palladium.mps_call_jit(
+    forward = pl.pallas_call(
         rk4_kernel,
+        interpret=interpret,
         grid=(n,),
         in_specs=[point] * 6,
         out_specs=(point, point)
@@ -343,9 +348,10 @@ def make_solver(n, *, steps=100, dt=0.01, interval=10, variant="reverse"):
     if variant == "forward":
         return forward
     if variant == "reference":
-        return forward.with_reference_vjp(reference)
-    backward = palladium.mps_call_jit(
+        return palladium.with_reference_vjp(forward, reference)
+    backward = pl.pallas_call(
         rk4_tangent_vjp_kernel if variant == "tangent" else rk4_reverse_vjp_kernel,
+        interpret=interpret,
         grid=(n,),
         in_specs=[point] * 6
         + ([checkpoint_row, checkpoint_row] if variant == "reverse" else [])
@@ -354,9 +360,9 @@ def make_solver(n, *, steps=100, dt=0.01, interval=10, variant="reverse"):
         out_shape=(jax.ShapeDtypeStruct((n,), jnp.float32),) * 6,
     )
     return (
-        forward.with_auxiliary_vjp(backward, output_count=2)
+        palladium.with_auxiliary_vjp(forward, backward, output_count=2)
         if variant == "reverse"
-        else forward.with_vjp(backward)
+        else palladium.with_vjp(forward, backward)
     )
 
 

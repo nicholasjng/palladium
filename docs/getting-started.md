@@ -6,11 +6,11 @@ where the call should run:
 
 | Entry point | Execution |
 |---|---|
-| mps_call_jit | jax-mps custom call on the MPS platform; composable with jax.jit |
+| pl.pallas_call on mps | palladium is the registered Pallas backend for jax-mps; composable with jax.jit |
 | metal_call | Eager Metal dispatch; NumPy inputs and outputs |
 | metal_call_jit | Metal dispatch through a CPU jax.ffi target; composable with jax.jit |
 
-The latter two use metal-runtime. mps_call_jit requires jax-mps to be
+The latter two use metal-runtime. The mps path requires jax-mps to be
 installed and selected. See the [README](../README.md) for the current install
 requirements.
 
@@ -67,7 +67,7 @@ compile or dispatch. palladium.debug_msl returns the generated MSL directly.
 
 Importing palladium registers it as the Pallas backend for the mps platform:
 a plain `pl.pallas_call` inside `jax.jit` on a jax-mps device lowers to the
-same Metal kernel `mps_call_jit` builds, with no wrapper call. Metal-side
+Metal kernel `metal_call_jit` would build, with no wrapper call. Metal-side
 options travel as `compiler_params`:
 
 ~~~python
@@ -80,8 +80,10 @@ jax.jit(call)(x)  # palladium.dispatch on mps; JAX's own lowering elsewhere
 ~~~
 
 Other platforms keep JAX's behavior (interpret=True, or an error), and
-`interpret=True` is honored everywhere. `mps_call_jit` remains for the
-interpreter fallback on non-mps platforms and the VJP helpers.
+`interpret=True` is honored everywhere. Gradients pair a forward call with a
+backward implementation: `palladium.with_vjp(forward, backward)`,
+`with_auxiliary_vjp` for checkpointed adjoints, or `with_reference_vjp` to
+borrow JAX's pullback of a pure-JAX reference.
 
 ## Iterating on the device
 
@@ -99,9 +101,8 @@ vmap_method="pipelined" handles the batch in one FFI call; nested batch
 levels and the sequential methods dispatch one element at a time. Put a
 batch axis in the Pallas grid when possible.
 
-mps_call_jit supports jax.jit; jax.vmap over its custom call runs one
-dispatch per batch element. Neither custom-call path derives gradients from
-emitted MSL. Pair
+On mps, jax.vmap over a pallas_call is JAX's own batching. No path derives
+gradients from emitted MSL. Pair
 forward and backward calls with jax.custom_vjp, or provide a pure-JAX
 reference VJP where supported. See the [supported functionality](supported-jax.md)
 for details.

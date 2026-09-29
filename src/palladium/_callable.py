@@ -1,8 +1,8 @@
 """What the three call paths share: option parsing, the per-shape cache of
 traced specs and emitted MSL, diagnostics, verification, and VJP attachment.
 
-`metal_call` (eager), `metal_call_jit` (CPU FFI), and `mps_call_jit`
-(jax-mps custom call) differ only in how a compiled kernel is dispatched;
+`metal_call` (eager) and `metal_call_jit` (CPU FFI) differ only in how a
+compiled kernel is dispatched;
 everything up to the MSL text is this module.
 """
 
@@ -30,6 +30,7 @@ from palladium.emit.core import CTYPES
 from palladium.errors import DispatchError
 from palladium.trace import KernelSpec, trace
 from palladium.verify import DEFAULT_ATOL, DEFAULT_RTOL, verify_against
+from palladium.vjp import with_auxiliary_vjp, with_reference_vjp, with_vjp
 
 __all__ = ["CallOptions", "PallasCallable", "check_dtypes", "unwrap"]
 
@@ -46,7 +47,6 @@ class CallOptions:
     cache_size: int
     dot_general: str
     vmap_method: str | None
-    fallback: str
 
     @classmethod
     def split(
@@ -54,7 +54,6 @@ class CallOptions:
         pallas_kwargs: dict[str, Any],
         *,
         vmap_method: str | None = None,
-        fallback: str = "interpret",
     ) -> CallOptions:
         """Pop the Metal-side keywords out of `pallas_kwargs` (mutated)."""
         from metal_runtime import MathMode
@@ -68,7 +67,6 @@ class CallOptions:
             cache_size=pallas_kwargs.pop("cache_size", 256),
             dot_general=dot_general,
             vmap_method=pallas_kwargs.pop("vmap_method", vmap_method),
-            fallback=pallas_kwargs.pop("fallback", fallback),
         )
 
 
@@ -93,10 +91,6 @@ def check_dtypes(args: tuple) -> None:
 def unwrap(outs):
     """Match `__call__`'s convention: a bare array for single-output."""
     return outs[0] if len(outs) == 1 else outs
-
-
-def _as_tuple(value: Any) -> tuple[Any, ...]:
-    return value if isinstance(value, tuple) else (value,)
 
 
 class PallasCallable:
@@ -228,91 +222,16 @@ class PallasCallable:
 
     # -- gradients ------------------------------------------------------
     # None of the paths derives a derivative from emitted MSL; these pair
-    # the forward call with a backward implementation.
+    # this call with a backward implementation (see palladium.vjp).
 
     def with_reference_vjp(self, reference: Callable) -> Callable:
-        """Attach a correctness-first VJP computed by JAX from `reference`.
-
-        The primal stays this call; the pullback is JAX's VJP of
-        `reference`, which must have the same inputs, outputs, and
-        differentiable semantics. Useful for putting a fused forward solve
-        into a training loop while a Pallas adjoint kernel is developed; it
-        is not a performance solution.
-        """
-
-        @jax.custom_vjp
-        def differentiated(*args):
-            return self(*args)
-
-        def forward(*args):
-            return self(*args), args
-
-        def backward(residual, cotangents):
-            _, pullback = jax.vjp(reference, *residual)
-            return pullback(cotangents)
-
-        differentiated.defvjp(forward, backward)
-        return differentiated
+        """`palladium.with_reference_vjp(self, reference)`."""
+        return with_reference_vjp(self, reference)
 
     def with_vjp(self, backward_call: Callable) -> Callable:
-        """Attach a Pallas custom VJP to this forward call.
-
-        `backward_call` receives the forward primals followed by one
-        cotangent per forward output and returns one cotangent per primal,
-        in order. It can itself be a palladium call on the same path.
-        """
-
-        @jax.custom_vjp
-        def differentiated(*args):
-            return self(*args)
-
-        def forward(*args):
-            return self(*args), args
-
-        def backward(residual, cotangents):
-            input_cotangents = _as_tuple(backward_call(*residual, *_as_tuple(cotangents)))
-            if len(input_cotangents) != len(residual):
-                raise TypeError(
-                    "Palladium VJP returned "
-                    f"{len(input_cotangents)} input cotangents for "
-                    f"{len(residual)} primals"
-                )
-            return input_cotangents
-
-        differentiated.defvjp(forward, backward)
-        return differentiated
+        """`palladium.with_vjp(self, backward_call)`."""
+        return with_vjp(self, backward_call)
 
     def with_auxiliary_vjp(self, backward_call: Callable, output_count: int) -> Callable:
-        """Attach a VJP while retaining trailing forward outputs as residuals.
-
-        The first `output_count` outputs are the public primal result; the
-        trailing outputs (checkpoints) are saved and passed to
-        `backward_call` after the primals and before the output cotangents.
-        """
-        if output_count < 1:
-            raise ValueError("output_count must be positive")
-
-        def split_outputs(raw_outputs):
-            values = _as_tuple(raw_outputs)
-            if output_count >= len(values):
-                raise ValueError(
-                    "with_auxiliary_vjp requires at least one trailing auxiliary output"
-                )
-            return unwrap(values[:output_count]), values[output_count:]
-
-        @jax.custom_vjp
-        def differentiated(*args):
-            public, _ = split_outputs(self(*args))
-            return public
-
-        def forward(*args):
-            public, auxiliaries = split_outputs(self(*args))
-            return public, (*args, *auxiliaries)
-
-        def backward(residual, cotangents):
-            # The custom-VJP protocol validates the returned pytree against
-            # the primal arguments; the auxiliary count is backward_call's ABI.
-            return _as_tuple(backward_call(*residual, *_as_tuple(cotangents)))
-
-        differentiated.defvjp(forward, backward)
-        return differentiated
+        """`palladium.with_auxiliary_vjp(self, backward_call, output_count)`."""
+        return with_auxiliary_vjp(self, backward_call, output_count)

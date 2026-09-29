@@ -41,6 +41,7 @@ def main():
             steps=args.steps,
             interval=args.interval,
             variant=args.variant,
+            interpret=args.device == "cpu",
             learning_rate=args.learning_rate,
         )
         start = time.perf_counter()

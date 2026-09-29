@@ -27,12 +27,7 @@ from palladium.errors import (
     UnsupportedPrimitiveError,
 )
 from palladium.ffi import FfiCallable, metal_call_jit
-from palladium.mps import (
-    MPS_CUSTOM_CALL_TARGET,
-    MpsCallable,
-    MpsDispatchDescriptor,
-    mps_call_jit,
-)
+from palladium.mps import MPS_CUSTOM_CALL_TARGET, MpsDispatchDescriptor
 from palladium.pallas_backend import CompilerParams, install as _install_pallas_backend
 from palladium.threadgroup import (
     barrier,
@@ -42,6 +37,7 @@ from palladium.threadgroup import (
 )
 from palladium.trace import BlockInfo, KernelSpec, ScratchInfo, trace
 from palladium.verify import VerificationError
+from palladium.vjp import with_auxiliary_vjp, with_reference_vjp, with_vjp
 
 __all__ = [
     "MPS_CUSTOM_CALL_TARGET",
@@ -54,7 +50,6 @@ __all__ = [
     "KernelDiagnostics",
     "KernelSpec",
     "MetalCallable",
-    "MpsCallable",
     "MpsDispatchDescriptor",
     "PalladiumError",
     "ScratchInfo",
@@ -69,12 +64,14 @@ __all__ = [
     "emit_msl",
     "metal_call",
     "metal_call_jit",
-    "mps_call_jit",
     "rule",
     "thread_index",
     "threadgroup_memory",
     "threads_per_threadgroup",
     "trace",
+    "with_auxiliary_vjp",
+    "with_reference_vjp",
+    "with_vjp",
 ]
 
 __version__ = "0.2.0"

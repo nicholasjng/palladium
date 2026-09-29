@@ -102,7 +102,9 @@ def reference_flow(states, parameters, *, steps=16, reverse=True):
     return jax.lax.fori_loop(0, steps, step, states)
 
 
-def make_flow(n, *, width=4, steps=16, interval=4, variant="reverse", reverse=True):
+def make_flow(
+    n, *, width=4, steps=16, interval=4, variant="reverse", reverse=True, interpret=False
+):
     """Integrate data to base (reverse=True) or base to data.
 
     Returns (n,3) augmented states. Parameters have shape (n,6*width+2);
@@ -183,8 +185,9 @@ def make_flow(n, *, width=4, steps=16, interval=4, variant="reverse", reverse=Tr
     checkpoint_spec = pl.BlockSpec((1, 3 * checkpoints), lambda i: (i, 0))
     shape = jax.ShapeDtypeStruct((n, 3), jnp.float32)
     saves = variant == "reverse"
-    forward = palladium.mps_call_jit(
+    forward = pl.pallas_call(
         forward_kernel,
+        interpret=interpret,
         grid=(n,),
         in_specs=(state_spec, params_spec),
         out_specs=(state_spec, checkpoint_spec) if saves else state_spec,
@@ -195,15 +198,16 @@ def make_flow(n, *, width=4, steps=16, interval=4, variant="reverse", reverse=Tr
     if variant == "forward":
         return forward
     if variant == "reference":
-        return forward.with_reference_vjp(reference)
-    backward = palladium.mps_call_jit(
+        return palladium.with_reference_vjp(forward, reference)
+    backward = pl.pallas_call(
         backward_kernel,
+        interpret=interpret,
         grid=(n,),
         in_specs=(state_spec, params_spec, checkpoint_spec, state_spec),
         out_specs=(state_spec, params_spec),
         out_shape=(shape, jax.ShapeDtypeStruct((n, count), jnp.float32)),
     )
-    return forward.with_auxiliary_vjp(backward, output_count=1)
+    return palladium.with_auxiliary_vjp(forward, backward, output_count=1)
 
 
 def make_log_prob(n, **kwargs):

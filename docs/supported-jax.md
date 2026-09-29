@@ -70,7 +70,7 @@ each query tile and runs the score and value matmuls with Metal TensorOps. Tile
 sizes and head dimensions must be multiples of 16, and both sequence lengths
 must divide evenly into their tiles. Short query sequences need padding and
 output cropping. Unsupported jaxpr forms and layouts raise `EmitError`.
-`mps_call_jit` follows the same policy: cooperative kernels are sent to jax-mps with
+The mps lowering follows the same policy: cooperative kernels are sent to jax-mps with
 their scaled thread grid and required threadgroup, and run under `jax.jit` on the
 `mps` platform (verified on an M1 Pro with JAX 0.11.2 and the jax-mps
 `palladium-dispatch` handler).
@@ -110,14 +110,14 @@ reference instead.
 
 | Path | JIT | vmap | Gradients |
 |---|---|---|---|
-| `mps_call_jit` | Yes, through jax-mps | Sequential: one dispatch per element through `lax.map` | Pair forward/backward calls with `custom_vjp`, or supply a pure-JAX reference VJP |
-| plain `pl.pallas_call` on `mps` | Yes: palladium is the registered Pallas backend for the platform (`palladium.CompilerParams` for options) | JAX's own `pallas_call` batching | As above, through `jax.custom_vjp` |
+| `pl.pallas_call` on `mps` | Yes: palladium is the registered Pallas backend for the platform (`palladium.CompilerParams` for options) | JAX's own `pallas_call` batching | `palladium.with_vjp`, `with_auxiliary_vjp`, or `with_reference_vjp` |
 | `metal_call_jit` | Yes, through CPU FFI to Metal | Pipelined by default; sequential methods also available | Pair with `custom_vjp` |
 | `metal_call` | Eager NumPy interface | Not a JAX transformation | No automatic differentiation |
 
-`mps_call_jit` uses FAST math and the Pallas interpreter on non-MPS
-platforms by default for independent kernels; `fallback="error"`
-requires MPS. Cooperative kernels reject interpreter fallback.
+The mps lowering uses FAST math. On other platforms a `pallas_call` keeps
+JAX's own behavior: `interpret=True` runs the Pallas interpreter, which
+models cooperative kernels as threadgroups of one and so computes something
+else for them.
 `metal_call_jit` dispatches to Metal through the CPU FFI target and
 does not need jax-mps.
 

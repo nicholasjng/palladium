@@ -4,7 +4,7 @@ jax-mps routes ``jax.nn.dot_product_attention`` to MLX's fused
 scaled-dot-product kernel, so this is the bar Palladium's cooperative
 attention has to clear to be worth using from JAX. Each case runs one
 candidate as an ordinary jitted JAX function on the ``mps`` device with
-resident inputs: Palladium via ``mps_call_jit``, MLX's fused SDPA, and a
+resident inputs: Palladium as the Pallas backend for mps, MLX's fused SDPA, and a
 plain ``jnp`` softmax attention to show what XLA fusion alone gets. Every
 candidate is checked against the NumPy reference before timing.
 
@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import mew
 import numpy as np
+from jax.experimental import pallas as pl
 
 from palladium.workloads.pallas_flash_attention import (
     attention_kernel,
@@ -79,14 +80,13 @@ def _palladium(sequence, heads, head_dim, tile_q, tile_k, causal):
     import palladium
 
     grid, in_specs, out_specs = attention_specs(BATCH, sequence, heads, tile_q, head_dim)
-    return palladium.mps_call_jit(
+    return pl.pallas_call(
         attention_kernel(tile_q=tile_q, tile_k=tile_k, head_dim=head_dim, causal=causal),
         grid=grid,
         in_specs=in_specs,
         out_specs=out_specs,
         out_shape=jax.ShapeDtypeStruct((BATCH, sequence, heads, head_dim), jnp.float32),
-        dot_general="tensorops",
-        fallback="error",
+        compiler_params=palladium.CompilerParams(dot_general="tensorops"),
     )
 
 

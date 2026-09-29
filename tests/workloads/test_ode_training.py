@@ -15,6 +15,10 @@ from palladium.workloads.ode_training import (
     reference_solve,
 )
 
+# Kernels run on the Pallas interpreter unless the mps platform is selected.
+INTERPRET = jax.default_backend() != "mps"
+make_solver = functools.partial(make_solver, interpret=INTERPRET)
+
 
 @pytest.mark.parametrize("steps,interval", [(1, 1), (7, 1), (7, 3), (7, 10), (23, 5), (100, 10)])
 @pytest.mark.parametrize("seed", [17, 29])

@@ -1,9 +1,10 @@
 # Palladium
 
-Palladium translates a supported subset of JAX Pallas kernels to Metal. Its
-main integration is [`mps_call_jit`](docs/supported-jax.md), which sends the
-generated kernel to the jax-mps backend. It also provides eager `metal_call`
-and a CPU-FFI `metal_call_jit` path.
+Palladium translates a supported subset of JAX Pallas kernels to Metal. With
+the [jax-mps](https://github.com/tillahoffmann/jax-mps) plugin selected, it
+is the Pallas backend for the `mps` platform: a plain `pl.pallas_call` under
+`jax.jit` lowers to a Metal kernel. It also provides eager `metal_call` and a
+CPU-FFI `metal_call_jit` path that need no plugin.
 
 ## Example
 
@@ -11,32 +12,28 @@ and a CPU-FFI `metal_call_jit` path.
 import jax
 import jax.experimental.pallas as pl
 import jax.numpy as jnp
-import palladium
+import palladium  # registers the mps lowering
 
 def saxpy(x_ref, y_ref, out_ref):
     out_ref[...] = 2.0 * x_ref[...] + y_ref[...]
 
 n = 4096
 block = pl.BlockSpec((1,), lambda i: (i,))
-call = palladium.mps_call_jit(
+call = pl.pallas_call(
     saxpy,
     grid=(n,),
     in_specs=(block, block),
     out_specs=block,
     out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
-    fallback="error",
+    compiler_params=palladium.CompilerParams(),  # optional Metal-side knobs
 )
 result = jax.jit(call)(x, y)  # x and y are float32 arrays on MPS
 ```
 
-`fallback="error"` requires the call to lower on MPS. Without it, independent
-kernels may use Pallas's interpreter on other platforms. Cooperative kernels
-always require MPS execution.
-
-With jax-mps selected, a plain `pl.pallas_call` under `jax.jit` also runs
-through Palladium: importing the package registers it as the Pallas backend
-for the `mps` platform, and `compiler_params=palladium.CompilerParams(...)`
-carries the Metal-side options.
+Other platforms keep JAX's own `pallas_call` behavior; pass `interpret=True`
+to run the same kernel on the Pallas interpreter anywhere. Gradients pair a
+forward call with a backward one through `palladium.with_vjp`,
+`with_auxiliary_vjp`, or `with_reference_vjp`.
 
 ## Install
 
@@ -50,7 +47,7 @@ uv sync
 uv run pytest -q
 ```
 
-To use `mps_call_jit`, install and select the jax-mps plugin separately. Its
+To run on the `mps` platform, install and select the jax-mps plugin separately. Its
 platform name is `mps`; the plugin is not installed by this repository.
 
 ## Documentation
