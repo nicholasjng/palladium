@@ -11,4 +11,5 @@ from . import (
     elementwise as elementwise,
     memory as memory,
     random as random,
+    structural as structural,
 )

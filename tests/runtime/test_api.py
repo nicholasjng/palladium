@@ -220,7 +220,7 @@ def test_unsupported_primitive_names_the_primitive_as_a_field():
     """So a caller can branch on it instead of matching message text."""
 
     def kernel(x_ref, o_ref):
-        o_ref[...] = jax.lax.cumsum(x_ref[...])
+        o_ref[...] = jnp.sort(x_ref[...])
 
     with pytest.raises(UnsupportedPrimitiveError) as excinfo:
         palladium.debug_msl(

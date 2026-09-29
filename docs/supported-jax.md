@@ -31,8 +31,11 @@ read snapshots are preserved across later writes.
   casts, bitcasts, logical and bitwise operations, shifts, and broadcasting.
   erf, erf_inv, expm1, and log1p are float32 helper functions emitted with
   the kernel; the rest map onto MSL builtins.
-- **Array structure:** reshape, permuted reshape, transpose, and selection via
-  `select_n`.
+- **Array structure:** reshape, permuted reshape, transpose, selection via
+  `select_n`, `broadcasted_iota`/`arange`, `concatenate`, and `dynamic_slice`
+  (start indices clamped as JAX defines).
+- **Cumulative:** `cumsum`, `cumprod`, `cummax`, `cummin` along one axis,
+  forward or reverse.
 - **Reductions:** sum, min, and max over supported axis subsets, including
   `jnp.minmax`.
 - **Dot:** standard rank-2 matrix multiplication and rank-1 matvec, vecmat, or
