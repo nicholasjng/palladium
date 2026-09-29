@@ -415,7 +415,7 @@ def test_tensorops_dot_is_used_by_jittable_metal_runtime_calls():
         out_shape=jax.ShapeDtypeStruct((32, 64), jnp.float32),
         dot_general="tensorops",
     )
-    _, msl = call._spec_and_msl(
+    _, msl, _ = call._spec_and_msl(
         (
             jax.ShapeDtypeStruct((32, 16), jnp.float32),
             jax.ShapeDtypeStruct((16, 64), jnp.float32),
