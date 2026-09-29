@@ -14,7 +14,6 @@ from palladium.emit.tensorops import (
     import_kernel,
     plan_kernel,
 )
-from palladium.errors import EmitError
 from palladium.trace import trace
 from palladium.workloads.pallas_flash_attention import make_pallas_flash_attention
 
@@ -202,9 +201,6 @@ def test_tensorops_matmul_lowering_emits_from_ir():
     assert "const device float*" not in compilation.source
     assert compilation.source == emit_msl(spec, dot_general="tensorops")
     assert compilation.threadgroup_bytes == 0
-
-    with pytest.raises(EmitError, match="requires 4 simdgroups"):
-        compile_kernel(spec, scope=ProgramScope.THREADGROUP, simdgroups=2)
 
 
 def test_tensorops_matmul_accumulates_k_in_tensorops_tiles_and_handles_tail():

@@ -13,6 +13,8 @@ import enum
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
 
+from ._shared import SIMDGROUPS
+
 
 class ProgramScope(enum.Enum):
     """Metal execution unit assigned to one logical Pallas grid point."""
@@ -84,12 +86,7 @@ class KernelPlan:
         return "thread_position_in_grid"
 
 
-def plan_kernel(
-    spec: KernelSpec,
-    *,
-    scope: ProgramScope | None = None,
-    simdgroups: int = 4,
-) -> KernelPlan:
+def plan_kernel(spec: KernelSpec, *, scope: ProgramScope | None = None) -> KernelPlan:
     """Build the tensorops frontend plan without selecting physical value layouts.
 
     Kernels that explicitly use thread indices, threadgroup size, barriers, or
@@ -104,13 +101,10 @@ def plan_kernel(
     selected_scope = scope or inferred_scope
     if spec.uses_threadgroup and selected_scope is ProgramScope.THREAD:
         raise EmitError("cooperative Pallas effects require one threadgroup per program")
-    if simdgroups <= 0:
-        raise EmitError("simdgroups must be positive")
-
     return KernelPlan(
         spec=spec,
         scope=selected_scope,
-        simdgroups=simdgroups if selected_scope is ProgramScope.THREADGROUP else 1,
+        simdgroups=SIMDGROUPS if selected_scope is ProgramScope.THREADGROUP else 1,
         inputs=tuple(_ref_layout(info, AddressSpace.DEVICE) for info in spec.inputs),
         outputs=tuple(_ref_layout(info, AddressSpace.DEVICE) for info in spec.outputs),
         scratch=tuple(
