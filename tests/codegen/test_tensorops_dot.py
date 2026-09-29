@@ -4,6 +4,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 from jax.experimental import pallas as pl
 from jax.extend.core import Jaxpr
@@ -288,7 +289,7 @@ def test_tensorops_dot_fuses_column_bias():
 
 def test_tensorops_batched_dot_maps_batch_and_output_tiles_to_threadgroups():
     msl = palladium.emit_msl(_blocked_batched_dot(), dot_general="tensorops")
-    ordinary = palladium.emit_msl(_blocked_batched_dot())
+    ordinary = palladium.emit_msl(_blocked_batched_dot(), dot_general="default")
 
     assert "uint3 _pid [[threadgroup_position_in_grid]]" in msl
     assert "matmul2d_descriptor desc(16, 32, 16" in msl
@@ -343,10 +344,41 @@ def test_tensorops_batched_dot_explain_scales_batch_axis_for_groups():
     assert diag.threadgroup == (128, 1, 1)
 
 
-def test_tensorops_dot_is_opt_in():
-    ordinary = palladium.emit_msl(_blocked_dot())
+def test_auto_selects_tensorops_for_tiled_dots_and_default_forces_the_primitive_path():
+    auto = palladium.emit_msl(_blocked_dot())
+    assert auto == palladium.emit_msl(_blocked_dot(), dot_general="tensorops")
+    ordinary = palladium.emit_msl(_blocked_dot(), dot_general="default")
     assert "MetalPerformancePrimitives" not in ordinary
     assert "thread_position_in_grid" in ordinary
+
+
+def test_auto_falls_back_to_the_primitive_path_for_dots_tensorops_rejects():
+    """Two outputs are outside the cooperative matmul's contract; "auto"
+    keeps the kernel on the one-thread-per-program emitter, while
+    "tensorops" surfaces the rejection."""
+
+    def kernel(a_ref, b_ref, o_ref, p_ref):
+        product = jnp.dot(a_ref[...], b_ref[...])
+        o_ref[...] = product
+        p_ref[...] = product * 2.0
+
+    out_spec = pl.BlockSpec((16, 32), lambda i, j: (i, j))
+    call = pl.pallas_call(
+        kernel,
+        grid=(2, 2),
+        in_specs=[
+            pl.BlockSpec((16, 16), lambda i, j: (i, 0)),
+            pl.BlockSpec((16, 32), lambda i, j: (0, j)),
+        ],
+        out_specs=(out_spec, out_spec),
+        out_shape=(jax.ShapeDtypeStruct((32, 64), jnp.float32),) * 2,
+    )
+    spec = palladium.trace(call, np.zeros((32, 16), np.float32), np.zeros((16, 64), np.float32))
+    auto = palladium.emit_msl(spec)
+    assert "MetalPerformancePrimitives" not in auto
+    assert auto == palladium.emit_msl(spec, dot_general="default")
+    with pytest.raises(EmitError):
+        palladium.emit_msl(spec, dot_general="tensorops")
 
 
 def test_tensorops_explain_reports_group_scaled_dispatch():

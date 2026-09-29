@@ -41,9 +41,13 @@ read snapshots are preserved across later writes.
 - **Effects:** Ref reads and writes, plus Palladium's explicit cooperative
   barrier effect. Debug printing and arbitrary JAX effects are unsupported.
 
-For `metal_call` and `metal_call_jit`, `dot_general="tensorops"` opts into an
-experimental Metal Runtime lowering for a standalone, tiled float32 rank-2
-matmul or matching rank-3 batches of matrices. The batched form uses arrays
+For `metal_call` and `metal_call_jit`, tiled matmuls on a 2D or 3D grid lower
+through Metal 4 TensorOps by default (`dot_general="auto"`); dots the
+cooperative lowering does not recognize keep the one-thread-per-program
+emitter. `dot_general="tensorops"` requires the cooperative lowering and
+raises where it does not apply; `dot_general="default"` forces the primitive
+path. The lowering covers a standalone, tiled rank-2 matmul or matching rank-3
+batches of matrices. The batched form uses arrays
 `[B, M, K] @ [B, K, N]`, one batch per Pallas grid coordinate, and one
 threadgroup per output tile. Batch sizes must match, M and N must tile evenly,
 and each tile must contain the full K dimension. Rank-2 inputs may be
