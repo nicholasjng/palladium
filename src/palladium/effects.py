@@ -1,5 +1,5 @@
-"""Jaxpr effect helpers: per-Ref read/write sets, and the gate against
-effects palladium cannot perform on the GPU.
+"""Jaxpr effect helpers: per-equation Ref read/write queries, and the gate
+against effects palladium cannot perform on the GPU.
 
 State effects (`Read`/`Write`/`Accum`, each keyed to a Ref var)
 aggregate per jaxpr and through control flow: a `swap` inside a `scan`
@@ -22,8 +22,6 @@ __all__ = [
     "eqn_reads_ref",
     "eqn_writes_ref",
     "foreign_effects",
-    "read_refs",
-    "written_refs",
 ]
 
 
@@ -48,26 +46,6 @@ def foreign_effects(jaxpr: Jaxpr) -> list[Effect]:
         (e for e in jaxpr.effects if not isinstance(e, (RefEffect, GpuNativeEffect))),
         key=lambda e: (type(e).__name__, str(e)),
     )
-
-
-def written_refs(jaxpr: Jaxpr) -> set[Var]:
-    """Ref vars `jaxpr` may write (swap or accumulate), at any depth."""
-    return {
-        e.input
-        for e in jaxpr.effects
-        if isinstance(e, (WriteEffect, AccumEffect)) and isinstance(e.input, Var)
-    }
-
-
-def read_refs(jaxpr: Jaxpr) -> set[Var]:
-    """Ref vars `jaxpr` may read, at any depth."""
-    return {
-        e.input
-        for e in jaxpr.effects
-        if isinstance(e, RefEffect)
-        and not isinstance(e, (WriteEffect, AccumEffect))
-        and isinstance(e.input, Var)
-    }
 
 
 def eqn_reads_ref(eqn: JaxprEqn, ref: Var) -> bool:

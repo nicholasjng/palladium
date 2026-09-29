@@ -48,19 +48,9 @@ def test_pure_state_effects_pass_the_gate():
     assert effects.foreign_effects(spec.jaxpr) == []
 
 
-def test_read_and_write_sets_are_keyed_to_the_kernel_refs():
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...] * 2.0
-
-    spec = _trace(kernel, [(8,)], jax.ShapeDtypeStruct((8,), F32))
-    x_ref, o_ref = spec.jaxpr.invars
-    assert effects.read_refs(spec.jaxpr) == {x_ref}
-    assert effects.written_refs(spec.jaxpr) == {o_ref}
-
-
 def test_effects_surface_through_control_flow():
-    """A read buried in a fori_loop body must appear in the outer
-    jaxpr's read set: no sub-jaxpr walking required."""
+    """A read buried in a fori_loop body must appear on the outer
+    equation's effects: no sub-jaxpr walking required."""
 
     def kernel(x_ref, o_ref):
         def body(i, acc):
@@ -70,16 +60,6 @@ def test_effects_surface_through_control_flow():
 
     spec = _trace(kernel, [(8,)], jax.ShapeDtypeStruct((1,), F32))
     x_ref, o_ref = spec.jaxpr.invars
-    assert x_ref in effects.read_refs(spec.jaxpr)
-    assert effects.written_refs(spec.jaxpr) == {o_ref}
-
-
-def test_read_modify_write_ref_appears_in_both_sets():
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...]
-        o_ref[...] += 1.0
-
-    spec = _trace(kernel, [(8,)], jax.ShapeDtypeStruct((8,), F32))
-    _, o_ref = spec.jaxpr.invars
-    assert o_ref in effects.read_refs(spec.jaxpr)
-    assert o_ref in effects.written_refs(spec.jaxpr)
+    loop = next(e for e in spec.jaxpr.eqns if e.primitive.name == "scan")
+    assert effects.eqn_reads_ref(loop, x_ref)
+    assert not effects.eqn_writes_ref(loop, o_ref)

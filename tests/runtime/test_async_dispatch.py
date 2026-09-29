@@ -35,7 +35,6 @@ def _make_bound(n: int, **bind_kwargs):
         inputs=(info_in,),
         outputs=(info_out,),
         scratch=(),
-        raw_params={},
     )
     return bind(spec, _INC_SOURCE, **bind_kwargs)
 

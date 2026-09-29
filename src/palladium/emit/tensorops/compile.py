@@ -8,7 +8,7 @@ from palladium.emit.core import emit_msl_stats
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
 
-from ._shared import SIMDGROUPS, uses_tensorops
+from ._shared import uses_tensorops
 from .attention import lower_attention_ir
 from .elementwise import lower_elementwise_ir
 from .ir import IRRegion, KernelIR, import_kernel
@@ -33,7 +33,6 @@ def compile_kernel(
     kernel_name: str | None = None,
     *,
     scope: ProgramScope | None = None,
-    simdgroups: int = 4,
     dot_general: str = "auto",
 ) -> Compilation:
     """Run tensorops planning and layout analysis, then lower the supported kernel.
@@ -47,7 +46,7 @@ def compile_kernel(
         raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
     if scope is None and uses_tensorops(spec, dot_general):
         scope = ProgramScope.THREADGROUP
-    plan = plan_kernel(spec, scope=scope, simdgroups=simdgroups)
+    plan = plan_kernel(spec, scope=scope)
     ir = assign_layouts(import_kernel(plan))
     operations = tuple(_walk_operations(ir.body))
     if plan.scope is ProgramScope.THREAD:
@@ -57,8 +56,6 @@ def compile_kernel(
             spec, kernel_name, dot_general="default" if dot_general == "tensorops" else dot_general
         )
         return Compilation(plan, ir, source, stats.threadgroup_bytes)
-    if plan.simdgroups != SIMDGROUPS:
-        raise EmitError(f"TensorOps lowering currently requires {SIMDGROUPS} simdgroups")
 
     dots = tuple(operation for operation in operations if operation.name == "dot_general")
     scans = tuple(operation for operation in operations if operation.name == "scan")
