@@ -1,4 +1,4 @@
-"""Lowerings for one part of the MSL execution model."""
+"""Threefry-2x32-20 random bits and fold_in."""
 
 from __future__ import annotations
 
@@ -19,10 +19,7 @@ _THREEFRY_ROT1 = (17, 29, 16, 24)
 
 
 def _emit_threefry2x32(cursor: Cursor, k1: str, k2: str, x1: str, x2: str) -> tuple[str, str]:
-    """Emit uint x0, x1 = threefry2x32(k1, k2, x1, x2); return their names.
-
-    Pure text emission, no bindings: takes a Cursor, not an Environment.
-    """
+    """Emit uint x0, x1 = threefry2x32(k1, k2, x1, x2); return their names."""
     ks2 = cursor.fresh("_ks2")
     cursor.emit(f"uint {ks2} = {k1} ^ {k2} ^ 0x1BD11BDAu;")
     ks = (k1, k2, ks2)
@@ -57,10 +54,10 @@ def _emit_threefry2x32(cursor: Cursor, k1: str, k2: str, x1: str, x2: str) -> tu
 
 @rule("random_bits")
 def _rule_random_bits(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """`jax.random.bits`: Threefry-2x32-20 counter-based bits, one hash
-    per output element. Counter is the element's flat row-major index
-    (hi word 0, lo word the index); matches jax's own construction for
-    any shape under 2**32 elements, which is every real kernel output.
+    """`jax.random.bits`: one Threefry-2x32-20 hash per output element.
+
+    The counter is (0, flat row-major index), matching jax's construction
+    for any shape under 2**32 elements.
     """
     if eqn.params["bit_width"] != 32:
         raise EmitError("random_bits: only bit_width=32 is implemented")

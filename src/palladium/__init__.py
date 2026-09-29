@@ -1,9 +1,8 @@
 """palladium: Pallas kernels on Apple GPU, via metal-runtime.
 
-Pipeline: trace (Pallas -> KernelSpec) -> emit (KernelSpec -> MSL text)
--> bind (MSL -> callable, via metal-runtime). `metal_call` composes the
-three behind a `pl.pallas_call`-shaped entry point; `debug_msl` exposes
-the intermediate text.
+trace (Pallas -> KernelSpec), emit (KernelSpec -> MSL), bind (MSL ->
+callable). `metal_call` composes the three behind a `pl.pallas_call`-shaped
+entry point; `debug_msl` returns the intermediate MSL.
 """
 
 from __future__ import annotations
@@ -110,8 +109,8 @@ class MetalCallable(PallasCallable):
 
     def pin(self, *args) -> Callable[[], np.ndarray | tuple[np.ndarray, ...]]:
         """Upload the inputs once; return a zero-argument callable that
-        re-dispatches on the pinned device buffers. For repeated calls on
-        unchanging inputs; later mutation of the arrays is not observed."""
+        re-dispatches on the pinned device buffers. Later mutation of the
+        arrays is not observed."""
         arrays = [np.asarray(a) for a in args]
         return self._bound(arrays).pinned(*arrays)
 
@@ -179,10 +178,6 @@ def debug_msl(kernel: Callable, *example_args, **pallas_kwargs) -> str:
     -------
     str
         The MSL source `metal_call` would compile for these shapes.
-
-    Examples
-    --------
-    >>> print(palladium.debug_msl(k, x, out_shape=...))  # doctest: +SKIP
     """
     import jax.experimental.pallas as pl
 
@@ -201,10 +196,12 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> MetalCallable:
     **pallas_kwargs
         The usual `pl.pallas_call` keywords (out_shape, grid, in_specs,
         out_specs, ...), plus Metal-side extras: `math_mode`
-        (metal_runtime.MathMode, FAST by default), `threadgroup`, and
-        `dot_general="default"` to force the primitive matmul path, or
-        `dot_general="tensorops"` to force cooperative TensorOps. The default
-        automatically selects TensorOps for tiled matmuls and attention.
+        (metal_runtime.MathMode, FAST by default), `threadgroup` (int or
+        tuple; None lets the runtime choose), `cache_size` (compiled kernels
+        kept per shape, 256 by default), and `dot_general`: "auto" (the
+        default) uses TensorOps for tiled and batched matmuls and supported
+        online-softmax attention and the primitive path for untiled dots;
+        "default" forces the primitive path; "tensorops" requires TensorOps.
 
     Notes
     -----
@@ -213,11 +210,6 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> MetalCallable:
     for f32 elementwise work, up to ~1e-4 through exp/log-heavy kernels and
     reductions. Use SAFE for IEEE ordering, and always for compensated
     arithmetic (FAST deletes the error terms).
-
-    Tiled matmuls, batched matmuls, and supported online-softmax attention
-    kernels use TensorOps automatically. Untiled dots use the general primitive
-    path. Pass `dot_general="default"` to force that path for all dots, or
-    `dot_general="tensorops"` to require TensorOps.
 
     Returns
     -------

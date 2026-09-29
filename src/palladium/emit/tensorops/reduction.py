@@ -1,4 +1,4 @@
-"""Initial cooperative lowering for standalone row reductions."""
+"""Cooperative lowering for standalone row reductions."""
 
 from __future__ import annotations
 

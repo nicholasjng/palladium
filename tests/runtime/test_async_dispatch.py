@@ -1,7 +1,7 @@
 """BoundKernel.launch()/PendingResult: the non-blocking dispatch path.
 
-Builds a KernelSpec by hand (no jax tracing needed -- launch()/__call__ only
-read spec.grid/inputs/outputs) so this runs independently of the emitter.
+Builds a KernelSpec by hand (launch()/__call__ only read
+spec.grid/inputs/outputs), so this runs independently of the emitter.
 """
 
 from typing import Any, cast
@@ -23,8 +23,7 @@ kernel void inc(device const float* x [[buffer(0)]], device float* o [[buffer(1)
 
 
 def _make_bound(n: int, **bind_kwargs):
-    # BoundKernel never reads jaxpr/index_map_jaxpr, only grid/inputs/outputs;
-    # cast rather than build real jaxprs this test has no use for.
+    # BoundKernel never reads jaxpr/index_map_jaxpr, only grid/inputs/outputs.
     no_jaxpr = cast(Any, None)
     info_in = BlockInfo((n,), (n,), np.dtype(np.float32), no_jaxpr)
     info_out = BlockInfo((n,), (n,), np.dtype(np.float32), no_jaxpr)
@@ -52,8 +51,7 @@ def test_launch_wait_matches_call(rng):
 
 
 def test_stepping_loop_via_launch_matches_repeated_call(rng):
-    """The launch()-then-wait()-then-launch() pattern the docstring
-    describes must produce the same trajectory as plain repeated calls."""
+    """launch()-then-wait()-then-launch() produces the same trajectory as plain repeated calls."""
     n = 64
     bound_a = _make_bound(n)
     bound_b = _make_bound(n)
@@ -75,7 +73,7 @@ def test_stepping_loop_via_launch_matches_repeated_call(rng):
 def test_second_launch_before_wait_does_not_corrupt_the_first(rng):
     """copy_from() reusing an input buffer must not race a still-in-flight
     read from an earlier, not-yet-waited-on launch."""
-    n = 1 << 16  # large enough that the kernel is still running when we re-launch
+    n = 1 << 16  # large enough that the kernel is still running at re-launch
     bound = _make_bound(n)
     x0 = rng.standard_normal(n).astype(np.float32)
     x1 = rng.standard_normal(n).astype(np.float32)
@@ -88,8 +86,7 @@ def test_second_launch_before_wait_does_not_corrupt_the_first(rng):
 
 
 def test_launch_stream_deeper_than_the_ring_stays_correct(rng):
-    """Many launches with all waits deferred: slot reuse under backpressure
-    must keep every launch's inputs and outputs paired correctly."""
+    """Slot reuse under backpressure keeps every launch's inputs and outputs paired correctly."""
     n = 1 << 14
     depth = 4
     launches = 4 * depth + 3  # several full ring wraps, ending mid-ring
@@ -103,8 +100,7 @@ def test_launch_stream_deeper_than_the_ring_stays_correct(rng):
 
 
 def test_synchronous_callers_stay_at_one_slot(rng):
-    """launch-then-wait callers must not pay pipeline_depth times the
-    input memory: a finished slot is reused, not grown past."""
+    """Synchronous callers reuse one finished slot instead of growing the ring."""
     n = 256
     bound = _make_bound(n)
     for _ in range(2 * bound.pipeline_depth):
@@ -124,8 +120,7 @@ def test_ring_grows_only_while_launches_overlap(rng):
 
 
 def test_pinned_inputs_survive_later_launches(rng):
-    """pinned() detaches its input buffers from the slot ring, so later
-    launch() traffic on the same BoundKernel can't overwrite them."""
+    """pinned() detaches its input buffers from the slot ring, so later launches cannot overwrite them."""
     n = 256
     bound = _make_bound(n)
     x_pinned = rng.standard_normal(n).astype(np.float32)

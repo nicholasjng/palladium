@@ -1,15 +1,10 @@
-"""Differential verification against a reference implementation.
+"""Differential verification of a GPU kernel against a reference.
 
-`assert_allclose(f(x), f.interpret(x))` as one call, with two defaults
-built in:
-
-- FAST math (the default) reorders float arithmetic and approximates
-  transcendentals, so GPU results are not bit-equal to the CPU oracle;
-  the default tolerances reflect that.
-- Kernels using `threadgroup_memory` have no interpret oracle: interpret
-  reports `thread_index() == 0` and `threads_per_threadgroup() == 1`, so
-  a cross-thread reduction computes something else there. `verify`
-  refuses and asks for an explicit `reference=`.
+Default tolerances allow for FAST math, which reorders float arithmetic
+and approximates transcendentals. Cooperative kernels have no interpret
+oracle (interpret reports `thread_index() == 0` and
+`threads_per_threadgroup() == 1`), so `verify` requires an explicit
+`reference=` for them.
 """
 
 from __future__ import annotations
@@ -27,10 +22,8 @@ DEFAULT_ATOL = 1e-6
 
 
 class VerificationError(AssertionError):
-    """A kernel's GPU output disagreed with its reference.
-
-    Subclasses AssertionError so pytest reports it as an assertion
-    failure while it stays catchable as a distinct type.
+    """A kernel's GPU output disagreed with its reference. Subclasses
+    AssertionError so pytest reports it as an assertion failure.
 
     Attributes
     ----------
@@ -115,11 +108,8 @@ def verify_against(
     atol: float,
 ) -> tuple[np.ndarray, ...]:
     """Run `gpu_fn` and a reference over `args`; raise on disagreement.
-
-    `reference` defaults to `oracle` (the interpret path), except for
-    cooperative kernels, which the interpreter cannot model. Backs
-    `PallasCallable.verify`, which documents the user-facing contract.
-    """
+    `reference` defaults to `oracle` (the interpret path), which is refused
+    for cooperative kernels. Backs `PallasCallable.verify`."""
     if reference is None:
         if uses_threadgroup:
             raise VerificationError(

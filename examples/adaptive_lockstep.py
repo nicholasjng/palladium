@@ -1,14 +1,15 @@
-"""Example 2: the lockstep tax, or why per-thread adaptivity is the prize.
+"""Example 2: per-thread adaptivity vs vmap lockstep.
 
 Docs: divergent while-loops, docs/supported-jax.md (control flow).
-vmap over an adaptive Diffrax solve forces the whole batch into lockstep:
-every trajectory takes (and rejects) the steps its worst neighbour needs.
-Measures that tax on the CPU by salting a mild Van der Pol ensemble with
-a few stiff members, then runs the same ensembles through palladium's
-per-thread adaptive kernel (Bogacki-Shampine 3(2), FSAL, PI controller;
-`pcoeff=0.4, icoeff=0.3`, diffrax's own suggestion for "moderate
-difficulty" problems) to show the tax doesn't apply there. Full recipe
-in tests/control_flow/test_adaptive_controller.py.
+vmap over an adaptive Diffrax solve forces the whole batch into
+lockstep: every trajectory takes (and rejects) the steps its worst
+neighbour needs. The example measures that cost on the CPU by salting a
+mild Van der Pol ensemble with a few stiff members, then runs the same
+ensembles through palladium's per-thread adaptive kernel
+(Bogacki-Shampine 3(2), FSAL, PI controller; `pcoeff=0.4, icoeff=0.3`,
+diffrax's suggestion for "moderate difficulty" problems). Compare the
+mixed-vs-mild wall-clock ratio on each side. Full recipe in
+tests/control_flow/test_adaptive_controller.py.
 """
 
 import time
@@ -53,8 +54,8 @@ def solve_batch(mu, solver=None):
             stepsize_controller=diffrax.PIDController(rtol=RTOL, atol=ATOL),
             max_steps=1_000_000,
         )
-        # num_steps = accepted + rejected attempts; num_accepted_steps is the
-        # one comparable to our `real` counter (accepted only, pre-T1).
+        # num_steps counts accepted + rejected attempts; num_accepted_steps
+        # is comparable to the kernel's `real` counter (accepted, pre-T1).
         return sol.ys[-1], sol.stats["num_steps"], sol.stats["num_accepted_steps"]
 
     out, steps, accepted = solve(mu)
@@ -124,7 +125,7 @@ def palladium_solver(n, pcoeff=PCOEFF, icoeff=ICOEFF):
             steps = steps + jnp.where(accept, 1.0, 0.0)
             rejected = rejected + jnp.where(accept, 0.0, 1.0)
             # was_real & accept would stage a boolean `and`, which has no
-            # emitter rule; nest the wheres instead (both branches numeric).
+            # emitter rule; nested wheres keep both branches numeric.
             real = real + jnp.where(was_real, jnp.where(accept, 1.0, 0.0), 0.0)
             return (
                 t2,

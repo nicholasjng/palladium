@@ -1,10 +1,7 @@
 """The consumer-facing conveniences layered over the core pipeline.
 
-`verify` (differential check against a reference), stack/threadgroup
-accounting in `explain`, device-derived threadgroup sizing, structured
-error fields, and bounded kernel caches. None of these change what the
-emitter produces; they change what a caller can find out and how loudly
-a mistake fails.
+`verify`, stack/threadgroup accounting in `explain`, device-derived
+threadgroup sizing, structured error fields, and bounded kernel caches.
 """
 
 import jax
@@ -66,7 +63,7 @@ def _block_sum_call(n, threadgroup=TG, extent=TG):
 
 
 def test_verify_returns_the_gpu_output(rng):
-    """It replaces a call site, so it must return what __call__ returns."""
+    """verify replaces a call site, so it returns what __call__ returns."""
     f = _tanh_call()
     x = rng.standard_normal(64, dtype=np.float32)
     np.testing.assert_array_equal(f.verify(x), f(x))
@@ -79,7 +76,7 @@ def test_verify_accepts_an_explicit_reference(rng):
 
 
 def test_verify_reports_the_worst_element():
-    """A failure has to say *where*, not just that something differed."""
+    """A verification failure names the worst element's index."""
     f = _tanh_call()
     x = np.zeros(64, dtype=np.float32)
 
@@ -105,9 +102,7 @@ def test_verify_catches_a_shape_disagreement():
 
 
 def test_verify_refuses_the_interpret_oracle_for_cooperative_kernels():
-    """Interpret models each instance as a threadgroup of one, so the
-    comparison is meaningless rather than merely imprecise. It has to
-    refuse, not quietly pass or quietly fail."""
+    """verify refuses the interpret oracle for cooperative kernels, since interpret models each instance as a threadgroup of one."""
     n = 64
     f = _block_sum_call(n)
     x = np.arange(n, dtype=np.float32)
@@ -139,8 +134,7 @@ def test_verify_on_the_ffi_path(rng):
 
 
 def test_explain_reports_per_thread_stack():
-    """The per-thread stack is the one hard limit with no published
-    ceiling, so the number has to be visible before compiling."""
+    """The per-thread stack has no published ceiling, so explain reports the estimate before compiling."""
     f = _tanh_call()
     d = f.explain(jax.ShapeDtypeStruct((64,), jnp.float32))
     # 64 f32 elements per live array, several arrays.
@@ -165,7 +159,7 @@ def test_explain_reports_threadgroup_memory_against_the_device_budget():
 
 
 def test_stack_overflow_carries_the_measured_size():
-    """The old message said 'too large'; the fix needs a number to aim at."""
+    """StackOverflowError carries the measured stack size."""
     n = 200_000
     f = palladium.metal_call(
         lambda x_ref, o_ref: o_ref.__setitem__(..., x_ref[...] * 2.0),
@@ -198,7 +192,7 @@ def test_simdgroup_sentinel_runs_a_cooperative_kernel():
 
 
 def test_threadgroup_memory_over_device_budget_is_rejected():
-    """Metal rejects the pipeline with a vaguer message; catch it first."""
+    """The device budget is checked before Metal rejects the pipeline with a vaguer message."""
     limit = device_limits()["max_threadgroup_memory_length"]
     too_many = limit // 4 + 1024  # in f32 elements
     f = _block_sum_call(64, threadgroup=TG, extent=too_many)
@@ -217,7 +211,7 @@ def test_threadgroup_over_device_thread_limit_is_rejected():
 
 
 def test_unsupported_primitive_names_the_primitive_as_a_field():
-    """So a caller can branch on it instead of matching message text."""
+    """The primitive name is a field a caller can branch on instead of matching message text."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.sort(x_ref[...])
@@ -233,7 +227,7 @@ def test_unsupported_primitive_names_the_primitive_as_a_field():
 
 
 def test_stack_overflow_error_is_an_emit_error():
-    """Existing `except EmitError` handlers must keep working."""
+    """Both structured errors subclass EmitError."""
     assert issubclass(StackOverflowError, EmitError)
     assert issubclass(UnsupportedPrimitiveError, EmitError)
 
@@ -242,12 +236,7 @@ def test_stack_overflow_error_is_an_emit_error():
 
 
 def test_eager_cache_evicts_least_recently_used(rng):
-    """Three shapes through one callable with room for two.
-
-    The surviving keys must be the two most recently used, not the two
-    most recently inserted -- re-touching the oldest shape should save
-    it from eviction.
-    """
+    """The surviving cache keys are the most recently used, not the most recently inserted."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2.0
@@ -257,7 +246,7 @@ def test_eager_cache_evicts_least_recently_used(rng):
         out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
         cache_size=2,
     )
-    # out_shape is fixed, so vary the *input* shape to vary the cache key.
+    # out_shape is fixed, so vary the input shape to vary the cache key.
     f_by_n = {
         n: palladium.metal_call(
             kernel,
@@ -273,7 +262,7 @@ def test_eager_cache_evicts_least_recently_used(rng):
 
 
 def test_eager_cache_is_bounded_across_shapes(rng):
-    """One callable, many shapes: the real dynamic-batch-size case."""
+    """The cache stays bounded across many input shapes."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2.0
@@ -313,7 +302,7 @@ def test_cache_size_zero_disables_eviction(rng):
 
 
 def test_ffi_pin_refuses_with_a_reason():
-    """Not silently missing: it explains why the eager trick cannot work."""
+    """pin on the FFI path refuses with a reason."""
     f = palladium.metal_call_jit(_tanh_kernel, out_shape=jax.ShapeDtypeStruct((64,), jnp.float32))
     with pytest.raises(NotImplementedError, match="XLA owns"):
         f.pin(jnp.zeros(64, jnp.float32))

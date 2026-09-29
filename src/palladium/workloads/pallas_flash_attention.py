@@ -119,9 +119,8 @@ def make_pallas_flash_attention(
 ):
     """Build a Pallas call for one program per batch, head, and query tile.
 
-    The full K/V refs are sliced by the kernel's static loop. This gives the
-    Pallas jaxpr the streaming algorithm while keeping this first version a
-    correctness prototype for the supported TensorOps attention lowering.
+    The kernel slices full K/V refs inside its key loop; the resulting jaxpr
+    is the form the TensorOps attention lowering recognizes.
     """
     if len(shape) != 4:
         raise ValueError("shape must be [batch, sequence, heads, D]")

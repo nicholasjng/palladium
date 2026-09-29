@@ -2,7 +2,8 @@
 writes that provably collide across a grid axis are rejected at trace
 time instead of racing silently on the GPU.
 
-Trace-only, runs without a Metal device (see conftest)."""
+Trace-only, runs without a Metal device.
+"""
 
 import jax
 import jax.experimental.pallas as pl

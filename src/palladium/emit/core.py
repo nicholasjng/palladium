@@ -51,10 +51,8 @@ def _unwrapped(expr: str) -> str:
 
 @dataclasses.dataclass(frozen=True)
 class CExpr:
-    """Small integer-expression tree used for address arithmetic.
-
-    Keeping sums and products structured until rendering makes address
-    simplifications (especially zero offsets) reliable without parsing C.
+    """Integer-expression tree for address arithmetic; sums and products
+    stay structured until rendering so zero terms fold without parsing C.
     """
 
     op: str
@@ -117,8 +115,8 @@ class BlockLayout:
 
 
 def shaped(aval: object) -> ShapedArray:
-    # Invariant, not a hope: every non-Ref value in a Pallas kernel jaxpr
-    # is shaped, and Refs never pass through declare()/val().
+    # Every non-Ref value in a Pallas kernel jaxpr is shaped; Refs never
+    # pass through declare() or val().
     assert isinstance(aval, ShapedArray), aval
     return aval
 
@@ -206,13 +204,12 @@ class CVal:
 
     @property
     def size(self) -> int:
-        """Element count; 1 for scalars (`math.prod(()) == 1`)."""
+        """Element count; 1 for scalars."""
         return math.prod(self.shape)
 
     def slot(self, index: str, shape: tuple[int, ...]) -> CVal:
-        """A view of `shape` at slot `index`: element offset
-        `index * prod(shape)` into this storage. Space, readonly, and
-        ctype carry over; alignment composes as gcd with the slot size.
+        """A view of `shape` at element offset `index * prod(shape)`;
+        alignment composes as gcd with the slot size.
         """
         assert self.shape and not self.transposed, self
         size = math.prod(shape)
@@ -224,8 +221,8 @@ class CVal:
         )
 
     def at(self, index: str) -> str:
-        """`expr` for scalars, `expr[index]` for arrays: the only
-        rank-0/rank-N absorption the emitter does."""
+        """`expr` for scalars, `expr[index]` for arrays; lazy and
+        index-mapped values substitute `index` for `$i`."""
         if self.lazy is not None:
             return self.lazy.replace("$i", index if index.isidentifier() else f"({index})")
         if self.index_map is not None:
@@ -272,22 +269,17 @@ class EmitStats:
 
 
 class Cursor:
-    """The write position into one kernel's growing MSL text.
-
-    Owns the emitted lines, current indentation, and the unique-name
-    counter; knows nothing about jaxpr Vars or bindings. Reusable on its
-    own wherever a rule needs to emit text without touching the
-    environment (e.g. `copy`, a pure element-loop codegen helper).
+    """The write position into one kernel's MSL text: emitted lines,
+    indentation, the unique-name counter, helpers, and storage totals.
+    Independent of jaxpr bindings.
     """
 
     def __init__(self) -> None:
         self.lines: list[str] = []
         self.indent = 1
         self._names = itertools.count()
-        # Running total of thread-local bytes declared, and the separate
-        # threadgroup-space total. Not liveness-aware: MSL declarations
-        # are function-scoped and Metal's own pipeline check is equally
-        # conservative, so this over-counts exactly where Metal does.
+        # Declared bytes per space; not liveness-aware, matching Metal's
+        # own function-scoped pipeline check.
         self.thread_bytes = 0
         self.threadgroup_bytes = 0
         # MSL functions the body calls, by name, emitted once above the
@@ -327,8 +319,8 @@ class Cursor:
         count = math.prod(shape)
         self.account(ctype, count, space)
         qualifier = "threadgroup " if space == "threadgroup" else ""
-        # One-element values are registers, not arrays: the compiler keeps
-        # them out of thread-local memory and every use is `name` itself.
+        # One-element values are declared as scalars so the compiler keeps
+        # them in registers.
         scalar = bool(shape) and count == 1
         declaration = f"{qualifier}{ctype} {name}"
         declaration += f"[{count}]" if shape and not scalar else ""
@@ -340,7 +332,7 @@ class Cursor:
         self.lines.append("    " * self.indent + line)
 
     def fresh(self, prefix: str = "t") -> str:
-        """Return a new unique C identifier; deterministic per process order."""
+        """Return a new unique C identifier, deterministic per Cursor."""
         return f"{prefix}{next(self._names)}"
 
     @contextlib.contextmanager
@@ -356,18 +348,12 @@ class Cursor:
     def loop(self, count: int | str, prefix: str = "_i", reverse: bool = False) -> Iterator[str]:
         """Emit a counted for-loop over `[0, count)`; yields the index name.
 
-        Ascending by default: `for (uint idx = 0; idx < count; ++idx)`.
-        With `reverse=True`, descending from `count - 1` to 0 with a
-        *signed* index -- a uint would wrap past zero instead of failing
-        `>= 0`, looping forever.
-
-        `count` is inlined verbatim, so pass e.g. `f"{n}u"` where the
-        call site needs an unsigned-literal suffix. An int `count` folds
-        `count - 1` at emit time so the reverse header carries a literal
-        bound rather than an expression.
+        Reverse loops use a signed index, since a uint would wrap past
+        zero. `count` is inlined verbatim; pass `f"{n}u"` where an
+        unsigned literal is needed. A count of 1 emits no loop and
+        yields "0".
         """
         if count == 1:
-            # A single trip needs no loop; the body indexes element 0.
             yield "0"
             return
         idx = self.fresh(prefix)
@@ -424,8 +410,6 @@ class Cursor:
 class Environment:
     """The symbol table for one kernel: jaxpr Var bindings and def-use info.
 
-    Owns no MSL text; knows nothing about indentation or emission order.
-
     Attributes
     ----------
     bindings : dict
@@ -444,13 +428,9 @@ class Environment:
         # Per-emission scratch for rules that memoize per-eqn analyses,
         # conventionally keyed ("name", id(eqn)).
         self.rule_cache: dict[object, object] = {}
-        # Var -> its consuming equations at that var's own jaxpr level
-        # (None marks "is a jaxpr outvar", i.e. escapes the level).
-        # Populated by emit_jaxpr before walking each (sub-)jaxpr; Vars
-        # are unique objects per jaxpr, so levels never collide.
+        # Per jaxpr level, populated before each (sub-)jaxpr is walked;
+        # Vars are unique objects per jaxpr, so levels never collide.
         self.consumers: dict[Var, list[JaxprEqn | None]] = {}
-        # Var -> the equation that defines it, for rules that need to
-        # inspect a not-yet-emitted producer.
         self.producers: dict[Var, JaxprEqn] = {}
 
     def val(self, atom: Atom) -> CVal:
@@ -478,8 +458,7 @@ class Environment:
         return cval
 
     def consumer_eqns(self, var: Var) -> list[JaxprEqn]:
-        """Consuming equations at `var`'s own jaxpr level, without the
-        None outvar marker (see `escapes`)."""
+        """Consuming equations at `var`'s jaxpr level, without the outvar marker."""
         return [e for e in self.consumers.get(var, []) if e is not None]
 
     def escapes(self, var: Var) -> bool:
@@ -496,13 +475,8 @@ class Environment:
 
 
 def declare(env: Environment, cursor: Cursor, var: Var) -> CVal:
-    """Emit thread-local storage for `var` and bind it in `env`. Use for
-    a rule producing a new value; use `env.bind` for aliasing.
-
-    The one operation that genuinely needs both a Cursor (it emits the
-    declaration) and an Environment (it binds the result) — everything
-    else a rule does is purely one or the other.
-    """
+    """Emit thread-local storage for `var` and bind it in `env`; use
+    `env.bind` for aliasing."""
     aval = shaped(var.aval)
     ctype = CTYPES[str(aval.dtype)]
     shape = tuple(int(d) for d in aval.shape)
@@ -537,10 +511,7 @@ def _emit_with_rules(
 ) -> list[CVal]:
     """Walk a jaxpr, dispatching each equation through `rules`.
 
-    Shared by both execution models: binds invars, records consumer and
-    producer maps for the rules that need lookahead, then emits each
-    equation. Nested jaxprs (scan bodies, index maps) recurse through the
-    model-specific wrappers.
+    Binds invars and records consumer and producer maps before emitting.
 
     Raises
     ------
@@ -574,21 +545,8 @@ def _emit_with_rules(
 def emit_jaxpr(env: Environment, cursor: Cursor, jaxpr: Jaxpr, in_vals: list[CVal]) -> list[CVal]:
     """Walk a jaxpr with the one-thread-per-instance rules (RULES).
 
-    Parameters
-    ----------
-    env : Environment
-        Var bindings and def-use info; updated in place.
-    cursor : Cursor
-        MSL text position; lines are appended in place.
-    jaxpr : Jaxpr
-        The (sub-)jaxpr to lower.
-    in_vals : list of CVal
-        Bindings for `jaxpr.invars`, in order.
-
-    Returns
-    -------
-    list of CVal
-        The values of `jaxpr.outvars`.
+    `in_vals` binds `jaxpr.invars` in order; returns the values of
+    `jaxpr.outvars`. `env` and `cursor` are updated in place.
     """
     return _emit_with_rules(
         env,
@@ -661,6 +619,9 @@ def emit_msl_stats(
         Traced kernel, from `palladium.trace`.
     kernel_name : str, optional
         Overrides `spec.name` as the MSL function name.
+    dot_general : str
+        "auto" tries the cooperative TensorOps lowering and falls back
+        to this emitter; "tensorops" requires it; "default" skips it.
 
     Returns
     -------
@@ -771,7 +732,7 @@ def emit_msl_stats(
             ptr = f"arg{k}_offset"
             cursor.emit(f"{qual} {ctype}* {ptr} = arg{k} + {offset};")
 
-        # access scalar refs (shape == ()) as axis-1 arrays, since all refs are pointers.
+        # Scalar refs (shape ()) are addressed as one-element arrays.
         ref_vals.append(
             CVal(
                 expr=ptr,
@@ -787,9 +748,8 @@ def emit_msl_stats(
         ctype = CTYPES[info.dtype.name]
         shape = info.shape
         size = math.prod(info.shape)
-        # Both spaces are compile-time-sized local arrays; only the
-        # qualifier differs. MSL requires threadgroup variables at kernel
-        # scope, which is where these already land.
+        # MSL requires threadgroup variables at kernel scope, which is
+        # where these land.
         cursor.account(ctype, size, info.space)
         scratch_op = f"{info.space} {ctype} scratch{k}"
         scratch_op += f"[{size}];" if shape else ";"
@@ -837,11 +797,7 @@ def emit_msl(
     *,
     dot_general: str = "auto",
 ) -> str:
-    """Assemble the full MSL source for a KernelSpec.
-
-    Thin wrapper over `emit_msl_stats` for callers that only want the
-    text. See that function for the full contract.
-    """
+    """Assemble the full MSL source for a KernelSpec; see `emit_msl_stats`."""
     return emit_msl_stats(spec, kernel_name, dot_general=dot_general)[0]
 
 
@@ -917,10 +873,9 @@ def ref_view(env: Environment, ref: CVal, indexer: NDIndexer) -> CVal:
 
 
 def _transpose_is_dot_rhs_only(env: Environment, eqn: JaxprEqn) -> bool:
-    """Whether this rank-2 `(1, 0)` transpose is consumed *only* as the
-    rhs of dot_general equations (never as lhs, never escaping as a
-    jaxpr outvar), i.e. safe to lower as a lazy `transposed` CVal that
-    only dot_general knows how to index."""
+    """Whether this rank-2 `(1, 0)` transpose is consumed only as a
+    dot_general rhs and never escapes, so it may lower to a lazy
+    `transposed` CVal."""
     if tuple(eqn.params["permutation"]) != (1, 0):
         return False
     outvar = eqn.outvars[0]

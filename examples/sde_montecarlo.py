@@ -5,15 +5,15 @@ Prices a European call under geometric Brownian motion: N paths x M
 Euler-Maruyama steps, one Metal thread per path, RNG generated in-kernel,
 validated against the Black-Scholes closed form.
 
-Two versions. `GBM_MSL` is hand-written MSL with a cheap pcg_hash RNG:
-the runtime showcase and the performance bar. `pallas_gbm_kernel` is the
-same model authored in Pallas, using `jax.random` directly inside the
-kernel (Threefry-2x32-20, `tests/codegen/test_random.py`) instead of
-hand-rolled MSL: `random_fold_in` derives an independent key per (path,
-step) pair, the same shape `pcg_hash`'s counter does. Threefry is ~20
-rounds of add-rotate-xor per draw versus pcg_hash's one; expect the
-Pallas version to cost more per step; the point is that it doesn't need
-to be hand-written at all, not that it's cheaper.
+Two versions. `GBM_MSL` is hand-written MSL with a pcg_hash RNG: the
+performance bar. `pallas_gbm_kernel` is the same model authored in
+Pallas, using `jax.random` inside the kernel (Threefry-2x32-20,
+`tests/codegen/test_random.py`): `random_fold_in` derives an
+independent key per (path, step) pair, the same shape `pcg_hash`'s
+counter does. Threefry is ~20 rounds of add-rotate-xor per draw versus
+pcg_hash's one, so the Pallas version costs more per step. The output
+lists price, standard error, wall clock and sigma distance from
+Black-Scholes for each version, then the Threefry / pcg_hash slowdown.
 """
 
 import time
@@ -107,9 +107,8 @@ def pallas_gbm_kernel(seed_ref, o_ref):
         k1 = jax.random.fold_in(key0, 2 * i)
         k2 = jax.random.fold_in(key0, 2 * i + 1)
         # Floored away from 0: jax.random.uniform's range is [0, 1), and
-        # log(0) = -inf poisons the whole path (same reason the
-        # hand-written kernel above uses an open-interval (hash+0.5)
-        # trick instead).
+        # log(0) = -inf poisons the whole path. The hand-written kernel
+        # uses the open-interval (hash + 0.5) form for the same reason.
         u1 = jnp.maximum(jax.random.uniform(k1, ()), 1e-7)
         u2 = jax.random.uniform(k2, ())
         z = jnp.sqrt(-2.0 * jnp.log(u1)) * jnp.cos(2.0 * jnp.pi * u2)

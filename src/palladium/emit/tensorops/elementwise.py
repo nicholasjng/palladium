@@ -66,8 +66,8 @@ def lower_elementwise_ir(kernel: KernelIR, kernel_name: str | None = None) -> tu
     """Lower same-shape float32 pointwise operations across threadgroup lanes.
 
     Each lane handles independent flattened elements from one Pallas tile.
-    The initial scope is intentionally restricted to rank-1 to rank-3 buffers,
-    one output, and a straight-line scalar elementwise graph.
+    Supports rank-1 to rank-3 buffers, one output, scalar or trailing
+    row-vector broadcast inputs, and a straight-line scalar graph.
     """
 
     plan = kernel.plan

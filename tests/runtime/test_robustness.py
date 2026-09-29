@@ -1,9 +1,4 @@
-"""Robustness: thread safety, the dtype coverage matrix, and resource limits.
-
-Sabotage checklist (each broken deliberately, matching test failed):
-MetalCallable cache lock removed (bind ran more than twice under the
-barrier), BoundKernel launch lock removed (cross-thread results corrupted).
-"""
+"""Robustness: thread safety, the dtype coverage matrix, and resource limits."""
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -34,9 +29,8 @@ def test_concurrent_first_calls_compile_once_per_shape(monkeypatch, rng):
 
     n_threads = 16
     call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32))
-    # Every thread gets its own data; half use shape (8,), half (16,).
-    # jax.ShapeDtypeStruct out_shape is fixed, so use two separate
-    # MetalCallables to exercise two cache entries under one barrier.
+    # out_shape is fixed per callable, so two callables exercise two cache
+    # entries under one barrier.
     call16 = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((16,), jnp.float32))
     inputs = [
         rng.standard_normal(8 if i % 2 == 0 else 16, dtype=np.float32) for i in range(n_threads)

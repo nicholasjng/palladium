@@ -1,12 +1,7 @@
 """Grids and blocks: `_rule_program_id` and `_block_offset`.
 
-Until now every kernel was one program instance seeing the whole array.
-These kernels tile: the grid launches many program instances and each one's
-Refs point at *its* block, so the emitted pointers need per-thread offsets
-computed from the BlockSpec index map.
-
-The offset arithmetic and the `+ pid` kernel reuse the elementwise
-rules.
+Each program instance's Refs point at its own block, so the emitted pointers
+carry per-thread offsets computed from the BlockSpec index map.
 """
 
 import jax
@@ -65,9 +60,7 @@ def test_row_blocks_2d(rng):
 
 
 def test_2d_grid_with_index_map_arithmetic(rng):
-    """A 2D grid mapped onto rows via `i * 16 + j`. If you evaluated the
-    index map by recursing with emit_jaxpr, the mul/add inside it come
-    from the ELEMENTWISE table for free."""
+    """A 2D grid mapped onto rows via `i * 16 + j` lowers the index map's arithmetic through the ELEMENTWISE table."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 3.0

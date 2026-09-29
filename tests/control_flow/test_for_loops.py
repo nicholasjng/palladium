@@ -1,10 +1,4 @@
-"""`_rule_scan` (emit/rules/control.py): fori_loop becomes a C for-loop.
-
-This is the rule that makes the whole project worthwhile: once the
-time-stepping loop lives *inside* the kernel, one dispatch does the whole
-solve, and the per-step overhead that dominates XLA-driven integrators is
-gone. Everything else was setup.
-"""
+"""`_rule_scan`: fori_loop becomes a C for-loop."""
 
 import jax
 import jax.numpy as jnp
@@ -14,11 +8,7 @@ import palladium
 
 
 def test_euler_logistic(rng):
-    """dy/dt = r*y(1 - y), 100 explicit Euler steps, entirely in-kernel.
-
-    The rate r is read from a Ref *before* the loop and used inside it;
-    that is how scan consts arise (see `_rule_scan`'s docstring), and
-    every real ODE kernel has them (its parameters)."""
+    """100 explicit Euler steps of dy/dt = r*y(1 - y) in-kernel, with r read before the loop so it becomes a scan const."""
     dt, steps = 0.01, 100
 
     def kernel(y0_ref, r_ref, o_ref):
@@ -35,7 +25,7 @@ def test_euler_logistic(rng):
     got = f(y0, r)
     want = np.asarray(f.interpret(y0, r))
     np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-6)
-    # And the physics: logistic flows toward the y=1 fixed point.
+    # The logistic flow moves toward the y=1 fixed point.
     assert np.all(np.abs(got - 1.0) < np.abs(y0 - 1.0))  # ty: ignore[unsupported-operator]
 
 
@@ -66,7 +56,7 @@ def test_tuple_carry(rng):
 
 
 def test_nested_loops(rng):
-    """A loop in a loop: substepping, the shape adaptive integrators take."""
+    """Nested fori_loops lower correctly."""
 
     def kernel(y_ref, o_ref):
         def outer(_, y):
@@ -83,9 +73,7 @@ def test_nested_loops(rng):
 
 
 def test_carry_permutation(rng):
-    """A body that returns its carries reordered: `return b, a` stages
-    outvars that ARE the carry vars, so a sequential copy-back clobbers;
-    scan semantics require all carries to update simultaneously."""
+    """A body that returns its carries reordered updates all carries simultaneously rather than clobbering through a sequential copy-back."""
 
     def kernel(x_ref, y_ref, xo_ref, yo_ref):
         def step(_, c):
@@ -112,18 +100,10 @@ def test_carry_permutation(rng):
 
 
 def test_carry_permutation_beside_computed_carry():
-    """Shrunk from the emitter fuzzer (2026-08-18): a carry swap next to
-    a computed third carry miscompiles on the Metal shader compiler when
-    the loop body holds three or more thread-local array temporaries.
-    The optimizer forwards a permuted carry's read across the write it
-    must precede: with init (0, 1, 0) and body
-    (c1, c0, tanh(c0 + 0*c0)), two iterations returned carry0 == 1
-    instead of 0. Verified against hand-written MSL: snapshot arrays,
-    fused copy-back loops, and hoisted declarations all still
-    miscompile; volatile reads/writes at the hazard endpoints (what
-    `_copy_back_carries` emits for permuted carries) do not. Fully
-    scalarizing the chain also avoids it, which is expression-AST
-    territory, not a copy-back fix.
+    """A carry swap beside a computed third carry miscompiles on the Metal shader compiler when the loop body holds three or more thread-local array temporaries: the optimizer forwards a permuted carry's read across the write it must precede.
+
+    Volatile reads/writes at the hazard endpoints, which `_copy_back_carries`
+    emits for permuted carries, avoid the miscompile.
     """
 
     def kernel(a_ref, b_ref, c_ref, ao_ref, bo_ref, co_ref):
@@ -151,12 +131,7 @@ def test_carry_permutation_beside_computed_carry():
 
 
 def test_carry_read_and_alias_conflict(rng):
-    """Found by test_fuzz_loops, shrunk by hand. 3 carries, length=2:
-    c0 and c2 swap (c0's new value is old c2, c2's new value is old c0),
-    c1 becomes tanh(c0). c0 is both the fresh computation's input and one
-    half of the swap. Was a strict xfail (a Metal compiler bug, not an
-    emitter logic error); fixed by the volatile hazard endpoints in
-    `_copy_back_carries`, see test_carry_permutation_beside_computed_carry."""
+    """c0 is both a computation's input and one half of a swap with c2, the same Metal compiler hazard as test_carry_permutation_beside_computed_carry."""
 
     def kernel(x0_ref, x1_ref, x2_ref, o0_ref, o1_ref, o2_ref):
         def step(_, carry):

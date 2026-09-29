@@ -1,10 +1,7 @@
-"""Step 1 of the pipeline: extract the kernel jaxpr from Pallas.
-
-Traces the wrapped `pl.pallas_call` with `jax.make_jaxpr` and repackages
-the resulting `pallas_call` equation into a KernelSpec.
-
-Pinned to JAX 0.11: `grid_mapping`/`block_mapping` dataclass fields are
-version-sensitive (see `_block_infos`).
+"""Extract the kernel jaxpr from Pallas: trace the wrapped `pl.pallas_call`
+with `jax.make_jaxpr` and repackage the `pallas_call` equation into a
+KernelSpec. Pinned to JAX 0.11: `grid_mapping`/`block_mapping` fields are
+version-sensitive.
 """
 
 from __future__ import annotations
@@ -41,11 +38,9 @@ class ScratchInfo:
     dtype: numpy.dtype
         Buffer element type.
     space: str
-        Metal address space: `"thread"` (private to one program
-        instance, the default) or `"threadgroup"` (shared across the
-        threadgroup, requested via `palladium.threadgroup_memory`). Sets
-        the qualifier `emit_msl` declares the storage with; both are
-        compile-time-sized local arrays.
+        Metal address space: `"thread"` (private to one program instance,
+        the default) or `"threadgroup"` (shared across the group, via
+        `palladium.threadgroup_memory`). Both are compile-time-sized arrays.
     """
 
     shape: tuple[int, ...]
@@ -99,11 +94,9 @@ def _primitive_names(jaxpr: Jaxpr) -> set[str]:
 
 
 def _validate_barriers(jaxpr: Jaxpr) -> None:
-    """Conservative convergence check; unknown inputs/Ref reads may vary by lane.
-
-    This does not prove memory race freedom. Barriers in control flow whose
-    uniformity cannot be established are rejected before a GPU can hang.
-    """
+    """Reject barriers in control flow whose uniformity across lanes cannot
+    be established (a divergent barrier hangs the GPU). Kernel inputs and
+    Ref reads are assumed to vary by lane. Does not prove race freedom."""
     if "palladium_barrier" not in _primitive_names(jaxpr):
         return
     varying = set(jaxpr.invars)
@@ -124,8 +117,8 @@ def _validate_barriers(jaxpr: Jaxpr) -> None:
             if isinstance(pred, Var) and pred in varying:
                 raise TraceError("barrier in a condition that may vary across threadgroup lanes")
         if has_barrier and name == "while":
-            # A general while's carried state can change the trip count by lane.
-            # Static-count fori_loop/scan is the supported convergent loop form.
+            # A while's carried state can change the trip count by lane;
+            # static-count fori_loop/scan is the supported loop form.
             raise TraceError("barrier in while: convergence is unproven; use a static-count scan")
         for child in children:
             _validate_barriers(child)
@@ -138,8 +131,7 @@ def _validate_barriers(jaxpr: Jaxpr) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class KernelSpec:
-    """The emitter's input: a traced pallas_call, reduced to what MSL
-    emission needs.
+    """A traced pallas_call, reduced to what MSL emission needs.
 
     Attributes
     ----------
@@ -168,18 +160,16 @@ class KernelSpec:
 
     @property
     def uses_threadgroup(self) -> bool:
-        """Whether instructions or shared scratch require cooperative geometry.
-
-        True makes the dispatch threadgroup size part of the kernel's
-        contract rather than a tuning knob; `bind` then requires it.
-        """
+        """Whether cooperative instructions or shared scratch make the
+        threadgroup size part of the kernel's contract; `bind` then
+        requires an explicit one."""
         return self.execution.cooperative or any(
             info.space == "threadgroup" for info in self.scratch
         )
 
     @property
     def execution(self) -> ExecutionRequirements:
-        # Low-level bind callers can supply hand-written MSL without a jaxpr.
+        # `bind` callers may supply hand-written MSL without a jaxpr.
         if self.jaxpr is None:
             return ExecutionRequirements()
         names = _primitive_names(self.jaxpr)
@@ -191,11 +181,9 @@ class KernelSpec:
 
     @property
     def lane_scratch_extents(self) -> tuple[int, ...]:
-        """Provable bounds for direct scratch[thread_index()] accesses.
-
-        Other index expressions and nested Ref bindings remain author-managed.
-        Do not constrain shared tiles that aren't indexed one slot per lane.
-        """
+        """Leading extents of threadgroup scratch indexed directly by
+        `thread_index()`; other index expressions are the author's
+        responsibility."""
         if self.jaxpr is None:
             return ()
         lane_vars = {
@@ -232,11 +220,10 @@ class KernelSpec:
 
 
 def _block_dim(dim: Any) -> int | None:
-    # JAX 0.11 stages BlockSpec shapes as BlockDim objects rather than
-    # plain ints; squeezed dims vanish from the visible block. pl.Element,
-    # pl.Indirect, and pl.BoundedSlice dims also carry `block_size` but
-    # mean different indexing semantics, and accepting them here would
-    # lower wrong offsets silently.
+    # JAX 0.11 stages BlockSpec shapes as BlockDim objects; squeezed dims
+    # vanish from the visible block. pl.Element, pl.Indirect, and
+    # pl.BoundedSlice also carry `block_size` but mean different indexing,
+    # so accepting them would lower wrong offsets silently.
     if isinstance(dim, (int, np.integer)):
         return int(dim)
     if isinstance(dim, pl.Squeezed):
@@ -272,11 +259,10 @@ def _validate_aliases(
     inputs: tuple[BlockInfo, ...],
     outputs: tuple[BlockInfo, ...],
 ) -> None:
-    """One buffer behind both refs is transparent only when (a) both sides
-    slice it identically and (b) every read of the input precedes any
-    write of the output, since Pallas keeps the input's pre-call values
-    visible throughout. (b) is checked on effect order over the eqns,
-    which covers sub-jaxprs.
+    """Sharing one buffer is transparent only when both refs slice it
+    identically and every read of the input precedes any write of the
+    output (Pallas keeps the input's pre-call values visible throughout).
+    Order is checked on equation effects, which cover sub-jaxprs.
     """
     for i, j in aliases:
         a, b = inputs[i], outputs[j]
@@ -313,9 +299,8 @@ def _validate_aliases(
 
 
 def _depends_on(jaxpr: Jaxpr, seeds: set[Var], targets: Sequence[Var | Literal]) -> bool:
-    """Forward data-dependence over top-level eqns: does any of `targets`
-    depend on a var in `seeds`? Coarse across sub-jaxpr eqns: any
-    tainted invar taints all outvars."""
+    """Whether any of `targets` depends on a var in `seeds` over top-level
+    eqns. Coarse across sub-jaxprs: any tainted invar taints all outvars."""
     tainted = set(seeds)
     for eqn in jaxpr.eqns:
         if any(isinstance(v, Var) and v in tainted for v in eqn.invars):
@@ -337,17 +322,15 @@ def _validate_parallel_writes(
     grid: tuple[int, ...],
     n_in: int,
 ) -> None:
-    """Program instances run as parallel threads, so two writing the same
-    output element race. Rejects the provable case: a grid axis that
-    neither the output's index map nor any top-level write index depends
-    on. Best-effort: writes inside sub-jaxprs and non-injective maps that
-    use the axis pass unchecked.
+    """Reject the provable write race: a grid axis that neither the output's
+    index map nor any top-level write index depends on. Writes inside
+    sub-jaxprs and non-injective maps that use the axis pass unchecked.
     """
     for j, info in enumerate(outputs):
         o_var = jaxpr.invars[n_in + j]
         writes = [e for e in jaxpr.eqns if e.primitive.name == "swap" and e.invars[0] is o_var]
         if not writes:
-            continue  # no top-level writes to analyze; sub-jaxprs stay unchecked
+            continue
         for axis, extent in enumerate(grid):
             if extent <= 1 or _map_uses_axis(info.index_map_jaxpr, axis):
                 continue
@@ -372,9 +355,7 @@ def _validate_parallel_writes(
 
 
 def _scratch_infos(scratch_avals: Any) -> list[ScratchInfo]:
-    # `memory_space` is typed `Any` upstream, so palladium's THREADGROUP
-    # sentinel rides through Pallas tracing on it untouched. Anything
-    # else (the pl.MemorySpace members) is thread-private storage.
+    # Any memory_space other than the THREADGROUP sentinel is thread-private.
     from palladium.threadgroup import THREADGROUP
 
     infos = []
@@ -431,11 +412,8 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
 
 
 def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
-    """Build a KernelSpec from a pallas_call equation's parameters.
-
-    `trace` finds the equation; a lowering rule for the pallas_call
-    primitive receives the same parameters directly.
-    """
+    """Build a KernelSpec from a pallas_call equation's parameters, as found
+    by `trace` or received by a lowering rule."""
     params = dict(pallas_params)
     grid_mapping = params["grid_mapping"]
 
@@ -460,7 +438,6 @@ def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
 
     grid = tuple(int(g) for g in grid_mapping.grid)
     if not grid:
-        # Gridless pallas_call: a single program instance.
         grid = (1,)
 
     inputs = _block_infos(mappings[:n_in])

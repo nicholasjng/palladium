@@ -3,11 +3,12 @@
 Run from the jax-mps environment with
 ``JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/``.
 
-The two MPS paths solve exactly the same fixed-step Lotka--Volterra RK4
-problem.  The Palladium path is a single Pallas-generated Metal dispatch;
-the baseline is the idiomatic JAX ``jit(vmap(scan(...)))`` expression.  Both
-return a downstream JAX reduction, demonstrating that the custom call stays
-inside the jax-mps graph.
+The two MPS paths solve the same fixed-step Lotka-Volterra RK4 problem.
+The Palladium path is a single Pallas-generated Metal dispatch; the
+baseline is the idiomatic JAX ``jit(vmap(scan(...)))`` expression. Both
+return a downstream JAX reduction, so the custom call is timed inside
+the jax-mps graph. Cases: ``palladium``, ``jax-mps`` and ``jax-cpu`` at
+n = 10k and 100k.
 """
 
 from __future__ import annotations
@@ -77,7 +78,7 @@ def make_pallas_solver(n: int, steps: int):
     @jax.jit
     def solve(*args):
         x, y = call(*args)
-        # A normal jax-mps operation after the custom call, included in both paths.
+        # A jax-mps operation after the custom call, present in both paths.
         return jnp.sum(x) + jnp.sum(y)
 
     return solve

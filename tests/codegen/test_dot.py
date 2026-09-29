@@ -1,11 +1,7 @@
 """`dot_general` baseline: the scalar triple-nested-loop matmul.
 
-Scoped to exactly the plain matmul contraction, rank-2 operands, no
-batch dims: verified against a real jaxpr before implementing (see
-`_rule_dot_general`'s docstring). Batch dims and higher rank are
-unimplemented, not silently wrong; each has its own rejection test.
-
-No threadgroup-memory tiling: this is the baseline O(M*N*K) path.
+Covers the plain rank-2 matmul contraction only; batch dims and non-standard
+contractions are rejected rather than lowered wrong.
 """
 
 import jax
@@ -64,8 +60,7 @@ def test_batched_matmul_is_rejected():
 
 
 def test_non_standard_contraction_is_rejected():
-    """Contracting lhs dim 0 (a transposed-lhs matmul): not the plain
-    `A @ B` pattern this rule implements."""
+    """Contracting lhs dim 0 (a transposed-lhs matmul) is rejected as a non-standard contraction."""
 
     def kernel(a_ref, b_ref, o_ref):
         o_ref[...] = jax.lax.dot_general(a_ref[...], b_ref[...], (((0,), (0,)), ((), ())))

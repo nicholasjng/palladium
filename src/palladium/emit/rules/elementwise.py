@@ -184,15 +184,10 @@ def _template(cursor: Cursor, eqn: JaxprEqn, opname: str, ops: list[CVal], ctype
 def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """One rule for every pure elementwise primitive.
 
-    Three templates are derived rather than looked up: integer_pow expands
-    to repeated multiplication (reciprocal for negative y); convert_element_type
-    casts to the output's ctype; bitcast_convert_type uses as_type<T>.
-
     Operands broadcast against `dst`'s shape numpy-style: right-aligned,
-    size-1 dims replicate. The arity check requires every template field
-    to be filled and every operand consumed.
+    size-1 dims replicate. Every template field must be filled and every
+    operand consumed.
     """
-
     out_aval = shaped(eqn.outvars[0].aval)
     out_shape = tuple(int(d) for d in out_aval.shape)
     out_ctype = CTYPES[str(out_aval.dtype)]

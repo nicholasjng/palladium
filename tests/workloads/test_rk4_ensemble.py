@@ -1,9 +1,7 @@
-"""The capstone composition: a batched RK4 Lotka-Volterra integrator.
+"""A batched RK4 Lotka-Volterra integrator.
 
-No new emitter rules: it composes load/store, elementwise, grids, and scan.
 One Metal thread integrates one (prey, predator) system over `STEPS` RK4
-steps with its own parameters; the grid is the ensemble. This is the
-kernel that examples/ode_ensembles.py benchmarks against Diffrax.
+steps with its own parameters; the grid is the ensemble.
 """
 
 import jax
@@ -69,9 +67,8 @@ def test_matches_interpret_oracle(rng):
     args = _ensemble(rng, n)
     got_x, got_y = f(*args)
     want_x, want_y = f.interpret(*args)
-    # 500 RK4 steps of f32 accumulate real drift between FAST-math GPU and
-    # CPU; 1e-3 relative is the honest bar (tighten with MathMode.SAFE or
-    # the df32 prelude later, and see how far you get).
+    # 500 RK4 steps of f32 accumulate real drift between the FAST-math GPU
+    # and the CPU, hence the 1e-3 relative bar.
     np.testing.assert_allclose(got_x, np.asarray(want_x), rtol=1e-3, atol=1e-5)
     np.testing.assert_allclose(got_y, np.asarray(want_y), rtol=1e-3, atol=1e-5)
 

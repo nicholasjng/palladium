@@ -1,25 +1,18 @@
 """Threadgroup-shared scratch and the cooperative primitives around it.
 
-Ordinary `scratch_shapes` entries are `thread`-space: private to one
-Metal thread. This module adds storage in Metal's `threadgroup` address
-space, visible to every thread in the same threadgroup, plus the barrier
-and thread-position primitives needed to use it safely.
+Ordinary `scratch_shapes` entries are `thread`-space, private to one Metal
+thread. `threadgroup_memory` requests storage in Metal's `threadgroup`
+address space, visible to every thread in the group; `barrier`,
+`thread_index`, and `threads_per_threadgroup` are the primitives for using
+it. Barriers are placed by the kernel author, never inferred.
 
-Pallas's `MemorySpace` enum has no "threadgroup" member, so a
-palladium-specific sentinel rides through tracing on `MemoryRef`'s
-`memory_space` field (typed `Any` upstream) and comes back out on
-`grid_mapping.scratch_avals`.
+Pallas's `MemorySpace` enum has no "threadgroup" member, so a sentinel
+rides through tracing on `MemoryRef.memory_space` (typed `Any` upstream).
 
-Barriers are placed by the kernel author, never inferred.
-
-Interpret-mode caveat
----------------------
-`interpret=True` runs program instances sequentially with no notion of a
-threadgroup: `thread_index()` is 0, `threads_per_threadgroup()` is 1,
-`barrier()` is a no-op, and every instance is modelled as a threadgroup
-of one. A kernel that reduces across threads therefore computes
-something *different* under interpret, so the oracle is not a
-correctness check for it; validate against a NumPy reference instead.
+Under `interpret=True`, `thread_index()` is 0, `threads_per_threadgroup()`
+is 1, `barrier()` is a no-op, and every instance is a threadgroup of one.
+A kernel that reduces across threads computes something else there;
+validate it against a NumPy reference instead.
 """
 
 from __future__ import annotations
@@ -43,12 +36,8 @@ __all__ = [
 
 
 class _ThreadgroupSpace:
-    """Sentinel marking a scratch request as `threadgroup`-space.
-
-    Carried on `MemoryRef.memory_space` and recovered by
-    `palladium.trace`. Not a `pl.MemorySpace` member: a Metal fact, not
-    a Pallas one.
-    """
+    """Sentinel marking a scratch request as `threadgroup`-space; carried on
+    `MemoryRef.memory_space` and recovered by `palladium.trace`."""
 
     def __repr__(self) -> str:
         return "threadgroup"
@@ -60,14 +49,12 @@ THREADGROUP = _ThreadgroupSpace()
 def threadgroup_memory(shape: tuple[int, ...], dtype: Any) -> pl.MemoryRef:
     """Request a `threadgroup`-space scratch Ref, shared by the whole group.
 
-    Pass the result in `scratch_shapes=`, like a `pl.MemorySpace.ANY(...)`
-    request; the kernel receives it as a trailing Ref argument.
-
-    The allocation is sized at compile time and shared, not per-thread: a
-    `(64,)` request is 64 elements for the whole threadgroup. Indexing it
-    by `thread_index()` is therefore safe only when the dispatch
-    threadgroup size does not exceed the leading extent, which is why
-    `bind` requires an explicit `threadgroup=` for these kernels.
+    Pass the result in `scratch_shapes=`; the kernel receives it as a
+    trailing Ref argument. The allocation is compile-time sized and shared,
+    not per-thread: a `(64,)` request is 64 elements for the whole group.
+    Indexing it by `thread_index()` is safe only when the threadgroup size
+    does not exceed the leading extent, so `bind` requires an explicit
+    `threadgroup=` for these kernels.
 
     Parameters
     ----------
@@ -75,27 +62,19 @@ def threadgroup_memory(shape: tuple[int, ...], dtype: Any) -> pl.MemoryRef:
         Shared array shape.
     dtype : dtype-like
         Element type.
-
-    Examples
-    --------
-    >>> scratch_shapes=[palladium.threadgroup_memory((32,), jnp.float32)]  # doctest: +SKIP
     """
     aval = jax_core.ShapedArray(tuple(int(d) for d in shape), np.dtype(dtype))
     return pl.MemoryRef(aval, THREADGROUP)
 
 
 class _ThreadgroupEffect(GpuNativeEffect):
-    """Marks the cooperative primitives as effectful.
-
-    Load-bearing: a zero-output primitive with no declared effect is dead
-    code, and JAX's DCE would drop `barrier()` from the jaxpr before
-    palladium sees it.
-    """
+    """Marks the cooperative primitives as effectful; without it JAX's DCE
+    drops the zero-output `barrier()` before palladium sees it."""
 
 
 _EFFECT = _ThreadgroupEffect()
 
-# Register a no-op CPU lowering so Pallas interpret can carry this effect
+# Allow the effect through control flow so Pallas interpret can carry it
 # through its while loop.
 for _set in (
     effects.control_flow_allowed_effects,
@@ -113,14 +92,10 @@ mlir.register_lowering(barrier_p, lambda ctx, **_: [])
 
 
 def barrier() -> None:
-    """Synchronize every thread in the threadgroup.
-
-    Lowers to `threadgroup_barrier(mem_flags::mem_threadgroup)`. Place one
-    between a write to `threadgroup_memory` and any read of another
-    thread's slot.
-
-    Under `interpret=True` this is a no-op (see the module docstring).
-    """
+    """Synchronize every thread in the threadgroup; lowers to
+    `threadgroup_barrier(mem_flags::mem_threadgroup)`. Place one between a
+    write to `threadgroup_memory` and any read of another thread's slot.
+    A no-op under `interpret=True`."""
     barrier_p.bind()
 
 
@@ -133,14 +108,11 @@ mlir.register_lowering(thread_index_p, mlir.lower_fun(lambda: np.int32(0), multi
 
 
 def thread_index() -> jax.Array:
-    """This thread's linear index within its threadgroup, as int32.
-
-    Linearizes `[[thread_position_in_threadgroup]]` with x fastest using
-    the actual group dimensions, including partial groups. Distinct from
-    `pl.program_id`, which is the position in the whole grid.
-
-    Under `interpret=True` this is always 0 (see the module docstring).
-    """
+    """This thread's linear index within its threadgroup, as int32:
+    `[[thread_position_in_threadgroup]]` linearized x-fastest over the
+    actual group dimensions, including partial groups. Distinct from
+    `pl.program_id`, the position in the whole grid. Always 0 under
+    `interpret=True`."""
     return thread_index_p.bind()
 
 
@@ -156,14 +128,10 @@ mlir.register_lowering(
 
 
 def threads_per_threadgroup() -> jax.Array:
-    """How many threads are in *this* threadgroup, as int32.
-
-    Multiplies the dimensions of `[[threads_per_threadgroup]]`. Use it as a cooperative
-    reduction's bound rather than a compile-time constant: Metal
-    dispatches non-uniform threadgroups, so a grid that is not a multiple
-    of the threadgroup size ends in a smaller group, and a baked-in
-    constant would fold in slots no thread wrote.
-
-    Under `interpret=True` this is always 1 (see the module docstring).
-    """
+    """Threads in this threadgroup, as int32: the product of
+    `[[threads_per_threadgroup]]`. Use it as a cooperative reduction's
+    bound rather than a constant: Metal dispatches non-uniform
+    threadgroups, so a grid that is not a multiple of the group size ends
+    in a smaller group, and a constant would fold in slots no thread
+    wrote. Always 1 under `interpret=True`."""
     return threads_per_threadgroup_p.bind()

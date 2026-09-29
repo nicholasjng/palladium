@@ -1,13 +1,8 @@
 """The per-thread adaptive controller kernel.
 
-Composition on top of the preflight checks' primitives (comparisons,
-select_n/where, inf/nan literals, fori_loop accumulation), the same way
-the RK4 capstone composes the base rules. No new emitter rules. Van der Pol
-ensemble, matching examples/adaptive_lockstep.py's mu distribution.
-
-Bogacki-Shampine 3(2): a smaller embedded pair than RK45 (roughly half
-the equations per stage of the RK4 capstone, not double), with a real
-error estimate, FSAL, and a PI step-size controller.
+A Van der Pol ensemble integrated with Bogacki-Shampine 3(2), FSAL, and a
+PI step-size controller, composed from comparisons, select_n, and a
+fixed-trip fori_loop.
 """
 
 import jax
@@ -23,7 +18,7 @@ F32 = jnp.float32
 
 X0, V0, DT0 = 2.0, 0.0, 0.01  # matches examples/adaptive_lockstep.py
 T1 = 10.0
-MAX_STEPS = 6000  # fori_loop trip budget; test_reaches_t1 tells you if it's too small
+MAX_STEPS = 6000  # fori_loop trip budget
 RTOL, ATOL = 1e-5, 1e-7  # error-norm scaling and the diffrax comparison tolerance
 
 pcoeff, icoeff = 0.4, 0.3  # diffrax's own suggestion for "moderate difficulty" problems
@@ -48,8 +43,6 @@ def vdp_adaptive_kernel(x0_ref, v0_ref, mu_ref, to_ref, xo_ref, vo_ref, steps_re
     Self-stalling loop: dt clamps to fmin(dt, T1 - t) at the top of each
     attempt, so once t reaches T1, dt is 0, err is 0, the step is always
     accepted, and the thread idles harmlessly for its remaining budget.
-    No while-shaped iteration or boolean and/or needed, just arithmetic
-    inside a fixed-trip fori_loop.
 
     FSAL: k4 of an accepted step is rhs evaluated at exactly the point
     the next attempt starts from, so it doubles as that attempt's k1
@@ -90,7 +83,6 @@ def vdp_adaptive_kernel(x0_ref, v0_ref, mu_ref, to_ref, xo_ref, vo_ref, steps_re
             v + dt * (7 / 24 * k1v + 1 / 4 * k2v + 1 / 3 * k3v + 1 / 8 * k4v),
         )
 
-        # error calculation
         err_x, err_v = y3[0] - y2[0], y3[1] - y2[1]
         x3, v3 = y3
         err_norm = jnp.maximum(
@@ -168,7 +160,7 @@ def _inputs(rng, n: int, stiff_fraction: float = 0.0):
 
 
 def test_matches_interpret_oracle(rng):
-    """(a) GPU agrees with the CPU oracle on a mild ensemble."""
+    """The GPU agrees with the CPU oracle on a mild ensemble."""
     n = 256
     f = make_solver(n)
     args = _inputs(rng, n)
@@ -178,17 +170,14 @@ def test_matches_interpret_oracle(rng):
     np.testing.assert_allclose(got_x, np.asarray(want_x), rtol=1e-3, atol=1e-4)
     np.testing.assert_allclose(got_v, np.asarray(want_v), rtol=1e-3, atol=1e-4)
     # A hard accept/reject threshold is sensitive to ULP-level differences
-    # between GPU (RELAXED reassociation) and the CPU oracle (strict
-    # order): a flipped decision on one step shifts every dt afterward,
-    # so exact step-count equality isn't the right bar here.
+    # between GPU (RELAXED reassociation) and the CPU oracle: one flipped
+    # decision shifts every dt afterward, so step counts get a tolerance.
     np.testing.assert_allclose(got_steps, np.asarray(want_steps), rtol=0, atol=20)
     np.testing.assert_allclose(got_rejected, np.asarray(want_rejected), rtol=0, atol=20)
 
 
 def test_reaches_t1(rng):
-    """(b) completion: every thread's clock lands on T1. Also the
-    MAX_STEPS budget-sizing feedback loop: raise MAX_STEPS if this fails
-    for the stiff members."""
+    """Every thread's clock lands on T1 within the MAX_STEPS budget, stiff members included."""
     n = 256
     f = make_solver(n)
     got_t, *_ = f(*_inputs(rng, n, stiff_fraction=0.02))
@@ -196,8 +185,7 @@ def test_reaches_t1(rng):
 
 
 def test_matches_diffrax(rng):
-    """(c) accuracy against per-trajectory Diffrax Bosh3 (the same
-    Bogacki-Shampine pair) at matched tolerances."""
+    """Final states agree with per-trajectory Diffrax Bosh3 at matched tolerances."""
     diffrax = pytest.importorskip("diffrax")
     n = 64
     f = make_solver(n)
@@ -223,17 +211,14 @@ def test_matches_diffrax(rng):
         return sol.ys[-1]
 
     want = solve(jnp.asarray(mu))
-    # A bare I controller with a fixed dt0 won't track a tuned PID
-    # controller step-for-step; loosen further if this is flaky, but it
-    # should be in the right ballpark once the kernel is correct.
+    # A PI controller with a fixed dt0 does not track diffrax's PID
+    # controller step-for-step, hence the loose tolerance.
     np.testing.assert_allclose(got_x, np.asarray(want)[:, 0], rtol=5e-2, atol=1e-2)
     np.testing.assert_allclose(got_v, np.asarray(want)[:, 1], rtol=5e-2, atol=1e-2)
 
 
 def test_step_counts_vary_with_stiffness(rng):
-    """(d) the point: adaptivity is observably per-thread. A mixed
-    ensemble (a few stiff members, per examples/adaptive_lockstep.py's
-    mu range) must show step-count variance, not a uniform trip count."""
+    """A mixed ensemble with a few stiff members shows step-count variance across threads."""
     n = 512
     f = make_solver(n)
     x0, v0, mu = _inputs(rng, n, stiff_fraction=0.02)

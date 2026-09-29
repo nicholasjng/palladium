@@ -1,4 +1,5 @@
-"""Lowerings for one part of the MSL execution model."""
+"""Shape and layout primitives: reshape, squeeze, transpose, select_n,
+broadcast_in_dim."""
 
 from __future__ import annotations
 
@@ -25,9 +26,8 @@ from palladium.emit.rules.elementwise import _rule_elementwise
 
 @rule("reshape")
 def _rule_reshape(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """Reshape aliases row-major storage where possible. An axis
-    permutation copies directly into the reshaped destination, without
-    allocating an intermediate transposed array.
+    """Alias row-major storage where possible; an axis permutation copies
+    directly into the reshaped destination.
     """
     src = env.val(eqn.invars[0])
     new_shape = eqn.params["new_sizes"]
@@ -72,19 +72,11 @@ def _rule_squeeze(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 
 @rule("transpose")
 def _rule_transpose(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """`x.T` / `jnp.transpose(x, perm)` -> a materialized, permuted copy.
+    """`jnp.transpose(x, perm)` -> a materialized, permuted copy.
 
-    A real copy, not a view like reshape: transposed storage is different
-    bytes in the row-major flat-array model. `a.T` inside a dot product
-    stages as a standalone `transpose` equation ahead of `dot_general`;
-    the contraction itself stays (lhs dim 1, rhs dim 0).
-
-    Exception: a rank-2 transpose consumed only as `dot_general` rhs
-    never materializes. It binds a `transposed` CVal (untransposed
-    storage plus a flag) and the dot reads element `(k, j)` at
-    `[j * K + k]`, unit-stride in the contraction index for both
-    operands. Gated on `Environment.consumers` so no generic
-    flat-indexing rule can observe the transposed CVal.
+    A rank-2 transpose consumed only as `dot_general` rhs instead binds
+    a lazy `transposed` CVal over the untransposed storage, which the
+    dot reads unit-stride in the contraction index.
     """
     src = env.val(eqn.invars[0])
     outvar = eqn.outvars[0]
@@ -132,7 +124,7 @@ def _rule_select_n(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         env.bind(eqn.outvars[0], cases[0])
         return
     if which.ctype == "bool":
-        # Preserve the established boolean codegen, including its snapshots.
+        # Boolean predicates take the elementwise template.
         _rule_elementwise(env, cursor, eqn)
         return
 

@@ -116,10 +116,9 @@ reference instead.
 
 The mps lowering uses FAST math. On other platforms a `pallas_call` keeps
 JAX's own behavior: `interpret=True` runs the Pallas interpreter, which
-models cooperative kernels as threadgroups of one and so computes something
-else for them.
-`metal_call_jit` dispatches to Metal through the CPU FFI target and
-does not need jax-mps.
+models cooperative kernels as threadgroups of one and computes different
+results for them. `metal_call_jit` dispatches to Metal through the CPU FFI
+target and does not need jax-mps.
 
 Unsupported primitives raise `UnsupportedPrimitiveError`;
 unsupported primitive cases raise `EmitError`. Unsupported Pallas

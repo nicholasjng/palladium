@@ -2,6 +2,8 @@
 
 Run on Apple Silicon with an MSL 4 capable GPU using
 ``JAX_PLATFORMS=mps,cpu uv run mew run benchmarks/bench_pallas_reduction_tensorops_coverage.py``.
+Cases: sum and max over partial row tiles (n = 129) and over wide rows
+(n = 1025). Each case checks against JAX before timing.
 """
 
 from __future__ import annotations

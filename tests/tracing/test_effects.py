@@ -1,8 +1,7 @@
 """The effects layer: foreign-effect rejection at trace time, and the
-read/write ref sets that later emitter passes build on.
+read/write ref sets the emitter builds on.
 
-Trace-only, so this module runs without a Metal device, same as
-the kernel tracing tests.
+Trace-only, so this module runs without a Metal device.
 """
 
 import jax
@@ -49,8 +48,7 @@ def test_pure_state_effects_pass_the_gate():
 
 
 def test_effects_surface_through_control_flow():
-    """A read buried in a fori_loop body must appear on the outer
-    equation's effects: no sub-jaxpr walking required."""
+    """A read buried in a fori_loop body appears on the outer equation's effects without sub-jaxpr walking."""
 
     def kernel(x_ref, o_ref):
         def body(i, acc):

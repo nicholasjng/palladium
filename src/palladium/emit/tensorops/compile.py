@@ -37,9 +37,9 @@ def compile_kernel(
 ) -> Compilation:
     """Run tensorops planning and layout analysis, then lower the supported kernel.
 
-    Thread programs use the existing primitive emitter. Threadgroup attention
-    and matmuls are selected from imported tensorops IR and emitted through shared
-    TensorOps and cooperative MSL primitives.
+    Thread-scope programs use the primitive emitter; threadgroup programs are
+    dispatched by their IR to the attention, matmul, row reduction, or
+    elementwise lowering.
     """
 
     if dot_general not in ("auto", "default", "tensorops"):

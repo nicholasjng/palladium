@@ -36,13 +36,7 @@ def test_spec_captures_scratch():
 
 
 def test_scratch_storage_is_declared():
-    """The emitted MSL must declare every scratch name it references.
-
-    Directly guards the failure mode where a scratch CVal is bound into
-    `ref_vals` but its declaration never reaches the Cursor: the kernel
-    body then references an undeclared identifier and only fails later,
-    inside the Metal compiler.
-    """
+    """The emitted MSL declares every scratch name it references; an undeclared identifier would only fail later inside the Metal compiler."""
 
     def kernel(x_ref, o_ref, s_ref):
         s_ref[...] = x_ref[...] * 2.0
@@ -80,12 +74,7 @@ def test_scratch_roundtrip(rng):
 
 
 def test_scalar_scratch(rng):
-    """Shape-() scratch: a single thread-local, not an array.
-
-    The operand path represents scalar refs as axis-1 arrays because
-    operands are pointers. Thread-space scratch is not a pointer, so a
-    scalar entry has to stay indexable to match.
-    """
+    """Shape-() scratch stays indexable, matching the operand path's axis-1 scalar refs."""
 
     def kernel(x_ref, o_ref, s_ref):
         s_ref[...] = x_ref[0] + x_ref[1]
@@ -118,12 +107,7 @@ def test_multiple_scratch_buffers_mixed_dtypes(rng):
 
 
 def test_scratch_is_private_per_program_instance(rng):
-    """Each grid point gets its own scratch; no bleed between threads.
-
-    Every instance writes its own program_id-derived value into scratch
-    and reads it straight back, so a shared or aliased allocation shows
-    up as another row's value.
-    """
+    """Each grid point gets its own scratch; a shared allocation would show up as another row's value."""
 
     def kernel(x_ref, o_ref, s_ref):
         i = pl.program_id(0)
@@ -144,11 +128,7 @@ def test_scratch_is_private_per_program_instance(rng):
 
 
 def test_scratch_accumulator_across_loop(rng):
-    """The motivating use case: scratch as a loop-carried accumulator.
-
-    A fori_loop body that stores into a scratch Ref rather than threading
-    the running value through the carry.
-    """
+    """A fori_loop body accumulates into a scratch Ref instead of threading the value through the carry."""
 
     def kernel(x_ref, o_ref, s_ref):
         s_ref[...] = jnp.zeros((4,), jnp.float32)

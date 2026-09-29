@@ -1,4 +1,4 @@
-"""Initial ownership assignment for values in the tensorops Pallas IR."""
+"""Ownership assignment for values in the tensorops Pallas IR."""
 
 from __future__ import annotations
 
@@ -11,12 +11,11 @@ from .plan import AddressSpace, Distribution, ProgramScope, ValueLayout
 
 
 def assign_layouts(kernel: KernelIR) -> KernelIR:
-    """Assign conservative storage and ownership layouts to jaxpr values.
+    """Assign storage and ownership layouts to jaxpr values.
 
-    This first pass handles the common cooperative pattern used by attention:
-    TensorOps produces a tile, elementwise operations consume it in place, and
-    row reductions assign one row to each lane. It is a layout analysis only;
-    target emission remains a separate pass.
+    Dots receive TensorOps ownership, nonscalar row reductions row-strided
+    ownership, and other threadgroup values inherit a distributed operand
+    layout or default to flat striding.
     """
 
     body, _ = _assign_region(kernel.body, kernel.plan.scope)

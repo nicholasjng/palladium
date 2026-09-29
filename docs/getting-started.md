@@ -102,10 +102,9 @@ levels and the sequential methods dispatch one element at a time. Put a
 batch axis in the Pallas grid when possible.
 
 On mps, jax.vmap over a pallas_call is JAX's own batching. No path derives
-gradients from emitted MSL. Pair
-forward and backward calls with jax.custom_vjp, or provide a pure-JAX
-reference VJP where supported. See the [supported functionality](supported-jax.md)
-for details.
+gradients from emitted MSL. Pair forward and backward calls with
+jax.custom_vjp, or provide a pure-JAX reference VJP where supported. See the
+[supported functionality](supported-jax.md) for details.
 
 Unsupported kernel structure raises TraceError; unsupported lowering raises
 EmitError or UnsupportedPrimitiveError. Invalid runtime arguments raise

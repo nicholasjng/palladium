@@ -7,16 +7,17 @@ stencil kernel: one thread per grid point, halo reads from neighbours via
 indexed ref access (`x_ref[i, j]`, `tests/memory/test_indexed_refs.py`).
 
 A PDE step depends on every thread's neighbours finishing the previous
-step first, which a single dispatch cannot guarantee across threadgroups
-(no device-wide barrier, only per-threadgroup). So this is one kernel
-launch per step with ping-pong buffers, not an in-kernel loop like the
-ODE/SDE examples: `metal_call(...).iterate(u0, v0, steps=STEPS)` encodes
+step, which a single dispatch cannot guarantee across threadgroups (no
+device-wide barrier, only per-threadgroup). The example therefore runs
+one kernel launch per step with ping-pong buffers instead of an
+in-kernel loop: `metal_call(...).iterate(u0, v0, steps=STEPS)` encodes
 all launches into one command buffer and feeds each step's outputs back
-into the next step's inputs on the device, so the grid never
-round-trips through NumPy.
+into the next step's inputs on the device, so the grid never round-trips
+through NumPy. Compare the two wall-clock times and the max abs
+deviation.
 
-Threadgroup-memory tiling for the halo reads is a later, separate
-optimization; this is plain global-memory indexed access.
+Threadgroup-memory tiling for the halo reads is a separate optimization;
+this is plain global-memory indexed access.
 """
 
 import time

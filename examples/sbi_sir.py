@@ -1,30 +1,32 @@
 """Example 7: the sbibm SIR simulator on the GPU, as an `sbi` simulator.
 
 Docs: fixed-step loops, docs/supported-jax.md (control flow).
-Simulation-based inference spends most of its wall clock in the
-simulator: `sbi.inference.simulate_for_sbi` draws parameters from the
-prior and calls a user simulator on them, batched through joblib on the
-CPU. This example ports the SIR task from the sbibm benchmark suite
-(Lueckmann et al. 2021) to a Pallas kernel, one Metal thread per
-parameter draw, and plugs it into `simulate_for_sbi` unchanged.
+`sbi.inference.simulate_for_sbi` draws parameters from the prior and
+calls a user simulator on them, batched through joblib on the CPU. This
+example ports the SIR task from the sbibm benchmark suite (Lueckmann et
+al. 2021) to a Pallas kernel, one Metal thread per parameter draw, and
+plugs it into `simulate_for_sbi` unchanged.
 
-The task, as sbibm defines it: beta ~ LogNormal(log 0.4, 0.5), gamma ~
+The task as sbibm defines it: beta ~ LogNormal(log 0.4, 0.5), gamma ~
 LogNormal(log 0.125, 0.2); a population of N = 1e6 with one initial
 infection; the SIR ODE integrated over 160 days; the infected fraction
-I(t)/N read at t = 0, 17, ..., 153 (every 17th unit-spaced sample); and
-the observation x = Binomial(1000, I/N) at those ten times. The GPU
-kernel integrates the ODE (RK4, fixed step) and returns the ten
-fractions; the binomial draw stays in NumPy on both paths, so the
-comparison is simulator against simulator.
+I(t)/N read at t = 0, 17, ..., 153 (every 17th unit-spaced sample); the
+observation x = Binomial(1000, I/N) at those ten times. The GPU kernel
+integrates the ODE (RK4, fixed step) and returns the ten fractions; the
+binomial draw stays in NumPy on both paths, so the comparison is
+simulator against simulator.
 
 Three simulators are timed on the same parameter draws:
-- NumPy: the same RK4 scheme, vectorized over the whole batch. This is
-  the strongest CPU baseline a user can write without leaving NumPy.
-- SciPy: `solve_ivp` per draw, the way most sbi users write an ODE
-  simulator, run through `simulate_for_sbi` with joblib workers. Needs
-  `sbi` installed (`uv run --with sbi examples/sbi_sir.py`).
+- NumPy: the same RK4 scheme, vectorized over the whole batch; the
+  strongest CPU baseline within NumPy.
+- SciPy: `solve_ivp` per draw, the idiomatic sbi ODE simulator, run
+  through `simulate_for_sbi` with joblib workers. Needs `sbi` installed
+  (`uv run --with sbi examples/sbi_sir.py`).
 - palladium: the Pallas kernel through `metal_call`, eager NumPy in and
-  out, which is exactly the callable shape `simulate_for_sbi` expects.
+  out, the callable shape `simulate_for_sbi` expects.
+
+The output lists wall-clock time per simulator and the max abs
+deviation between simulators.
 """
 
 from __future__ import annotations

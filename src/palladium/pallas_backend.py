@@ -1,12 +1,9 @@
 """Palladium as the Pallas backend for the ``mps`` platform.
 
-Importing palladium installs a lowering for the ``pallas_call`` primitive
-that, when a program is lowered for ``mps``, emits a ``palladium.dispatch``
-custom call carrying the kernel. A plain
-``pl.pallas_call`` under ``jax.jit`` on a jax-mps device therefore runs
-Palladium's Metal kernel; every other platform keeps JAX's own lowering.
-
-Metal-side options travel as ``compiler_params``::
+Importing palladium installs a ``pallas_call`` lowering that, for ``mps``,
+emits a ``palladium.dispatch`` custom call carrying the kernel; every other
+platform keeps JAX's own lowering. Metal-side options travel as
+``compiler_params``::
 
     pl.pallas_call(kernel, out_shape=..., compiler_params=palladium.CompilerParams(
         dot_general="tensorops", threadgroup=128))
@@ -46,7 +43,7 @@ class CompilerParams(pallas_core.CompilerParams):
     threadgroup : int, tuple, or None
         Explicit threadgroup size; required by cooperative kernels.
     math_mode : metal_runtime.MathMode
-        Only FAST is available on the jax-mps path today.
+        Only FAST is available on the jax-mps path.
     """
 
     BACKEND: str = "palladium"
@@ -95,11 +92,9 @@ _installed = False
 def install() -> None:
     """Route pallas_call lowering for the ``mps`` platform through Palladium.
 
-    Registered as the primitive's common rule wrapping JAX's own, so it
-    applies whether or not the jax-mps plugin was discovered before this
-    import: JAX only accepts platform-specific registrations for platforms
-    it already knows. Other platforms and ``interpret=True`` are delegated
-    unchanged.
+    Registered as the primitive's common rule wrapping JAX's own, since JAX
+    accepts platform-specific registrations only for platforms it already
+    knows. Other platforms and ``interpret=True`` are delegated unchanged.
     """
     global _installed
     if _installed:

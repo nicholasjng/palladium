@@ -1,25 +1,24 @@
 """Example 8: neural posterior estimation on GPU-simulated SIR data.
 
 Docs: examples/sbi_sir.py for the simulator.
-Simulation-based inference is simulate, train a neural posterior estimator
-on the (theta, x) pairs, then sample it at the observation. The GPU only
-touches the first stage, so this example answers two questions the SIR
-simulator alone cannot:
+Simulation-based inference is simulate, train a neural posterior
+estimator on the (theta, x) pairs, then sample it at the observation.
+The GPU touches only the first stage. This example measures two things:
 
-1. Is GPU-simulated data interchangeable with CPU-simulated data? Train
-   sbi's NPE on the same number of draws from the Palladium simulator and
-   from a per-draw SciPy solver, sample both posteriors at one observation,
-   and compare them with the classifier two-sample test (C2ST; 0.5 means
-   indistinguishable).
-2. Where does the wall clock go once simulation is cheap? Time simulation
-   and training separately for the full-size Palladium dataset.
+1. Interchangeability of GPU- and CPU-simulated data. sbi's NPE is
+   trained on the same number of draws from the Palladium simulator and
+   from a per-draw SciPy solver; both posteriors are sampled at one
+   observation and compared with the classifier two-sample test (C2ST;
+   0.5 means indistinguishable).
+2. The split of wall clock between simulation and training for the
+   full-size Palladium dataset.
 
-Finally a posterior predictive check pushes posterior draws back through
-the Palladium simulator and compares predicted infected counts with the
-observation, the plot sbi users know from its tutorials.
+A posterior predictive check pushes posterior draws back through the
+Palladium simulator and compares predicted infected counts with the
+observation.
 
-NPE training runs on CPU torch, deliberately: torch-MPS normalizing flows
-are a separate variable. Run with
+NPE training runs on CPU torch, so torch-MPS normalizing flows are not
+a variable. Run with
 
     uv run --with sbi examples/sbi_sir_npe.py [--n 20000] [--compare-n 2000]
 """
@@ -106,9 +105,8 @@ def main() -> None:
     # 1. Interchangeability: same draws, two simulators, one observation.
     # The observation model quantizes I/N into counts of 1000, so simulators
     # that agree to a few 1e-6 in the fraction usually produce bit-identical
-    # datasets, and then identical estimators. Report that directly; C2ST
-    # only carries information when the datasets actually differ (and the
-    # metric misbehaves on identical sample sets).
+    # datasets and identical estimators. C2ST is reported only when the
+    # datasets differ; the metric misbehaves on identical sample sets.
     print(f"\ninterchangeability at {args.compare_n} draws per simulator")
     datasets, posteriors = {}, {}
     for name, fractions in (("palladium", palladium_simulator), ("scipy", scipy_simulator)):

@@ -1,8 +1,4 @@
-"""Block load/store: `_rule_get` and `_rule_swap` (emit/rules/memory.py).
-
-The smallest kernel that exists: copy in, copy out. Green means the
-emitted MSL compiles, dispatches, and the block load/store loops are right.
-"""
+"""Block load/store: `_rule_get` and `_rule_swap`."""
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +19,7 @@ def test_emitted_source_is_plausible_msl(rng):
     msl = palladium.emit_msl(spec)
     assert "kernel void" in msl
     assert "[[buffer(0)]]" in msl and "[[buffer(1)]]" in msl
-    # It must actually compile: Metal's frontend is the real judge.
+    # The MSL must compile under Metal's own frontend.
     import metal_runtime as mr
 
     mr.Kernel(msl, spec.name)
@@ -53,10 +49,7 @@ def _sum_and_diff_kernel(x_ref, y_ref, sum_ref, diff_ref):
 
 
 def test_multi_output_kernel(rng):
-    """Two output refs: `_rule_swap` is generic over which ref it targets,
-    and dispatch.py's BoundKernel.launch already loops over spec.outputs,
-    so this needs no new emitter or dispatch code, only a kernel that
-    exercises it."""
+    """Two output refs are each stored by `_rule_swap` and returned by dispatch."""
     f = palladium.metal_call(
         _sum_and_diff_kernel,
         out_shape=(

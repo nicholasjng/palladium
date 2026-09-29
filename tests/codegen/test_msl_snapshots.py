@@ -1,18 +1,12 @@
 """Golden-MSL snapshots: pin the emitted text, not just its behavior.
 
-The oracle tests prove kernels compute the right values; these prove the
-emitter produces the *same text* it did when the snapshot was blessed.
-Unintended codegen drift (a qualifier change, a lost offset factor, an
-extra copy) shows up as a reviewable diff instead of silence. Cursor's name
-counter is deterministic, so snapshots are stable across runs.
-
-Regenerate after an *intended* emitter change:
+Cursor's name counter is deterministic, so snapshots are stable across runs.
+Regenerate after an intended emitter change:
 
     PALLADIUM_REGEN_GOLDEN=1 uv run pytest tests/codegen/test_msl_snapshots.py
 
-then review the diff in jj like any other code change. These tests need no
-GPU (pure text comparison) and run on CI runners without a Metal device;
-the canary job failing here means a JAX upgrade changed kernel staging.
+No GPU is needed; a failure on CI without a Metal device means a JAX upgrade
+changed kernel staging.
 """
 
 import os
@@ -94,11 +88,9 @@ def _rk4_lotka_volterra():
 
 
 def _conditional_loop():
-    # Pins the adaptive-controller vocabulary in one kernel: a comparison, select_n
-    # reached through jnp.where's jit wrapper (inlined by _inline_jit),
-    # and both inside a scan with a const. The jit staging is a JAX
-    # implementation detail; if an upgrade changes it, this golden turns
-    # the canary red before any GPU sees the difference.
+    # A comparison and a select_n reached through jnp.where's jit wrapper,
+    # inside a loop with a const; the jit staging is a JAX implementation
+    # detail that an upgrade may change.
     def kernel(y0_ref, r_ref, o_ref):
         r = r_ref[...]
 
@@ -114,9 +106,8 @@ def _conditional_loop():
 
 
 def _dense_output_scan():
-    # Pins the stacked-scan vocabulary: a scanned xs sliced per step, a
-    # stacked ys streaming straight to the output ref (no thread-local
-    # trajectory array), and the consuming swap degenerating to a no-op.
+    # A scanned xs sliced per step and a stacked ys streaming straight to the
+    # output ref, with the consuming swap degenerating to a no-op.
     def kernel(y0_ref, ts_ref, o_ref):
         def step(y, t):
             y_next = y + 0.1 * t * y

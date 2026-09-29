@@ -1,6 +1,6 @@
 """Ensemble ODE benchmarks: palladium's Metal kernels vs Diffrax on CPU.
 
-The measured story behind the ODE ensemble example: one thread per Lotka-Volterra
+The ODE ensemble example under Mew: one thread per Lotka-Volterra
 system, the whole RK4 solve fused into a single dispatch, against
 jit(vmap(diffeqsolve)), the practical Diffrax deployment on macOS.
 

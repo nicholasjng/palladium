@@ -1,8 +1,4 @@
-"""The runtime side works without palladium.
-
-If these fail, the problem is the metal-runtime install (or the
-machine), not the emitter; fix that first.
-"""
+"""The metal-runtime side works without palladium."""
 
 import metal_runtime as mr
 import numpy as np

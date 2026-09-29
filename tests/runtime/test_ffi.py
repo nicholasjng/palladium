@@ -1,11 +1,8 @@
-"""jax.ffi integration (`native/ffi/palladium_ffi.cpp`).
+"""jax.ffi integration.
 
-`metal_call_jit` emits MSL the same way `metal_call` does, but dispatches
-through a registered jax.ffi target, so the result composes inside
-`jax.jit` next to ordinary `jnp` ops. The native handler ships inside the
-`palladium` package (root `CMakeLists.txt`, scikit-build-core) and is
-built automatically by `uv sync`/`pip install`; this skips cleanly only
-if that didn't happen (e.g. an unbuilt from-source checkout).
+`metal_call_jit` dispatches through a registered jax.ffi target, so the
+result composes inside `jax.jit` next to ordinary `jnp` ops. The module
+skips when the native handler is not built.
 """
 
 import jax
@@ -44,8 +41,7 @@ def test_eager_call_matches_interpret(rng):
 
 
 def test_composes_inside_jax_jit_with_ordinary_jnp_ops(rng):
-    """The actual point: a bare palladium kernel result feeding into
-    jnp.sum under jax.jit, no np.asarray/tracer conflict."""
+    """A kernel result feeds jnp.sum under jax.jit with no tracer conflict."""
     x = rng.standard_normal((8, 8), dtype=np.float32)
     y = rng.standard_normal((8, 8), dtype=np.float32)
     call = palladium.metal_call_jit(
@@ -62,9 +58,7 @@ def test_composes_inside_jax_jit_with_ordinary_jnp_ops(rng):
 
 
 def test_repeated_calls_reuse_the_cached_kernel(rng):
-    """Second call with the same shape/dtype must not retrace or
-    recompile; correctness across two distinct inputs is what proves the
-    cached MSL/spec weren't stale for the second one."""
+    """A second call with the same shape/dtype hits the cache and still computes the right result."""
     call = palladium.metal_call_jit(
         _add_kernel, out_shape=jax.ShapeDtypeStruct((4, 4), jnp.float32)
     )
@@ -88,9 +82,7 @@ def test_repeated_calls_reuse_the_cached_kernel(rng):
 
 
 def test_multi_output_kernel(rng):
-    """RemainingRets with more than one buffer: a genuinely different code
-    path from the single-output case (list vs bare ShapeDtypeStruct on
-    the Python side, n_inputs offset into `wrapped` on the C++ side)."""
+    """Multiple outputs take a different path from the single-output case on both the Python and C++ sides."""
 
     def kernel(x_ref, y_ref, sum_ref, diff_ref):
         sum_ref[...] = x_ref[...] + y_ref[...]
@@ -121,13 +113,7 @@ def test_multi_output_kernel(rng):
 
 
 def test_math_mode_safe_is_actually_requested(rng):
-    """`x + nan` only reliably produces NaN under SAFE: FAST permits
-    Metal to assume NaN never occurs (the preflight check's
-    `test_nan_literal_propagates` establishes this for the base
-    metal_call path). Confirmed load-bearing by sabotage: swapping the
-    SAFE/FAST ordinals in ffi.py's _MATH_MODE_ORDINALS makes this fail,
-    so a passing run means math_mode is actually reaching
-    mr_compile_library, not silently ignored."""
+    """`x + nan` only reliably produces NaN under SAFE, so a passing run shows math_mode reaches mr_compile_library."""
 
     def kernel(x_ref, o_ref):
         x = x_ref[...]
@@ -164,9 +150,7 @@ def test_vmap_sequential_matches_per_element(rng):
 
 
 def test_vmap_pipelined_matches_interpret_and_sequential(rng):
-    """'pipelined' handles the whole batch in one FFI call (the native
-    handler loops with several dispatches in flight); results must be
-    element-for-element identical to the sequential path and the oracle."""
+    """'pipelined' handles the whole batch in one FFI call and matches the sequential path element for element."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.tanh(x_ref[...]) * 2.0
@@ -194,8 +178,7 @@ def test_vmap_pipelined_matches_interpret_and_sequential(rng):
 
 
 def test_vmap_pipelined_broadcasts_unbatched_operands(rng):
-    """in_axes=(0, None): the shared operand rides along at stride 0, read
-    by every batch element instead of being materialized per element."""
+    """An unbatched operand rides along at stride 0 rather than being materialized per element."""
 
     def kernel(x_ref, w_ref, o_ref):
         o_ref[...] = x_ref[...] * w_ref[...] + 1.0
@@ -233,10 +216,7 @@ def test_vmap_pipelined_multi_output(rng):
 
 
 def test_vmap_works_by_default(rng):
-    """The default is 'pipelined': jax.vmap composes with no opt-in. Was
-    None, which sent users to jax.ffi's own NotImplementedError — and that
-    message recommends expand_dims/broadcast_all, the two methods
-    metal_call_jit rejects as silently wrong here."""
+    """The default vmap_method is 'pipelined', so jax.vmap composes with no opt-in."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.tanh(x_ref[...]) * 2.0
@@ -252,8 +232,7 @@ def test_vmap_works_by_default(rng):
 
 
 def test_nested_vmap_batches_outer_levels_sequentially(rng):
-    """One pipelined FFI call is one vmap level; an enclosing vmap batches
-    the ffi_call itself, one dispatch per outer element."""
+    """An enclosing vmap batches the ffi_call itself, one dispatch per outer element."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 3.0
@@ -264,8 +243,7 @@ def test_nested_vmap_batches_outer_levels_sequentially(rng):
 
 
 def test_vmap_method_none_refuses_batching_in_palladium_terms():
-    """Opting out still reports through palladium: the custom_vmap rule
-    raises before jax.ffi can suggest the unsafe whole-batch methods."""
+    """With vmap_method=None the custom_vmap rule raises before jax.ffi can suggest the unsafe whole-batch methods."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...]
@@ -297,9 +275,7 @@ def test_whole_batch_vmap_methods_rejected():
 
 
 def test_custom_vjp_pairs_forward_and_backward_kernels(rng):
-    """The custom-VJP recipe: y = tanh(x @ W) forward and
-    a fused backward kernel, paired with jax.custom_vjp; gradients must
-    match jax.grad of the plain jnp expression."""
+    """Forward and fused backward kernels paired with jax.custom_vjp match jax.grad of the plain jnp expression."""
     m, k, n = 8, 16, 8
 
     def fwd_kernel(x_ref, w_ref, y_ref):

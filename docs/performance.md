@@ -7,9 +7,9 @@ parallelism comes from the grid.
 
 ## Recorded results
 
-These local Apple-GPU runs show what the approach can do. They are workload-
-and machine-specific, not general speedup guarantees. The training results
-used JAX 0.11.1; the recorded notes did not consistently retain the GPU model.
+These are local Apple-GPU runs, workload- and machine-specific, not general
+speedup guarantees. The training results used JAX 0.11.1; the GPU model was
+not recorded consistently.
 
 | Workload | Palladium | Comparison |
 |---|---:|---:|
@@ -53,7 +53,7 @@ owns each score row by one SIMD group (lanes across columns, `simd_max` and
 the output accumulator in the value matmul's cooperative tensor instead of
 threadgroup memory, addressed through MPP element coordinates. Threadgroup
 memory per group fell from `BQ×BK + BQ×D + 2·BQ` to `BQ×BK + 3·BQ` floats, which
-is what makes 128-wide key tiles affordable. On an M2 (8-core GPU) through
+makes 128-wide key tiles affordable. On an M2 (8-core GPU) through
 metal-runtime, f32, `[1, 4096, 4, 64]`, medians of resident-buffer runs:
 
 | Tiles (q×k) | Before | After |
@@ -73,13 +73,12 @@ measured and rejected: it costs 1.5x at 4,096 through lost occupancy.
 These are steady-state medians with resident inputs; the generated kernel
 passed the benchmark's NumPy correctness check for both mask modes. Causal and
 noncausal timings are within the variation between runs, with no consistent
-overhead from causal masking at these sizes. These are workload-specific
-results, not a general TensorOps speedup guarantee.
+overhead from causal masking at these sizes.
 
 A separate JAX 0.11.2 forward-only probe ran 4,096 CNF trajectories for 64
 RK4 steps through CPU FFI to Metal. Warm medians were 0.510 ms at width 4,
 3.347 ms at width 16, and 9.276 ms at width 32. It used five samples and had
-overlapping CPU activity, so treat the values as rough scaling data.
+overlapping CPU activity; the values are rough scaling data.
 
 The symplectic example measures numerical behavior rather than throughput. Over
 5,000,000 Kepler Verlet steps, float32 energy error grows with a fitted log-log

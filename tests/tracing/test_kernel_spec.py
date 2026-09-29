@@ -1,8 +1,4 @@
-"""Tracing Pallas into KernelSpecs.
-
-Also the map of the territory: run with -s and read the printed jaxprs;
-every emitter rule consumes exactly these structures.
-"""
+"""Tracing Pallas into KernelSpecs."""
 
 import jax
 import jax.numpy as jnp
@@ -64,9 +60,7 @@ def test_gridded_spec_and_loop_staging(rng):
 
 
 def test_interpret_mode_is_the_oracle(rng):
-    """interpret=True runs the kernel on CPU, the reference every
-    lowering test diffs against. (Without it, pallas_call refuses to run
-    on CPU at all.)"""
+    """interpret=True runs the kernel on CPU, the reference every lowering test diffs against."""
     f = pl.pallas_call(
         _mad_kernel,
         out_shape=jax.ShapeDtypeStruct((32,), jnp.float32),
@@ -89,9 +83,7 @@ def test_trace_rejects_multiple_pallas_calls(rng):
 
 
 def test_non_blocked_dims_rejected():
-    """pl.Element/Indirect/BoundedSlice dims duck-type as Blocked through
-    their block_size attribute but mean different indexing semantics;
-    the tracer must reject them by name, never lower them silently."""
+    """pl.Element/Indirect/BoundedSlice dims duck-type as Blocked through block_size but mean different indexing semantics, so the tracer rejects them by name."""
     from palladium.errors import TraceError
 
     def kernel(x_ref, o_ref):

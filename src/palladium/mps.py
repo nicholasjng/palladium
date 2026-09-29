@@ -1,11 +1,9 @@
 """The ``palladium.dispatch`` custom-call ABI shared with jax-mps.
 
-Palladium traces a Pallas kernel and emits MSL; on the ``mps`` platform the
-pallas_call lowering (``palladium.pallas_backend``) turns that into a
-StableHLO custom call whose ``backend_config`` is
-``MpsDispatchDescriptor.to_json()``. jax-mps's handler for
-``MPS_CUSTOM_CALL_TARGET`` builds an MLX kernel from it on its own Metal
-stream. Nothing here executes anything.
+On the ``mps`` platform the pallas_call lowering emits a StableHLO custom
+call whose ``backend_config`` is ``MpsDispatchDescriptor.to_json()``;
+jax-mps's handler for ``MPS_CUSTOM_CALL_TARGET`` builds an MLX kernel from
+it on its own Metal stream. Nothing here executes anything.
 """
 
 from __future__ import annotations
@@ -30,9 +28,8 @@ __all__ = [
 ]
 
 
-# This is intentionally an ordinary StableHLO custom-call target, rather than
-# a jax.ffi target: jax-mps owns MPS buffers and must encode the dispatch on
-# its existing Metal stream.
+# An ordinary StableHLO custom-call target, not a jax.ffi target: jax-mps
+# owns the buffers and encodes the dispatch on its own Metal stream.
 MPS_CUSTOM_CALL_TARGET = "palladium.dispatch"
 _DESCRIPTOR_VERSION = 2
 
@@ -44,12 +41,9 @@ _PARAMETER = re.compile(
 
 
 def split_kernel_source(msl_source: str) -> tuple[str, list[str], str]:
-    """Split emitted MSL into (header, parameter lines, body).
-
-    The header is everything before the kernel: includes, using directives,
-    and helper functions. Parameters are the raw parameter declarations. The
-    body is the kernel's statement list without its braces.
-    """
+    """Split emitted MSL into (header, parameter lines, body): everything
+    before the kernel, the raw parameter declarations, and the kernel's
+    statements without braces."""
     kernel = msl_source.find("kernel void ")
     if kernel < 0:
         raise ValueError("source is not a Palladium MSL kernel")
@@ -69,12 +63,10 @@ def split_kernel_source(msl_source: str) -> tuple[str, list[str], str]:
 def kernel_prologue(params: list[str]) -> str:
     """Bind the emitter's parameter names inside an MLX custom kernel.
 
-    MLX declares buffers itself, named `arg<N>_base` by the handler in
-    operand-then-result order, and exposes Metal builtins under their
-    attribute names. Each emitted parameter becomes one declaration: buffer
-    N cast to the emitter's own qualifier and name, builtins constructed
-    from the attribute. The emitter's buffer names are not assumed: the
-    attention lowering calls its buffers query, key, value, and output.
+    MLX declares buffers as `arg<N>_base` in operand-then-result order and
+    exposes Metal builtins under their attribute names; each emitted
+    parameter becomes one declaration. Buffer names are taken from the
+    source, not assumed (the attention lowering names its buffers).
     """
     lines = []
     for param in params:
@@ -101,18 +93,14 @@ def _aval_to_ir_type(aval):
 
 @dataclasses.dataclass(frozen=True)
 class MpsDispatchDescriptor:
-    """Static ABI sent from the JAX lowering to jax-mps.
+    """Static ABI sent from the JAX lowering to jax-mps. No process-local
+    handles, so it can live in ``backend_config`` and be cached by PJRT.
 
-    The descriptor contains no process-local handles.  It can therefore live
-    in StableHLO's ``backend_config`` and be cached by the PJRT compiler.
-
-    The kernel travels as three pieces of text the handler concatenates with
-    MLX's generated signature between them: ``header`` (includes, using
-    directives, helper functions), ``prologue`` (declarations binding the
-    emitter's parameter names to MLX's buffers and builtins), and ``body``.
+    The handler concatenates ``header``, MLX's generated signature,
+    ``prologue`` (bindings of the emitter's parameter names), and ``body``.
     ``grid`` is in threads; cooperative kernels carry the scaled grid and
-    their required ``threadgroup``. Operand and result shapes are not part
-    of the contract: the handler reads them from the custom call's types.
+    their required ``threadgroup``. Operand and result shapes come from the
+    custom call's types.
     """
 
     version: int
@@ -139,8 +127,7 @@ class MpsDispatchDescriptor:
         if threadgroup is not None:
             tg3 = (tuple(int(d) for d in threadgroup) + (1, 1, 1))[:3]
         if emits_cooperative(msl_source):
-            # One threadgroup per program: the source addresses programs by
-            # threadgroup position, so the thread grid is scaled to match.
+            # One threadgroup per program; the thread grid scales to match.
             required, grid3 = cooperative_launch(grid, simdgroup_width())
             if tg3 is not None and tg3 != required:
                 raise ValueError(f"cooperative kernel requires threadgroup={required}, got {tg3}")
@@ -158,16 +145,15 @@ class MpsDispatchDescriptor:
     def to_json(self) -> str:
         """The stable, language-neutral custom-call payload."""
         payload = dataclasses.asdict(self)
-        # LLVM JSON distinguishes a missing field from a present null. The MPS
-        # handler uses absence to request its ordinary independent-thread
-        # launch policy, while a present array is an explicit cooperative size.
+        # LLVM JSON distinguishes a missing field from null: absence means the
+        # handler's default launch policy, an array is an explicit size.
         if payload["threadgroup"] is None:
             del payload["threadgroup"]
         return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
     @classmethod
     def from_json(cls, value: str) -> MpsDispatchDescriptor:
-        """Parse and validate a descriptor in tests or native-adapter shims."""
+        """Parse and validate a descriptor."""
         raw = json.loads(value)
         if raw.get("version") != _DESCRIPTOR_VERSION:
             raise ValueError(

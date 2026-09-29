@@ -2,6 +2,8 @@
 
 Run on Apple Silicon with an MSL 4 capable GPU using
 ``JAX_PLATFORMS=mps,cpu uv run mew run benchmarks/bench_pallas_matmul_tensorops_coverage.py``.
+Cases: a float32 matmul with a K tail and output edge tiles, a float16
+K loop, and a bfloat16 K tail. Each case checks against JAX before timing.
 """
 
 from __future__ import annotations
