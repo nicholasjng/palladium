@@ -21,8 +21,6 @@ import mew
 import numpy as np
 from jax.experimental import pallas as pl
 
-import palladium
-
 DT = 0.01
 
 
@@ -65,7 +63,7 @@ def make_pallas_solver(n: int, steps: int):
         yo_ref[...] = y
 
     spec = pl.BlockSpec((1,), lambda i: (i,))
-    call = palladium.mps_call_jit(
+    call = pl.pallas_call(
         kernel,
         grid=(n,),
         in_specs=[spec] * 6,

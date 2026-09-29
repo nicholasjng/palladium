@@ -1,8 +1,8 @@
 """Palladium as the Pallas backend for the ``mps`` platform.
 
 Importing palladium installs a lowering for the ``pallas_call`` primitive
-that, when a program is lowered for ``mps``, emits the same
-``palladium.dispatch`` custom call ``mps_call_jit`` produces. A plain
+that, when a program is lowered for ``mps``, emits a ``palladium.dispatch``
+custom call carrying the kernel. A plain
 ``pl.pallas_call`` under ``jax.jit`` on a jax-mps device therefore runs
 Palladium's Metal kernel; every other platform keeps JAX's own lowering.
 
@@ -26,7 +26,7 @@ from metal_runtime import MathMode
 from palladium._callable import DOT_GENERAL_POLICIES
 from palladium.diagnostics import check_threadgroup, normalize_threadgroup
 from palladium.emit import emit_msl
-from palladium.mps import MpsDispatchDescriptor, _mps_lowering
+from palladium.mps import MpsDispatchDescriptor, lower_dispatch
 from palladium.trace import spec_from_params
 
 __all__ = ["CompilerParams", "install"]
@@ -86,7 +86,7 @@ def _palladium_lowering(ctx: mlir.LoweringRuleContext, *in_nodes, interpret: Any
     descriptor = MpsDispatchDescriptor.from_spec(
         spec, msl, threadgroup=threadgroup, math_mode=_FAST_ORDINAL
     )
-    return _mps_lowering(ctx, *in_nodes, descriptor=descriptor)
+    return lower_dispatch(ctx, *in_nodes, descriptor=descriptor)
 
 
 _installed = False

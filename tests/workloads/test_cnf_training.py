@@ -21,6 +21,12 @@ from palladium.workloads.cnf_training import (
     reference_flow,
 )
 
+# Kernels run on the Pallas interpreter unless the mps platform is selected.
+INTERPRET = jax.default_backend() != "mps"
+make_flow = functools.partial(make_flow, interpret=INTERPRET)
+make_log_prob = functools.partial(make_log_prob, interpret=INTERPRET)
+make_training_step = functools.partial(make_training_step, interpret=INTERPRET)
+
 
 def test_density_matches_change_of_variables():
     """Independent check of the divergence integral and reverse-density sign.

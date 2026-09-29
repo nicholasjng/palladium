@@ -28,7 +28,7 @@ See the reproducible scripts for [RK4](../benchmarks/bench_jax_mps_rk4.py),
 checks causal and noncausal Pallas TensorOps lowering against a NumPy reference
 and measures resident-buffer runs at sequence lengths from 1,024 to 4,096. It
 needs an MSL 4-capable runtime. The [MLX SDPA comparison](../benchmarks/bench_attention_vs_mlx_sdpa.py)
-times the same kernel through `mps_call_jit` under `jax.jit` against
+times the same kernel as a plain `pl.pallas_call` under `jax.jit` on mps against
 `jax.nn.dot_product_attention`, which jax-mps routes to MLX's fused kernel; run it
 with the same `mew run --random-interleaving` command as the other benchmarks.
 
