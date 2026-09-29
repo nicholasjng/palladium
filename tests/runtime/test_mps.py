@@ -185,6 +185,34 @@ def test_descriptor_scales_the_launch_for_a_cooperative_tensorops_kernel():
     assert "matmul2d" in descriptor.body
 
 
+def test_descriptor_binds_buffers_by_index_not_by_emitted_name():
+    """The attention lowering names its buffers query/key/value/output; the
+    handler only knows arg<N>_base."""
+    from palladium.workloads.pallas_flash_attention import attention_kernel, attention_specs
+
+    grid, in_specs, out_specs = attention_specs(1, 128, 2, 16, 16)
+    call = palladium.mps_call_jit(
+        attention_kernel(tile_q=16, tile_k=16, head_dim=16, causal=False),
+        grid=grid,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        out_shape=jax.ShapeDtypeStruct((1, 128, 2, 16), jnp.float32),
+        dot_general="tensorops",
+    )
+    shape = jax.ShapeDtypeStruct((1, 128, 2, 16), jnp.float32)
+    _, descriptor = _descriptor_for(call, shape, shape, shape)
+    lines = descriptor.prologue.splitlines()
+    assert "device float* query = (device float*)arg0_base;" in lines
+    assert "device float* key = (device float*)arg1_base;" in lines
+    assert "device float* value = (device float*)arg2_base;" in lines
+    assert "device float* output = (device float*)arg3_base;" in lines
+    assert "uint3 group = uint3(threadgroup_position_in_grid);" in lines
+    assert "uint tid = uint(thread_index_in_threadgroup);" in lines
+    assert not any(
+        f"{name}_base" in descriptor.body for name in ("query", "key", "value", "output")
+    )
+
+
 def test_descriptor_rejects_a_mismatched_cooperative_threadgroup():
     def dot(a_ref, b_ref, o_ref):
         o_ref[...] = jnp.dot(a_ref[...], b_ref[...])

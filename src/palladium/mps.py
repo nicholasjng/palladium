@@ -79,10 +79,12 @@ def split_kernel_source(msl_source: str) -> tuple[str, list[str], str]:
 def kernel_prologue(params: list[str]) -> str:
     """Bind the emitter's parameter names inside an MLX custom kernel.
 
-    MLX declares buffers itself as `<name>_base` and exposes Metal builtins
-    under their attribute names, so each emitted parameter becomes one
-    declaration: buffers cast to the emitter's own qualifier, builtins
-    constructed from the attribute.
+    MLX declares buffers itself, named `arg<N>_base` by the handler in
+    operand-then-result order, and exposes Metal builtins under their
+    attribute names. Each emitted parameter becomes one declaration: buffer
+    N cast to the emitter's own qualifier and name, builtins constructed
+    from the attribute. The emitter's buffer names are not assumed: the
+    attention lowering calls its buffers query, key, value, and output.
     """
     lines = []
     for param in params:
@@ -91,7 +93,7 @@ def kernel_prologue(params: list[str]) -> str:
             raise ValueError(f"unrecognized kernel parameter {param!r}")
         ctype, name, attr = match["type"], match["name"], match["attr"]
         if attr == "buffer":
-            lines.append(f"{ctype} {name} = ({ctype}){name}_base;")
+            lines.append(f"{ctype} {name} = ({ctype})arg{match['index']}_base;")
         else:
             lines.append(f"{ctype} {name} = {ctype}({attr});")
     return "\n".join(lines)
