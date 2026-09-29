@@ -186,18 +186,8 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         inputs = {name: op.at(op_index(op, idx_vars)) for name, op in zip(PRIMITIVE_INVARS, ops)}
         return f"{dst.at(dst_idx)} = {_unwrapped(template.format(**inputs))};"
 
-    idx_vars = [cursor.fresh("_i") for _ in range(rank)]
-
-    def emit_loops(d: int) -> None:
-        if d == rank:
-            cursor.emit(assign(idx_vars))
-            return
-        with cursor.block(
-            f"for (uint {idx_vars[d]} = 0; {idx_vars[d]} < {dst.shape[d]}; ++{idx_vars[d]})"
-        ):
-            emit_loops(d + 1)
-
-    emit_loops(0)
+    with cursor.loop_nest(dst.shape) as idx_vars:
+        cursor.emit(assign(idx_vars))
 
 
 for _name in [

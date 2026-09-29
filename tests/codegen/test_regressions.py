@@ -65,15 +65,15 @@ def test_fractional_bfloat_literal():
 
 
 @pytest.mark.parametrize("kind", ["scalar_to_array", "array_to_scalar"])
-def test_reshape_preserves_storage_kind(kind):
+def test_reshape_between_scalar_and_one_element_array_stays_in_registers(kind):
+    """Rank-0 values and one-element arrays are both plain scalar variables;
+    neither side of the reshape may index the other."""
     source = _source(kind)
     scalars = re.findall(r"^    float (t\d+);$", source, re.MULTILINE)
-    arrays = re.findall(r"^    float (t\d+)\[1\];$", source, re.MULTILINE)
-    assert scalars and arrays
+    assert scalars
+    assert not re.search(r"^    float t\d+\[1\];$", source, re.MULTILINE)
     for scalar in scalars:
         assert not re.search(rf"\b{scalar}\[", source)
-    for array in arrays:
-        assert not re.search(rf"= {array};", source)
 
 
 def test_zero_power_is_constant_one():

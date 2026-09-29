@@ -312,14 +312,14 @@ def _copy_back_carries(cursor: Cursor, outs: list[CVal], carries: list[CVal]) ->
             # address to cast).
             if not (hazard and out.expr in carry_exprs):
                 return out.at(index)
-            if carry.shape:
+            if carry.shape and not carry.scalar_storage:
                 return f"((volatile thread {carry.ctype}*){out.expr})[{index}]"
             return f"(*(volatile thread {carry.ctype}*)&{out.expr})"
 
         def write(carry: CVal, t: str) -> str:
             if not hazard:
                 return f"{carry.at(index)} = {t};"
-            if carry.shape:
+            if carry.shape and not carry.scalar_storage:
                 return f"((volatile thread {carry.ctype}*){carry.expr})[{index}] = {t};"
             return f"(*(volatile thread {carry.ctype}*)&{carry.expr}) = {t};"
 

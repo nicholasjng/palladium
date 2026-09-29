@@ -195,6 +195,9 @@ class CVal:
     # Such refs are materialized on reads, never passed to pointer optimizations.
     index_map: str | None = None
     valid: str | None = None
+    # A ranked value of one element declared as a plain scalar variable, so
+    # `at` never indexes it and no pointer to it may be formed.
+    scalar_storage: bool = False
 
     @property
     def size(self) -> int:
@@ -220,7 +223,9 @@ class CVal:
         rank-0/rank-N absorption the emitter does."""
         if self.index_map is not None:
             return f"{self.expr}[{self.index_map.replace('$i', f'({index})')}]"
-        return self.expr if not self.shape else f"{self.expr}[{index}]"
+        if not self.shape or self.scalar_storage:
+            return self.expr
+        return f"{self.expr}[{index}]"
 
     def read(self, index: str) -> str:
         value = self.at(index)
@@ -315,10 +320,13 @@ class Cursor:
         count = math.prod(shape)
         self.account(ctype, count, space)
         qualifier = "threadgroup " if space == "threadgroup" else ""
+        # One-element values are registers, not arrays: the compiler keeps
+        # them out of thread-local memory and every use is `name` itself.
+        scalar = bool(shape) and count == 1
         declaration = f"{qualifier}{ctype} {name}"
-        declaration += f"[{count}]" if shape else ""
+        declaration += f"[{count}]" if shape and not scalar else ""
         self.emit(declaration + ";")
-        return CVal(name, shape, ctype, space=space)
+        return CVal(name, shape, ctype, space=space, scalar_storage=scalar)
 
     def emit(self, line: str) -> None:
         """Append one MSL line at the current indentation."""
@@ -351,6 +359,10 @@ class Cursor:
         `count - 1` at emit time so the reverse header carries a literal
         bound rather than an expression.
         """
+        if count == 1:
+            # A single trip needs no loop; the body indexes element 0.
+            yield "0"
+            return
         idx = self.fresh(prefix)
         if reverse:
             first = count - 1 if isinstance(count, int) else f"{count} - 1"
@@ -359,6 +371,18 @@ class Cursor:
             header = f"for (uint {idx} = 0; {idx} < {count}; ++{idx})"
         with self.block(header):
             yield idx
+
+    @contextlib.contextmanager
+    def loop_nest(self, shape: tuple[int, ...], prefix: str = "_i") -> Iterator[list[str]]:
+        """Emit nested counted loops over `shape`; yields one index per dim.
+
+        Size-1 dimensions get the literal index "0" and no loop.
+        """
+        indices: list[str] = []
+        with contextlib.ExitStack() as stack:
+            for extent in shape:
+                indices.append(stack.enter_context(self.loop(extent, prefix)))
+            yield indices
 
     @contextlib.contextmanager
     def strided_loop(
