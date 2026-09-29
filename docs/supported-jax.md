@@ -67,7 +67,8 @@ each query tile and runs the score and value matmuls with Metal TensorOps. Tile
 sizes and head dimensions must be multiples of 16, and both sequence lengths
 must divide evenly into their tiles. Short query sequences need padding and
 output cropping. Unsupported jaxpr forms and layouts raise `EmitError`.
-`mps_call_jit` does not use this path.
+`mps_call_jit` follows the same policy: cooperative kernels are sent to jax-mps with
+their scaled thread grid and required threadgroup.
 
 The backend supports float32, float16, bfloat16, int32, uint32, and bool, with
 operation-specific limits:

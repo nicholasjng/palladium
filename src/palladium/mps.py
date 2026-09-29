@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import json
+import re
 import threading
 from collections.abc import Callable
 from typing import Any, overload
@@ -25,6 +26,8 @@ from jax._src import core as jax_core, dispatch as jax_dispatch
 from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
 
+from palladium.diagnostics import simdgroup_width
+from palladium.emit.tensorops import cooperative_launch, emits_cooperative
 from palladium.ffi import FfiCallable
 from palladium.trace import KernelSpec
 from palladium.verify import DEFAULT_ATOL, DEFAULT_RTOL, verify_against
@@ -41,7 +44,57 @@ __all__ = [
 # a jax.ffi target: jax-mps owns MPS buffers and must encode the dispatch on
 # its existing Metal stream.
 MPS_CUSTOM_CALL_TARGET = "palladium.dispatch"
-_DESCRIPTOR_VERSION = 1
+_DESCRIPTOR_VERSION = 2
+
+# One kernel parameter as the emitter writes it: a buffer with its index, or
+# a Metal builtin such as `uint3 _pid [[thread_position_in_grid]]`.
+_PARAMETER = re.compile(
+    r"^(?P<type>.+?)\s+(?P<name>\w+)\s+\[\[(?P<attr>\w+)(?:\((?P<index>\d+)\))?\]\]$"
+)
+
+
+def split_kernel_source(msl_source: str) -> tuple[str, list[str], str]:
+    """Split emitted MSL into (header, parameter lines, body).
+
+    The header is everything before the kernel: includes, using directives,
+    and helper functions. Parameters are the raw parameter declarations. The
+    body is the kernel's statement list without its braces.
+    """
+    kernel = msl_source.find("kernel void ")
+    if kernel < 0:
+        raise ValueError("source is not a Palladium MSL kernel")
+    open_paren = msl_source.index("(", kernel)
+    close_paren = msl_source.index(")\n{", open_paren)
+    close_brace = msl_source.rstrip().rfind("}")
+    header = msl_source[:kernel]
+    params = [
+        line.strip().rstrip(",")
+        for line in msl_source[open_paren + 1 : close_paren].splitlines()
+        if line.strip()
+    ]
+    body = msl_source[close_paren + len(")\n{") : close_brace].strip("\n")
+    return header, params, body
+
+
+def kernel_prologue(params: list[str]) -> str:
+    """Bind the emitter's parameter names inside an MLX custom kernel.
+
+    MLX declares buffers itself as `<name>_base` and exposes Metal builtins
+    under their attribute names, so each emitted parameter becomes one
+    declaration: buffers cast to the emitter's own qualifier, builtins
+    constructed from the attribute.
+    """
+    lines = []
+    for param in params:
+        match = _PARAMETER.match(param)
+        if match is None:
+            raise ValueError(f"unrecognized kernel parameter {param!r}")
+        ctype, name, attr = match["type"], match["name"], match["attr"]
+        if attr == "buffer":
+            lines.append(f"{ctype} {name} = ({ctype}){name}_base;")
+        else:
+            lines.append(f"{ctype} {name} = {ctype}({attr});")
+    return "\n".join(lines)
 
 
 def _layout(rank: int) -> tuple[int, ...]:
@@ -59,13 +112,20 @@ class MpsDispatchDescriptor:
     """Static ABI sent from the JAX lowering to jax-mps.
 
     The descriptor contains no process-local handles.  It can therefore live
-    in StableHLO's ``backend_config`` and be cached by the PJRT compiler.  MSL
-    is kept as text for the first implementation; a later registry can replace
-    it with a content-addressed source key without changing the other fields.
+    in StableHLO's ``backend_config`` and be cached by the PJRT compiler.
+
+    The kernel travels as three pieces of text the handler concatenates with
+    MLX's generated signature between them: ``header`` (includes, using
+    directives, helper functions), ``prologue`` (declarations binding the
+    emitter's parameter names to MLX's buffers and builtins), and ``body``.
+    ``grid`` is in threads; cooperative kernels carry the scaled grid and
+    their required ``threadgroup``.
     """
 
     version: int
-    msl_source: str
+    header: str
+    prologue: str
+    body: str
     function_name: str
     grid: tuple[int, int, int]
     threadgroup: tuple[int, int, int] | None
@@ -85,14 +145,24 @@ class MpsDispatchDescriptor:
         threadgroup: tuple[int, ...] | None,
         math_mode: int,
     ) -> MpsDispatchDescriptor:
+        header, params, body = split_kernel_source(msl_source)
         grid = tuple(int(d) for d in spec.grid)
         grid3 = (grid + (1, 1, 1))[:3]
         tg3 = None
         if threadgroup is not None:
             tg3 = (tuple(int(d) for d in threadgroup) + (1, 1, 1))[:3]
+        if emits_cooperative(msl_source):
+            # One threadgroup per program: the source addresses programs by
+            # threadgroup position, so the thread grid is scaled to match.
+            required, grid3 = cooperative_launch(grid, simdgroup_width())
+            if tg3 is not None and tg3 != required:
+                raise ValueError(f"cooperative kernel requires threadgroup={required}, got {tg3}")
+            tg3 = required
         return cls(
             version=_DESCRIPTOR_VERSION,
-            msl_source=msl_source,
+            header=header,
+            prologue=kernel_prologue(params),
+            body=body,
             function_name=spec.name,
             grid=grid3,
             threadgroup=tg3,
@@ -231,6 +301,7 @@ class MpsCallable:
         threadgroup: int | tuple[int, ...] | None,
         cache_size: int,
         fallback: str = "interpret",
+        dot_general: str = "auto",
     ) -> None:
         if fallback not in ("interpret", "error"):
             raise ValueError("fallback must be 'interpret' or 'error'")
@@ -244,7 +315,7 @@ class MpsCallable:
             vmap_method=None,
             threadgroup=threadgroup,
             cache_size=cache_size,
-            dot_general="default",
+            dot_general=dot_general,
         )
         self.interpret = self._staged.interpret
         self._staged._execution_path = "mps-or-pallas-interpret (selected at lowering)"
@@ -477,17 +548,16 @@ def mps_call_jit(
     math_mode = pallas_kwargs.pop("math_mode", MathMode.FAST)
     threadgroup = pallas_kwargs.pop("threadgroup", None)
     cache_size = pallas_kwargs.pop("cache_size", 256)
-    dot_general = pallas_kwargs.pop("dot_general", "default")
-    if dot_general != "default":
-        raise ValueError(
-            "dot_general='tensorops' is currently available only through "
-            "the metal-runtime backend, not mps_call_jit"
-        )
+    dot_general = pallas_kwargs.pop("dot_general", "auto")
+    if dot_general not in ("auto", "default", "tensorops"):
+        raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
     vmap_method = pallas_kwargs.pop("vmap_method", None)
     if vmap_method is not None:
         raise ValueError(
             "mps_call_jit does not batch a custom call in v1; put the batch "
             "dimension in the Pallas grid so the whole batch is one dispatch"
         )
-    call = MpsCallable(kernel, pallas_kwargs, math_mode, threadgroup, cache_size, fallback)
+    call = MpsCallable(
+        kernel, pallas_kwargs, math_mode, threadgroup, cache_size, fallback, dot_general
+    )
     return call if vjp_reference is None else call.with_reference_vjp(vjp_reference)

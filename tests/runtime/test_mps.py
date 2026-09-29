@@ -108,8 +108,10 @@ def _checkpoint_kernel(x_ref, final_ref, checkpoints_ref):
 
 def test_descriptor_round_trip_is_stable():
     descriptor = palladium.MpsDispatchDescriptor(
-        version=1,
-        msl_source="kernel void add() {}",
+        version=2,
+        header="#include <metal_stdlib>\nusing namespace metal;\n",
+        prologue="const device float* arg0 = (const device float*)arg0_base;",
+        body="arg1[_pid.x] = arg0[_pid.x];",
         function_name="add",
         grid=(8, 1, 1),
         threadgroup=None,
@@ -121,6 +123,90 @@ def test_descriptor_round_trip_is_stable():
         aliases=(),
     )
     assert palladium.MpsDispatchDescriptor.from_json(descriptor.to_json()) == descriptor
+
+
+def _descriptor_for(call, *shapes):
+    spec, msl = call._staged._spec_and_msl(tuple(shapes))
+    return msl, palladium.MpsDispatchDescriptor.from_spec(
+        spec, msl, threadgroup=call._staged._threadgroup, math_mode=2
+    )
+
+
+def test_descriptor_splits_an_independent_kernel_into_header_prologue_body():
+    call = palladium.mps_call_jit(_add_kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32))
+    shape = jax.ShapeDtypeStruct((8,), jnp.float32)
+    msl, descriptor = _descriptor_for(call, shape, shape)
+
+    assert descriptor.header.startswith("#include <metal_stdlib>")
+    assert "kernel void" not in descriptor.header
+    assert "kernel void" not in descriptor.body
+    assert descriptor.prologue.splitlines() == [
+        "const device float* arg0 = (const device float*)arg0_base;",
+        "const device float* arg1 = (const device float*)arg1_base;",
+        "device float* arg2 = (device float*)arg2_base;",
+        "uint3 _pid = uint3(thread_position_in_grid);",
+    ]
+    assert descriptor.grid == (1, 1, 1)
+    assert descriptor.threadgroup is None
+    # Nothing is lost: the pieces reassemble the emitted source.
+    assert descriptor.header in msl
+    assert descriptor.body in msl
+
+
+def test_descriptor_scales_the_launch_for_a_cooperative_tensorops_kernel():
+    def dot(a_ref, b_ref, o_ref):
+        o_ref[...] = jnp.dot(a_ref[...], b_ref[...])
+
+    call = palladium.mps_call_jit(
+        dot,
+        grid=(2, 2),
+        in_specs=[
+            pl.BlockSpec((16, 16), lambda i, j: (i, 0)),
+            pl.BlockSpec((16, 32), lambda i, j: (0, j)),
+        ],
+        out_specs=pl.BlockSpec((16, 32), lambda i, j: (i, j)),
+        out_shape=jax.ShapeDtypeStruct((32, 64), jnp.float32),
+        dot_general="tensorops",
+    )
+    _, descriptor = _descriptor_for(
+        call,
+        jax.ShapeDtypeStruct((32, 16), jnp.float32),
+        jax.ShapeDtypeStruct((16, 64), jnp.float32),
+    )
+    width = palladium.diagnostics.simdgroup_width()
+
+    assert "MetalPerformancePrimitives" in descriptor.header
+    assert "using namespace mpp;" in descriptor.header
+    assert descriptor.threadgroup == (4 * width, 1, 1)
+    assert descriptor.grid == (2 * 4 * width, 2, 1)
+    lines = descriptor.prologue.splitlines()
+    assert "device float* arg0 = (device float*)arg0_base;" in lines
+    assert "uint3 _pid = uint3(threadgroup_position_in_grid);" in lines
+    assert "matmul2d" in descriptor.body
+
+
+def test_descriptor_rejects_a_mismatched_cooperative_threadgroup():
+    def dot(a_ref, b_ref, o_ref):
+        o_ref[...] = jnp.dot(a_ref[...], b_ref[...])
+
+    call = palladium.mps_call_jit(
+        dot,
+        grid=(2, 2),
+        in_specs=[
+            pl.BlockSpec((16, 16), lambda i, j: (i, 0)),
+            pl.BlockSpec((16, 32), lambda i, j: (0, j)),
+        ],
+        out_specs=pl.BlockSpec((16, 32), lambda i, j: (i, j)),
+        out_shape=jax.ShapeDtypeStruct((32, 64), jnp.float32),
+        dot_general="tensorops",
+        threadgroup=64,
+    )
+    with pytest.raises(ValueError, match="cooperative kernel requires threadgroup"):
+        _descriptor_for(
+            call,
+            jax.ShapeDtypeStruct((32, 16), jnp.float32),
+            jax.ShapeDtypeStruct((16, 64), jnp.float32),
+        )
 
 
 def test_manual_rk4_step_transpose_matches_jax_vjp():
@@ -152,12 +238,12 @@ def test_mps_call_requires_batch_in_the_grid():
         )
 
 
-def test_mps_call_rejects_the_metal_runtime_tensorops_lowering():
-    with pytest.raises(ValueError, match="only through the metal-runtime backend"):
+def test_mps_call_validates_the_dot_general_policy():
+    with pytest.raises(ValueError, match="dot_general must be"):
         palladium.mps_call_jit(
             _add_kernel,
             out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
-            dot_general="tensorops",
+            dot_general="simdgroup",
         )
 
 
