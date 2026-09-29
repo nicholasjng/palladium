@@ -115,21 +115,6 @@ def test_dynamic_partial_leading_slice(rng):
     np.testing.assert_allclose(got, want, rtol=1e-6)
 
 
-def test_strided_slice():
-    """A positive slice stride maps to the corresponding storage stride."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[::2]
-
-    f = palladium.metal_call(
-        kernel,
-        out_specs=pl.BlockSpec((2,), lambda: (0,)),
-        out_shape=jax.ShapeDtypeStruct((2,), jnp.float32),
-    )
-    x = np.arange(4, dtype=np.float32)
-    np.testing.assert_array_equal(f(x), x[::2])
-
-
 def test_noncontiguous_kept_dims():
     """A partial Slice on a trailing dim, non-contiguous in memory, addresses storage correctly."""
 

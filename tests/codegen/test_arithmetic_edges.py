@@ -1,4 +1,4 @@
-"""Numerical semantics of sign/rem and dynamic-bound Pallas loops."""
+"""Numerical semantics of `sign` and `rem` at dtype edges (inf, NaN, signed zero, division by zero, integer limits)."""
 
 import jax
 import jax.numpy as jnp

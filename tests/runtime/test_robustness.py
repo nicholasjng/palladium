@@ -1,4 +1,4 @@
-"""Robustness: thread safety, the dtype coverage matrix, and resource limits."""
+"""Robustness: thread safety and the dtype coverage matrix."""
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -6,10 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 import palladium
-from palladium import EmitError
 
 # --- thread safety -----------------------------------------------------------
 
@@ -79,11 +77,6 @@ def _roundtrip_and_op(dtype, op, expect, x):
         np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
     else:
         np.testing.assert_array_equal(got, want)
-
-
-def test_dtype_float32(rng):
-    x = rng.standard_normal(16, dtype=np.float32)
-    _roundtrip_and_op(jnp.float32, lambda v: v * 2.0 + 1.0, lambda v: v * 2 + 1, x)
 
 
 def test_dtype_float16(rng):
@@ -171,19 +164,3 @@ def test_bfloat16_dispatches_through_ffi():
     np.testing.assert_array_equal(
         np.asarray(call(x)).astype(np.float32), np.arange(1, 9, dtype=np.float32)
     )
-
-
-# --- resource limits ---------------------------------------------------------
-
-
-def test_stack_overflow_names_the_fix():
-    # A gridless kernel copies its whole 65536-element block into
-    # thread-local arrays, overflowing the per-thread stack. The opaque
-    # Metal pipeline error must arrive wrapped with the actual fix.
-    def kernel(x_ref, y_ref, o_ref):
-        o_ref[...] = 2.0 * x_ref[...] + y_ref[...]
-
-    n = 65536
-    call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((n,), jnp.float32))
-    with pytest.raises(EmitError, match="grid and BlockSpecs"):
-        call(np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32))

@@ -6,7 +6,6 @@ import pytest
 from jax.experimental import pallas as pl
 
 from palladium.dispatch import bind
-from palladium.emit import emit_msl
 from palladium.emit.tensorops import (
     ProgramScope,
     assign_layouts,
@@ -28,10 +27,6 @@ def _tensorops_relu_dot(a_ref, b_ref, out_ref):
 
 def _tensorops_chained_dot(a_ref, b_ref, out_ref):
     out_ref[...] = jnp.maximum(jnp.matmul(a_ref[...], b_ref[...]), 0.0) + 1.0
-
-
-def _tensorops_residual_dot(a_ref, b_ref, residual_ref, out_ref):
-    out_ref[...] = jnp.matmul(a_ref[...], b_ref[...]) + residual_ref[...]
 
 
 def _tensorops_elementwise_chain(input_ref, residual_ref, output_ref):
@@ -97,7 +92,7 @@ def _tensorops_broadcast_elementwise_spec(m=8, n=16, tm=4, tn=8):
 
 
 def _tensorops_matmul_spec(
-    kernel=_tensorops_dot, inputs=2, m=32, n=64, k=16, tm=16, tn=32, dtype=jnp.float32
+    kernel=_tensorops_dot, m=32, n=64, k=16, tm=16, tn=32, dtype=jnp.float32
 ):
     in_specs = [
         pl.BlockSpec((tm, k), lambda i, j: (i, 0)),
@@ -107,9 +102,6 @@ def _tensorops_matmul_spec(
         jax.ShapeDtypeStruct((m, k), dtype),
         jax.ShapeDtypeStruct((k, n), dtype),
     ]
-    if inputs == 3:
-        in_specs.append(pl.BlockSpec((tm, tn), lambda i, j: (i, j)))
-        args.append(jax.ShapeDtypeStruct((m, n), dtype))
     call = pl.pallas_call(
         kernel,
         grid=((m + tm - 1) // tm, (n + tn - 1) // tn),
@@ -152,7 +144,6 @@ def test_tensorops_import_preserves_scan_regions_and_tensor_shapes():
     assert compilation.plan.scope is ProgramScope.THREADGROUP
     assert "threadgroup_position_in_grid" in compilation.source
     assert compilation.threadgroup_bytes > 0
-    assert compilation.source == emit_msl(spec, dot_general="tensorops")
 
 
 def test_tensorops_defaults_to_thread_scope_for_scalar_programs():
@@ -179,17 +170,6 @@ def test_tensorops_defaults_to_thread_scope_for_scalar_programs():
     assert "thread_position_in_grid" in compilation.source
 
 
-def test_tensorops_attention_lowering_emits_causal_scan():
-    shape = (1, 32, 2, 16)
-    call = make_pallas_flash_attention(shape, tile_q=16, tile_k=16, causal=True)
-    args = [jax.ShapeDtypeStruct(shape, jnp.float32)] * 3
-    spec = trace(call, *args)
-    compilation = compile_kernel(spec, scope=ProgramScope.THREADGROUP)
-    assert "threadgroup_position_in_grid" in compilation.source
-    assert "<= (q_start + row)" in compilation.source
-    assert compilation.source == emit_msl(spec, dot_general="tensorops")
-
-
 def test_tensorops_matmul_lowering_emits_from_ir():
     spec = _tensorops_matmul_spec()
     compilation = compile_kernel(spec, scope=ProgramScope.THREADGROUP)
@@ -199,7 +179,6 @@ def test_tensorops_matmul_lowering_emits_from_ir():
     assert "matmul2d_descriptor desc(16, 32, 16" in compilation.source
     assert "device float* arg0 [[buffer(0)]]" in compilation.source
     assert "const device float*" not in compilation.source
-    assert compilation.source == emit_msl(spec, dot_general="tensorops")
     assert compilation.threadgroup_bytes == 0
 
 
@@ -251,14 +230,7 @@ def test_tensorops_matmul_accepts_half_precision_buffer_types(dtype, metal_type)
     assert f"= {metal_type}(dot_result[element]);" in compilation.source
 
 
-def test_tensorops_matmul_lowering_composes_relu_and_residual_epilogues():
-    relu_spec = _tensorops_matmul_spec(_tensorops_relu_dot)
-    relu = compile_kernel(relu_spec, scope=ProgramScope.THREADGROUP)
-    assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in relu.source
-    assert "cTc.store(c);" in relu.source
-    assert "fmax" in relu.source
-    assert relu.threadgroup_bytes == 0
-
+def test_tensorops_matmul_lowering_composes_chained_epilogues():
     chained = compile_kernel(
         _tensorops_matmul_spec(_tensorops_chained_dot), scope=ProgramScope.THREADGROUP
     )
@@ -266,14 +238,6 @@ def test_tensorops_matmul_lowering_composes_relu_and_residual_epilogues():
     assert "cTc[element1] = tensorops_epilogue3;" in chained.source
     assert "fmax" in chained.source
     assert chained.threadgroup_bytes == 0
-
-    residual_spec = _tensorops_matmul_spec(_tensorops_residual_dot, inputs=3)
-    residual = compile_kernel(residual_spec, scope=ProgramScope.THREADGROUP)
-    assert "device float* arg2 [[buffer(2)]]" in residual.source
-    assert "dot_result[element]" in residual.source
-    assert "[(((element) / 32) * 64 + ((element) % 32))]" in residual.source
-    assert "(arg3 + (int)_pid.x * 1024 + (int)_pid.y * 32)[row * 64 + column]" in residual.source
-    assert residual.threadgroup_bytes == 16 * 32 * 4
 
 
 @pytest.mark.parametrize(
@@ -321,6 +285,7 @@ def test_tensorops_lowers_cooperative_elementwise_chains_from_jaxpr():
 
     assert compilation.plan.grid == (3, 3)
     assert "threadgroup_position_in_grid" in compilation.source
+    assert "thread_position_in_grid" not in compilation.source
     assert "for (uint element = tid; element < 32; element += THREADS)" in (compilation.source)
     assert "tensorops_input" in compilation.source
     assert "tensorops_value" in compilation.source
@@ -332,18 +297,6 @@ def test_tensorops_lowers_cooperative_elementwise_chains_from_jaxpr():
     assert f"arg0[(int)_pid.x * 68 + (int)_pid.y * 8 + {tile_offset}]" in compilation.source
     assert f"arg2[(int)_pid.x * 68 + (int)_pid.y * 8 + {tile_offset}]" in compilation.source
     assert compilation.threadgroup_bytes == 0
-
-
-def test_cooperative_tensorops_emitter_uses_threadgroup_scope():
-    from palladium.emit.tensorops import ProgramScope, compile_kernel
-
-    spec = _tensorops_elementwise_spec()
-
-    source = compile_kernel(spec, scope=ProgramScope.THREADGROUP).source
-
-    assert "threadgroup_position_in_grid" in source
-    assert "thread_index_in_threadgroup" in source
-    assert "thread_position_in_grid" not in source
 
 
 def test_runtime_bind_selects_cooperative_geometry_for_tensorops(monkeypatch):

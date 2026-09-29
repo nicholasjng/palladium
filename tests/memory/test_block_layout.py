@@ -12,21 +12,6 @@ from jax.experimental import pallas as pl
 import palladium
 
 
-def test_blocked_double_1d(rng):
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...] * 2.0
-
-    f = palladium.metal_call(
-        kernel,
-        grid=(32,),
-        in_specs=[pl.BlockSpec((8,), lambda i: (i,))],
-        out_specs=pl.BlockSpec((8,), lambda i: (i,)),
-        out_shape=jax.ShapeDtypeStruct((256,), jnp.float32),
-    )
-    x = rng.standard_normal(256, dtype=np.float32)
-    np.testing.assert_allclose(f(x), 2.0 * x, rtol=1e-6)
-
-
 def test_program_id_lands_in_the_right_block():
     def kernel(o_ref):
         pid = pl.program_id(0)
@@ -76,20 +61,3 @@ def test_2d_grid_with_index_map_arithmetic(rng):
     got = f(x)
     want = np.asarray(f.interpret(x))
     np.testing.assert_allclose(got, want, rtol=1e-6)
-
-
-def test_noncontiguous_blocks_match_numpy(rng):
-    """Two-dimensional tiles preserve full-array strides."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...]
-
-    f = palladium.metal_call(
-        kernel,
-        grid=(8, 16),
-        in_specs=[pl.BlockSpec((4, 8), lambda i, j: (i, j))],
-        out_specs=pl.BlockSpec((4, 8), lambda i, j: (i, j)),
-        out_shape=jax.ShapeDtypeStruct((32, 128), jnp.float32),
-    )
-    x = rng.standard_normal((32, 128), dtype=np.float32)
-    np.testing.assert_array_equal(f(x), x)

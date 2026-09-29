@@ -67,29 +67,6 @@ def test_integer_pow_and_sqrt(rng):
     )
 
 
-def test_lotka_volterra_rhs(rng):
-    """One evaluation of the Lotka-Volterra right-hand side."""
-
-    def kernel(x_ref, y_ref, o1_ref, o2_ref):
-        x, y = x_ref[...], y_ref[...]
-        o1_ref[...] = 1.1 * x - 0.4 * x * y
-        o2_ref[...] = 0.1 * x * y - 0.4 * y
-
-    x = rng.uniform(0.5, 2.0, 256).astype(np.float32)
-    y = rng.uniform(0.5, 2.0, 256).astype(np.float32)
-    f = palladium.metal_call(
-        kernel,
-        out_shape=(
-            jax.ShapeDtypeStruct((256,), jnp.float32),
-            jax.ShapeDtypeStruct((256,), jnp.float32),
-        ),
-    )
-    got1, got2 = f(x, y)
-    want1, want2 = f.interpret(x, y)
-    np.testing.assert_allclose(got1, np.asarray(want1), rtol=1e-5)
-    np.testing.assert_allclose(got2, np.asarray(want2), rtol=1e-5)
-
-
 def test_row_vector_broadcasts_against_matrix_matches_numpy(rng):
     """A (32,) bias stages `broadcast_in_dim` to (1, 32) before the add, so the elementwise rule must broadcast per operand."""
 

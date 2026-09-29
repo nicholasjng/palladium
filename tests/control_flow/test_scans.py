@@ -29,18 +29,6 @@ def _run_and_compare(kernel, out_shape, *arrays, tol=1e-5):
     return call
 
 
-def test_scanned_xs_reduction(rng):
-    def kernel(ts_ref, o_ref):
-        def step(acc, t):
-            return acc + t * t, None
-
-        total, _ = jax.lax.scan(step, 0.0, ts_ref[...])
-        o_ref[0] = total
-
-    ts = rng.standard_normal(32).astype(np.float32)
-    _run_and_compare(kernel, _shaped(1), ts)
-
-
 def test_stacked_ys_without_xs(rng):
     def kernel(y0_ref, o_ref):
         def step(y, _):

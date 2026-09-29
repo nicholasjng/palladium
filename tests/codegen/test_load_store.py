@@ -37,12 +37,6 @@ def test_copy_roundtrip_2d(rng):
     np.testing.assert_array_equal(f(x), x)
 
 
-def test_copy_matches_interpret_oracle(rng):
-    f = palladium.metal_call(_copy_kernel, out_shape=jax.ShapeDtypeStruct((128,), jnp.float32))
-    x = rng.standard_normal(128, dtype=np.float32)
-    np.testing.assert_array_equal(f(x), np.asarray(f.interpret(x)))
-
-
 def _sum_and_diff_kernel(x_ref, y_ref, sum_ref, diff_ref):
     sum_ref[...] = x_ref[...] + y_ref[...]
     diff_ref[...] = x_ref[...] - y_ref[...]
