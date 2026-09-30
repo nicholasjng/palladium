@@ -46,9 +46,9 @@ N = 1024  # ensemble members, one Metal thread each
 # exactly: float32 state is float32 on the way out, and the df32 kernel
 # hands back both limbs rather than collapsing to float32, which would
 # discard the compensation being measured.
-CHUNK = 50_000
-CHUNKS = 100  # 5e6 steps, ~1600 orbits
-MARKS = (1, 2, 5, 10, 20, 50, 100)  # chunk indices to print a row for
+CHUNK = 10_000
+CHUNKS = 500  # 5e6 steps, ~1600 orbits
+MARKS = (5, 10, 25, 50, 100, 250, 500)  # chunk indices to print a row for
 
 DF32_KERNEL = """
 inline df32 operator+(df32 a, df32 b) { return df_add(a, b); }
