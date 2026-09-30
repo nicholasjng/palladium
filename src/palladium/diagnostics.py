@@ -60,12 +60,10 @@ class KernelDiagnostics:
     thread_bytes: int = 0
     threadgroup_bytes: int = 0
     threadgroup_limit: int | None = None
-    execution_path: str = "metal"
     cooperative: bool = False
 
     def __str__(self) -> str:
         parts = [f"palladium kernel {self.name}: grid={self.grid}"]
-        parts.append(f"execution={self.execution_path}")
         if self.threadgroup is not None:
             parts.append(f"threadgroup={self.threadgroup}")
         parts.append(f"stack~{_human(self.thread_bytes)}/thread")
@@ -222,17 +220,9 @@ def _explain_enabled() -> bool:
 def log_compile(
     spec: KernelSpec,
     threadgroup: int | tuple[int, ...] | None = None,
-    *,
-    execution_path: str = "metal",
     dot_general: str = "auto",
 ) -> None:
     """One stderr line per compiled kernel when PALLADIUM_EXPLAIN is set;
     called on the cache-miss path only."""
     if _explain_enabled():
-        print(
-            dataclasses.replace(
-                explain_spec(spec, threadgroup, dot_general=dot_general),
-                execution_path=execution_path,
-            ),
-            file=sys.stderr,
-        )
+        print(explain_spec(spec, threadgroup, dot_general=dot_general), file=sys.stderr)

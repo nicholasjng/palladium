@@ -13,7 +13,7 @@ import palladium
 
 
 def test_concurrent_first_calls_emit_once_per_shape(monkeypatch, rng):
-    import palladium._callable as callable_module
+    import palladium.ffi as callable_module
 
     emits = []
     real_emit = callable_module.emit_msl
