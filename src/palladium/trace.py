@@ -13,7 +13,15 @@ from typing import Any, Literal as TLiteral
 import jax
 import jax.experimental.pallas as pl
 import numpy as np
-from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var, subjaxprs
+from jax.extend.core import (
+    ClosedJaxpr,
+    Jaxpr,
+    JaxprEqn,
+    Literal,
+    Var,
+    jaxprs_in_params,
+    subjaxprs,
+)
 
 from palladium import effects
 from palladium.errors import TraceError
@@ -292,16 +300,16 @@ def _validate_parallel_writes(
     n_in: int,
 ) -> None:
     """Reject the provable write race: a grid axis that neither the output's
-    index map nor any top-level write index depends on. Writes inside
-    sub-jaxprs and non-injective maps that use the axis pass unchecked.
+    index map nor any write index depends on. A write inside control flow
+    counts as indexed by the axis when the control-flow equation takes an
+    operand derived from `program_id(axis)` or calls it in its body.
+    Non-injective maps that use the axis pass unchecked.
     """
     for j, info in enumerate(outputs):
         o_var = jaxpr.invars[n_in + j]
-        writes = [e for e in jaxpr.eqns if e.primitive.name == "swap" and e.invars[0] is o_var]
-        if not writes:
-            continue
+        writes = [e for e in jaxpr.eqns if effects.eqn_writes_ref(e, o_var)]
         for axis, extent in enumerate(grid):
-            if extent <= 1 or _map_uses_axis(info.index_map_jaxpr, axis):
+            if not writes or extent <= 1 or _map_uses_axis(info.index_map_jaxpr, axis):
                 continue
             pid_vars = {
                 out
@@ -310,8 +318,13 @@ def _validate_parallel_writes(
                 for out in e.outvars
             }
             for eqn in writes:
-                indexer_args = list(eqn.invars[2:])
-                if not (pid_vars and _depends_on(jaxpr, pid_vars, indexer_args)):
+                if eqn.primitive.name == "swap":
+                    indexed = _depends_on(jaxpr, pid_vars, list(eqn.invars[2:]))
+                else:
+                    indexed = _depends_on(jaxpr, pid_vars, list(eqn.invars)) or any(
+                        _calls_program_id(child, axis) for child in jaxprs_in_params(eqn.params)
+                    )
+                if not indexed:
                     raise TraceError(
                         f"output {j} is written identically by all "
                         f"{extent} program instances along grid axis "
@@ -321,6 +334,12 @@ def _validate_parallel_writes(
                         f"the output BlockSpec index map use grid axis "
                         f"{axis}, or index the write with pl.program_id({axis})"
                     )
+
+
+def _calls_program_id(jaxpr: Jaxpr, axis: int) -> bool:
+    return any(
+        eqn.primitive.name == "program_id" and eqn.params["axis"] == axis for eqn in jaxpr.eqns
+    ) or any(_calls_program_id(child, axis) for child in subjaxprs(jaxpr))
 
 
 def _scratch_infos(scratch_avals: Any) -> list[ScratchInfo]:
