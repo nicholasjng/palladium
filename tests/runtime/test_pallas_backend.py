@@ -14,6 +14,7 @@ from jax.experimental import pallas as pl
 from metal_runtime import MathMode
 
 import palladium
+import palladium.device
 
 
 def _add(x_ref, y_ref, o_ref):

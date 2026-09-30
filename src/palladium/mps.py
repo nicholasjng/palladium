@@ -185,10 +185,10 @@ def _palladium_lowering(ctx: mlir.LoweringRuleContext, *in_nodes, interpret: Any
             "input_output_aliases are not supported on the mps path: jax-mps's "
             "MLX custom-kernel path allocates functional outputs"
         )
-    check_threadgroup(spec, options.threadgroup)
+    check_threadgroup(spec, options.threadgroup_dims)
     msl = emit_msl(spec, dot_general=options.dot_general)
     descriptor = MpsDispatchDescriptor.from_spec(
-        spec, msl, threadgroup=options.threadgroup, math_mode=_FAST_ORDINAL
+        spec, msl, threadgroup=options.threadgroup_dims, math_mode=_FAST_ORDINAL
     )
     return lower_dispatch(ctx, *in_nodes, descriptor=descriptor)
 

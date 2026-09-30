@@ -48,7 +48,12 @@ class CompilerParams(pallas_core.CompilerParams):
     def __post_init__(self) -> None:
         if self.dot_general not in DOT_GENERAL_POLICIES:
             raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
-        object.__setattr__(self, "threadgroup", normalize_threadgroup(self.threadgroup))
+        normalize_threadgroup(self.threadgroup)
+
+    @property
+    def threadgroup_dims(self) -> tuple[int, ...] | None:
+        """`threadgroup` as a tuple of ints."""
+        return normalize_threadgroup(self.threadgroup)
 
 
 def normalize_threadgroup(threadgroup: int | tuple[int, ...] | None) -> tuple[int, ...] | None:

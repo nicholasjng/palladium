@@ -43,6 +43,14 @@ metal-runtime = { path = "../metal-runtime" }
 [tool.uv.extra-build-dependencies]
 palladium = ["jax", "metal-runtime"]
 
+[tool.ty.environment]
+# Tests and benchmarks import the shared workloads from examples/.
+extra-paths = ["examples", "tests"]
+
+[tool.ty.analysis]
+# Optional dependencies of the SBI examples and the torch benchmark.
+allowed-unresolved-imports = ["torch", "sbi.**", "matplotlib.**"]
+
 [tool.mew]
 benchpaths = ["benchmarks"]
 

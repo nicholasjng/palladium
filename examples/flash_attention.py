@@ -131,7 +131,7 @@ def main() -> None:
     q, k, v = (jnp.asarray(rng.standard_normal(shape, dtype=np.float32)) for _ in range(3))
     kernel = jax.jit(attention_call(shape, tile_q=16, tile_k=128, call=palladium.metal_call))
     dense = jax.jit(lambda q, k, v: jax.nn.dot_product_attention(q, k, v))
-    expected = reference_attention(*map(np.asarray, (q, k, v)), causal=False)
+    expected = reference_attention(np.asarray(q), np.asarray(k), np.asarray(v), causal=False)
 
     for name, fn in (("palladium (Metal, TensorOps)", kernel), ("jax.nn on CPU", dense)):
         got = jax.block_until_ready(fn(q, k, v))

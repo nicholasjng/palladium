@@ -495,7 +495,10 @@ def _emit(plan: _AttentionPlan, spec: KernelSpec, kernel_name: str | None):
     scale_atom = next(
         atom for atom in online_softmax.score_scale.invars if atom is not dots[0].outvars[0]
     )
-    scale = literal(scan.invars[online_softmax.body_invars.index(scale_atom)]).expr
+    scale_arg = scan.invars[online_softmax.body_invars.index(scale_atom)]
+    if not isinstance(scale_arg, Literal):
+        raise EmitError("tensorops attention requires a constant softmax scale")
+    scale = literal(scale_arg).expr
 
     key_loop_stop = "(((q_start + BQ + BK - 1) / BK) * BK)" if causal else str(key_length)
     with cursor.strided_loop("0", key_loop_stop, "BK", name="k_start"):

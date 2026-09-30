@@ -94,7 +94,7 @@ def scipy_simulator(theta: np.ndarray) -> np.ndarray:
 
     times = np.arange(OBSERVATIONS) * DAYS_BETWEEN_OBSERVATIONS
     out = np.empty((theta.shape[0], OBSERVATIONS), np.float32)
-    for row, (beta, gamma) in enumerate(np.asarray(theta, np.float64)):
+    for row, (beta, gamma) in enumerate(np.asarray(theta, np.float64).tolist()):
 
         def rhs(_, u, beta=beta, gamma=gamma):
             s, i, _r = u

@@ -151,8 +151,8 @@ class FfiCallable:
                 if entry is None:
                     check_dtypes(tuple(args))
                     spec = trace(self._staged, *self._shapes(args))
-                    check_threadgroup(spec, self._params.threadgroup)
-                    log_compile(spec, self._params.threadgroup, self._params.dot_general)
+                    check_threadgroup(spec, self._params.threadgroup_dims)
+                    log_compile(spec, self._params.threadgroup_dims, self._params.dot_general)
                     msl = emit_msl(spec, dot_general=self._params.dot_general)
                     entry = (spec, msl, hashlib.sha256(msl.encode()).hexdigest())
                     self._cache[key] = entry
@@ -173,7 +173,7 @@ class FfiCallable:
         check_dtypes(args)
         return explain_spec(
             trace(self._staged, *self._shapes(args)),
-            self._params.threadgroup,
+            self._params.threadgroup_dims,
             dot_general=self._params.dot_general,
         )
 
@@ -223,7 +223,7 @@ class FfiCallable:
             for a, b in zip(args, batched, strict=True)
         ]
         spec, msl_source, source_id = self._spec_and_msl(tuple(unbatched))
-        grid, threadgroup = launch_geometry(spec, msl_source, self._params.threadgroup)
+        grid, threadgroup = launch_geometry(spec, msl_source, self._params.threadgroup_dims)
         # MRLaunchDesc takes 3 grid dims; a (0, 0, 0) threadgroup lets the
         # runtime choose.
         threadgroup = threadgroup or (0, 0, 0)

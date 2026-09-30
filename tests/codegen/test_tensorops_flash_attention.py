@@ -215,7 +215,9 @@ def test_tensorops_attention_supports_multiples_of_sixteen_head_dimensions(head_
     assert f"16, 16, {head_dim}, false, true, false);" in source
     assert f"16, {head_dim}, 16, false, false, false," in source
     scale_line = next(line for line in source.splitlines() if "scores[row * 16 + lane] *" in line)
-    scale = float(re.search(r"\* ([0-9.e-]+)f\)", scale_line).group(1))
+    match = re.search(r"\* ([0-9.e-]+)f\)", scale_line)
+    assert match is not None
+    scale = float(match.group(1))
     assert scale == pytest.approx(head_dim**-0.5, rel=1e-6)
 
 
