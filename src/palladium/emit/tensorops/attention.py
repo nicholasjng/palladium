@@ -8,7 +8,7 @@ import math
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.device import simdgroup_width
-from palladium.emit.core import Cursor, CVal, Environment
+from palladium.emit.core import Cursor, CVal, literal
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
 
@@ -495,7 +495,7 @@ def _emit(plan: _AttentionPlan, spec: KernelSpec, kernel_name: str | None):
     scale_atom = next(
         atom for atom in online_softmax.score_scale.invars if atom is not dots[0].outvars[0]
     )
-    scale = Environment().val(scan.invars[online_softmax.body_invars.index(scale_atom)]).expr
+    scale = literal(scan.invars[online_softmax.body_invars.index(scale_atom)]).expr
 
     key_loop_stop = "(((q_start + BQ + BK - 1) / BK) * BK)" if causal else str(key_length)
     with cursor.strided_loop("0", key_loop_stop, "BK", name="k_start"):
