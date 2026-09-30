@@ -1,135 +1,19 @@
-"""Cooperative elementwise emission for values shared by a threadgroup."""
+"""Online-softmax emission for the cooperative attention lowering."""
 
 from __future__ import annotations
 
 import dataclasses
-import math
 import string
-from typing import Literal as TypingLiteral
 
 from jax.extend.core import JaxprEqn, Literal, Var
 
-from palladium.emit.core import ELEMENTWISE, Cursor, CVal, EmitError, Environment, shaped
+from palladium.emit.core import ELEMENTWISE, Cursor, CVal, Environment, shaped
 from palladium.emit.numeric import typed_expression
-
-
-@dataclasses.dataclass(frozen=True)
-class CooperativeValue:
-    """Threadgroup storage and the rule assigning its elements to lanes."""
-
-    storage: CVal
-    ownership: TypingLiteral["flat_strided", "row_strided", "tensorops"]
-
-    def __post_init__(self) -> None:
-        if self.storage.space != "threadgroup":
-            raise ValueError("cooperative values must use threadgroup storage")
-
-
-def emit_elementwise(
-    cursor: Cursor,
-    eqn: JaxprEqn,
-    operands: tuple[CVal | CooperativeValue, ...],
-    output: CooperativeValue,
-    *,
-    thread_count: str | None = None,
-    row_index: str | None = None,
-) -> CooperativeValue:
-    """Emit a supported elementwise equation with one lane per output element.
-
-    Shaped operands must match the output shape; scalar operands broadcast.
-    The output may alias one input because each lane reads and writes only its
-    own element. Flat-strided consumers synchronize before another lane reads
-    the result; row-strided work can continue on the same row owner.
-    """
-    dst = output.storage
-    if output.ownership not in ("flat_strided", "row_strided"):
-        raise EmitError("cooperative elementwise output needs a lane-owned layout")
-    input_values = tuple(op.storage if isinstance(op, CooperativeValue) else op for op in operands)
-    shape = tuple(int(d) for d in shaped(eqn.outvars[0].aval).shape)
-    if shape != dst.shape or len(input_values) != len(eqn.invars):
-        raise EmitError("cooperative elementwise shapes do not match the jaxpr equation")
-    if any(op.shape not in ((), shape) for op in input_values):
-        raise EmitError("cooperative elementwise operands must be scalar or match the output")
-
-    opname = eqn.primitive.name
-    template = typed_expression(opname, dst.ctype) or ELEMENTWISE.get(opname)
-    if template is None:
-        raise EmitError(f"unsupported cooperative elementwise primitive {opname!r}")
-    fields = {field for _, field, _, _ in string.Formatter().parse(template) if field}
-    names = string.ascii_lowercase[: len(input_values)]
-    if fields != set(names):
-        raise EmitError(f"{opname} requires {len(fields)} operands, got {len(operands)}")
-
-    def emit_at(index: str) -> None:
-        expressions = {
-            name: op.at(index) if op.shape else op.expr
-            for name, op in zip(names, input_values, strict=True)
-        }
-        cursor.emit(f"{dst.at(index)} = {template.format(**expressions)};")
-
-    if output.ownership == "flat_strided":
-        if thread_count is None:
-            raise EmitError("flat-strided elementwise output requires a thread count")
-        with cursor.strided_loop("tid", str(dst.size), thread_count, name="element") as index:
-            emit_at(index)
-    else:
-        if row_index is None or len(shape) != 2:
-            raise EmitError("row-strided elementwise output requires a matrix row index")
-        with cursor.loop(shape[1], "_column") as column:
-            emit_at(f"{row_index} * {shape[1]} + {column}")
-    return output
-
-
-def emit_elementwise_store(
-    cursor: Cursor,
-    eqn: JaxprEqn,
-    operands: tuple[CVal | CooperativeValue, ...],
-    output: CVal,
-    *,
-    thread_count: str,
-) -> None:
-    """Apply one elementwise equation across a cooperative tile into a buffer."""
-    values = tuple(op.storage if isinstance(op, CooperativeValue) else op for op in operands)
-    shape = tuple(int(d) for d in shaped(eqn.outvars[0].aval).shape)
-    if math.prod(shape) != output.size or len(values) != len(eqn.invars):
-        raise EmitError("cooperative store shapes do not match the jaxpr equation")
-    if any(
-        value.shape
-        and value.size != output.size
-        and not (len(shape) >= 2 and value.shape == (shape[-1],))
-        for value in values
-    ):
-        raise EmitError("cooperative store operands must be scalar or match the output")
-
-    opname = eqn.primitive.name
-    template = typed_expression(opname, output.ctype) or ELEMENTWISE.get(opname)
-    if template is None:
-        raise EmitError(f"unsupported cooperative store primitive {opname!r}")
-    fields = {field for _, field, _, _ in string.Formatter().parse(template) if field}
-    names = string.ascii_lowercase[: len(values)]
-    if fields != set(names):
-        raise EmitError(f"{opname} requires {len(fields)} operands, got {len(values)}")
-
-    with cursor.strided_loop("tid", str(output.size), thread_count, name="element") as index:
-        expressions = {
-            name: (
-                value.at(f"{index} % {shape[-1]}")
-                if len(value.shape) == 1 and value.shape == (shape[-1],)
-                else value.at(index)
-                if value.shape
-                else value.expr
-            )
-            for name, value in zip(names, values, strict=True)
-        }
-        cursor.emit(f"{output.at(index)} = {template.format(**expressions)};")
+from palladium.errors import EmitError
 
 
 def row_reduction_expression(
-    eqn: JaxprEqn,
-    input_shape: tuple[int, int],
-    ctype: str,
-    left: str,
-    right: str,
+    eqn: JaxprEqn, input_shape: tuple[int, int], left: str, right: str
 ) -> str:
     """Return one combine expression for a recognized row reduction."""
     expected = (input_shape[0],)
@@ -189,14 +73,14 @@ class OnlineSoftmaxPlan:
 
 def _simd_reduction(eqn: JaxprEqn, input_shape: tuple[int, int], value: str) -> str:
     """The SIMD-group reduction matching a recognized row reduction."""
-    row_reduction_expression(eqn, input_shape, "float", value, value)
+    row_reduction_expression(eqn, input_shape, value, value)
     return f"simd_max({value})" if eqn.primitive.name == "reduce_max" else f"simd_sum({value})"
 
 
 def emit_online_softmax_simd(
     cursor: Cursor,
     plan: OnlineSoftmaxPlan,
-    scores: CooperativeValue,
+    scores: CVal,
     row_max: CVal,
     row_sum: CVal,
     row_scale: CVal,
@@ -219,9 +103,7 @@ def emit_online_softmax_simd(
     a barrier. Rows are disjoint across groups, so the step itself needs no
     barrier.
     """
-    score_storage = scores.storage
-    if scores.ownership != "tensorops":
-        raise EmitError("online softmax input scores must be TensorOps-owned")
+    score_storage = scores
     if score_storage.shape != (rows, columns):
         raise EmitError("online softmax score tile shape does not match its plan")
     if any(carry.shape != (rows,) for carry in (row_max, row_sum, row_scale)):
@@ -280,7 +162,7 @@ def emit_online_softmax_simd(
             else:
                 cursor.emit(f"s[{j}] = {scaled};")
             combine = row_reduction_expression(
-                plan.score_max, (rows, columns), ctype, "lane_max", f"s[{j}]"
+                plan.score_max, (rows, columns), "lane_max", f"s[{j}]"
             )
             cursor.emit(f"lane_max = {combine};")
         cursor.emit(
@@ -322,7 +204,7 @@ def emit_online_softmax_simd(
             else:
                 cursor.emit(store)
             combine = row_reduction_expression(
-                plan.probability_sum, (rows, columns), ctype, "lane_sum", f"s[{j}]"
+                plan.probability_sum, (rows, columns), "lane_sum", f"s[{j}]"
             )
             cursor.emit(f"lane_sum = {combine};")
         cursor.emit(

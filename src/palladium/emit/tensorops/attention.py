@@ -8,13 +8,6 @@ import math
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.diagnostics import simdgroup_width
-from palladium.emit.cooperative import (
-    CooperativeValue,
-    OnlineSoftmaxPlan,
-    accumulator_rescale_expression,
-    elementwise_expression,
-    emit_online_softmax_simd,
-)
 from palladium.emit.core import Cursor, CVal, Environment
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
@@ -26,6 +19,12 @@ from ._shared import (
     _shape,
     _TensorOpsMatmul,
     _TensorView,
+)
+from .softmax import (
+    OnlineSoftmaxPlan,
+    accumulator_rescale_expression,
+    elementwise_expression,
+    emit_online_softmax_simd,
 )
 
 
@@ -512,7 +511,7 @@ def _emit(plan: _AttentionPlan, spec: KernelSpec, kernel_name: str | None):
         emit_online_softmax_simd(
             cursor,
             online_softmax,
-            CooperativeValue(scores, "tensorops"),
+            scores,
             row_max,
             row_sum,
             row_scale,
