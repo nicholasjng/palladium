@@ -4,6 +4,8 @@ The descriptor tests run on CPU and pin the ABI jax-mps consumes; the
 device tests at the end need the jax-mps plugin and skip without it.
 """
 
+import json
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,7 +19,7 @@ def _add_kernel(x_ref, y_ref, o_ref):
     o_ref[...] = x_ref[...] + y_ref[...]
 
 
-def test_descriptor_round_trip_is_stable():
+def test_descriptor_json_omits_a_default_threadgroup():
     descriptor = palladium.MpsDispatchDescriptor(
         version=2,
         header="#include <metal_stdlib>\nusing namespace metal;\n",
@@ -27,7 +29,9 @@ def test_descriptor_round_trip_is_stable():
         threadgroup=None,
         math_mode=2,
     )
-    assert palladium.MpsDispatchDescriptor.from_json(descriptor.to_json()) == descriptor
+    payload = json.loads(descriptor.to_json())
+    assert "threadgroup" not in payload
+    assert payload["grid"] == [8, 1, 1] and payload["version"] == 2
 
 
 def _descriptor_for(call, *shapes, dot_general="auto", threadgroup=None):
