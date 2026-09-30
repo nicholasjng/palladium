@@ -26,6 +26,8 @@ from palladium.trace import BlockInfo, KernelSpec
 
 __all__ = ["EmitError"]
 
+DOT_GENERAL_POLICIES = ("auto", "default", "tensorops")
+
 
 MAX_PRIMITIVE_ARITY = 6
 PRIMITIVE_INVARS = string.ascii_lowercase[:MAX_PRIMITIVE_ARITY]
@@ -636,7 +638,7 @@ def emit_msl_stats(
     UnsupportedPrimitiveError
         If the kernel stages a primitive with no registered rule.
     """
-    if dot_general not in ("auto", "default", "tensorops"):
+    if dot_general not in DOT_GENERAL_POLICIES:
         raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
     if dot_general != "default":
         from palladium.emit.tensorops import uses_tensorops

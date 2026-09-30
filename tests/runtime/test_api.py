@@ -1,5 +1,5 @@
-"""The conveniences layered over the core pipeline: `verify`, storage
-accounting in `explain`, device-derived threadgroup sizing, structured
+"""The conveniences layered over the core pipeline: storage accounting in
+`explain`, device-derived threadgroup sizing, structured
 error fields, and the bounded per-shape cache.
 """
 
@@ -21,7 +21,6 @@ from palladium.threadgroup import (
     threadgroup_memory,
     threads_per_threadgroup,
 )
-from palladium.verify import VerificationError
 
 TG = 32
 
@@ -56,52 +55,10 @@ def _block_sum_call(n, threadgroup=TG, extent=TG):
     )
 
 
-# --- verify --------------------------------------------------------------
+# --- cooperative execution ------------------------------------------
 
 
-def test_verify_returns_the_gpu_output(rng):
-    """verify replaces a call site, so it returns what __call__ returns."""
-    f = _tanh_call()
-    x = rng.standard_normal(64, dtype=np.float32)
-    np.testing.assert_array_equal(f.verify(x), f(x))
-
-
-def test_verify_reports_the_worst_element():
-    """A verification failure names the worst element's index."""
-    f = _tanh_call()
-    x = np.zeros(64, dtype=np.float32)
-
-    def wrong(a):
-        out = np.tanh(a) * 2.0
-        out[7] += 1.0
-        return out
-
-    with pytest.raises(VerificationError) as excinfo:
-        f.verify(x, reference=wrong)
-    e = excinfo.value
-    assert e.worst_index == (7,)
-    assert e.mismatches == 1 and e.size == 64
-    assert e.want == pytest.approx(1.0)
-    assert "worst at (7,)" in str(e)
-
-
-def test_verify_catches_a_shape_disagreement():
-    f = _tanh_call()
-    x = np.zeros(64, dtype=np.float32)
-    with pytest.raises(VerificationError, match="shape"):
-        f.verify(x, reference=lambda a: np.zeros(32, dtype=np.float32))
-
-
-def test_verify_refuses_the_interpret_oracle_for_cooperative_kernels():
-    """verify refuses the interpret oracle for cooperative kernels, since interpret models each instance as a threadgroup of one."""
-    n = 64
-    f = _block_sum_call(n)
-    x = np.arange(n, dtype=np.float32)
-    with pytest.raises(VerificationError, match="threadgroup_memory"):
-        f.verify(x)
-
-
-def test_verify_works_on_cooperative_kernels_with_a_reference():
+def test_cooperative_kernel_matches_an_explicit_reference():
     n = 100
     f = _block_sum_call(n)
     x = np.arange(n, dtype=np.float32)
@@ -112,7 +69,7 @@ def test_verify_works_on_cooperative_kernels_with_a_reference():
             out[start : start + TG] = a[start : start + TG].sum()
         return out
 
-    np.testing.assert_allclose(f.verify(x, reference=reference), reference(x))
+    np.testing.assert_allclose(f(x), reference(x))
 
 
 # --- explain / accounting ------------------------------------------------

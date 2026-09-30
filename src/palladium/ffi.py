@@ -9,10 +9,13 @@ out-of-tree build.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
+import hashlib
 import importlib.resources
 import math
 import os
 import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -20,8 +23,18 @@ from typing import Any
 import jax
 import numpy as np
 
-from palladium._callable import CallOptions, PallasCallable
-from palladium.diagnostics import simdgroup_width
+from palladium.diagnostics import (
+    KernelDiagnostics,
+    check_threadgroup,
+    explain_spec,
+    log_compile,
+    normalize_threadgroup,
+    simdgroup_width,
+)
+from palladium.emit import emit_msl
+from palladium.emit.core import CTYPES, DOT_GENERAL_POLICIES
+from palladium.errors import DispatchError
+from palladium.trace import KernelSpec, trace
 
 __all__ = ["FfiCallable", "metal_call"]
 
@@ -70,18 +83,73 @@ def _register() -> None:
         _registered = True
 
 
+@dataclasses.dataclass(frozen=True)
+class CallOptions:
+    """The Metal-side keywords every call path accepts, split off the
+    `pl.pallas_call` keywords once at construction."""
+
+    math_mode: Any
+    threadgroup: tuple[int, ...] | None
+    cache_size: int
+    dot_general: str
+    vmap_method: str | None
+
+    @classmethod
+    def split(
+        cls,
+        pallas_kwargs: dict[str, Any],
+        *,
+        vmap_method: str | None = None,
+    ) -> CallOptions:
+        """Pop the Metal-side keywords out of `pallas_kwargs` (mutated)."""
+        from metal_runtime import MathMode
+
+        dot_general = pallas_kwargs.pop("dot_general", "auto")
+        if dot_general not in DOT_GENERAL_POLICIES:
+            raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
+        return cls(
+            math_mode=pallas_kwargs.pop("math_mode", MathMode.FAST),
+            threadgroup=normalize_threadgroup(pallas_kwargs.pop("threadgroup", None)),
+            cache_size=pallas_kwargs.pop("cache_size", 256),
+            dot_general=dot_general,
+            vmap_method=pallas_kwargs.pop("vmap_method", vmap_method),
+        )
+
+
+def check_dtypes(args: tuple) -> None:
+    """Reject unsupported dtypes before tracing; they otherwise surface
+    as a KeyError inside emit."""
+    for i, a in enumerate(args):
+        dtype = getattr(a, "dtype", None)
+        name = np.dtype(dtype if dtype is not None else np.asarray(a).dtype).name
+        if name not in CTYPES:
+            hint = (
+                "; float64 usually means jax_enable_x64 is on, disable it or cast to float32"
+                if name == "float64"
+                else ""
+            )
+            raise DispatchError(
+                f"argument {i} has dtype {name}, which palladium cannot "
+                f"lower (supported: {', '.join(CTYPES)}){hint}"
+            )
+
+
 # Whole-batch methods conflict with the shape-specialized grid. pipelined
 # batches in one FFI call; nested vmap levels run sequentially.
 _SAFE_VMAP_METHODS = (None, "sequential", "sequential_unrolled", "pipelined")
 
 
-class FfiCallable(PallasCallable):
+class FfiCallable:
     """A palladium kernel registered as a jax.ffi target, dispatched inside
     XLA's execution so it composes under `jax.jit`. Tracing and MSL emission
     are cached per input shape/dtype. Not differentiable by itself (`ffi_call`
-    has no JVP/transpose rule); pair with a backward kernel via `with_vjp`."""
+    has no JVP/transpose rule); pair with a backward kernel via `with_vjp`.
 
-    execution_path = "cpu-ffi-to-metal"
+    Attributes
+    ----------
+    interpret : callable
+        The same pallas_call with `interpret=True`: the CPU oracle.
+    """
 
     def __init__(self, kernel: Callable, pallas_kwargs: dict[str, Any], options: CallOptions):
         if options.vmap_method not in _SAFE_VMAP_METHODS:
@@ -94,12 +162,70 @@ class FfiCallable(PallasCallable):
                 "dispatch per batch element), or put the batch dimension "
                 "in the Pallas grid instead."
             )
-        super().__init__(kernel, pallas_kwargs, options)
+        import jax.experimental.pallas as pl
+
+        self._staged = pl.pallas_call(kernel, **pallas_kwargs)
+        self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
+        self._options = options
+        # Bounded LRU of (spec, msl, digest) per input shape signature.
+        self._cache: OrderedDict[tuple, tuple[KernelSpec, str, str]] = OrderedDict()
+        # Serialize cache misses: concurrent first calls compile once.
+        self._lock = threading.Lock()
         self._math_mode_ordinal = _MATH_MODE_ORDINALS[options.math_mode]
         self._vmap_method = options.vmap_method
         # None is wrapped too, so its batching error names Palladium's options.
         self._pipelined = (
             self._build_pipelined() if options.vmap_method in ("pipelined", None) else None
+        )
+
+    @staticmethod
+    def _shapes(args) -> list[jax.ShapeDtypeStruct]:
+        return [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
+
+    def _spec_and_msl(self, args: tuple[Any, ...]) -> tuple[KernelSpec, str, str]:
+        """Trace and emit for these argument shapes, cached per signature.
+
+        Returns the spec, the MSL text, and its SHA-256 digest, which native
+        caches key on instead of the source itself.
+        """
+        key = tuple((a.shape, np.dtype(a.dtype).str) for a in args)
+        # Lookup and LRU promotion under one lock: a concurrent miss can
+        # evict this entry between the two.
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is not None:
+                self._cache.move_to_end(key)
+        if entry is None:
+            with self._lock:
+                entry = self._cache.get(key)
+                if entry is None:
+                    check_dtypes(tuple(args))
+                    spec = trace(self._staged, *self._shapes(args))
+                    check_threadgroup(spec, self._options.threadgroup)
+                    log_compile(spec, self._options.threadgroup, self._options.dot_general)
+                    msl = emit_msl(spec, dot_general=self._options.dot_general)
+                    entry = (spec, msl, hashlib.sha256(msl.encode()).hexdigest())
+                    self._cache[key] = entry
+                    size = self._options.cache_size
+                    while size and len(self._cache) > size:
+                        self._cache.popitem(last=False)
+        return entry
+
+    def explain(self, *args) -> KernelDiagnostics:
+        """Report launch geometry and emitted MSL size for these inputs.
+        Emits MSL; compiles and dispatches nothing.
+
+        Parameters
+        ----------
+        *args
+            Arrays or `jax.ShapeDtypeStruct`s fixing input shapes; no
+            data is read.
+        """
+        check_dtypes(args)
+        return explain_spec(
+            trace(self._staged, *self._shapes(args)),
+            self._options.threadgroup,
+            dot_general=self._options.dot_general,
         )
 
     def __call__(self, *args):
@@ -170,15 +296,17 @@ class FfiCallable(PallasCallable):
         if emits_cooperative(msl_source):
             required, grid = cooperative_launch(spec.grid, simdgroup_width())
             provided = (
-                (self._threadgroup + (1, 1, 1))[:3] if self._threadgroup is not None else None
+                (self._options.threadgroup + (1, 1, 1))[:3]
+                if self._options.threadgroup is not None
+                else None
             )
             if provided is not None and provided != required:
                 raise ValueError(
-                    f"cooperative kernel requires threadgroup={required}, got {self._threadgroup}"
+                    f"cooperative kernel requires threadgroup={required}, got {self._options.threadgroup}"
                 )
             threadgroup = required
         else:
-            tg = self._threadgroup or (0,)
+            tg = self._options.threadgroup or (0,)
             threadgroup = (tuple(tg) + (1, 1, 1))[:3] if tg != (0,) else (0, 0, 0)
         in_strides = [
             np.dtype(u.dtype).itemsize * math.prod(u.shape) if b else 0

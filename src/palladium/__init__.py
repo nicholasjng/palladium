@@ -30,7 +30,6 @@ from palladium.threadgroup import (
     threads_per_threadgroup,
 )
 from palladium.trace import BlockInfo, KernelSpec, ScratchInfo, trace
-from palladium.verify import VerificationError
 from palladium.vjp import with_auxiliary_vjp, with_reference_vjp, with_vjp
 
 __all__ = [
@@ -47,7 +46,6 @@ __all__ = [
     "ScratchInfo",
     "TraceError",
     "UnsupportedPrimitiveError",
-    "VerificationError",
     "barrier",
     "debug_msl",
     "emit_jaxpr",

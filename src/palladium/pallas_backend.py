@@ -20,9 +20,9 @@ from jax._src.pallas import core as pallas_core
 from jax._src.pallas.pallas_call import pallas_call_p
 from metal_runtime import MathMode
 
-from palladium._callable import DOT_GENERAL_POLICIES
 from palladium.diagnostics import check_threadgroup, normalize_threadgroup
 from palladium.emit import emit_msl
+from palladium.emit.core import DOT_GENERAL_POLICIES
 from palladium.mps import MpsDispatchDescriptor, lower_dispatch
 from palladium.trace import spec_from_params
 
