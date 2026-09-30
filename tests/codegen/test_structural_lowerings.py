@@ -10,15 +10,6 @@ import pytest
 
 import palladium
 
-
-@pytest.fixture
-def metal_device():
-    try:
-        mr.device_name()
-    except mr.DeviceError as exc:
-        pytest.skip(str(exc))
-
-
 RESHAPES = [
     ((2, 3), (1, 0), (6,)),
     ((2, 3, 4), (2, 0, 1), (4, 6)),

@@ -39,3 +39,14 @@ def pytest_collection_modifyitems(config, items):
 @pytest.fixture
 def rng():
     return np.random.default_rng(seed=17)
+
+
+@pytest.fixture
+def metal_device():
+    """Skip the test when no Metal device is present."""
+    import metal_runtime as mr
+
+    try:
+        mr.device_name()
+    except mr.DeviceError as exc:
+        pytest.skip(str(exc))

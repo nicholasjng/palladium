@@ -9,14 +9,6 @@ import pytest
 import palladium
 
 
-@pytest.fixture
-def metal_device():
-    try:
-        mr.device_name()
-    except mr.DeviceError as exc:
-        pytest.skip(str(exc))
-
-
 def call_for(op, *args, mode=mr.MathMode.SAFE):
     def kernel(*refs):
         *inputs, out = refs
