@@ -140,7 +140,7 @@ def make_solver(n: int, math_mode: mr.MathMode = mr.MathMode.RELAXED):
         in_specs=[spec_1] * 3,
         out_specs=(spec_1, spec_1, spec_1, spec_1, spec_1),
         out_shape=tuple(jax.ShapeDtypeStruct((n,), F32) for _ in range(5)),
-        math_mode=math_mode,
+        compiler_params=palladium.CompilerParams(math_mode=math_mode),
     )
 
 

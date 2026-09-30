@@ -178,7 +178,7 @@ def palladium_solver(n, pcoeff=PCOEFF, icoeff=ICOEFF):
         in_specs=[spec_1] * 3,
         out_specs=(spec_1,) * 6,
         out_shape=tuple(jax.ShapeDtypeStruct((n,), jnp.float32) for _ in range(6)),
-        math_mode=mr.MathMode.RELAXED,
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.RELAXED),
     )
 
 

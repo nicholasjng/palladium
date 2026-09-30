@@ -164,7 +164,9 @@ def test_expm1_and_log1p_keep_precision_near_zero():
     import metal_runtime as mr
 
     call = palladium.metal_call(
-        kernel, out_shape=jax.ShapeDtypeStruct((5,), jnp.float32), math_mode=mr.MathMode.SAFE
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((5,), jnp.float32),
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
     )
     want = np.expm1(x.astype(np.float64)) + np.log1p(x.astype(np.float64))
     np.testing.assert_allclose(call(x), want.astype(np.float32), rtol=1e-6)

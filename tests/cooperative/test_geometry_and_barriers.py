@@ -7,7 +7,7 @@ import pytest
 from jax.experimental import pallas as pl
 
 import palladium
-from palladium.diagnostics import normalize_threadgroup
+from palladium.launch import normalize_threadgroup
 
 
 @pytest.fixture
@@ -27,7 +27,11 @@ def test_thread_indices_without_scratch_2d(metal_device):
     spec = pl.BlockSpec((1, 1), lambda i, j: (i, j))
     out = jax.ShapeDtypeStruct(shape, np.int32)
     call = palladium.metal_call(
-        kernel, grid=shape, threadgroup=(4, 3), out_specs=(spec, spec), out_shape=(out, out)
+        kernel,
+        grid=shape,
+        out_specs=(spec, spec),
+        out_shape=(out, out),
+        compiler_params=palladium.CompilerParams(threadgroup=(4, 3)),
     )
     actual, sizes = call()
     expected = np.empty(shape, np.int32)
@@ -57,7 +61,9 @@ def test_nested_lane_dependent_barrier_rejected():
         out[0] = 1
 
     call = palladium.metal_call(
-        kernel, threadgroup=4, out_shape=jax.ShapeDtypeStruct((1,), np.int32)
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((1,), np.int32),
+        compiler_params=palladium.CompilerParams(threadgroup=4),
     )
     with pytest.raises(palladium.TraceError, match="vary across"):
         call.explain()
@@ -82,10 +88,10 @@ def test_lane_scratch_extent_checked_without_device():
     call = palladium.metal_call(
         kernel,
         grid=(32,),
-        threadgroup=32,
         out_specs=spec,
         out_shape=jax.ShapeDtypeStruct((32,), np.int32),
         scratch_shapes=[palladium.threadgroup_memory((16,), np.int32)],
+        compiler_params=palladium.CompilerParams(threadgroup=32),
     )
     with pytest.raises(palladium.EmitError, match="scratch dimension"):
         call.explain()
@@ -107,10 +113,10 @@ def test_uniform_barriers_in_static_loop(metal_device):
     call = palladium.metal_call(
         kernel,
         grid=(35,),
-        threadgroup=8,
         out_specs=pl.BlockSpec((1,), lambda i: (i,)),
         out_shape=jax.ShapeDtypeStruct((35,), np.int32),
         scratch_shapes=[palladium.threadgroup_memory((8,), np.int32)],
+        compiler_params=palladium.CompilerParams(threadgroup=8),
     )
     np.testing.assert_array_equal(call(), np.full(35, 4, np.int32))
 
@@ -125,7 +131,9 @@ def test_jitted_lane_predicate_barrier_rejected():
         out[0] = 1
 
     call = palladium.metal_call(
-        kernel, threadgroup=4, out_shape=jax.ShapeDtypeStruct((1,), np.int32)
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((1,), np.int32),
+        compiler_params=palladium.CompilerParams(threadgroup=4),
     )
     with pytest.raises(palladium.TraceError, match="vary across"):
         call.explain()
@@ -139,9 +147,9 @@ def test_thread_indices_3d(metal_device):
     call = palladium.metal_call(
         kernel,
         grid=shape,
-        threadgroup=group,
         out_specs=pl.BlockSpec((1, 1, 1), lambda i, j, k: (i, j, k)),
         out_shape=jax.ShapeDtypeStruct(shape, np.int32),
+        compiler_params=palladium.CompilerParams(threadgroup=group),
     )
     expected = np.empty(shape, np.int32)
     for start in np.ndindex(2, 2, 2):

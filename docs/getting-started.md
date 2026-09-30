@@ -65,7 +65,7 @@ palladium.debug_msl returns the generated MSL directly.
 Importing palladium registers it as the Pallas backend for the mps platform:
 a plain `pl.pallas_call` inside `jax.jit` on a jax-mps device lowers to the
 same Metal kernel `metal_call` would build, with no wrapper call. Metal-side
-options travel as `compiler_params`:
+options travel as `compiler_params` on both paths:
 
 ~~~python
 call = pl.pallas_call(
@@ -78,15 +78,14 @@ jax.jit(call)(x)  # palladium.dispatch on mps; JAX's own lowering elsewhere
 
 Other platforms keep JAX's behavior (interpret=True, or an error), and
 `interpret=True` is honored everywhere. Gradients pair a forward call with a
-backward implementation: `palladium.with_vjp(forward, backward)`,
-`with_auxiliary_vjp` for checkpointed adjoints, or `with_reference_vjp` to
-borrow JAX's pullback of a pure-JAX reference.
+backward implementation: `palladium.with_vjp(forward, backward)`. Pass
+`residuals=k` to keep the forward call's last `k` outputs (checkpoints, for
+example) for the backward pass instead of returning them.
 
 ## JAX transformations
 
-metal_call supports jax.jit and jax.vmap. Its default
-vmap_method="pipelined" handles the batch in one FFI call; nested batch
-levels and the sequential methods dispatch one element at a time. Put a
+metal_call supports jax.jit and jax.vmap. A vmapped call handles the batch
+in one FFI call; nested batch levels dispatch one element at a time. Put a
 batch axis in the Pallas grid when possible. A kernel that advances a state
 over many dispatches is an ordinary `lax.fori_loop` or `lax.scan` around the
 call under `jax.jit`.

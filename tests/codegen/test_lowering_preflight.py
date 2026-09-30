@@ -91,8 +91,8 @@ def test_inf_literal(rng):
     assert "INFINITY" in src and "inff" not in src
     f = palladium.metal_call(
         kernel,
-        math_mode=mr.MathMode.SAFE,
         out_shape=jax.ShapeDtypeStruct((64,), F32),
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
     )
     x = rng.standard_normal(64, dtype=np.float32)
     np.testing.assert_array_equal(f(x), x)
@@ -109,8 +109,8 @@ def test_negative_inf_sentinel(rng):
 
     f = palladium.metal_call(
         kernel,
-        math_mode=mr.MathMode.SAFE,
         out_shape=jax.ShapeDtypeStruct((64,), F32),
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
     )
     x = rng.standard_normal(64, dtype=np.float32)
     _oracle_check(f, x)
@@ -125,8 +125,8 @@ def test_nan_literal_propagates(rng):
 
     f = palladium.metal_call(
         kernel,
-        math_mode=mr.MathMode.SAFE,
         out_shape=jax.ShapeDtypeStruct((64,), F32),
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
     )
     x = rng.standard_normal(64, dtype=np.float32)
     got = f(x)

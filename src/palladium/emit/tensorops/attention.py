@@ -7,9 +7,9 @@ import math
 
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var
 
-from palladium.diagnostics import simdgroup_width
 from palladium.emit.core import Cursor, CVal, Environment
 from palladium.errors import EmitError
+from palladium.launch import simdgroup_width
 from palladium.trace import KernelSpec
 
 from ._shared import (

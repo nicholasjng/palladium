@@ -9,7 +9,6 @@ out-of-tree build.
 from __future__ import annotations
 
 import ctypes
-import dataclasses
 import hashlib
 import importlib.resources
 import math
@@ -23,17 +22,11 @@ from typing import Any
 import jax
 import numpy as np
 
-from palladium.diagnostics import (
-    KernelDiagnostics,
-    check_threadgroup,
-    explain_spec,
-    log_compile,
-    normalize_threadgroup,
-    simdgroup_width,
-)
+from palladium.diagnostics import KernelDiagnostics, explain_spec, log_compile
 from palladium.emit import emit_msl
-from palladium.emit.core import CTYPES, DOT_GENERAL_POLICIES
+from palladium.emit.core import CTYPES
 from palladium.errors import DispatchError
+from palladium.launch import CompilerParams, check_threadgroup, launch_geometry
 from palladium.trace import KernelSpec, trace
 
 __all__ = ["FfiCallable", "metal_call"]
@@ -83,39 +76,6 @@ def _register() -> None:
         _registered = True
 
 
-@dataclasses.dataclass(frozen=True)
-class CallOptions:
-    """The Metal-side keywords every call path accepts, split off the
-    `pl.pallas_call` keywords once at construction."""
-
-    math_mode: Any
-    threadgroup: tuple[int, ...] | None
-    cache_size: int
-    dot_general: str
-    vmap_method: str | None
-
-    @classmethod
-    def split(
-        cls,
-        pallas_kwargs: dict[str, Any],
-        *,
-        vmap_method: str | None = None,
-    ) -> CallOptions:
-        """Pop the Metal-side keywords out of `pallas_kwargs` (mutated)."""
-        from metal_runtime import MathMode
-
-        dot_general = pallas_kwargs.pop("dot_general", "auto")
-        if dot_general not in DOT_GENERAL_POLICIES:
-            raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
-        return cls(
-            math_mode=pallas_kwargs.pop("math_mode", MathMode.FAST),
-            threadgroup=normalize_threadgroup(pallas_kwargs.pop("threadgroup", None)),
-            cache_size=pallas_kwargs.pop("cache_size", 256),
-            dot_general=dot_general,
-            vmap_method=pallas_kwargs.pop("vmap_method", vmap_method),
-        )
-
-
 def check_dtypes(args: tuple) -> None:
     """Reject unsupported dtypes before tracing; they otherwise surface
     as a KeyError inside emit."""
@@ -134,9 +94,8 @@ def check_dtypes(args: tuple) -> None:
             )
 
 
-# Whole-batch methods conflict with the shape-specialized grid. pipelined
-# batches in one FFI call; nested vmap levels run sequentially.
-_SAFE_VMAP_METHODS = (None, "sequential", "sequential_unrolled", "pipelined")
+# Traced shapes kept per callable.
+_CACHE_SIZE = 256
 
 
 class FfiCallable:
@@ -151,32 +110,24 @@ class FfiCallable:
         The same pallas_call with `interpret=True`: the CPU oracle.
     """
 
-    def __init__(self, kernel: Callable, pallas_kwargs: dict[str, Any], options: CallOptions):
-        if options.vmap_method not in _SAFE_VMAP_METHODS:
-            raise ValueError(
-                f"vmap_method {options.vmap_method!r} is not supported: the launch "
-                "grid is baked per unbatched shape, so whole-batch methods "
-                "would dispatch it over batched buffers. Use 'pipelined' "
-                "(the default: one FFI call, the native handler loops the "
-                "batch), 'sequential' or 'sequential_unrolled' (one "
-                "dispatch per batch element), or put the batch dimension "
-                "in the Pallas grid instead."
-            )
+    def __init__(self, kernel: Callable, pallas_kwargs: dict[str, Any]):
         import jax.experimental.pallas as pl
 
+        params = pallas_kwargs.get("compiler_params")
+        if params is None:
+            params = CompilerParams()
+        elif not isinstance(params, CompilerParams):
+            raise TypeError(
+                f"metal_call takes palladium.CompilerParams, not {type(params).__name__}"
+            )
+        self._params = params
         self._staged = pl.pallas_call(kernel, **pallas_kwargs)
         self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
-        self._options = options
         # Bounded LRU of (spec, msl, digest) per input shape signature.
         self._cache: OrderedDict[tuple, tuple[KernelSpec, str, str]] = OrderedDict()
         # Serialize cache misses: concurrent first calls compile once.
         self._lock = threading.Lock()
-        self._math_mode_ordinal = _MATH_MODE_ORDINALS[options.math_mode]
-        self._vmap_method = options.vmap_method
-        # None is wrapped too, so its batching error names Palladium's options.
-        self._pipelined = (
-            self._build_pipelined() if options.vmap_method in ("pipelined", None) else None
-        )
+        self._pipelined = self._build_pipelined()
 
     @staticmethod
     def _shapes(args) -> list[jax.ShapeDtypeStruct]:
@@ -201,13 +152,12 @@ class FfiCallable:
                 if entry is None:
                     check_dtypes(tuple(args))
                     spec = trace(self._staged, *self._shapes(args))
-                    check_threadgroup(spec, self._options.threadgroup)
-                    log_compile(spec, self._options.threadgroup, self._options.dot_general)
-                    msl = emit_msl(spec, dot_general=self._options.dot_general)
+                    check_threadgroup(spec, self._params.threadgroup)
+                    log_compile(spec, self._params.threadgroup, self._params.dot_general)
+                    msl = emit_msl(spec, dot_general=self._params.dot_general)
                     entry = (spec, msl, hashlib.sha256(msl.encode()).hexdigest())
                     self._cache[key] = entry
-                    size = self._options.cache_size
-                    while size and len(self._cache) > size:
+                    if len(self._cache) > _CACHE_SIZE:
                         self._cache.popitem(last=False)
         return entry
 
@@ -224,24 +174,20 @@ class FfiCallable:
         check_dtypes(args)
         return explain_spec(
             trace(self._staged, *self._shapes(args)),
-            self._options.threadgroup,
-            dot_general=self._options.dot_general,
+            self._params.threadgroup,
+            dot_general=self._params.dot_general,
         )
 
     def __call__(self, *args):
         """Dispatch via jax.ffi; traceable and jittable."""
         _register()
-        if self._pipelined is not None:
-            return self._pipelined(*args)
-        return self._ffi_dispatch(args, vmap_method=self._vmap_method)
+        return self._pipelined(*args)
 
     def _build_pipelined(self):
-        """The 'pipelined' batching rule: under jax.vmap, one FFI call over
-        the whole batch; unvmapped calls dispatch once. With
-        `vmap_method=None` the rule rejects the batch."""
+        """Under jax.vmap, one FFI call over the whole batch, looped by the
+        native handler; unvmapped calls dispatch once. jax.ffi's whole-batch
+        methods would dispatch the per-shape grid over batched buffers."""
         import jax.custom_batching
-
-        batching_disabled = self._vmap_method is None
 
         @jax.custom_batching.custom_vmap
         def pipelined(*args):
@@ -249,16 +195,6 @@ class FfiCallable:
 
         @pipelined.def_vmap
         def _pipelined_vmap_rule(axis_size, in_batched, *args):
-            if batching_disabled:
-                raise ValueError(
-                    "jax.vmap over this kernel needs a vmap_method, and this "
-                    "one was built with vmap_method=None. Pass "
-                    "metal_call(..., vmap_method='pipelined') for one FFI "
-                    "call over the whole batch, or 'sequential' for one "
-                    "dispatch per element. jax.ffi's own whole-batch methods "
-                    "(expand_dims, broadcast_all) are not usable here: the "
-                    "launch grid is baked per unbatched shape."
-                )
             # 'sequential', not None: this rule takes one vmap level, an
             # enclosing one batches the ffi_call itself.
             out = self._ffi_dispatch(
@@ -288,26 +224,10 @@ class FfiCallable:
             for a, b in zip(args, batched, strict=True)
         ]
         spec, msl_source, source_id = self._spec_and_msl(tuple(unbatched))
-        # MRLaunchDesc takes 3 grid dims; (0, 0, 0) threadgroup lets the
+        grid, threadgroup = launch_geometry(spec, msl_source, self._params.threadgroup)
+        # MRLaunchDesc takes 3 grid dims; a (0, 0, 0) threadgroup lets the
         # runtime choose.
-        grid = (tuple(spec.grid) + (1, 1, 1))[:3]
-        from palladium.emit.tensorops import cooperative_launch, emits_cooperative
-
-        if emits_cooperative(msl_source):
-            required, grid = cooperative_launch(spec.grid, simdgroup_width())
-            provided = (
-                (self._options.threadgroup + (1, 1, 1))[:3]
-                if self._options.threadgroup is not None
-                else None
-            )
-            if provided is not None and provided != required:
-                raise ValueError(
-                    f"cooperative kernel requires threadgroup={required}, got {self._options.threadgroup}"
-                )
-            threadgroup = required
-        else:
-            tg = self._options.threadgroup or (0,)
-            threadgroup = (tuple(tg) + (1, 1, 1))[:3] if tg != (0,) else (0, 0, 0)
+        threadgroup = threadgroup or (0, 0, 0)
         in_strides = [
             np.dtype(u.dtype).itemsize * math.prod(u.shape) if b else 0
             for u, b in zip(unbatched, batched, strict=True)
@@ -338,7 +258,7 @@ class FfiCallable:
             threadgroup_x=int(threadgroup[0]),
             threadgroup_y=int(threadgroup[1]),
             threadgroup_z=int(threadgroup[2]),
-            math_mode=self._math_mode_ordinal,
+            math_mode=_MATH_MODE_ORDINALS[self._params.math_mode],
             batch_size=1 if axis_size is None else int(axis_size),
             elem_strides=np.asarray(in_strides + out_strides, dtype=np.int64),
         )
@@ -355,13 +275,8 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> FfiCallable:
         A Pallas kernel function (operates on Refs).
     **pallas_kwargs
         The usual `pl.pallas_call` keywords (out_shape, grid, in_specs,
-        out_specs, ...), plus `math_mode` (`metal_runtime.MathMode`, FAST
-        by default; SAFE for compensated arithmetic), `threadgroup` (int
-        or tuple; None lets the runtime choose), `cache_size` (traced
-        shapes kept, 256 by default), `dot_general` ("auto", "default", or
-        "tensorops"), and `vmap_method` ("pipelined" by default: one FFI
-        call per batch; "sequential" or "sequential_unrolled" dispatch per
-        element; None rejects vmap).
+        out_specs, ...). Metal-side options travel as
+        `compiler_params=palladium.CompilerParams(...)`, as on mps.
 
     Notes
     -----
@@ -374,9 +289,8 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> FfiCallable:
     Returns
     -------
     FfiCallable
-        Composable with `jax.jit` and `jax.vmap`; NumPy inputs are accepted
-        and outputs are JAX arrays. `.interpret` is the CPU oracle.
+        Composable with `jax.jit` and `jax.vmap` (one FFI call per batch);
+        NumPy inputs are accepted and outputs are JAX arrays. `.interpret`
+        is the CPU oracle.
     """
-    return FfiCallable(
-        kernel, pallas_kwargs, CallOptions.split(pallas_kwargs, vmap_method="pipelined")
-    )
+    return FfiCallable(kernel, pallas_kwargs)

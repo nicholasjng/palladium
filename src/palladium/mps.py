@@ -1,9 +1,13 @@
-"""The ``palladium.dispatch`` custom-call ABI shared with jax-mps.
+"""Palladium as the Pallas backend for the jax-mps ``mps`` platform.
 
-On the ``mps`` platform the pallas_call lowering emits a StableHLO custom
-call whose ``backend_config`` is ``MpsDispatchDescriptor.to_json()``;
-jax-mps's handler for ``MPS_CUSTOM_CALL_TARGET`` builds an MLX kernel from
-it on its own Metal stream. Nothing here executes anything.
+Importing palladium wraps the ``pallas_call`` lowering: on ``mps`` it emits
+a ``palladium.dispatch`` StableHLO custom call whose ``backend_config`` is
+``MpsDispatchDescriptor.to_json()``, and jax-mps's handler builds an MLX
+kernel from it on its own Metal stream. Every other platform keeps JAX's
+own lowering. Metal-side options travel as ``compiler_params``::
+
+    pl.pallas_call(kernel, out_shape=..., compiler_params=palladium.CompilerParams(
+        dot_general="tensorops", threadgroup=128))
 """
 
 from __future__ import annotations
@@ -11,26 +15,24 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
+from typing import Any
 
+from jax._src import effects as jax_effects
 from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
+from jax._src.pallas.pallas_call import pallas_call_p
+from metal_runtime import MathMode
 
-from palladium.diagnostics import simdgroup_width
-from palladium.emit.tensorops import cooperative_launch, emits_cooperative
-from palladium.trace import KernelSpec
+from palladium.emit import emit_msl
+from palladium.launch import CompilerParams, check_threadgroup, launch_geometry
+from palladium.trace import KernelSpec, spec_from_params
 
-__all__ = [
-    "MPS_CUSTOM_CALL_TARGET",
-    "MpsDispatchDescriptor",
-    "kernel_prologue",
-    "lower_dispatch",
-    "split_kernel_source",
-]
+__all__ = ["MpsDispatchDescriptor"]
 
 
 # An ordinary StableHLO custom-call target, not a jax.ffi target: jax-mps
 # owns the buffers and encodes the dispatch on its own Metal stream.
-MPS_CUSTOM_CALL_TARGET = "palladium.dispatch"
+_CUSTOM_CALL_TARGET = "palladium.dispatch"
 _DESCRIPTOR_VERSION = 2
 
 # One kernel parameter as the emitter writes it: a buffer with its index, or
@@ -121,24 +123,14 @@ class MpsDispatchDescriptor:
         math_mode: int,
     ) -> MpsDispatchDescriptor:
         header, params, body = split_kernel_source(msl_source)
-        grid = tuple(int(d) for d in spec.grid)
-        grid3 = (grid + (1, 1, 1))[:3]
-        tg3 = None
-        if threadgroup is not None:
-            tg3 = (tuple(int(d) for d in threadgroup) + (1, 1, 1))[:3]
-        if emits_cooperative(msl_source):
-            # One threadgroup per program; the thread grid scales to match.
-            required, grid3 = cooperative_launch(grid, simdgroup_width())
-            if tg3 is not None and tg3 != required:
-                raise ValueError(f"cooperative kernel requires threadgroup={required}, got {tg3}")
-            tg3 = required
+        grid, group = launch_geometry(spec, msl_source, threadgroup)
         return cls(
             version=_DESCRIPTOR_VERSION,
             header=header,
             prologue=kernel_prologue(params),
             body=body,
-            grid=grid3,
-            threadgroup=tg3,
+            grid=grid,
+            threadgroup=group,
             math_mode=math_mode,
         )
 
@@ -158,7 +150,7 @@ def lower_dispatch(ctx, *args, descriptor: MpsDispatchDescriptor):
     operand_layouts = [_layout(len(aval.shape)) for aval in ctx.avals_in]
     result_layouts = [_layout(len(aval.shape)) for aval in ctx.avals_out]
     op = mlir.custom_call(
-        MPS_CUSTOM_CALL_TARGET,
+        _CUSTOM_CALL_TARGET,
         result_types=result_types,
         operands=args,
         backend_config=descriptor.to_json(),
@@ -167,3 +159,64 @@ def lower_dispatch(ctx, *args, descriptor: MpsDispatchDescriptor):
         result_layouts=result_layouts,
     )
     return op.results
+
+
+_FAST_ORDINAL = 2
+
+
+def _palladium_lowering(ctx: mlir.LoweringRuleContext, *in_nodes, interpret: Any, **params):
+    """Lower one pallas_call as a Palladium Metal kernel for jax-mps."""
+    options = params.get("compiler_params")
+    if options is None:
+        options = CompilerParams()
+    elif not isinstance(options, CompilerParams):
+        raise TypeError(
+            f"pallas_call on mps lowers through Palladium, which takes "
+            f"palladium.CompilerParams, not {type(options).__name__}"
+        )
+    if options.math_mode != MathMode.FAST:
+        raise ValueError(
+            "mps lowering supports math_mode=FAST only; jax-mps's metal_kernel "
+            "API does not expose Palladium's SAFE/RELAXED modes"
+        )
+    spec = spec_from_params(params)
+    if spec.aliases:
+        raise ValueError(
+            "input_output_aliases are not supported on the mps path: jax-mps's "
+            "MLX custom-kernel path allocates functional outputs"
+        )
+    check_threadgroup(spec, options.threadgroup)
+    msl = emit_msl(spec, dot_general=options.dot_general)
+    descriptor = MpsDispatchDescriptor.from_spec(
+        spec, msl, threadgroup=options.threadgroup, math_mode=_FAST_ORDINAL
+    )
+    return lower_dispatch(ctx, *in_nodes, descriptor=descriptor)
+
+
+def _install() -> None:
+    """Route pallas_call lowering for the ``mps`` platform through Palladium.
+
+    Registered as the primitive's common rule wrapping JAX's own, since JAX
+    accepts platform-specific registrations only for platforms it already
+    knows. Other platforms and ``interpret=True`` are delegated unchanged.
+    """
+    original = mlir._lowerings[pallas_call_p].rule
+
+    def lowering(ctx, *in_nodes, interpret, **params):
+        if interpret:
+            return original(ctx, *in_nodes, interpret=interpret, **params)
+        return mlir.lower_per_platform(
+            ctx,
+            "pallas_call",
+            {"mps": _palladium_lowering},
+            original,
+            jax_effects.no_effects,
+            *in_nodes,
+            interpret=interpret,
+            **params,
+        )
+
+    mlir.register_lowering(pallas_call_p, lowering)
+
+
+_install()

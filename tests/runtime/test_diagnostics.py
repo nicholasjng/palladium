@@ -24,7 +24,7 @@ def _classic_call():
 
 def test_explain_reports_geometry():
     diag = _classic_call().explain(_shaped(8, 8), _shaped(8, 8))
-    assert diag.grid == (1,)
+    assert diag.grid == (1, 1, 1)
     assert diag.threadgroup is None
     assert diag.msl_lines > 0
     assert f"palladium kernel {diag.name}" in str(diag)
@@ -34,10 +34,12 @@ def test_explain_explicit_threadgroup():
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2.0
 
-    call = palladium.metal_call(kernel, out_shape=_shaped(64), threadgroup=64)
+    call = palladium.metal_call(
+        kernel, out_shape=_shaped(64), compiler_params=palladium.CompilerParams(threadgroup=64)
+    )
     diag = call.explain(_shaped(64))
-    assert diag.threadgroup == (64,)
-    assert "threadgroup=(64,)" in str(diag)
+    assert diag.threadgroup == (64, 1, 1)
+    assert "threadgroup=(64, 1, 1)" in str(diag)
 
 
 def test_explain_ffi_matches_metal_call():
@@ -45,7 +47,7 @@ def test_explain_ffi_matches_metal_call():
         o_ref[...] = jnp.dot(q_ref[...], k_ref[...] * 2.0)
 
     call = palladium.metal_call(kernel, out_shape=_shaped(8, 8))
-    assert call.explain(_shaped(8, 8), _shaped(8, 8)).grid == (1,)
+    assert call.explain(_shaped(8, 8), _shaped(8, 8)).grid == (1, 1, 1)
 
 
 def test_explain_env_logs_once_per_compile(monkeypatch, capsys, rng):

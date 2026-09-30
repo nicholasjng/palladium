@@ -169,8 +169,8 @@ def test_fuzz_elementwise(case):
         kwargs |= {"grid": (N // 8,), "in_specs": [spec] * n_inputs, "out_specs": spec}
     f = palladium.metal_call(
         make_elementwise_kernel(tree, n_inputs),
-        math_mode=mr.MathMode.SAFE,
         **kwargs,
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
     )
     _assert_matches_oracle(f, args)
 
@@ -231,8 +231,8 @@ def test_fuzz_loops(case):
     out_shape = tuple(jax.ShapeDtypeStruct((N,), jnp.float32) for _ in range(n_carry))
     f = palladium.metal_call(
         make_loop_kernel(n_carry, n_consts, length, plans),
-        math_mode=mr.MathMode.SAFE,
         out_shape=out_shape,
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
     )
     _assert_matches_oracle(f, args)
 
@@ -348,8 +348,8 @@ def test_fuzz_scan_xs_ys(case):
             carry_plans,
             ys_plans,
         ),
-        math_mode=mr.MathMode.SAFE,
         out_shape=out_shape,
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
     )
     _assert_matches_oracle(f, args)
 
@@ -393,8 +393,8 @@ def test_fuzz_cond(case):
         kwargs |= {"grid": (N // 8,), "in_specs": [spec] * n_inputs, "out_specs": spec}
     f = palladium.metal_call(
         make_switch_kernel(branches, n_inputs),
-        math_mode=mr.MathMode.SAFE,
         **kwargs,
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
     )
     _assert_matches_oracle(f, args)
 
@@ -469,7 +469,7 @@ def test_fuzz_while(case):
         }
     f = palladium.metal_call(
         make_while_kernel(n_carry, n_consts, plans),
-        math_mode=mr.MathMode.SAFE,
         **kwargs,
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
     )
     _assert_matches_oracle(f, args)

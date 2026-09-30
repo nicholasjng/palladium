@@ -107,7 +107,7 @@ def bench_pallas_flash_attention(
         in_specs=in_specs,
         out_specs=out_specs,
         out_shape=shape,
-        dot_general="tensorops",
+        compiler_params=palladium.CompilerParams(dot_general="tensorops"),
     )
     kernel = mr.Kernel(source, "palladium_kernel")
     compile_ms = (time.perf_counter() - start) * 1000

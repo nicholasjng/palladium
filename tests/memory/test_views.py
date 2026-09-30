@@ -116,10 +116,10 @@ def test_padding_matches_interpreter(metal_device, dtype):
     call = palladium.metal_call(
         kernel,
         grid=(2,),
-        math_mode=mr.MathMode.SAFE,
         in_specs=[pl.BlockSpec((8,), lambda i: (i,))],
         out_specs=pl.BlockSpec((1,), lambda i: (i,)),
         out_shape=jax.ShapeDtypeStruct((2,), dtype),
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
     )
     x = np.arange(9, dtype=np.float32).astype(dtype)
     np.testing.assert_array_equal(
