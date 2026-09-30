@@ -1,5 +1,11 @@
+import os
+import sys
+
 import numpy as np
 import pytest
+
+# The CNF and attention workloads live with the examples that run them.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
 
 # Modules with device-independent checks; any GPU tests within them
 # handle their own skips, so pure checks still run without Metal.
@@ -15,7 +21,6 @@ _NO_GPU_MODULES = {
     "test_tensorops_flash_attention",
     "test_cursor",
     "test_views",
-    "test_pallas_flash_attention",
 }
 
 

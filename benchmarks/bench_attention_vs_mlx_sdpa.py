@@ -19,6 +19,8 @@ Run on a Metal 4 machine with the jax-mps ``palladium-dispatch`` handler:
 from __future__ import annotations
 
 import functools
+import os
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -26,11 +28,8 @@ import mew
 import numpy as np
 from jax.experimental import pallas as pl
 
-from palladium.workloads.pallas_flash_attention import (
-    attention_kernel,
-    attention_specs,
-    reference_attention,
-)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
+from flash_attention import attention_kernel, attention_specs, reference_attention
 
 BATCH = 1
 CANDIDATES = ("palladium", "mlx-sdpa", "jnp-softmax")

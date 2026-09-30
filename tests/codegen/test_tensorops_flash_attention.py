@@ -6,22 +6,17 @@ import re
 import jax
 import jax.numpy as jnp
 import pytest
-from jax.experimental import pallas as pl
+from flash_attention import attention_call
 from jax.extend.core import Jaxpr
 
 import palladium
 from palladium.diagnostics import explain_spec
 from palladium.emit import EmitError
-from palladium.workloads.pallas_flash_attention import (
-    attention_kernel,
-    attention_specs,
-    make_pallas_flash_attention,
-)
 
 
 def _spec(*, causal: bool = False, tile_q: int = 16, tile_k: int = 16, head_dim: int = 64):
     shape = (1, 32, 2, head_dim)
-    call = make_pallas_flash_attention(shape, tile_q=tile_q, tile_k=tile_k, causal=causal)
+    call = attention_call(shape, tile_q=tile_q, tile_k=tile_k, causal=causal)
     args = (jax.ShapeDtypeStruct(shape, jnp.float32),) * 3
     return palladium.trace(call, *args)
 
@@ -37,7 +32,7 @@ def _cross_attention_spec(
 ):
     q_shape = (1, query_length, heads, head_dim)
     kv_shape = (1, key_length, heads, head_dim)
-    call = make_pallas_flash_attention(q_shape, tile_q=tile_q, tile_k=tile_k, key_length=key_length)
+    call = attention_call(q_shape, tile_q=tile_q, tile_k=tile_k, key_length=key_length)
     args = (jax.ShapeDtypeStruct(q_shape, jnp.float32),) + (
         jax.ShapeDtypeStruct(kv_shape, jnp.float32),
     ) * 2
@@ -190,14 +185,7 @@ def test_tensorops_attention_explain_scales_batch_axis_for_cooperative_groups():
 
 def test_tensorops_attention_emits_benchmark_tile_configuration():
     shape = (1, 128, 4, 64)
-    grid, in_specs, out_specs = attention_specs(shape[0], shape[1], shape[2], tile_q=32)
-    call = pl.pallas_call(
-        attention_kernel(tile_q=32, tile_k=64),
-        grid=grid,
-        in_specs=in_specs,
-        out_specs=out_specs,
-        out_shape=jax.ShapeDtypeStruct(shape, jnp.float32),
-    )
+    call = attention_call(shape, tile_q=32, tile_k=64)
     args = (jax.ShapeDtypeStruct(shape, jnp.float32),) * 3
     source = palladium.emit_msl(palladium.trace(call, *args), dot_general="tensorops")
 
@@ -208,14 +196,7 @@ def test_tensorops_attention_emits_benchmark_tile_configuration():
 
 def test_tensorops_attention_emits_large_query_tile_with_bounded_shared_memory():
     shape = (1, 64, 1, 64)
-    grid, in_specs, out_specs = attention_specs(shape[0], shape[1], shape[2], tile_q=64)
-    call = pl.pallas_call(
-        attention_kernel(tile_q=64, tile_k=32),
-        grid=grid,
-        in_specs=in_specs,
-        out_specs=out_specs,
-        out_shape=jax.ShapeDtypeStruct(shape, jnp.float32),
-    )
+    call = attention_call(shape, tile_q=64, tile_k=32)
     args = (jax.ShapeDtypeStruct(shape, jnp.float32),) * 3
     source, stats = palladium.emit.emit_msl_stats(
         palladium.trace(call, *args), dot_general="tensorops"
@@ -240,7 +221,7 @@ def test_tensorops_attention_supports_multiples_of_sixteen_head_dimensions(head_
 
 def test_tensorops_attention_rejects_unsupported_tile_shape():
     shape = (1, 32, 2, 64)
-    call = make_pallas_flash_attention(shape, tile_q=8, tile_k=16)
+    call = attention_call(shape, tile_q=8, tile_k=16)
     args = (jax.ShapeDtypeStruct(shape, jnp.float32),) * 3
     spec = palladium.trace(call, *args)
 

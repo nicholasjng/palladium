@@ -5,14 +5,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flash_attention import attention_kernel, attention_specs, reference_attention
 from jax.experimental import pallas as pl
 
 import palladium
-from palladium.workloads.pallas_flash_attention import (
-    attention_kernel,
-    attention_specs,
-    reference_attention,
-)
 
 TM = 16
 

@@ -11,6 +11,8 @@ and key tile sizes for 16-, 32-, and 64-wide heads.
 from __future__ import annotations
 
 import functools
+import os
+import sys
 import time
 
 import jax
@@ -20,14 +22,11 @@ import mew
 import numpy as np
 
 from palladium.emit.tensorops import SIMDGROUPS
-from palladium.workloads.pallas_flash_attention import (
-    HEAD_DIM,
-    TILE_K,
-    TILE_Q,
-    attention_kernel,
-    attention_specs,
-    reference_attention,
-)
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
+from flash_attention import attention_kernel, attention_specs, reference_attention
+
+HEAD_DIM, TILE_Q, TILE_K = 64, 32, 64
 
 BATCH = 1
 HEADS = 4

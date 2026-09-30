@@ -5,13 +5,19 @@ The ``cpu-reverse-k4-ffi`` case runs the same two kernels through the CPU
 FFI bridge, so the rest of the update is XLA on CPU; it needs no plugin.
 """
 
+import os
+import sys
 import time
 
 import jax
 import mew
 import numpy as np
+from jax.experimental import pallas as pl
 
-from palladium.workloads.cnf_training import initial_state, make_training_step, mixture_data
+import palladium
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
+from cnf_density import initial_state, make_training_step, mixture_data
 
 N, WIDTH, STEPS = 256, 4, 16
 INTERVALS = (1, 4, 8)
@@ -42,7 +48,7 @@ def bench_cnf_training(
             steps=STEPS,
             interval=interval,
             variant=variant,
-            ffi=ffi,
+            call=palladium.metal_call if ffi else pl.pallas_call,
         )
         jax.block_until_ready((initial, data))
         start = time.perf_counter()
