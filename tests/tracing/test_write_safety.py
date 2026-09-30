@@ -76,9 +76,7 @@ def test_second_grid_axis_ignored_by_map_and_writes_is_rejected():
         _trace(kernel, (4, 3), (4,), (4,))
 
 
-def test_writes_inside_control_flow_stay_unchecked():
-    # The write hides in the cond branches; the validator stays
-    # permissive rather than guessing, and the kernel traces fine.
+def test_write_in_control_flow_indexed_by_a_program_id_operand_passes():
     def kernel(x_ref, o_ref):
         i = pl.program_id(0)
 
@@ -90,6 +88,31 @@ def test_writes_inside_control_flow_stay_unchecked():
 
     spec = _trace(kernel, (4,), (4,), (4,))
     assert spec.grid == (4,)
+
+
+def test_write_in_a_loop_calling_program_id_passes():
+    def kernel(x_ref, o_ref):
+        def body(_, carry):
+            i = pl.program_id(0)
+            o_ref[i] = x_ref[i] + carry
+            return carry
+
+        jax.lax.fori_loop(0, 3, body, 0.0)
+
+    spec = _trace(kernel, (4,), (4,), (4,))
+    assert spec.grid == (4,)
+
+
+def test_write_in_a_loop_ignoring_the_grid_axis_is_rejected():
+    def kernel(x_ref, o_ref):
+        def body(k, carry):
+            o_ref[k] = x_ref[k] + carry
+            return carry
+
+        jax.lax.fori_loop(0, 8, body, 0.0)
+
+    with pytest.raises(TraceError, match="grid axis 0"):
+        _trace(kernel, (4,), (8,), (8,))
 
 
 def test_unit_extent_axes_are_exempt():
