@@ -8,17 +8,17 @@ import math
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.emit.core import (
-    _PID,
     CTYPES,
+    PID,
     Cursor,
     CVal,
-    EmitError,
     Environment,
     declare,
     emit_jaxpr,
     rule,
     shaped,
 )
+from palladium.errors import EmitError
 
 
 @rule("program_id")
@@ -28,7 +28,7 @@ def _rule_program_id(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     Pure aliasing, no storage or code. The (int) cast keeps index arithmetic signed.
     """
     axis: int = eqn.params["axis"]
-    env.bind(eqn.outvars[0], CVal(f"(int){_PID[axis]}", (), "int"))
+    env.bind(eqn.outvars[0], CVal(f"(int){PID[axis]}", (), "int"))
 
 
 @rule("scan")

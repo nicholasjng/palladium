@@ -75,7 +75,7 @@ def test_compiler_params_select_tensorops_and_scale_the_launch():
     a = jnp.ones((32, 16), jnp.float32)
     b = jnp.ones((16, 64), jnp.float32)
     config = _backend_config(_lower_for(("mps",), call, a, b))
-    width = palladium.launch.simdgroup_width()
+    width = palladium.device.simdgroup_width()
     assert "matmul2d" in config["body"]
     assert config["threadgroup"] == [4 * width, 1, 1]
     assert config["grid"] == [2 * 4 * width, 2, 1]

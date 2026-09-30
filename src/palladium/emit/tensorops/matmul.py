@@ -7,8 +7,9 @@ import string
 
 from jax.extend.core import Literal, Var
 
-from palladium.emit.core import CTYPES, ELEMENTWISE, Cursor, CVal, Environment, _block_offset
-from palladium.emit.numeric import typed_expression
+from palladium.emit.addressing import block_offset
+from palladium.emit.core import CTYPES, Cursor, CVal, Environment
+from palladium.emit.numeric import ELEMENTWISE, typed_expression
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
 
@@ -196,7 +197,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
     env = Environment()
     infos = (*spec.inputs, output_info)
     ref_values: dict[Var, CVal] = {}
-    offsets = tuple(_block_offset(env, cursor, spec, info) for info in infos)
+    offsets = tuple(block_offset(env, cursor, spec, info) for info in infos)
     for index, (ref, info, offset) in enumerate(
         zip(spec.jaxpr.invars, infos, offsets, strict=True)
     ):

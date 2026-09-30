@@ -1,6 +1,83 @@
-"""Dtype-aware MSL expressions shared by elementwise and reduction rules."""
+"""Scalar MSL expression templates: the elementwise table and the
+dtype-aware variants shared by the rules and the TensorOps lowerings."""
+
+import functools
+import string
 
 from palladium.errors import EmitError
+
+MAX_PRIMITIVE_ARITY = 6
+PRIMITIVE_INVARS = string.ascii_lowercase[:MAX_PRIMITIVE_ARITY]
+
+
+@functools.cache
+def template_fields(template: str) -> frozenset[str]:
+    return frozenset(f for _, f, _, _ in string.Formatter().parse(template) if f)
+
+
+def unwrapped(expr: str) -> str:
+    if not (expr.startswith("(") and expr.endswith(")")):
+        return expr
+    depth = 0
+    for i, ch in enumerate(expr):
+        depth += ch == "("
+        depth -= ch == ")"
+        if depth == 0 and i < len(expr) - 1:
+            # The leading paren closes early: shapes like (a) * (b).
+            return expr
+    return expr[1:-1]
+
+
+ELEMENTWISE: dict[str, str] = {
+    # binary
+    "add": "({a} + {b})",
+    # AD cotangent accumulation; supported numeric arrays use ordinary addition.
+    "add_any": "({a} + {b})",
+    "sub": "({a} - {b})",
+    "mul": "({a} * {b})",
+    "div": "({a} / {b})",
+    "pow": "pow({a}, {b})",
+    # unary
+    "neg": "-{a}",
+    "abs": "fabs({a})",
+    "exp": "exp({a})",
+    "log": "log({a})",
+    "sin": "sin({a})",
+    "cos": "cos({a})",
+    "sqrt": "sqrt({a})",
+    "rsqrt": "rsqrt({a})",
+    "tanh": "tanh({a})",
+    "exp2": "exp2({a})",
+    "tan": "tan({a})",
+    "asin": "asin({a})",
+    "acos": "acos({a})",
+    "atan": "atan({a})",
+    "sinh": "sinh({a})",
+    "cosh": "cosh({a})",
+    "asinh": "asinh({a})",
+    "acosh": "acosh({a})",
+    "atanh": "atanh({a})",
+    "atan2": "atan2({a}, {b})",
+    "floor": "floor({a})",
+    "ceil": "ceil({a})",
+    "square": "({a} * {a})",
+    "logistic": "(1.0f / (1.0f + exp(-{a})))",
+    "is_finite": "isfinite({a})",
+    # ternary
+    "select_n": "({a} ? {c} : {b})",  # a: predicate (bool), c when true, b when false
+    "clamp": "clamp({b}, {a}, {c})",  # jaxpr order (min, x, max) -> metal (x, min, max)
+    # logical
+    "lt": "({a} < {b})",
+    "le": "({a} <= {b})",
+    "gt": "({b} < {a})",
+    "ge": "({b} <= {a})",
+    "eq": "({a} == {b})",
+    "ne": "({a} != {b})",
+    # bitwise, integer/bool operands.
+    "and": "({a} & {b})",
+    "or": "({a} | {b})",
+    "xor": "({a} ^ {b})",
+}
 
 
 def extremum(op: str, ctype: str, a: str, b: str) -> str:

@@ -2,7 +2,8 @@
 
 import pytest
 
-from palladium.emit import Cursor, EmitError
+from palladium.emit.core import Cursor
+from palladium.errors import EmitError
 
 
 def test_cursor_allocates_typed_threadgroup_storage():

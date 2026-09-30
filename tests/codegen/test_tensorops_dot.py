@@ -10,7 +10,7 @@ from jax.experimental import pallas as pl
 from jax.extend.core import Jaxpr
 
 import palladium
-from palladium.emit import EmitError
+from palladium.errors import EmitError
 
 
 def _dot(a_ref, b_ref, out_ref):

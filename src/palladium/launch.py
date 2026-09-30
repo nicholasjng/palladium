@@ -5,22 +5,21 @@ from __future__ import annotations
 import dataclasses
 import math
 import operator
-from typing import Any
 
 from jax._src.pallas import core as pallas_core
 from metal_runtime import MathMode
 
-from palladium.emit.core import DOT_GENERAL_POLICIES
+from palladium.device import device_limits, simdgroup_width
+from palladium.emit.kernel import DOT_GENERAL_POLICIES
+from palladium.emit.tensorops import cooperative_launch, emits_cooperative
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
 
 __all__ = [
     "CompilerParams",
     "check_threadgroup",
-    "device_limits",
     "launch_geometry",
     "normalize_threadgroup",
-    "simdgroup_width",
 ]
 
 
@@ -52,19 +51,6 @@ class CompilerParams(pallas_core.CompilerParams):
         object.__setattr__(self, "threadgroup", normalize_threadgroup(self.threadgroup))
 
 
-def device_limits() -> dict[str, Any]:
-    """`metal_runtime.device_info()`, or an empty dict with no device.
-    Callers treat a missing device as unknown limits, not an error."""
-    try:
-        import metal_runtime as mr
-    except ImportError:  # pragma: no cover - metal_runtime is a hard dep
-        return {}
-    try:
-        return dict(mr.device_info())
-    except mr.DeviceError:  # pragma: no cover - no Metal device
-        return {}
-
-
 def normalize_threadgroup(threadgroup: int | tuple[int, ...] | None) -> tuple[int, ...] | None:
     """A `threadgroup=` value as a tuple of ints; None lets the runtime choose."""
     if threadgroup is None:
@@ -77,12 +63,6 @@ def normalize_threadgroup(threadgroup: int | tuple[int, ...] | None) -> tuple[in
     if not 1 <= len(result) <= 3 or any(t <= 0 for t in result):
         raise ValueError("threadgroup must have 1 to 3 positive dimensions")
     return result
-
-
-def simdgroup_width() -> int:
-    """Threads per SIMD group. 32 on every Apple GPU family to date, and
-    the fallback when no device is present."""
-    return int(device_limits().get("simdgroup_width", 32))
 
 
 def check_threadgroup(spec: KernelSpec, threadgroup: tuple[int, ...] | None) -> None:
@@ -110,8 +90,6 @@ def launch_geometry(
     must match it. Otherwise the grid is the Pallas grid and a None
     threadgroup lets the runtime choose.
     """
-    from palladium.emit.tensorops import cooperative_launch, emits_cooperative
-
     grid = _pad3(spec.grid)
     group = None if threadgroup is None else _pad3(threadgroup)
     if emits_cooperative(msl_source):
