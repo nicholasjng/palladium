@@ -7,24 +7,15 @@ PALLADIUM_EXPLAIN=1 prints one stderr line per newly compiled kernel.
 from __future__ import annotations
 
 import dataclasses
-import math
-import operator
 import os
 import sys
-from typing import Any, Literal
 
 from palladium.emit import emit_msl_stats
-from palladium.errors import EmitError
+from palladium.emit.tensorops import emits_cooperative
+from palladium.launch import check_threadgroup, device_limits, launch_geometry
 from palladium.trace import KernelSpec
 
-__all__ = [
-    "KernelDiagnostics",
-    "check_threadgroup",
-    "device_limits",
-    "explain_spec",
-    "normalize_threadgroup",
-    "simdgroup_width",
-]
+__all__ = ["KernelDiagnostics", "explain_spec", "log_compile"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -36,7 +27,7 @@ class KernelDiagnostics:
     name : str
         MSL function name (`spec.name`).
     grid : tuple of int
-        Threads dispatched per grid axis.
+        Threads dispatched per Metal grid axis (x, y, z).
     threadgroup : tuple of int or None
         Fixed threadgroup size; None lets the runtime choose.
     msl_lines : int
@@ -82,134 +73,25 @@ def _human(nbytes: int) -> str:
     return f"{nbytes / 1024:.1f}KB"
 
 
-def device_limits() -> dict[str, Any]:
-    """`metal_runtime.device_info()`, or an empty dict with no device.
-    Callers treat a missing device as unknown limits, not an error."""
-    try:
-        import metal_runtime as mr
-    except ImportError:  # pragma: no cover - metal_runtime is a hard dep
-        return {}
-    try:
-        return dict(mr.device_info())
-    except mr.DeviceError:  # pragma: no cover - no Metal device
-        return {}
-
-
-def normalize_threadgroup(
-    threadgroup: int | tuple[int, ...] | Literal["simdgroup", "threadgroup"] | None,
-) -> tuple[int, ...] | None:
-    """Normalize a `threadgroup=` argument to a tuple of ints, shared by every
-    entry point. None means the runtime chooses; `"simdgroup"` resolves to
-    the device's SIMD width (a reduction over one SIMD group pays no
-    cross-simdgroup latency)."""
-    if threadgroup is None:
-        return None
-    if threadgroup == "simdgroup":
-        return (simdgroup_width(),)
-    if isinstance(threadgroup, str):
-        raise ValueError("unknown threadgroup policy; expected 'simdgroup'")  # noqa: TRY004
-    try:
-        values = (threadgroup,) if isinstance(threadgroup, int) else tuple(threadgroup)
-        result = tuple(operator.index(t) for t in values)
-    except TypeError as exc:
-        raise ValueError("threadgroup dimensions must be integers") from exc
-    if not 1 <= len(result) <= 3 or any(t <= 0 for t in result):
-        raise ValueError("threadgroup must have 1 to 3 positive dimensions")
-    return result
-
-
-def simdgroup_width() -> int:
-    """Threads per SIMD group. 32 on every Apple GPU family to date, and
-    the fallback when no device is present."""
-    return int(device_limits().get("simdgroup_width", 32))
-
-
-def check_threadgroup(spec: KernelSpec, threadgroup: tuple[int, ...] | None) -> None:
-    """Validate launch geometry: cooperative requirements and lane-indexed
-    scratch bounds always, device resource limits when a device is present.
-    Explicit group sizes are checked for independent kernels too."""
-    if spec.uses_threadgroup and threadgroup is None:
-        raise EmitError(
-            f"kernel {spec.name!r} uses cooperative instructions or shared scratch; "
-            "pass an explicit threadgroup= size"
-        )
-    limits = device_limits()
-    shared_bytes = sum(
-        math.prod(s.shape) * s.dtype.itemsize for s in spec.scratch if s.space == "threadgroup"
-    )
-    budget = limits.get("max_threadgroup_memory_length")
-    if budget and shared_bytes > budget:
-        raise EmitError(
-            f"kernel {spec.name!r} declares {shared_bytes} bytes of "
-            f"threadgroup_memory, over this device's "
-            f"max_threadgroup_memory_length of {budget}. Shrink the "
-            "threadgroup_memory request, or split the reduction across "
-            "more, smaller threadgroups."
-        )
-
-    max_threads = limits.get("max_threads_per_threadgroup")
-    if threadgroup and max_threads:
-        total = 1
-        for t in threadgroup:
-            total *= t
-        if total > max_threads:
-            raise EmitError(
-                f"threadgroup={threadgroup} is {total} threads, over this "
-                f"device's max_threads_per_threadgroup of {max_threads}"
-            )
-
-    if threadgroup:
-        actual = math.prod(
-            min(g, t)
-            for g, t in zip(
-                spec.grid + (1,) * (3 - len(spec.grid)), threadgroup + (1,) * (3 - len(threadgroup))
-            )
-        )
-        if any(actual > extent for extent in spec.lane_scratch_extents):
-            raise EmitError(
-                f"threadgroup has up to {actual} lanes but a directly lane-indexed "
-                f"scratch dimension is smaller: {spec.lane_scratch_extents}"
-            )
-    if spec.uses_threadgroup and not limits.get("supports_non_uniform_threadgroups", True):
-        raise EmitError(  # pragma: no cover - all Apple silicon supports this
-            f"kernel {spec.name!r} uses threads_per_threadgroup() to bound a "
-            "cooperative loop, which is only correct when the device "
-            "dispatches non-uniform threadgroups; this device reports it does "
-            "not, so the final partial group would read unwritten slots."
-        )
-
-
 def explain_spec(
     spec: KernelSpec,
-    threadgroup: int | tuple[int, ...] | None = None,
+    threadgroup: tuple[int, ...] | None = None,
     *,
     dot_general: str = "auto",
 ) -> KernelDiagnostics:
     """Diagnostics for a traced spec: emits MSL, compiles nothing."""
     msl, stats = emit_msl_stats(spec, dot_general=dot_general)
-    tg = normalize_threadgroup(threadgroup)
-    from palladium.emit.tensorops import cooperative_launch, emits_cooperative
-
-    tensorops_kernel = emits_cooperative(msl)
-    if tensorops_kernel:
-        required, grid = cooperative_launch(spec.grid, simdgroup_width())
-        provided = (tg + (1, 1, 1))[:3] if tg is not None else None
-        if provided is not None and provided != required:
-            raise EmitError(f"cooperative lowering requires threadgroup={required}, got {tg}")
-        tg = required
-    else:
-        grid = tuple(int(g) for g in spec.grid)
-    check_threadgroup(spec, tg)
-    limits = device_limits()
+    grid, group = launch_geometry(spec, msl, threadgroup)
+    check_threadgroup(spec, group)
     return KernelDiagnostics(
         name=spec.name,
         grid=grid,
-        threadgroup=tg,
+        threadgroup=group,
         msl_lines=len(msl.splitlines()),
         thread_bytes=stats.thread_bytes,
         threadgroup_bytes=stats.threadgroup_bytes,
-        threadgroup_limit=limits.get("max_threadgroup_memory_length"),
-        cooperative=spec.uses_threadgroup or tensorops_kernel,
+        threadgroup_limit=device_limits().get("max_threadgroup_memory_length"),
+        cooperative=spec.uses_threadgroup or emits_cooperative(msl),
     )
 
 
@@ -219,7 +101,7 @@ def _explain_enabled() -> bool:
 
 def log_compile(
     spec: KernelSpec,
-    threadgroup: int | tuple[int, ...] | None = None,
+    threadgroup: tuple[int, ...] | None = None,
     dot_general: str = "auto",
 ) -> None:
     """One stderr line per compiled kernel when PALLADIUM_EXPLAIN is set;

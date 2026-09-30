@@ -27,8 +27,8 @@ def test_sign_and_remainder(dtype):
     # SAFE is required for meaningful NaN/signed-zero behavior on Metal.
     call = palladium.metal_call(
         kernel,
-        math_mode=MathMode.SAFE,
         out_shape=(jax.ShapeDtypeStruct(x.shape, dtype),) * 2,
+        compiler_params=palladium.CompilerParams(math_mode=MathMode.SAFE),
     )
     actual = call(x, y)
     with jax.default_device(jax.devices("cpu")[0]):

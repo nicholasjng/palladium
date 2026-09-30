@@ -333,7 +333,7 @@ def test_tensorops_batched_dot_explain_scales_batch_axis_for_groups():
         ],
         out_specs=pl.BlockSpec((1, 16, 32), lambda b, i, j: (b, i, j)),
         out_shape=jax.ShapeDtypeStruct((2, 32, 64), jnp.float32),
-        dot_general="tensorops",
+        compiler_params=palladium.CompilerParams(dot_general="tensorops"),
     )
     diag = f.explain(
         jax.ShapeDtypeStruct((2, 32, 16), jnp.float32),
@@ -391,7 +391,7 @@ def test_tensorops_explain_reports_group_scaled_dispatch():
         ],
         out_specs=pl.BlockSpec((16, 32), lambda i, j: (i, j)),
         out_shape=jax.ShapeDtypeStruct((32, 64), jnp.float32),
-        dot_general="tensorops",
+        compiler_params=palladium.CompilerParams(dot_general="tensorops"),
     )
     diag = f.explain(
         jax.ShapeDtypeStruct((32, 16), jnp.float32),
@@ -413,7 +413,7 @@ def test_tensorops_dot_is_used_by_jittable_metal_runtime_calls():
         ],
         out_specs=pl.BlockSpec((16, 32), lambda i, j: (i, j)),
         out_shape=jax.ShapeDtypeStruct((32, 64), jnp.float32),
-        dot_general="tensorops",
+        compiler_params=palladium.CompilerParams(dot_general="tensorops"),
     )
     _, msl, _ = call._spec_and_msl(
         (

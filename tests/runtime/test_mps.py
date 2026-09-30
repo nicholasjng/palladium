@@ -13,6 +13,7 @@ import pytest
 from jax.experimental import pallas as pl
 
 import palladium
+from palladium.mps import MpsDispatchDescriptor
 
 
 def _add_kernel(x_ref, y_ref, o_ref):
@@ -20,7 +21,7 @@ def _add_kernel(x_ref, y_ref, o_ref):
 
 
 def test_descriptor_json_omits_a_default_threadgroup():
-    descriptor = palladium.MpsDispatchDescriptor(
+    descriptor = MpsDispatchDescriptor(
         version=2,
         header="#include <metal_stdlib>\nusing namespace metal;\n",
         prologue="const device float* arg0 = (const device float*)arg0_base;",
@@ -37,9 +38,7 @@ def test_descriptor_json_omits_a_default_threadgroup():
 def _descriptor_for(call, *shapes, dot_general="auto", threadgroup=None):
     spec = palladium.trace(call, *shapes)
     msl = palladium.emit_msl(spec, dot_general=dot_general)
-    return msl, palladium.MpsDispatchDescriptor.from_spec(
-        spec, msl, threadgroup=threadgroup, math_mode=2
-    )
+    return msl, MpsDispatchDescriptor.from_spec(spec, msl, threadgroup=threadgroup, math_mode=2)
 
 
 def _tiled_dot_call():

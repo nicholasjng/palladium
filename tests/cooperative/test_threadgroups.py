@@ -48,7 +48,7 @@ def _block_sum_call(n, threadgroup=TG, extent=TG):
         out_specs=pl.BlockSpec((1,), lambda i: (i,)),
         out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
         scratch_shapes=[threadgroup_memory((extent,), jnp.float32)],
-        threadgroup=threadgroup,
+        compiler_params=palladium.CompilerParams(threadgroup=threadgroup),
     )
 
 
@@ -196,7 +196,7 @@ def _block_sum_jit(n, threadgroup=TG, extent=TG):
         out_specs=pl.BlockSpec((1,), lambda i: (i,)),
         out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
         scratch_shapes=[threadgroup_memory((extent,), jnp.float32)],
-        threadgroup=threadgroup,
+        compiler_params=palladium.CompilerParams(threadgroup=threadgroup),
     )
 
 
@@ -219,7 +219,7 @@ def test_ffi_path_composes_under_jit():
 
 def test_ffi_explain_reports_the_threadgroup():
     d = _block_sum_jit(64).explain(jax.ShapeDtypeStruct((64,), jnp.float32))
-    assert d.threadgroup == (TG,)
+    assert d.threadgroup == (TG, 1, 1)
 
 
 def test_interpret_models_a_threadgroup_of_one():
@@ -270,10 +270,9 @@ def _batched_block_sums(xb, tg):
     return out
 
 
-@pytest.mark.parametrize("vmap_method", ["sequential", "pipelined"])
 @pytest.mark.parametrize("n", [TG * 4, 100])
-def test_vmap_over_a_cooperative_kernel(vmap_method, n):
-    """Every vmap method preserves threadgroup geometry: the native handler issues one dispatch per batch element with the same grid and threadgroup, varying only buffer offsets.
+def test_vmap_over_a_cooperative_kernel(n):
+    """vmap preserves threadgroup geometry: the native handler issues one dispatch per batch element with the same grid and threadgroup, varying only buffer offsets.
 
     n=100 is not a multiple of TG, so it also exercises the partial tail group.
     """
@@ -286,8 +285,7 @@ def test_vmap_over_a_cooperative_kernel(vmap_method, n):
         out_specs=pl.BlockSpec((1,), lambda i: (i,)),
         out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
         scratch_shapes=[threadgroup_memory((TG,), jnp.float32)],
-        threadgroup=TG,
-        vmap_method=vmap_method,
+        compiler_params=palladium.CompilerParams(threadgroup=TG),
     )
     got = np.asarray(jax.jit(jax.vmap(f))(jnp.asarray(xb)))
     np.testing.assert_allclose(got, _batched_block_sums(xb, TG), rtol=1e-6)
@@ -303,7 +301,6 @@ def test_vmap_over_a_cooperative_kernel_still_needs_a_threadgroup():
         out_specs=pl.BlockSpec((1,), lambda i: (i,)),
         out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
         scratch_shapes=[threadgroup_memory((TG,), jnp.float32)],
-        vmap_method="pipelined",
     )
     xb = jnp.zeros((2, n), jnp.float32)
     with pytest.raises(EmitError, match="explicit"):

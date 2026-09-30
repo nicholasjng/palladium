@@ -37,7 +37,6 @@ def test_matmul(rng, m, n, k, tn, dtype, tol):
 
     call = palladium.metal_call(
         kernel,
-        dot_general="tensorops",
         grid=(_tiles(m, TM), _tiles(n, tn)),
         in_specs=[
             pl.BlockSpec((TM, k), lambda i, j: (i, 0)),
@@ -45,6 +44,7 @@ def test_matmul(rng, m, n, k, tn, dtype, tol):
         ],
         out_specs=pl.BlockSpec((TM, tn), lambda i, j: (i, j)),
         out_shape=jax.ShapeDtypeStruct((m, n), dtype),
+        compiler_params=palladium.CompilerParams(dot_general="tensorops"),
     )
     a = jnp.asarray(rng.standard_normal((m, k), dtype=np.float32), dtype)
     b = jnp.asarray(rng.standard_normal((k, n), dtype=np.float32), dtype)
@@ -63,11 +63,11 @@ def test_attention(rng, head_dim, tile_q, tile_k, causal):
     grid, in_specs, out_specs = attention_specs(1, 256, 2, tile_q, head_dim)
     call = palladium.metal_call(
         attention_kernel(tile_q=tile_q, tile_k=tile_k, head_dim=head_dim, causal=causal),
-        dot_general="tensorops",
         grid=grid,
         in_specs=in_specs,
         out_specs=out_specs,
         out_shape=jax.ShapeDtypeStruct(shape, jnp.float32),
+        compiler_params=palladium.CompilerParams(dot_general="tensorops"),
     )
     q, k, v = (rng.standard_normal(shape, dtype=np.float32) for _ in range(3))
     np.testing.assert_allclose(

@@ -53,7 +53,7 @@ def test_permuted_reshape_on_metal(metal_device, shape, perm, new_shape):
     call = palladium.metal_call(
         _reshape_kernel(perm, new_shape),
         out_shape=jax.ShapeDtypeStruct(new_shape, np.float32),
-        math_mode=mr.MathMode.SAFE,
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
     )
     x = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
     expected = np.transpose(x, perm).reshape(new_shape)

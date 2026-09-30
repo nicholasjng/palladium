@@ -97,7 +97,9 @@ def test_regressions_against_interpret(kind):
     except mr.DeviceError as exc:
         pytest.skip(str(exc))
     kernel, arg, kwargs = _case(kind)
-    call = palladium.metal_call(kernel, math_mode=mr.MathMode.SAFE, **kwargs)
+    call = palladium.metal_call(
+        kernel, **kwargs, compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE)
+    )
     x = np.arange(np.prod(arg.shape), dtype=np.float32).reshape(arg.shape)
     x = x.astype(arg.dtype)
     np.testing.assert_array_equal(

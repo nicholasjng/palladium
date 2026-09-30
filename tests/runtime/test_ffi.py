@@ -115,8 +115,8 @@ def test_math_mode_safe_is_actually_requested(rng):
 
     f = palladium.metal_call(
         kernel,
-        math_mode=mr.MathMode.SAFE,
         out_shape=jax.ShapeDtypeStruct((64,), jnp.float32),
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
     )
     x = rng.standard_normal(64, dtype=np.float32)
     got = f(x)
@@ -125,23 +125,21 @@ def test_math_mode_safe_is_actually_requested(rng):
     np.testing.assert_allclose(got[~np.isnan(got)], want[~np.isnan(want)])
 
 
-def test_vmap_pipelined_matches_interpret_and_sequential(rng):
-    """'pipelined' handles the whole batch in one FFI call and matches the sequential path element for element."""
+def test_vmap_matches_per_element_calls_and_interpret(rng):
+    """jax.vmap handles the whole batch in one FFI call and matches per-element calls bit for bit."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.tanh(x_ref[...]) * 2.0
 
     kwargs = {"out_shape": jax.ShapeDtypeStruct((16,), jnp.float32)}
-    f = palladium.metal_call(kernel, **kwargs, vmap_method="pipelined")
-    f_seq = palladium.metal_call(kernel, **kwargs, vmap_method="sequential")
+    f = palladium.metal_call(kernel, **kwargs)
     # A batch deeper than the handler's in-flight ring (8), so slot reuse
     # and backpressure inside the native loop are exercised.
     xs = rng.standard_normal((37, 16)).astype(np.float32)
 
     got = np.asarray(jax.vmap(f)(xs))
-    # GPU vs GPU: the pipelined loop must be bit-identical to per-element
-    # sequential dispatch of the same compiled kernel.
-    np.testing.assert_array_equal(got, np.asarray(jax.vmap(f_seq)(xs)))
+    # GPU vs GPU: the batched loop must be bit-identical to per-element
+    # dispatch of the same compiled kernel.
     want = np.stack([np.asarray(f(x)) for x in xs])
     np.testing.assert_array_equal(got, want)
     # vs the interpret oracle, at FAST-math tolerance (tanh approximation).
@@ -153,7 +151,7 @@ def test_vmap_pipelined_matches_interpret_and_sequential(rng):
     np.testing.assert_array_equal(np.asarray(f(xs[0])), want[0])
 
 
-def test_vmap_pipelined_broadcasts_unbatched_operands(rng):
+def test_vmap_broadcasts_unbatched_operands(rng):
     """An unbatched operand rides along at stride 0 rather than being materialized per element."""
 
     def kernel(x_ref, w_ref, o_ref):
@@ -162,7 +160,6 @@ def test_vmap_pipelined_broadcasts_unbatched_operands(rng):
     f = palladium.metal_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((16,), jnp.float32),
-        vmap_method="pipelined",
     )
     xs = rng.standard_normal((5, 16)).astype(np.float32)
     w = rng.standard_normal(16).astype(np.float32)
@@ -172,7 +169,7 @@ def test_vmap_pipelined_broadcasts_unbatched_operands(rng):
     np.testing.assert_allclose(got, want, rtol=1e-6)
 
 
-def test_vmap_pipelined_multi_output(rng):
+def test_vmap_multi_output(rng):
     def kernel(x_ref, s_ref, d_ref):
         s_ref[...] = x_ref[...] + x_ref[...]
         d_ref[...] = x_ref[...] * x_ref[...]
@@ -183,28 +180,11 @@ def test_vmap_pipelined_multi_output(rng):
             jax.ShapeDtypeStruct((8,), jnp.float32),
             jax.ShapeDtypeStruct((8,), jnp.float32),
         ),
-        vmap_method="pipelined",
     )
     xs = rng.standard_normal((6, 8)).astype(np.float32)
     got_s, got_d = jax.vmap(f)(xs)
     np.testing.assert_allclose(np.asarray(got_s), xs + xs, rtol=1e-6)
     np.testing.assert_allclose(np.asarray(got_d), xs * xs, rtol=1e-6)
-
-
-def test_vmap_works_by_default(rng):
-    """The default vmap_method is 'pipelined', so jax.vmap composes with no opt-in."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = jnp.tanh(x_ref[...]) * 2.0
-
-    kwargs = {"out_shape": jax.ShapeDtypeStruct((16,), jnp.float32)}
-    f = palladium.metal_call(kernel, **kwargs)
-    xs = rng.standard_normal((12, 16)).astype(np.float32)
-
-    got = np.asarray(jax.vmap(f)(xs))
-    explicit = palladium.metal_call(kernel, **kwargs, vmap_method="pipelined")
-    np.testing.assert_array_equal(got, np.asarray(jax.vmap(explicit)(xs)))
-    np.testing.assert_array_equal(got, np.stack([np.asarray(f(x)) for x in xs]))
 
 
 def test_nested_vmap_batches_outer_levels_sequentially(rng):
@@ -216,38 +196,6 @@ def test_nested_vmap_batches_outer_levels_sequentially(rng):
     f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32))
     xs = rng.standard_normal((3, 5, 8)).astype(np.float32)
     np.testing.assert_array_equal(np.asarray(jax.vmap(jax.vmap(f))(xs)), xs * 3.0)
-
-
-def test_vmap_method_none_refuses_batching_in_palladium_terms():
-    """With vmap_method=None the custom_vmap rule raises before jax.ffi can suggest the unsafe whole-batch methods."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...]
-
-    f = palladium.metal_call(
-        kernel,
-        out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
-        vmap_method=None,
-    )
-    x = np.ones((8,), dtype=np.float32)
-    np.testing.assert_array_equal(np.asarray(f(x)), x)  # unvmapped still works
-    with pytest.raises(ValueError, match="vmap_method='pipelined'"):
-        jax.vmap(f)(np.ones((4, 8), dtype=np.float32))
-
-
-def test_whole_batch_vmap_methods_rejected():
-    # expand_dims/broadcast_all re-invoke the target once with batched
-    # buffers, but the launch grid is baked per unbatched shape; accepting
-    # them would return wrong results silently.
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...]
-
-    with pytest.raises(ValueError, match="pipelined"):
-        palladium.metal_call(
-            kernel,
-            out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
-            vmap_method="expand_dims",
-        )
 
 
 def test_custom_vjp_pairs_forward_and_backward_kernels(rng):

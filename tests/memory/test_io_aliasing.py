@@ -63,12 +63,11 @@ def test_ffi_aliased_call_matches_interpret_under_jit(rng):
     np.testing.assert_allclose(got, np.asarray(f.interpret(x)), rtol=1e-6)
 
 
-def test_ffi_aliased_pipelined_vmap(rng):
+def test_ffi_aliased_vmap(rng):
     f = palladium.metal_call(
         _double_kernel,
         out_shape=jax.ShapeDtypeStruct((16,), F32),
         input_output_aliases={0: 0},
-        vmap_method="pipelined",
     )
     xs = rng.standard_normal((11, 16)).astype(np.float32)
     got = np.asarray(jax.vmap(f)(xs))

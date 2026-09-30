@@ -33,8 +33,7 @@ result = jax.jit(call)(x, y)  # x and y are float32 arrays on MPS
 
 Other platforms keep JAX's own `pallas_call` behavior; pass `interpret=True`
 to run the same kernel on the Pallas interpreter anywhere. Gradients pair a
-forward call with a backward one through `palladium.with_vjp`,
-`with_auxiliary_vjp`, or `with_reference_vjp`.
+forward call with a backward one through `palladium.with_vjp`.
 
 ## Install
 

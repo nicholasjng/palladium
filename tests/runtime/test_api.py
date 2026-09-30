@@ -10,11 +10,11 @@ import pytest
 from jax.experimental import pallas as pl
 
 import palladium
-from palladium.diagnostics import device_limits, normalize_threadgroup, simdgroup_width
 from palladium.errors import (
     EmitError,
     UnsupportedPrimitiveError,
 )
+from palladium.launch import device_limits, normalize_threadgroup, simdgroup_width
 from palladium.threadgroup import (
     barrier,
     thread_index,
@@ -51,7 +51,7 @@ def _block_sum_call(n, threadgroup=TG, extent=TG):
         out_specs=pl.BlockSpec((1,), lambda i: (i,)),
         out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
         scratch_shapes=[threadgroup_memory((extent,), jnp.float32)],
-        threadgroup=threadgroup,
+        compiler_params=palladium.CompilerParams(threadgroup=threadgroup),
     )
 
 
@@ -165,24 +165,14 @@ def _key(n):
     return (((n,), np.dtype(np.float32).str),)
 
 
-def test_cache_is_bounded(rng):
+def test_cache_is_bounded(rng, monkeypatch):
     """Under JAX's trace caching a hit need not re-enter Python, so the
     bound is on entries, not on recency."""
+    monkeypatch.setattr(palladium.ffi, "_CACHE_SIZE", 2)
     # out_shape is fixed while the input length is free, so every n is a new key.
-    f = palladium.metal_call(
-        _sum_kernel, out_shape=jax.ShapeDtypeStruct((1,), jnp.float32), cache_size=2
-    )
+    f = palladium.metal_call(_sum_kernel, out_shape=jax.ShapeDtypeStruct((1,), jnp.float32))
     for n in (8, 16, 24):
         f(rng.standard_normal(n, dtype=np.float32))
     assert list(f._cache) == [_key(16), _key(24)]
     f(rng.standard_normal(32, dtype=np.float32))
     assert list(f._cache) == [_key(24), _key(32)]
-
-
-def test_cache_size_zero_disables_eviction(rng):
-    f = palladium.metal_call(
-        _sum_kernel, out_shape=jax.ShapeDtypeStruct((1,), jnp.float32), cache_size=0
-    )
-    for n in (8, 16, 24, 32):
-        f(rng.standard_normal(n, dtype=np.float32))
-    assert list(f._cache) == [_key(n) for n in (8, 16, 24, 32)]

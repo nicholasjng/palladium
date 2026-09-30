@@ -23,7 +23,9 @@ def call_for(op, *args, mode=mr.MathMode.SAFE):
         out[...] = op(*(ref[...] for ref in inputs))
 
     shape = jax.eval_shape(op, *args)
-    return palladium.metal_call(kernel, out_shape=shape, math_mode=mode)
+    return palladium.metal_call(
+        kernel, out_shape=shape, compiler_params=palladium.CompilerParams(math_mode=mode)
+    )
 
 
 @pytest.mark.parametrize("dtype", [np.int32, np.uint32])
@@ -144,7 +146,11 @@ def test_minmax_pair(metal_device, dtype):
 
     x = np.array([1, 2**24 + 1, 7, 2**24 + 3], dtype)
     scalar = jax.ShapeDtypeStruct((), dtype)
-    call = palladium.metal_call(kernel, out_shape=(scalar, scalar), math_mode=mr.MathMode.SAFE)
+    call = palladium.metal_call(
+        kernel,
+        out_shape=(scalar, scalar),
+        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
+    )
     np.testing.assert_array_equal(call(x), call.interpret(x))
 
 

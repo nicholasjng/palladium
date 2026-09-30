@@ -100,6 +100,24 @@ def reference_flow(states, parameters, *, steps=16, reverse=True):
     return jax.lax.fori_loop(0, steps, step, states)
 
 
+def _with_reference_vjp(forward, reference):
+    """`forward` with the VJP JAX derives from `reference`, for timing the
+    forward kernel against JAX's own backward pass."""
+
+    @jax.custom_vjp
+    def differentiated(*args):
+        return forward(*args)
+
+    def fwd(*args):
+        return forward(*args), args
+
+    def bwd(primals, cotangents):
+        return jax.vjp(reference, *primals)[1](cotangents)
+
+    differentiated.defvjp(fwd, bwd)
+    return differentiated
+
+
 def make_flow(
     n,
     *,
@@ -210,7 +228,7 @@ def make_flow(
     if variant == "forward":
         return forward
     if variant == "reference":
-        return palladium.with_reference_vjp(forward, reference)
+        return _with_reference_vjp(forward, reference)
     backward = call(
         backward_kernel,
         grid=(n,),
@@ -218,7 +236,7 @@ def make_flow(
         out_specs=(state_spec, params_spec),
         out_shape=(shape, jax.ShapeDtypeStruct((n, count), jnp.float32)),
     )
-    return palladium.with_auxiliary_vjp(forward, backward, output_count=1)
+    return palladium.with_vjp(forward, backward, residuals=1)
 
 
 def make_log_prob(n, **kwargs):

@@ -224,11 +224,11 @@ def palladium_run(math_mode, state0, on_mark):
     out = jax.ShapeDtypeStruct((N,), jnp.float32)
     f = palladium.metal_call(
         verlet_kernel,
-        math_mode=math_mode,
         grid=(N,),
         in_specs=[spec_1] * 4,
         out_specs=(spec_1,) * 4,
         out_shape=(out,) * 4,
+        compiler_params=palladium.CompilerParams(math_mode=math_mode),
     )
     step = jax.jit(f)
     jax.block_until_ready(step(*state0))  # trace + emit + Metal compile outside the clock

@@ -49,7 +49,7 @@ read snapshots are preserved across later writes.
   barrier effect. Debug printing and arbitrary JAX effects are unsupported.
 
 On both paths, tiled matmuls on a 2D or 3D grid lower
-through Metal 4 TensorOps by default (`dot_general="auto"`); dots the
+through Metal 4 TensorOps by default (`CompilerParams(dot_general="auto")`); dots the
 cooperative lowering does not recognize keep the one-thread-per-program
 emitter. `dot_general="tensorops"` requires the cooperative lowering and
 raises where it does not apply; `dot_general="default"` forces the primitive
@@ -96,7 +96,8 @@ for numeric comparisons and measurement caveats.
 
 `thread_index()`, `threads_per_threadgroup()`,
 `barrier()`, and shared scratch support one to three dimensions.
-Any cooperative operation requires an explicit `threadgroup=`.
+Any cooperative operation requires an explicit
+`CompilerParams(threadgroup=...)`.
 Thread indices are linearized with x fastest. Barriers must be reached
 uniformly; a conservative analysis rejects divergent barrier control flow.
 Palladium checks direct top-level `scratch[thread_index()]` bounds,
@@ -110,8 +111,8 @@ reference instead.
 
 | Path | JIT | vmap | Gradients |
 |---|---|---|---|
-| `pl.pallas_call` on `mps` | Yes: palladium is the registered Pallas backend for the platform (`palladium.CompilerParams` for options) | JAX's own `pallas_call` batching | `palladium.with_vjp`, `with_auxiliary_vjp`, or `with_reference_vjp` |
-| `metal_call` | Yes, through CPU FFI to Metal | Pipelined by default; sequential methods also available | Pair with `custom_vjp` or the `with_*vjp` helpers |
+| `pl.pallas_call` on `mps` | Yes: palladium is the registered Pallas backend for the platform (`palladium.CompilerParams` for options) | JAX's own `pallas_call` batching | `palladium.with_vjp` |
+| `metal_call` | Yes, through CPU FFI to Metal | One FFI call per batch; nested levels run one element at a time | `palladium.with_vjp` or `jax.custom_vjp` |
 
 The mps lowering uses FAST math. On other platforms a `pallas_call` keeps
 JAX's own behavior: `interpret=True` runs the Pallas interpreter, which
