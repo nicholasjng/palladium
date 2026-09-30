@@ -177,32 +177,16 @@ def _emit_reduce(
     dst = declare(env, cursor, eqn.outvars[0])
     src_strides = element_strides(src.shape)
     dst_strides = element_strides(dst.shape)
-    idx_vars: dict[int, str] = {}
 
-    def emit_loops(dims: list[int], body: Callable[[], None]) -> None:
-        if not dims:
-            body()
-            return
-        d, rest = dims[0], dims[1:]
-        idx_vars[d] = cursor.fresh(f"_d{d}")
-        with cursor.block(
-            f"for (uint {idx_vars[d]} = 0; {idx_vars[d]} < {src.shape[d]}; ++{idx_vars[d]})"
-        ):
-            emit_loops(rest, body)
-
-    def accumulate() -> None:
+    with cursor.loop_nest(tuple(src.shape[d] for d in kept_dims), "_d") as kept:
         acc = cursor.fresh("_acc")
         cursor.emit(f"{dst.ctype} {acc} = {init};")
-
-        def inner_body() -> None:
-            src_idx = flat_index([(idx_vars[d], src_strides[d]) for d in range(rank)])
+        with cursor.loop_nest(tuple(src.shape[d] for d in reduced_dims), "_d") as reduced:
+            index = dict(zip(kept_dims, kept)) | dict(zip(reduced_dims, reduced))
+            src_idx = flat_index([(index[d], src_strides[d]) for d in range(rank)])
             cursor.emit(f"{acc} = {combine(acc, src.at(src_idx))};")
-
-        emit_loops(reduced_dims, inner_body)
-        dst_idx = flat_index([(idx_vars[d], dst_strides[i]) for i, d in enumerate(kept_dims)])
+        dst_idx = flat_index(list(zip(kept, dst_strides)))
         cursor.emit(f"{dst.at(dst_idx)} = {acc};")
-
-    emit_loops(kept_dims, accumulate)
 
 
 @rule("reduce_sum")
