@@ -32,10 +32,10 @@ import jax
 import jax.numpy as jnp
 import metal_runtime as mr
 import numpy as np
+from df32 import kernel as df32_kernel
 from jax.experimental import pallas as pl
 
 import palladium
-from palladium.experimental import df32 as mrdf32
 
 H = 0.002  # ~3140 steps per orbit; the truncation floor is O(H^2)
 N = 1024  # ensemble members, one Metal thread each
@@ -240,7 +240,7 @@ def palladium_run(math_mode, state0, on_mark):
 
 
 def df32_run(state0, on_mark):
-    kernel = mrdf32.kernel(DF32_KERNEL, "kepler_verlet_df32")
+    kernel = df32_kernel(DF32_KERNEL, "kepler_verlet_df32")
     # Two limbs per component. The low limbs start at zero: the initial
     # conditions are exactly the float32 ones the other runs use, so the
     # three variants start from bit-identical states.
