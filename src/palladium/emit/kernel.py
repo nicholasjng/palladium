@@ -14,7 +14,6 @@ from palladium.emit.addressing import (
     flat_index,
 )
 from palladium.emit.core import (
-    CTYPES,
     PID,
     Cursor,
     CVal,
@@ -22,6 +21,7 @@ from palladium.emit.core import (
     EmitStats,
     Environment,
     emit_jaxpr,
+    msl_type,
 )
 from palladium.emit.tensorops import compile_kernel, uses_tensorops
 from palladium.trace import KernelSpec
@@ -87,7 +87,7 @@ def emit_msl_stats(
     params = []
     for k, info in enumerate(operands):
         qual = "device" if k >= n_in else "const device"
-        ctype = CTYPES[info.dtype.name]
+        ctype = msl_type(info.dtype)
         params.append(f"{qual} {ctype}* arg{k} [[buffer({k})]]")
     params.append("uint3 _pid [[thread_position_in_grid]]")
 
@@ -104,7 +104,7 @@ def emit_msl_stats(
     aliased_inputs = {i for i, _ in spec.aliases}
     for k, info in enumerate(operands):
         qual = "device" if k >= n_in else "const device"
-        ctype = CTYPES[info.dtype.name]
+        ctype = msl_type(info.dtype)
         layout = BlockLayout.from_info(info)
         full = layout.shape
         strided = any(b != a for b, a in zip(full[1:], info.array_shape[1:]))
@@ -158,7 +158,7 @@ def emit_msl_stats(
         )
 
     for k, info in enumerate(spec.scratch):
-        ctype = CTYPES[info.dtype.name]
+        ctype = msl_type(info.dtype)
         shape = info.shape
         size = math.prod(info.shape)
         cursor.account(ctype, size, "thread")

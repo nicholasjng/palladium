@@ -15,8 +15,11 @@ import math
 from collections.abc import Callable, Iterator
 from typing import Literal as TLiteral
 
+import jax.numpy as jnp
+import numpy as np
 from jax.core import Atom, ShapedArray
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
+from numpy.typing import DTypeLike
 
 from palladium.errors import EmitError, UnsupportedPrimitiveError
 
@@ -28,14 +31,20 @@ def shaped(aval: object) -> ShapedArray:
     return aval
 
 
-CTYPES = {
-    "float32": "float",
-    "float16": "half",
-    "bfloat16": "bfloat",
-    "int32": "int",
-    "uint32": "uint",
-    "bool": "bool",
+CTYPES: dict[np.dtype, str] = {
+    np.dtype(np.float32): "float",
+    np.dtype(np.float16): "half",
+    np.dtype(jnp.bfloat16): "bfloat",
+    np.dtype(np.int32): "int",
+    np.dtype(np.uint32): "uint",
+    np.dtype(np.bool_): "bool",
 }
+
+
+def msl_type(dtype: DTypeLike) -> str:
+    """The MSL type name for a supported dtype; KeyError otherwise."""
+    return CTYPES[np.dtype(dtype)]
+
 
 # Size of each CTYPES value, for the per-thread stack estimate in
 # `Cursor.account`. MSL bool is one byte.
@@ -62,7 +71,7 @@ class CVal:
     shape : tuple of int
         Logical shape; `()` for scalars.
     ctype : str
-        C type name, always a value of CTYPES (`"float"`, not `"float32"`).
+        MSL type name, a value of CTYPES (`"float"`, not `"float32"`).
     space : str
         Metal address space of the storage behind `expr`: `"thread"` for
         emitter-declared locals, `"threadgroup"` for per-threadgroup
@@ -364,7 +373,7 @@ class Environment:
 
 def literal(atom: Literal) -> CVal:
     """A jaxpr Literal as a typed C constant."""
-    ctype = CTYPES[str(shaped(atom.aval).dtype)]
+    ctype = msl_type(shaped(atom.aval).dtype)
     v = atom.val
     if math.isinf(v):
         expr = "-INFINITY" if v < 0 else "INFINITY"
@@ -382,7 +391,7 @@ def declare(env: Environment, cursor: Cursor, var: Var) -> CVal:
     """Emit thread-local storage for `var` and bind it in `env`; use
     `env.bind` for aliasing."""
     aval = shaped(var.aval)
-    ctype = CTYPES[str(aval.dtype)]
+    ctype = msl_type(aval.dtype)
     shape = tuple(int(d) for d in aval.shape)
     cval = cursor.allocate(ctype, shape)
     env.bind(var, cval)

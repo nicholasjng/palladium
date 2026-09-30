@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import math
 
+import numpy as np
 from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.device import simdgroup_width
@@ -72,8 +73,7 @@ def _analyze_attention(spec: KernelSpec, scan: JaxprEqn, body: Jaxpr) -> _Attent
     query, key, value = spec.inputs
     output = spec.outputs[0]
     if any(
-        info.dtype.name != "float32" or len(info.array_shape) != 4
-        for info in (*spec.inputs, output)
+        info.dtype != np.float32 or len(info.array_shape) != 4 for info in (*spec.inputs, output)
     ):
         raise EmitError("tensorops attention currently requires rank-4 float32 buffers")
     batch, query_length, heads, dim = query.array_shape

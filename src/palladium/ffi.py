@@ -79,17 +79,17 @@ def check_dtypes(args: tuple) -> None:
     """Reject unsupported dtypes before tracing; they otherwise surface
     as a KeyError inside emit."""
     for i, a in enumerate(args):
-        dtype = getattr(a, "dtype", None)
-        name = np.dtype(dtype if dtype is not None else np.asarray(a).dtype).name
-        if name not in CTYPES:
+        dtype = np.dtype(a.dtype)
+        if dtype not in CTYPES:
             hint = (
                 "; float64 usually means jax_enable_x64 is on, disable it or cast to float32"
-                if name == "float64"
+                if dtype == np.float64
                 else ""
             )
+            supported = ", ".join(d.name for d in CTYPES)
             raise DispatchError(
-                f"argument {i} has dtype {name}, which palladium cannot "
-                f"lower (supported: {', '.join(CTYPES)}){hint}"
+                f"argument {i} has dtype {dtype.name}, which palladium cannot "
+                f"lower (supported: {supported}){hint}"
             )
 
 

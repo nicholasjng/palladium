@@ -8,13 +8,13 @@ import math
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.emit.core import (
-    CTYPES,
     PID,
     Cursor,
     CVal,
     Environment,
     declare,
     emit_jaxpr,
+    msl_type,
     rule,
     shaped,
 )
@@ -223,7 +223,7 @@ def _ys_stream_target(env: Environment, outvar: Var) -> CVal | None:
     ):
         return None
     aval = shaped(outvar.aval)
-    if ref.size != math.prod(aval.shape) or ref.ctype != CTYPES[str(aval.dtype)]:
+    if ref.size != math.prod(aval.shape) or ref.ctype != msl_type(aval.dtype):
         return None
     return ref
 

@@ -7,7 +7,7 @@ import dataclasses
 from jax.extend.core import Literal, Var
 
 from palladium.emit.addressing import block_offset
-from palladium.emit.core import CTYPES, Cursor, CVal, Environment
+from palladium.emit.core import CTYPES, Cursor, CVal, Environment, msl_type
 from palladium.emit.numeric import ELEMENTWISE, format_scalar, typed_expression
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
@@ -65,9 +65,9 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
 
     lhs_info, rhs_info = spec.inputs[:2]
     output_info = spec.outputs[0]
-    matmul_dtype = lhs_info.dtype.name
-    if matmul_dtype not in ("float32", "float16", "bfloat16") or any(
-        info.dtype.name != matmul_dtype for info in (*spec.inputs, output_info)
+    matmul_dtype = lhs_info.dtype
+    if CTYPES.get(matmul_dtype) not in ("float", "half", "bfloat") or any(
+        info.dtype != matmul_dtype for info in (*spec.inputs, output_info)
     ):
         raise EmitError("TensorOps matmul requires matching float32, float16, or bfloat16 types")
     rank = len(output_info.array_shape)
@@ -163,7 +163,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
 
     cursor = Cursor()
     params = tuple(
-        f"device {CTYPES[info.dtype.name]}* arg{index} [[buffer({index})]]"
+        f"device {msl_type(info.dtype)}* arg{index} [[buffer({index})]]"
         for index, info in enumerate((*spec.inputs, output_info))
     ) + ("uint3 _pid [[threadgroup_position_in_grid]]",)
     has_epilogue = bool(elementwise_eqns)
@@ -177,7 +177,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
         ):
             cooperative_epilogue = False
         available_epilogue_values.update(eqn.outvars)
-    output_ctype = CTYPES[output_info.dtype.name]
+    output_ctype = msl_type(output_info.dtype)
     # Half and bfloat products accumulate in float, then narrow on the
     # per-element store; the cooperative tensor cannot narrow on `store`.
     acc_ctype = "float"
@@ -204,7 +204,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
         ref_values[ref] = CVal(
             pointer,
             info.block_shape,
-            CTYPES[info.dtype.name],
+            msl_type(info.dtype),
             space="device",
             readonly=index < len(spec.inputs),
         )
@@ -270,7 +270,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
         CVal(
             f"(arg0 + {a_offset})",
             (tm, k),
-            CTYPES[lhs_info.dtype.name],
+            msl_type(lhs_info.dtype),
             space="device",
             readonly=True,
         ),
@@ -282,7 +282,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
         CVal(
             f"(arg1 + {b_offset})",
             (k, tn),
-            CTYPES[rhs_info.dtype.name],
+            msl_type(rhs_info.dtype),
             space="device",
             readonly=True,
         ),
@@ -316,7 +316,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
             CVal(
                 f"(arg0 + {a_offset} + k_start * {m if transpose_lhs else 1})",
                 (tm, k_tile),
-                CTYPES[lhs_info.dtype.name],
+                msl_type(lhs_info.dtype),
                 space="device",
                 readonly=True,
             ),
@@ -328,7 +328,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
             CVal(
                 f"(arg1 + {b_offset} + k_start * {1 if transpose_rhs else n})",
                 (k_tile, tn),
-                CTYPES[rhs_info.dtype.name],
+                msl_type(rhs_info.dtype),
                 space="device",
                 readonly=True,
             ),
@@ -350,7 +350,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
                     _scalar_value(atom, scalar_values, values, env, index, (tm, tn))
                     for atom in eqn.invars
                 )
-                result_type = CTYPES[eqn.outvars[0].aval.dtype.name]
+                result_type = msl_type(eqn.outvars[0].aval.dtype)
                 expression = _elementwise_expression(eqn, result_type, operands)
                 result_name = cursor.fresh("tensorops_epilogue")
                 cursor.emit(f"{result_type} {result_name} = {expression};")
@@ -383,7 +383,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
                         _scalar_value(atom, scalar_values, values, env, index, (tm, tn))
                         for atom in eqn.invars
                     )
-                    result_type = CTYPES[eqn.outvars[0].aval.dtype.name]
+                    result_type = msl_type(eqn.outvars[0].aval.dtype)
                     expression = _elementwise_expression(eqn, result_type, operands)
                     result_name = cursor.fresh("tensorops_epilogue")
                     cursor.emit(f"{result_type} {result_name} = {expression};")

@@ -5,7 +5,7 @@ from __future__ import annotations
 from jax.extend.core import JaxprEqn
 
 from palladium.emit.addressing import element_strides, flat_index
-from palladium.emit.core import CTYPES, RULES, Cursor, CVal, Environment, declare, shaped
+from palladium.emit.core import RULES, Cursor, CVal, Environment, declare, msl_type, shaped
 from palladium.emit.numeric import (
     ELEMENTWISE,
     PRIMITIVE_INVARS,
@@ -114,7 +114,7 @@ def _fuses_into_consumer(env: Environment, var, shape: tuple[int, ...], ops: lis
     # only plain table templates and helper calls qualify, since derived
     # templates (sign, rem, integer_pow, min/max with NaN handling) repeat
     # their operands.
-    consumer_ctype = CTYPES[str(shaped(consumer.outvars[0].aval).dtype)]
+    consumer_ctype = msl_type(shaped(consumer.outvars[0].aval).dtype)
     if typed_expression(name, consumer_ctype) is not None:
         return False
     if name in HELPERS or name == "convert_element_type":
@@ -177,7 +177,7 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """
     out_aval = shaped(eqn.outvars[0].aval)
     out_shape = tuple(int(d) for d in out_aval.shape)
-    out_ctype = CTYPES[str(out_aval.dtype)]
+    out_ctype = msl_type(out_aval.dtype)
     ops = [env.val(v) for v in eqn.invars]
     opname = eqn.primitive.name
 
