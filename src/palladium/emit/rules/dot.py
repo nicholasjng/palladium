@@ -7,17 +7,10 @@ from collections.abc import Callable
 
 from jax.extend.core import JaxprEqn
 
-from palladium.emit.core import (
-    Cursor,
-    CVal,
-    EmitError,
-    Environment,
-    _element_strides,
-    _flat_index,
-    declare,
-    rule,
-)
+from palladium.emit.addressing import element_strides, flat_index
+from palladium.emit.core import Cursor, CVal, Environment, declare, rule
 from palladium.emit.numeric import extremum, extremum_identity
+from palladium.errors import EmitError
 
 
 @rule("dot_general")
@@ -182,8 +175,8 @@ def _emit_reduce(
     reduced_dims = [d for d in range(rank) if d in axes]
 
     dst = declare(env, cursor, eqn.outvars[0])
-    src_strides = _element_strides(src.shape)
-    dst_strides = _element_strides(dst.shape)
+    src_strides = element_strides(src.shape)
+    dst_strides = element_strides(dst.shape)
     idx_vars: dict[int, str] = {}
 
     def emit_loops(dims: list[int], body: Callable[[], None]) -> None:
@@ -202,11 +195,11 @@ def _emit_reduce(
         cursor.emit(f"{dst.ctype} {acc} = {init};")
 
         def inner_body() -> None:
-            src_idx = _flat_index([(idx_vars[d], src_strides[d]) for d in range(rank)])
+            src_idx = flat_index([(idx_vars[d], src_strides[d]) for d in range(rank)])
             cursor.emit(f"{acc} = {combine(acc, src.at(src_idx))};")
 
         emit_loops(reduced_dims, inner_body)
-        dst_idx = _flat_index([(idx_vars[d], dst_strides[i]) for i, d in enumerate(kept_dims)])
+        dst_idx = flat_index([(idx_vars[d], dst_strides[i]) for i, d in enumerate(kept_dims)])
         cursor.emit(f"{dst.at(dst_idx)} = {acc};")
 
     emit_loops(kept_dims, accumulate)

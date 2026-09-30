@@ -9,11 +9,11 @@ import numpy as np
 import pytest
 
 import palladium
+from palladium.device import device_limits
 from palladium.errors import (
     EmitError,
     UnsupportedPrimitiveError,
 )
-from palladium.launch import device_limits
 
 
 def _tanh_kernel(x_ref, o_ref):

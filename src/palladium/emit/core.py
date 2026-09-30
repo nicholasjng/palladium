@@ -1,119 +1,24 @@
-"""Core emitter machinery.
+"""The lowering IR for one-thread-per-program kernels.
 
-CVal, Cursor (MSL text position) and Environment (jaxpr Var bindings),
-the rule registries, jaxpr walking, ref views, and MSL assembly.
-Per-primitive lowering rules live in `rules` (one thread per program instance).
+CVal (a lowered value), Cursor (the MSL text being written), Environment
+(jaxpr Var bindings and def-use info), the rule registry, and the jaxpr
+walk. Per-primitive rules live in `rules`; addressing in `addressing`;
+kernel assembly in `kernel`.
 """
 
 from __future__ import annotations
 
 import contextlib
 import dataclasses
-import functools
 import itertools
 import math
-import string
 from collections.abc import Callable, Iterator
-from typing import Literal as TLiteral, cast
+from typing import Literal as TLiteral
 
-import jax.experimental.pallas as pl
-from jax._src.state.indexing import NDIndexer
 from jax.core import Atom, ShapedArray
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.errors import EmitError, UnsupportedPrimitiveError
-from palladium.trace import BlockInfo, KernelSpec
-
-__all__ = ["EmitError"]
-
-DOT_GENERAL_POLICIES = ("auto", "default", "tensorops")
-
-
-MAX_PRIMITIVE_ARITY = 6
-PRIMITIVE_INVARS = string.ascii_lowercase[:MAX_PRIMITIVE_ARITY]
-
-
-@functools.cache
-def _template_fields(template: str) -> frozenset[str]:
-    return frozenset(f for _, f, _, _ in string.Formatter().parse(template) if f)
-
-
-def _unwrapped(expr: str) -> str:
-    if not (expr.startswith("(") and expr.endswith(")")):
-        return expr
-    depth = 0
-    for i, ch in enumerate(expr):
-        depth += ch == "("
-        depth -= ch == ")"
-        if depth == 0 and i < len(expr) - 1:
-            # The leading paren closes early: shapes like (a) * (b).
-            return expr
-    return expr[1:-1]
-
-
-@dataclasses.dataclass(frozen=True)
-class CExpr:
-    """Integer-expression tree for address arithmetic; sums and products
-    stay structured until rendering so zero terms fold without parsing C.
-    """
-
-    op: str
-    value: str | int | None = None
-    args: tuple[CExpr, ...] = ()
-
-    @classmethod
-    def raw(cls, value: str | int) -> CExpr:
-        if isinstance(value, str) and value.lstrip("-").isdigit():
-            value = int(value)
-        return cls("raw", value)
-
-    @classmethod
-    def add(cls, *terms: CExpr) -> CExpr:
-        flattened = tuple(
-            arg for term in terms for arg in (term.args if term.op == "add" else (term,))
-        )
-        kept = tuple(term for term in flattened if not (term.op == "raw" and term.value == 0))
-        return cls("add", args=kept)
-
-    @classmethod
-    def mul(cls, left: CExpr, right: CExpr) -> CExpr:
-        if (left.op == "raw" and left.value == 0) or (right.op == "raw" and right.value == 0):
-            return cls.raw(0)
-        return cls("mul", args=(left, right))
-
-    def render(self) -> str:
-        if self.op == "raw":
-            return str(self.value)
-        if self.op == "mul":
-            return f"{self.args[0].render()} * {self.args[1].render()}"
-        if self.op == "add":
-            return " + ".join(term.render() for term in self.args) or "0"
-        raise AssertionError(self.op)
-
-
-@dataclasses.dataclass(frozen=True)
-class BlockLayout:
-    """Shared logical/physical facts for one Pallas operand block."""
-
-    shape: tuple[int, ...]
-    strides: tuple[int, ...]
-
-    @classmethod
-    def from_info(cls, info: BlockInfo) -> BlockLayout:
-        return cls(_full_block_shape(info), _element_strides(info.array_shape))
-
-    def offset(self, indices: list[str]) -> str:
-        return CExpr.add(
-            *(
-                CExpr.mul(CExpr.raw(index), CExpr.raw(block * stride))
-                for index, block, stride in zip(indices, self.shape, self.strides, strict=True)
-            )
-        ).render()
-
-    def alignment(self) -> int:
-        return math.gcd(
-            0, *(block * stride for block, stride in zip(self.shape, self.strides, strict=True))
-        )
 
 
 def shaped(aval: object) -> ShapedArray:
@@ -143,7 +48,7 @@ CTYPE_BYTES = {
     "bool": 1,
 }
 
-_PID = ("_pid.x", "_pid.y", "_pid.z")
+PID = ("_pid.x", "_pid.y", "_pid.z")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -434,19 +339,7 @@ class Environment:
         """Resolve a jaxpr atom: Vars from bindings, Literals formatted
         in place."""
         if isinstance(atom, Literal):
-            ctype = CTYPES[str(shaped(atom.aval).dtype)]
-            v = atom.val
-            if math.isinf(v):
-                expr = "-INFINITY" if v < 0 else "INFINITY"
-            elif math.isnan(v):
-                expr = "NAN"
-            else:
-                expr = f"{float(v)!r}f" if ctype in ("float", "half", "bfloat") else str(int(v))
-            if ctype == "bfloat":
-                # MSL does not implicitly narrow a float expression to
-                # bfloat. Keep literals typed so arithmetic stays bfloat.
-                expr = f"bfloat({expr})"
-            return CVal(expr=expr, shape=(), ctype=ctype)
+            return literal(atom)
         return self.bindings[atom]
 
     def bind(self, var: Var, cval: CVal) -> CVal:
@@ -469,6 +362,23 @@ class Environment:
         if len(uses) == 1 and uses[0] is not None:
             return uses[0]
         return None
+
+
+def literal(atom: Literal) -> CVal:
+    """A jaxpr Literal as a typed C constant."""
+    ctype = CTYPES[str(shaped(atom.aval).dtype)]
+    v = atom.val
+    if math.isinf(v):
+        expr = "-INFINITY" if v < 0 else "INFINITY"
+    elif math.isnan(v):
+        expr = "NAN"
+    else:
+        expr = f"{float(v)!r}f" if ctype in ("float", "half", "bfloat") else str(int(v))
+    if ctype == "bfloat":
+        # MSL does not implicitly narrow a float expression to
+        # bfloat. Keep literals typed so arithmetic stays bfloat.
+        expr = f"bfloat({expr})"
+    return CVal(expr=expr, shape=(), ctype=ctype)
 
 
 def declare(env: Environment, cursor: Cursor, var: Var) -> CVal:
@@ -498,22 +408,19 @@ def rule(*names: str) -> Callable[[RuleFn], RuleFn]:
     return register
 
 
-def _emit_with_rules(
-    env: Environment,
-    cursor: Cursor,
-    jaxpr: Jaxpr,
-    in_vals: list[CVal],
-    rules: dict[str, RuleFn],
-    missing: Callable[[str], Exception],
-) -> list[CVal]:
-    """Walk a jaxpr, dispatching each equation through `rules`.
+def emit_jaxpr(env: Environment, cursor: Cursor, jaxpr: Jaxpr, in_vals: list[CVal]) -> list[CVal]:
+    """Walk a jaxpr, dispatching each equation to its rule in RULES.
 
-    Binds invars and records consumer and producer maps before emitting.
+    `in_vals` binds `jaxpr.invars` in order; returns the values of
+    `jaxpr.outvars`. Consumer and producer maps are recorded before any
+    rule runs, so rules can look ahead.
 
     Raises
     ------
     EmitError
         If the jaxpr captures arrays as constvars.
+    UnsupportedPrimitiveError
+        If an equation's primitive has no rule.
     """
     if jaxpr.constvars:
         raise EmitError(
@@ -532,411 +439,9 @@ def _emit_with_rules(
         if isinstance(ov, Var):
             env.consumers.setdefault(ov, []).append(None)
     for eqn in jaxpr.eqns:
-        impl = rules.get(eqn.primitive.name)
+        name = eqn.primitive.name
+        impl = RULES.get(name)
         if impl is None:
-            raise missing(eqn.primitive.name)
+            raise UnsupportedPrimitiveError(f"no MSL rule for primitive '{name}'", primitive=name)
         impl(env, cursor, eqn)
     return [env.val(v) for v in jaxpr.outvars]
-
-
-def emit_jaxpr(env: Environment, cursor: Cursor, jaxpr: Jaxpr, in_vals: list[CVal]) -> list[CVal]:
-    """Walk a jaxpr with the one-thread-per-instance rules (RULES).
-
-    `in_vals` binds `jaxpr.invars` in order; returns the values of
-    `jaxpr.outvars`. `env` and `cursor` are updated in place.
-    """
-    return _emit_with_rules(
-        env,
-        cursor,
-        jaxpr,
-        in_vals,
-        RULES,
-        lambda name: UnsupportedPrimitiveError(
-            f"no MSL rule for primitive '{name}'; add one with @rule(...)",
-            primitive=name,
-        ),
-    )
-
-
-def _constant_offset(info: BlockInfo) -> str | None:
-    """Fold index maps with no inputs (gridless or constant) to an offset."""
-    imj = info.index_map_jaxpr.jaxpr
-    if imj.invars or imj.eqns:
-        return None
-    strides = _element_strides(info.array_shape)
-    full_block = _full_block_shape(info)
-    off = 0
-    for o, b, s in zip(imj.outvars, full_block, strides, strict=True):
-        # No invars and no eqns leaves only inline constants as outputs.
-        assert isinstance(o, Literal), o
-        off += int(o.val) * b * s
-    return str(off)
-
-
-def _element_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
-    return tuple(math.prod(shape[d + 1 :]) for d in range(len(shape)))
-
-
-def _flat_index(terms: list[tuple[str, int]]) -> str:
-    """C expression for `sum(var * stride for var, stride in terms)`,
-    omitting the `* 1` for a unit stride and any zero-stride term."""
-    return CExpr.add(
-        *(
-            CExpr.raw(var) if stride == 1 else CExpr.mul(CExpr.raw(var), CExpr.raw(stride))
-            for var, stride in terms
-            if stride != 0
-        )
-    ).render()
-
-
-def _full_block_shape(info: BlockInfo) -> tuple[int, ...]:
-    """block_shape with squeezed dims restored as 1, rank-matched to array."""
-    return tuple(1 if dim is None else dim for dim in info.full_block_shape)
-
-
-def emit_msl_stats(
-    spec: KernelSpec,
-    kernel_name: str | None = None,
-    *,
-    dot_general: str = "auto",
-) -> tuple[str, EmitStats]:
-    """Assemble the full MSL source for a KernelSpec, with its storage stats.
-
-    Signature convention (relied on by `dispatch.bind`): operands in
-    jaxpr order (inputs then outputs) bound to `[[buffer(k)]]`, then
-    `uint3 _pid [[thread_position_in_grid]]`, one thread per program
-    instance.
-
-    Parameters
-    ----------
-    spec : KernelSpec
-        Traced kernel, from `palladium.trace`.
-    kernel_name : str, optional
-        Overrides `spec.name` as the MSL function name.
-    dot_general : str
-        "auto" tries the cooperative TensorOps lowering and falls back
-        to this emitter; "tensorops" requires it; "default" skips it.
-
-    Returns
-    -------
-    tuple of (str, EmitStats)
-        Complete, self-contained MSL source, and the per-instance
-        storage the kernel declares.
-
-    Raises
-    ------
-    EmitError
-        For grids over rank 3 or unsupported addressing forms.
-    UnsupportedPrimitiveError
-        If the kernel stages a primitive with no registered rule.
-    """
-    if dot_general not in DOT_GENERAL_POLICIES:
-        raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
-    if dot_general != "default":
-        from palladium.emit.tensorops import uses_tensorops
-
-        if uses_tensorops(spec, dot_general):
-            from palladium.emit.tensorops import compile_kernel
-
-            try:
-                source, threadgroup_bytes = compile_kernel(spec, kernel_name)
-            except EmitError:
-                # "auto" only takes dots the cooperative lowering recognizes;
-                # anything else keeps the one-thread-per-program emitter.
-                if dot_general != "auto":
-                    raise
-            else:
-                return source, EmitStats(thread_bytes=0, threadgroup_bytes=threadgroup_bytes)
-
-    name = kernel_name or spec.name
-    if len(spec.grid) > 3:
-        raise EmitError(f"grid {spec.grid} has rank > 3; Metal grids are 3D")
-
-    operands = list(spec.inputs) + list(spec.outputs)
-    n_in = len(spec.inputs)
-    params = []
-    for k, info in enumerate(operands):
-        qual = "device" if k >= n_in else "const device"
-        ctype = CTYPES[info.dtype.name]
-        params.append(f"{qual} {ctype}* arg{k} [[buffer({k})]]")
-    params.append("uint3 _pid [[thread_position_in_grid]]")
-
-    env = Environment(
-        no_stream_refs=frozenset(
-            spec.jaxpr.invars[k] for i, j in spec.aliases for k in (i, n_in + j)
-        )
-    )
-    cursor = Cursor()
-    ref_vals: list[CVal] = []
-    # Aliased inputs share their buffer with an output; dropping readonly
-    # forces gets to copy instead of binding a view that would observe
-    # the in-place write.
-    aliased_inputs = {i for i, _ in spec.aliases}
-    for k, info in enumerate(operands):
-        qual = "device" if k >= n_in else "const device"
-        ctype = CTYPES[info.dtype.name]
-        layout = BlockLayout.from_info(info)
-        full = layout.shape
-        strided = any(b != a for b, a in zip(full[1:], info.array_shape[1:]))
-        edge = any(a % b for a, b in zip(info.array_shape, full))
-        if strided or edge:
-            dims = info.full_block_shape
-            pids = [
-                CVal(f"(int){_PID[d]}", (), "int")
-                for d in range(len(info.index_map_jaxpr.jaxpr.invars))
-            ]
-            origins = emit_jaxpr(env, cursor, info.index_map_jaxpr.jaxpr, pids)
-            logical_strides = iter(_element_strides(info.block_shape))
-            coords = []
-            for dim, size, origin in zip(dims, full, origins, strict=True):
-                local = "0" if dim is None else f"(($i / {next(logical_strides)}) % {size})"
-                coords.append(f"(int({origin.expr}) * {size} + int({local}))")
-            address = _flat_index(list(zip(coords, _element_strides(info.array_shape))))
-            valid = " && ".join(
-                f"({c} >= 0 && {c} < {a})" for c, a in zip(coords, info.array_shape)
-            )
-            ref_vals.append(
-                CVal(
-                    f"arg{k}",
-                    info.block_shape or (1,),
-                    ctype,
-                    space="device",
-                    readonly=k < n_in and k not in aliased_inputs,
-                    index_map=address,
-                    valid=valid,
-                )
-            )
-            continue
-        constant_offset = _constant_offset(info)
-        offset = constant_offset
-        if offset is None:
-            offset = _block_offset(env, cursor, spec, info)
-        if offset == "0":
-            ptr = f"arg{k}"
-        else:
-            ptr = f"arg{k}_offset"
-            cursor.emit(f"{qual} {ctype}* {ptr} = arg{k} + {offset};")
-
-        # Scalar refs (shape ()) are addressed as one-element arrays.
-        ref_vals.append(
-            CVal(
-                expr=ptr,
-                shape=info.block_shape or (1,),
-                ctype=ctype,
-                space="device",
-                readonly=k < n_in and k not in aliased_inputs,
-                align=layout.alignment() if constant_offset is None else int(constant_offset),
-            )
-        )
-
-    for k, info in enumerate(spec.scratch):
-        ctype = CTYPES[info.dtype.name]
-        shape = info.shape
-        size = math.prod(info.shape)
-        cursor.account(ctype, size, "thread")
-        scratch_op = f"{ctype} scratch{k}"
-        scratch_op += f"[{size}];" if shape else ";"
-        cursor.emit(scratch_op)
-        ref_vals.append(
-            CVal(
-                expr=f"scratch{k}",
-                shape=shape,
-                ctype=ctype,
-                readonly=False,
-                align=0,
-            )
-        )
-
-    n_refs = len(operands) + len(spec.scratch)
-    if len(spec.jaxpr.invars) != n_refs:
-        raise EmitError(
-            f"kernel has {len(spec.jaxpr.invars)} refs but spec carries {n_refs} operands"
-        )
-    emit_jaxpr(env, cursor, spec.jaxpr, ref_vals)
-
-    head = f"kernel void {name}(\n    " + ",\n    ".join(params) + ")\n{"
-    source = "\n".join(
-        [
-            "#include <metal_stdlib>",
-            "using namespace metal;",
-            "",
-            *cursor.helpers.values(),
-            head,
-            *cursor.lines,
-            "}",
-            "",
-        ]
-    )
-    return source, EmitStats(
-        thread_bytes=cursor.thread_bytes,
-        threadgroup_bytes=cursor.threadgroup_bytes,
-    )
-
-
-def emit_msl(
-    spec: KernelSpec,
-    kernel_name: str | None = None,
-    *,
-    dot_general: str = "auto",
-) -> str:
-    """Assemble the full MSL source for a KernelSpec; see `emit_msl_stats`."""
-    return emit_msl_stats(spec, kernel_name, dot_general=dot_general)[0]
-
-
-def ref_view(env: Environment, ref: CVal, indexer: NDIndexer) -> CVal:
-    """Compose logical Ref indexing with its underlying storage addressing.
-
-    Slices keep dimensions and scalar indices squeeze them. Contiguous views
-    retain pointer offsets; strided/guarded views map flattened logical indices
-    to the original allocation, keeping its bounds predicate intact. Positive
-    static slice strides are supported; arbitrary gathers are not.
-    """
-    strides = _element_strides(indexer.shape)
-    terms: list[CExpr] = []
-    kept: list[tuple[int, int]] = []
-    steps: dict[int, int] = {}
-    align = ref.align
-    for d, (idx, stride) in enumerate(zip(indexer.indices, strides, strict=True)):
-        if isinstance(idx, pl.Slice):
-            if idx.stride < 1:
-                raise EmitError(f"ref access dim {d}: stride must be positive")
-            steps[d] = idx.stride
-            # pl.Slice.size is always static, and a dynamic start
-            # is always a jaxpr atom (Var/Literal), never a live Array.
-            kept.append((d, cast(int, idx.size)))
-            start = idx.start
-            expr = str(start) if isinstance(start, int) else env.val(cast(Atom, start)).expr
-        else:
-            # A non-Slice index here is always a jaxpr atom.
-            expr = env.val(cast(Atom, idx)).expr
-        if expr != "0":
-            terms.append(CExpr.mul(CExpr.raw(expr), CExpr.raw(stride)))
-            # A dynamic index contributes its stride as the provable
-            # multiple; a literal index contributes its exact offset.
-            lit = expr.lstrip("-").isdigit()
-            align = math.gcd(align, int(expr) * stride if lit else stride)
-
-    # Squeezed trailing dimensions can make even full slices strided:
-    # x[:, 1] is a column, not a contiguous span starting at x[0, 1].
-    kept_strides = _element_strides(tuple(size for _, size in kept))
-    noncontiguous = any(
-        size > 1 and strides[d] * steps[d] != expected
-        for (d, size), expected in zip(kept, kept_strides, strict=True)
-    )
-
-    offset = CExpr.add(*terms).render()
-    if noncontiguous or ref.index_map is not None:
-        coordinates = [f"(($i / {s}) % {size})" for (_, size), s in zip(kept, kept_strides)]
-        flat = f"({offset}) + " + _flat_index(
-            [(c, strides[d] * steps[d]) for c, (d, _) in zip(coordinates, kept)]
-        )
-        address = flat if ref.index_map is None else ref.index_map.replace("$i", f"({flat})")
-        valid = None if ref.valid is None else ref.valid.replace("$i", f"({flat})")
-        return dataclasses.replace(
-            ref, shape=tuple(size for _, size in kept), index_map=address, valid=valid, align=1
-        )
-    if not kept:
-        return CVal(
-            expr=f"{ref.expr}[{offset}]",
-            shape=(),
-            ctype=ref.ctype,
-            space=ref.space,
-            readonly=ref.readonly,
-        )
-    expr = f"({ref.expr} + {offset})" if offset != "0" else ref.expr
-    return CVal(
-        expr=expr,
-        shape=tuple(size for _, size in kept),
-        ctype=ref.ctype,
-        space=ref.space,
-        readonly=ref.readonly,
-        align=align,
-    )
-
-
-def _transpose_is_dot_rhs_only(env: Environment, eqn: JaxprEqn) -> bool:
-    """Whether this rank-2 `(1, 0)` transpose is consumed only as a
-    dot_general rhs and never escapes, so it may lower to a lazy
-    `transposed` CVal."""
-    if tuple(eqn.params["permutation"]) != (1, 0):
-        return False
-    outvar = eqn.outvars[0]
-    uses = env.consumer_eqns(outvar)
-    return (
-        bool(uses)
-        and not env.escapes(outvar)
-        and all(
-            use.primitive.name == "dot_general"
-            and use.invars[1] is outvar
-            and use.invars[0] is not outvar
-            for use in uses
-        )
-    )
-
-
-ELEMENTWISE: dict[str, str] = {
-    # binary
-    "add": "({a} + {b})",
-    # AD cotangent accumulation; supported numeric arrays use ordinary addition.
-    "add_any": "({a} + {b})",
-    "sub": "({a} - {b})",
-    "mul": "({a} * {b})",
-    "div": "({a} / {b})",
-    "pow": "pow({a}, {b})",
-    # unary
-    "neg": "-{a}",
-    "abs": "fabs({a})",
-    "exp": "exp({a})",
-    "log": "log({a})",
-    "sin": "sin({a})",
-    "cos": "cos({a})",
-    "sqrt": "sqrt({a})",
-    "rsqrt": "rsqrt({a})",
-    "tanh": "tanh({a})",
-    "exp2": "exp2({a})",
-    "tan": "tan({a})",
-    "asin": "asin({a})",
-    "acos": "acos({a})",
-    "atan": "atan({a})",
-    "sinh": "sinh({a})",
-    "cosh": "cosh({a})",
-    "asinh": "asinh({a})",
-    "acosh": "acosh({a})",
-    "atanh": "atanh({a})",
-    "atan2": "atan2({a}, {b})",
-    "floor": "floor({a})",
-    "ceil": "ceil({a})",
-    "square": "({a} * {a})",
-    "logistic": "(1.0f / (1.0f + exp(-{a})))",
-    "is_finite": "isfinite({a})",
-    # ternary
-    "select_n": "({a} ? {c} : {b})",  # a: predicate (bool), c when true, b when false
-    "clamp": "clamp({b}, {a}, {c})",  # jaxpr order (min, x, max) -> metal (x, min, max)
-    # logical
-    "lt": "({a} < {b})",
-    "le": "({a} <= {b})",
-    "gt": "({b} < {a})",
-    "ge": "({b} <= {a})",
-    "eq": "({a} == {b})",
-    "ne": "({a} != {b})",
-    # bitwise, integer/bool operands.
-    "and": "({a} & {b})",
-    "or": "({a} | {b})",
-    "xor": "({a} ^ {b})",
-}
-
-
-def _block_offset(env: Environment, cursor: Cursor, spec: KernelSpec, info: BlockInfo) -> str:
-    """Element offset of this program instance's block, as a C expression.
-
-    The index map is a jaxpr over grid indices (bound to _pid components),
-    recursed through emit_jaxpr. Map outputs are block indices per array
-    dim, converted to elements as
-
-        offset = sum(idx[d] * full_block[d] * stride[d] for d in dims)
-
-    Zero-literal terms are elided; falls back to "0" for an all-zero map.
-    """
-    pid_vals = [CVal(f"(int){_PID[k]}", (), "int") for k in range(len(spec.grid))]
-    out_vals = emit_jaxpr(env, cursor, info.index_map_jaxpr.jaxpr, pid_vals)
-    return BlockLayout.from_info(info).offset([val.expr for val in out_vals])

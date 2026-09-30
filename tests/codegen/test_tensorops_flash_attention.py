@@ -11,7 +11,7 @@ from jax.extend.core import Jaxpr
 
 import palladium
 from palladium.diagnostics import explain_spec
-from palladium.emit import EmitError
+from palladium.errors import EmitError
 
 
 def _spec(*, causal: bool = False, tile_q: int = 16, tile_k: int = 16, head_dim: int = 64):

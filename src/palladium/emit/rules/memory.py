@@ -7,16 +7,9 @@ import math
 
 from jax.extend.core import Jaxpr, JaxprEqn
 
-from palladium.emit.core import (
-    Cursor,
-    EmitError,
-    Environment,
-    declare,
-    emit_jaxpr,
-    ref_view,
-    rule,
-    shaped,
-)
+from palladium.emit.addressing import ref_view
+from palladium.emit.core import Cursor, Environment, declare, emit_jaxpr, rule, shaped
+from palladium.errors import EmitError
 
 
 @rule("get")

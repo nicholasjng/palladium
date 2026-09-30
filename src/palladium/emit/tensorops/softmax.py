@@ -7,8 +7,8 @@ import string
 
 from jax.extend.core import JaxprEqn, Literal, Var
 
-from palladium.emit.core import ELEMENTWISE, Cursor, CVal, Environment, shaped
-from palladium.emit.numeric import typed_expression
+from palladium.emit.core import Cursor, CVal, Environment, shaped
+from palladium.emit.numeric import ELEMENTWISE, typed_expression
 from palladium.errors import EmitError
 
 

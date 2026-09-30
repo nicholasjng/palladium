@@ -8,20 +8,11 @@ import math
 
 from jax.extend.core import JaxprEqn
 
-from palladium.emit.core import (
-    Cursor,
-    CVal,
-    EmitError,
-    Environment,
-    _element_strides,
-    _flat_index,
-    _transpose_is_dot_rhs_only,
-    _unwrapped,
-    declare,
-    rule,
-    shaped,
-)
+from palladium.emit.addressing import element_strides, flat_index
+from palladium.emit.core import Cursor, CVal, Environment, declare, rule, shaped
+from palladium.emit.numeric import unwrapped
 from palladium.emit.rules.elementwise import _rule_elementwise
+from palladium.errors import EmitError
 
 
 @rule("reshape")
@@ -98,12 +89,12 @@ def _emit_permuted_copy(cursor: Cursor, src: CVal, dst: CVal, perm: tuple[int, .
     the iteration domain, which is the source shape after permutation.
     """
     perm_shape = tuple(src.shape[d] for d in perm)
-    src_strides = _element_strides(src.shape)
-    dst_strides = _element_strides(perm_shape)
+    src_strides = element_strides(src.shape)
+    dst_strides = element_strides(perm_shape)
     rank = len(src.shape)
     with cursor.loop_nest(tuple(perm_shape), "_t") as idx_vars:
-        src_idx = _flat_index([(idx_vars[dd], src_strides[perm[dd]]) for dd in range(rank)])
-        dst_idx = _flat_index([(idx_vars[dd], dst_strides[dd]) for dd in range(rank)])
+        src_idx = flat_index([(idx_vars[dd], src_strides[perm[dd]]) for dd in range(rank)])
+        dst_idx = flat_index([(idx_vars[dd], dst_strides[dd]) for dd in range(rank)])
         cursor.emit(f"{dst.at(dst_idx)} = {src.at(src_idx)};")
 
 
@@ -140,9 +131,9 @@ def _rule_select_n(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 
     if dst.shape:
         with cursor.loop(dst.size) as index:
-            cursor.emit(f"{dst.at(index)} = {_unwrapped(select(index, 0, len(cases)))};")
+            cursor.emit(f"{dst.at(index)} = {unwrapped(select(index, 0, len(cases)))};")
     else:
-        cursor.emit(f"{dst.expr} = {_unwrapped(select('0', 0, len(cases)))};")
+        cursor.emit(f"{dst.expr} = {unwrapped(select('0', 0, len(cases)))};")
 
 
 @rule("broadcast_in_dim")
@@ -160,15 +151,35 @@ def _rule_broadcast_in_dim(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> N
         return
     dst = declare(env, cursor, eqn.outvars[0])
     bcast_dims: tuple[int, ...] = eqn.params["broadcast_dimensions"]
-    src_strides = _element_strides(src.shape)
-    dst_strides = _element_strides(dst.shape)
+    src_strides = element_strides(src.shape)
+    dst_strides = element_strides(dst.shape)
     with cursor.loop_nest(dst.shape, "_b") as idx_vars:
-        src_idx = _flat_index(
+        src_idx = flat_index(
             [
                 (idx_vars[od], src_strides[sd])
                 for sd, od in enumerate(bcast_dims)
                 if src.shape[sd] != 1
             ]
         )
-        dst_idx = _flat_index(list(zip(idx_vars, dst_strides)))
+        dst_idx = flat_index(list(zip(idx_vars, dst_strides)))
         cursor.emit(f"{dst.at(dst_idx)} = {src.at(src_idx)};")
+
+
+def _transpose_is_dot_rhs_only(env: Environment, eqn: JaxprEqn) -> bool:
+    """Whether this rank-2 `(1, 0)` transpose is consumed only as a
+    dot_general rhs and never escapes, so it may lower to a lazy
+    `transposed` CVal."""
+    if tuple(eqn.params["permutation"]) != (1, 0):
+        return False
+    outvar = eqn.outvars[0]
+    uses = env.consumer_eqns(outvar)
+    return (
+        bool(uses)
+        and not env.escapes(outvar)
+        and all(
+            use.primitive.name == "dot_general"
+            and use.invars[1] is outvar
+            and use.invars[0] is not outvar
+            for use in uses
+        )
+    )

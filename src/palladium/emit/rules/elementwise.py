@@ -4,23 +4,16 @@ from __future__ import annotations
 
 from jax.extend.core import JaxprEqn
 
-from palladium.emit.core import (
-    CTYPES,
+from palladium.emit.addressing import element_strides, flat_index
+from palladium.emit.core import CTYPES, RULES, Cursor, CVal, Environment, declare, shaped
+from palladium.emit.numeric import (
     ELEMENTWISE,
     PRIMITIVE_INVARS,
-    RULES,
-    Cursor,
-    CVal,
-    EmitError,
-    Environment,
-    _element_strides,
-    _flat_index,
-    _template_fields,
-    _unwrapped,
-    declare,
-    shaped,
+    template_fields,
+    typed_expression,
+    unwrapped,
 )
-from palladium.emit.numeric import typed_expression
+from palladium.errors import EmitError
 
 # MSL has no erf, erfinv, expm1, or log1p; these are float32 helpers emitted
 # once per kernel on first use. erf: Abramowitz and Stegun 7.1.26 (abs error
@@ -199,7 +192,7 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         cursor.copy(dst, CVal("1", (), dst.ctype), dst.size)
         return
     template = _template(cursor, eqn, opname, ops, out_ctype)
-    fields = _template_fields(template)
+    fields = template_fields(template)
     expected = set(PRIMITIVE_INVARS[: len(ops)])
     if fields != expected:
         raise EmitError(f"{opname} requires {len(fields)} operands, got {len(ops)}")
@@ -218,14 +211,14 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 
     dst = declare(env, cursor, eqn.outvars[0])
     rank = len(dst.shape)
-    dst_strides = _element_strides(dst.shape)
+    dst_strides = element_strides(dst.shape)
 
     def op_index(op: CVal, idx_vars: list[str]) -> str:
         # numpy right-alignment: an operand's dim d lines up with dst's
         # dim d + (rank - len(op.shape)); size-1 dims always read index 0.
         rank_diff = rank - len(op.shape)
-        op_strides = _element_strides(op.shape)
-        return _flat_index(
+        op_strides = element_strides(op.shape)
+        return flat_index(
             [
                 (idx_vars[d + rank_diff], op_strides[d])
                 for d, size in enumerate(op.shape)
@@ -234,9 +227,9 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         )
 
     def assign(idx_vars: list[str]) -> str:
-        dst_idx = _flat_index(list(zip(idx_vars, dst_strides)))
+        dst_idx = flat_index(list(zip(idx_vars, dst_strides)))
         inputs = {name: op.at(op_index(op, idx_vars)) for name, op in zip(PRIMITIVE_INVARS, ops)}
-        return f"{dst.at(dst_idx)} = {_unwrapped(template.format(**inputs))};"
+        return f"{dst.at(dst_idx)} = {unwrapped(template.format(**inputs))};"
 
     with cursor.loop_nest(dst.shape) as idx_vars:
         cursor.emit(assign(idx_vars))

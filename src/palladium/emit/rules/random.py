@@ -4,14 +4,8 @@ from __future__ import annotations
 
 from jax.extend.core import JaxprEqn
 
-from palladium.emit.core import (
-    Cursor,
-    CVal,
-    EmitError,
-    Environment,
-    declare,
-    rule,
-)
+from palladium.emit.core import Cursor, CVal, Environment, declare, rule
+from palladium.errors import EmitError
 
 # Threefry-2x32-20, the algorithm `jax._src.random.threefry2x32` runs by default.
 _THREEFRY_ROT0 = (13, 15, 26, 6)

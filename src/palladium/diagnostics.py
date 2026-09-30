@@ -10,9 +10,10 @@ import dataclasses
 import os
 import sys
 
+from palladium.device import device_limits
 from palladium.emit import emit_msl_stats
 from palladium.emit.tensorops import emits_cooperative
-from palladium.launch import check_threadgroup, device_limits, launch_geometry
+from palladium.launch import check_threadgroup, launch_geometry
 from palladium.trace import KernelSpec
 
 __all__ = ["KernelDiagnostics", "explain_spec", "log_compile"]
