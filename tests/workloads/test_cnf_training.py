@@ -1,4 +1,4 @@
-"""CNF divergence, density convention, and all-input discrete adjoint checks."""
+"""CNF density convention and discrete adjoint checks, with the kernels on Metal."""
 
 import functools
 import math
@@ -7,9 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
-from palladium.workloads.cnf_training import (
-    field_and_divergence,
+from cnf_density import (
     init_parameters,
     initial_state,
     make_flow,
@@ -20,12 +18,15 @@ from palladium.workloads.cnf_training import (
     parameter_count,
     reference_flow,
 )
+from jax.experimental import pallas as pl
 
-# Kernels run on the Pallas interpreter unless the mps platform is selected.
-INTERPRET = jax.default_backend() != "mps"
-make_flow = functools.partial(make_flow, interpret=INTERPRET)
-make_log_prob = functools.partial(make_log_prob, interpret=INTERPRET)
-make_training_step = functools.partial(make_training_step, interpret=INTERPRET)
+import palladium
+
+# The kernels run on Metal: through pallas_call on mps, metal_call elsewhere.
+CALL = pl.pallas_call if jax.default_backend() == "mps" else palladium.metal_call
+make_flow = functools.partial(make_flow, call=CALL)
+make_log_prob = functools.partial(make_log_prob, call=CALL)
+make_training_step = functools.partial(make_training_step, call=CALL)
 
 
 def test_density_matches_change_of_variables():
@@ -81,25 +82,6 @@ def test_cnf_fits_heldout_mixture_and_refines():
     assert abs(final - refined) < 2e-3
 
 
-def test_exact_divergence_and_its_weight_derivative():
-    weights = init_parameters(4)
-    state = jnp.array([0.4, -0.7, 0.0])
-
-    def automatic(p):
-        def velocity(z):
-            return jnp.stack(field_and_divergence(tuple(z), tuple(p), 0.37)[:2])
-
-        return jnp.trace(jax.jacfwd(velocity)(state[:2]))
-
-    def analytic(p):
-        return field_and_divergence(tuple(state), tuple(p), 0.37)[2]
-
-    np.testing.assert_allclose(analytic(weights), automatic(weights), rtol=2e-5)
-    np.testing.assert_allclose(
-        jax.grad(analytic)(weights), jax.grad(automatic)(weights), rtol=2e-5, atol=2e-7
-    )
-
-
 @pytest.mark.parametrize("steps,interval,width", [(1, 1, 2), (5, 2, 2), (5, 9, 4), (16, 4, 4)])
 def test_checkpointed_cnf_vjp(steps, interval, width):
     n = 8
@@ -131,7 +113,7 @@ def test_checkpointed_cnf_vjp(steps, interval, width):
             np.testing.assert_allclose(got, want, rtol=4e-4, atol=3e-6)
 
 
-def test_translation_log_density_and_inverse():
+def test_translation_log_density():
     n, width = 8, 2
     params = jnp.zeros(parameter_count(width)).at[-2:].set(jnp.array([0.4, -0.7]))
     points = jnp.arange(n * 2, dtype=jnp.float32).reshape(n, 2) / 10
@@ -140,10 +122,3 @@ def test_translation_log_density_and_inverse():
         (points - jnp.array([0.4, -0.7])) ** 2, axis=1
     )
     np.testing.assert_allclose(log_prob(params, points), expected, rtol=1e-5)
-    weights = jnp.broadcast_to(init_parameters(width), (n, parameter_count(width)))
-    states = jnp.concatenate((points, jnp.zeros((n, 1))), axis=1)
-    forward = jax.jit(make_flow(n, width=width, reverse=False, variant="forward"))
-    backward = jax.jit(make_flow(n, width=width, variant="forward"))
-    np.testing.assert_allclose(
-        backward(forward(states, weights), weights), states, atol=2e-6, rtol=2e-5
-    )

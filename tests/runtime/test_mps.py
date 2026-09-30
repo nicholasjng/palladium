@@ -87,7 +87,7 @@ def test_descriptor_splits_an_independent_kernel_into_header_prologue_body():
 def test_descriptor_binds_buffers_by_index_not_by_emitted_name():
     """The attention lowering names its buffers query/key/value/output; the
     handler only knows arg<N>_base."""
-    from palladium.workloads.pallas_flash_attention import attention_kernel, attention_specs
+    from flash_attention import attention_kernel, attention_specs
 
     grid, in_specs, out_specs = attention_specs(1, 128, 2, 16, 16)
     call = pl.pallas_call(
