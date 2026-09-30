@@ -1,7 +1,6 @@
 """Exception hierarchy: everything palladium raises derives from
 PalladiumError, split by stage (trace, emit, dispatch). TraceError also
-subclasses ValueError, DispatchError TypeError. `UnsupportedPrimitiveError.primitive`
-carries the deciding value.
+subclasses ValueError, DispatchError TypeError.
 """
 
 from __future__ import annotations
@@ -47,5 +46,4 @@ class UnsupportedPrimitiveError(EmitError, NotImplementedError):
 
 
 class DispatchError(PalladiumError, TypeError):
-    """A compiled kernel was called with arguments that do not match its
-    traced spec (wrong count, shape, or dtype)."""
+    """A `metal_call` argument has a dtype palladium cannot lower."""

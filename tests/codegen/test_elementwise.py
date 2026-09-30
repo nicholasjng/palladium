@@ -82,8 +82,6 @@ def test_row_vector_broadcasts_against_matrix_matches_numpy(rng):
 
 
 def test_column_vector_broadcasts_against_matrix_matches_numpy(rng):
-    """Broadcasting along the other axis: (4, 1) against (4, 32)."""
-
     def kernel(x_ref, col_ref, o_ref):
         o_ref[...] = x_ref[...] + col_ref[...]
 

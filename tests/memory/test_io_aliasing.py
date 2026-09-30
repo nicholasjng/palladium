@@ -1,5 +1,5 @@
 """input_output_aliases: in-place kernels, one buffer behind the aliased
-input/output pair, on the eager and the jax.ffi paths."""
+input/output pair."""
 
 import jax
 import jax.experimental.pallas as pl
@@ -24,10 +24,11 @@ def test_aliased_call_matches_interpret(rng):
         input_output_aliases={0: 0},
     )
     x = rng.standard_normal(64).astype(np.float32)
+    before = x.copy()
     got = f(x)
-    np.testing.assert_allclose(got, np.asarray(f.interpret(x)), rtol=1e-6)
+    np.testing.assert_allclose(got, np.asarray(f.interpret(before)), rtol=1e-6)
     # The caller's array is copied at upload, so it must stay untouched.
-    np.testing.assert_array_equal(x, x.copy())
+    np.testing.assert_array_equal(x, before)
 
 
 def test_aliased_kernel_grid_and_second_input(rng):

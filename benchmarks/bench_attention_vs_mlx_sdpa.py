@@ -8,7 +8,8 @@ Pallas backend for mps, MLX's fused SDPA, and a plain ``jnp`` softmax
 attention as the XLA-fusion-only baseline. Every candidate is checked
 against the NumPy reference before timing.
 
-Run on a Metal 4 machine with the jax-mps ``palladium-dispatch`` handler:
+Run on a Metal 4 machine with jax-mps built from its ``palladium-dispatch``
+branch, which carries the ``palladium.dispatch`` handler:
 
     JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving \\
         benchmarks/bench_attention_vs_mlx_sdpa.py

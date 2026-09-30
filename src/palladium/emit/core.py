@@ -183,8 +183,6 @@ class Cursor:
         self.lines: list[str] = []
         self.indent = 1
         self._names = itertools.count()
-        # Declared bytes per space; not liveness-aware, matching Metal's
-        # own function-scoped pipeline check.
         self.thread_bytes = 0
         self.threadgroup_bytes = 0
         # MSL functions the body calls, by name, emitted once above the
@@ -375,8 +373,7 @@ def literal(atom: Literal) -> CVal:
     else:
         expr = f"{float(v)!r}f" if ctype in ("float", "half", "bfloat") else str(int(v))
     if ctype == "bfloat":
-        # MSL does not implicitly narrow a float expression to
-        # bfloat. Keep literals typed so arithmetic stays bfloat.
+        # MSL does not implicitly narrow float to bfloat.
         expr = f"bfloat({expr})"
     return CVal(expr=expr, shape=(), ctype=ctype)
 

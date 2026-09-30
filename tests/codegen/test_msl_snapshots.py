@@ -1,4 +1,4 @@
-"""Golden-MSL snapshots: pin the emitted text, not just its behavior.
+"""Golden-MSL snapshots: pin the emitted text, not only its behavior.
 
 Cursor's name counter is deterministic, so snapshots are stable across runs.
 Regenerate after an intended emitter change:

@@ -1,6 +1,6 @@
 """Kernel diagnostics: launch geometry and MSL size for a traced kernel.
 
-`explain` on a palladium call returns a KernelDiagnostics; setting
+`FfiCallable.explain` returns a KernelDiagnostics; setting
 PALLADIUM_EXPLAIN=1 prints one stderr line per newly compiled kernel.
 """
 

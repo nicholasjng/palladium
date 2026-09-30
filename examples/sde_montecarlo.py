@@ -1,19 +1,15 @@
 """SDE Monte Carlo on the GPU.
 
-Docs: in-kernel RNG, docs/supported-jax.md (JAX operations).
 Prices a European call under geometric Brownian motion: N paths x M
 Euler-Maruyama steps, one Metal thread per path, RNG generated in-kernel,
 validated against the Black-Scholes closed form.
 
 Two versions. `GBM_MSL` is hand-written MSL with a pcg_hash RNG: the
 performance bar. `pallas_gbm_kernel` is the same model authored in
-Pallas, using `jax.random` inside the kernel (Threefry-2x32-20,
-`tests/codegen/test_random.py`): `random_fold_in` derives an
-independent key per (path, step) pair, the same shape `pcg_hash`'s
-counter does. Threefry is ~20 rounds of add-rotate-xor per draw versus
-pcg_hash's one, so the Pallas version costs more per step. The output
-lists price, standard error, wall clock and sigma distance from
-Black-Scholes for each version, then the Threefry / pcg_hash slowdown.
+Pallas, using `jax.random` inside the kernel (Threefry-2x32-20):
+`random_fold_in` derives an independent key per (path, step) pair, as
+`pcg_hash`'s counter does. Threefry is ~20 rounds of add-rotate-xor per
+draw versus pcg_hash's one, so the Pallas version costs more per step.
 """
 
 import time

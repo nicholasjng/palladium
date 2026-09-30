@@ -62,8 +62,7 @@ _registered = False
 
 
 def _register() -> None:
-    """Load the native handler and register it, once per process. Locked
-    so concurrent first calls do not both run the registration body."""
+    """Load the native handler and register it, once per process."""
     global _registered
     if _registered:
         return
@@ -278,6 +277,13 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> FfiCallable:
         out_specs, ...). Metal-side options travel as
         `compiler_params=palladium.CompilerParams(...)`, as on mps.
 
+    Returns
+    -------
+    FfiCallable
+        Composable with `jax.jit` and `jax.vmap` (one FFI call per batch);
+        NumPy inputs are accepted and outputs are JAX arrays. `.interpret`
+        is the CPU oracle.
+
     Notes
     -----
     FAST math reorders float arithmetic and approximates transcendentals,
@@ -285,12 +291,5 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> FfiCallable:
     for f32 elementwise work, up to ~1e-4 through exp/log-heavy kernels and
     reductions. Use SAFE for IEEE ordering, and always for compensated
     arithmetic (FAST deletes the error terms).
-
-    Returns
-    -------
-    FfiCallable
-        Composable with `jax.jit` and `jax.vmap` (one FFI call per batch);
-        NumPy inputs are accepted and outputs are JAX arrays. `.interpret`
-        is the CPU oracle.
     """
     return FfiCallable(kernel, pallas_kwargs)

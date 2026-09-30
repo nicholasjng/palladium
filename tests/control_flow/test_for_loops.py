@@ -30,8 +30,6 @@ def test_euler_logistic(rng):
 
 
 def test_tuple_carry(rng):
-    """fori_loop with a tuple carry -> scan with two carried values."""
-
     def kernel(x_ref, o1_ref, o2_ref):
         def step(_, carry):
             a, b = carry
@@ -56,8 +54,6 @@ def test_tuple_carry(rng):
 
 
 def test_nested_loops(rng):
-    """Nested fori_loops lower correctly."""
-
     def kernel(y_ref, o_ref):
         def outer(_, y):
             def inner(_, z):

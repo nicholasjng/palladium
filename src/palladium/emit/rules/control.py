@@ -41,10 +41,8 @@ def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     (`_ys_stream_target`) or fill thread-local stacked storage, bounded
     by the per-thread stack.
 
-    Copy-back runs in two phases: scan updates all carries
-    simultaneously, so phase 1 snapshots reads that alias other carries
-    into temps, then phase 2 overwrites the carries. ys slices are
-    stored before copy-back, while the body outputs still hold this
+    Carries update simultaneously (see `_copy_back_carries`). ys slices
+    are stored before copy-back, while the body outputs still hold this
     iteration's values.
     """
     length: int = eqn.params["length"]
@@ -184,8 +182,7 @@ def _consumed_only_as_scan_xs(env: Environment, var: Var) -> bool:
         try:
             shape = _scan_shape(eqn)
         except EmitError:
-            # Malformed scan: fall back to the copy; the scan rule will
-            # raise the real diagnostic when it gets there.
+            # Keep the copy; the scan rule raises the real diagnostic.
             return False
         if any(iv is var for iv in eqn.invars[: shape.first_xs]):
             return False

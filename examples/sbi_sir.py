@@ -1,6 +1,5 @@
 """The sbibm SIR simulator on the GPU, as an `sbi` simulator.
 
-Docs: fixed-step loops, docs/supported-jax.md (control flow).
 `sbi.inference.simulate_for_sbi` draws parameters from the prior and
 calls a user simulator on them, batched through joblib on the CPU. This
 example ports the SIR task from the sbibm benchmark suite (Lueckmann et
@@ -24,9 +23,6 @@ Three simulators are timed on the same parameter draws:
   (`uv run --with sbi examples/sbi_sir.py`).
 - palladium: the Pallas kernel through `metal_call`, NumPy in and out
   around a jitted dispatch, the callable shape `simulate_for_sbi` expects.
-
-The output lists wall-clock time per simulator and the max abs
-deviation between simulators.
 """
 
 from __future__ import annotations

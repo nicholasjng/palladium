@@ -19,7 +19,7 @@ F32 = jnp.float32
 
 
 def test_random_bits_matches_jax_exactly(rng):
-    """Raw `random_bits` output, bit-for-bit, not just the float conversion."""
+    """Raw `random_bits` output, bit-for-bit, not only the float conversion."""
 
     def kernel(k_ref, o_ref):
         key = jax.random.wrap_key_data(k_ref[...], impl="threefry2x32")
@@ -49,8 +49,6 @@ def test_uniform_matches_jax_exactly():
 
 
 def test_fold_in_matches_jax_exactly():
-    """fold_in's derived key data matches JAX bit-for-bit."""
-
     def kernel(k_ref, d_ref, ko_ref):
         key = jax.random.wrap_key_data(k_ref[...], impl="threefry2x32")
         folded = jax.random.fold_in(key, d_ref[0])
@@ -92,5 +90,4 @@ def test_per_thread_independent_streams():
     )
     got = got.reshape(8, 4)
     np.testing.assert_array_equal(got, want)
-    # Every lane's stream is distinct.
     assert len({tuple(row) for row in got}) == 8

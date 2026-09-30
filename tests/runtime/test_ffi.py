@@ -54,7 +54,6 @@ def test_composes_inside_jax_jit_with_ordinary_jnp_ops(rng):
 
 
 def test_repeated_calls_reuse_the_cached_kernel(rng):
-    """A second call with the same shape/dtype hits the cache and still computes the right result."""
     call = palladium.metal_call(_add_kernel, out_shape=jax.ShapeDtypeStruct((4, 4), jnp.float32))
 
     @jax.jit
@@ -133,8 +132,6 @@ def test_vmap_matches_per_element_calls_and_interpret(rng):
 
     kwargs = {"out_shape": jax.ShapeDtypeStruct((16,), jnp.float32)}
     f = palladium.metal_call(kernel, **kwargs)
-    # A batch deeper than the handler's in-flight ring (8), so slot reuse
-    # and backpressure inside the native loop are exercised.
     xs = rng.standard_normal((37, 16)).astype(np.float32)
 
     got = np.asarray(jax.vmap(f)(xs))

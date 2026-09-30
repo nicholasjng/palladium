@@ -38,17 +38,16 @@ forward call with a backward one through `palladium.with_vjp`.
 ## Install
 
 Palladium requires macOS on Apple silicon, Python 3.12+, CMake, Ninja,
-and the sibling [metal-runtime](https://github.com/nicholasjng/metal-runtime)
-checkout for the CPU-FFI path. In development, check the repositories
-out side by side and run:
+and a sibling [metal-runtime](https://github.com/nicholasjng/metal-runtime)
+checkout. Check the repositories out side by side and run:
 
 ```sh
 uv sync
 uv run pytest -q
 ```
 
-To run on the `mps` platform, install and select the jax-mps plugin separately. Its
-platform name is `mps`; the plugin is not installed by this repository.
+To run on the `mps` platform, install and select the jax-mps plugin
+separately; this repository does not install it.
 
 ## Documentation
 

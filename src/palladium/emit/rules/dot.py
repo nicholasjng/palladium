@@ -86,10 +86,8 @@ def _rule_dot_general(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         cursor.emit(f"{dst.at(f'{i} * {n} + {j}')} = {acc};")
 
 
-# Cutoff for the m == 1 float4 path. Above it the extra float4
-# accumulator registers compete with the kernel's live carries for the
-# register budget and the vectorization loses; the value is the largest
-# width confirmed to win in a fused kernel.
+# Largest n confirmed to win on the m == 1 float4 path in a fused kernel;
+# above it the float4 accumulators compete with live carries for registers.
 _M1_VECTORIZE_MAX_N = 32
 
 
@@ -99,8 +97,7 @@ def _emit_dot_general_m1_vectorized(
     """`(1, k) @ (k, n) -> (1, n)`, `n % 4 == 0`, `n <= _M1_VECTORIZE_MAX_N`.
 
     `k` outer, `j` inner in float4 lanes, with the `n/4`-wide accumulator
-    held in registers for the whole `k` sweep; the cutoff keeps it
-    register-resident. `dst` is a thread-local array; `rhs` may be
+    held in registers for the whole `k` sweep. `dst` is a thread-local array; `rhs` may be
     thread-local or a device view, so its float4 cast is qualified by
     `rhs.space` and 4-element alignment is checked at the call site.
     """

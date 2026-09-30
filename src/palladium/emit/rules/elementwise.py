@@ -136,7 +136,7 @@ def _template(cursor: Cursor, eqn: JaxprEqn, opname: str, ops: list[CVal], ctype
     elif opname == "not":
         template = "(!{a})" if ops[0].ctype == "bool" else "(~{a})"
     elif opname == "sign":
-        # Return the original zero/NaN, preserving signed zero and NaNs.
+        # Zero and NaN pass through unchanged, keeping signed zero.
         template = f"(({{a}} > 0) ? {ctype}(1) : (({{a}} < 0) ? {ctype}(-1) : {{a}}))"
     elif opname == "rem":
         if ops[0].ctype in ("float", "half", "bfloat"):
@@ -160,8 +160,6 @@ def _template(cursor: Cursor, eqn: JaxprEqn, opname: str, ops: list[CVal], ctype
     elif opname == "convert_element_type":
         template = f"(({ctype}){{a}})"
     elif opname == "bitcast_convert_type":
-        # Reinterprets bits without a numeric conversion (unlike
-        # convert_element_type's cast); Metal's equivalent is as_type<T>.
         template = f"as_type<{ctype}>({{a}})"
     else:
         template = ELEMENTWISE[opname]
