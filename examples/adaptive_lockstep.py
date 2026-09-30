@@ -1,4 +1,4 @@
-"""Example 2: per-thread adaptivity vs vmap lockstep.
+"""Per-thread adaptivity vs vmap lockstep.
 
 Docs: divergent while-loops, docs/supported-jax.md (control flow).
 vmap over an adaptive Diffrax solve forces the whole batch into
@@ -216,14 +216,16 @@ def main():
     x0 = np.full(N, X0, dtype=np.float32)
     v0 = np.full(N, V0, dtype=np.float32)
 
-    solve(x0, v0, mild)  # trace + emit + Metal compile outside the clock
-    t0 = time.perf_counter()
-    _, _, _, steps_mild_gpu, _, real_mild_gpu = solve(x0, v0, mild)
-    t_mild_gpu = time.perf_counter() - t0
+    def timed(*args):
+        t0 = time.perf_counter()
+        outs = jax.block_until_ready(solve(*args))
+        return tuple(np.asarray(o) for o in outs), time.perf_counter() - t0
 
-    t0 = time.perf_counter()
-    _, _, _, steps_mixed_gpu, rejected_mixed_gpu, real_mixed_gpu = solve(x0, v0, mixed)
-    t_mixed_gpu = time.perf_counter() - t0
+    timed(x0, v0, mild)  # trace + emit + Metal compile outside the clock
+    (_, _, _, steps_mild_gpu, _, real_mild_gpu), t_mild_gpu = timed(x0, v0, mild)
+    (_, _, _, steps_mixed_gpu, rejected_mixed_gpu, real_mixed_gpu), t_mixed_gpu = timed(
+        x0, v0, mixed
+    )
 
     print("palladium (Apple GPU, per-thread BS3(2) + FSAL + PI controller):")
     print(
@@ -254,7 +256,7 @@ def main():
     print("Controller-quality check: same kernel, PI vs. I-only (pcoeff=0),")
     print("on the mixed ensemble. Fewer rejections means less wasted work:")
     i_only = palladium_solver(N, pcoeff=0.0, icoeff=1.0)
-    _, _, _, _, rejected_i, _ = i_only(x0, v0, mixed)
+    rejected_i = np.asarray(i_only(x0, v0, mixed)[4])
     print(
         f"  I-only (pcoeff=0.0): rejected mean {np.mean(rejected_i):.1f}, "
         f"max {np.max(rejected_i):.0f}"

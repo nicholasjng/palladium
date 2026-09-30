@@ -1,6 +1,6 @@
-"""What the call paths share: option parsing, the per-shape cache of traced
-specs and emitted MSL, diagnostics, verification, and VJP attachment.
-`metal_call` (eager) and `metal_call_jit` (CPU FFI) differ only in dispatch.
+"""What a Palladium callable is beyond dispatch: option parsing, the
+per-shape cache of traced specs and emitted MSL, diagnostics, verification,
+and VJP attachment.
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ def unwrap(outs):
 
 
 class PallasCallable:
-    """Base of the three call paths.
+    """Trace-and-emit half of a callable; subclasses dispatch.
 
     Attributes
     ----------

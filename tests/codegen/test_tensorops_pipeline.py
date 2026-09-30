@@ -5,7 +5,6 @@ import jax.numpy as jnp
 import pytest
 from jax.experimental import pallas as pl
 
-from palladium.dispatch import bind
 from palladium.emit.tensorops import (
     ProgramScope,
     assign_layouts,
@@ -297,39 +296,6 @@ def test_tensorops_lowers_cooperative_elementwise_chains_from_jaxpr():
     assert f"arg0[(int)_pid.x * 68 + (int)_pid.y * 8 + {tile_offset}]" in compilation.source
     assert f"arg2[(int)_pid.x * 68 + (int)_pid.y * 8 + {tile_offset}]" in compilation.source
     assert compilation.threadgroup_bytes == 0
-
-
-def test_runtime_bind_selects_cooperative_geometry_for_tensorops(monkeypatch):
-    from palladium.emit.tensorops import ProgramScope, compile_kernel
-
-    spec = _tensorops_elementwise_spec()
-
-    class MockPipeline:
-        thread_execution_width = 32
-        max_threads_per_threadgroup = 1024
-
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-    monkeypatch.setattr("palladium.dispatch.mr.Kernel", MockPipeline)
-    source = compile_kernel(spec, scope=ProgramScope.THREADGROUP).source
-    bound = bind(spec, source)
-
-    assert bound.threadgroup == (128, 1, 1)
-    assert bound.cooperative_simdgroups == 4
-
-    class MockBatch:
-        def add(self, _kernel, **kwargs):
-            self.kwargs = kwargs
-
-        def commit(self):
-            pass
-
-    batch = MockBatch()
-    monkeypatch.setattr("palladium.dispatch.mr.Batch", lambda: batch)
-    bound._dispatch([], [])
-    assert batch.kwargs["grid"] == (384, 3)
-    assert batch.kwargs["threadgroup"] == (128, 1, 1)
 
 
 def test_tensorops_lowers_scalar_and_row_vector_elementwise_broadcasts():

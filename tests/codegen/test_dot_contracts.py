@@ -92,7 +92,8 @@ def test_preferred_element_type_f16_to_f32(rng):
     b = rng.standard_normal((16, 8)).astype(np.float16)
     call = palladium.metal_call(kernel, out_shape=_shaped(8, 8))
     got = call(a, b)
-    assert isinstance(got, np.ndarray)  # single out_shape: never a tuple
+    assert not isinstance(got, tuple)  # single out_shape: never a tuple
+    got = np.asarray(got)
     assert got.dtype == np.float32
     want = a.astype(np.float32) @ b.astype(np.float32)
     np.testing.assert_allclose(got, want, rtol=2e-3, atol=2e-3)

@@ -1,6 +1,6 @@
 """jax.ffi integration.
 
-`metal_call_jit` dispatches through a registered jax.ffi target, so the
+`metal_call` dispatches through a registered jax.ffi target, so the
 result composes inside `jax.jit` next to ordinary `jnp` ops. The module
 skips when the native handler is not built.
 """
@@ -32,9 +32,7 @@ def _add_kernel(x_ref, y_ref, o_ref):
 def test_eager_call_matches_interpret(rng):
     x = rng.standard_normal((8, 8), dtype=np.float32)
     y = rng.standard_normal((8, 8), dtype=np.float32)
-    call = palladium.metal_call_jit(
-        _add_kernel, out_shape=jax.ShapeDtypeStruct((8, 8), jnp.float32)
-    )
+    call = palladium.metal_call(_add_kernel, out_shape=jax.ShapeDtypeStruct((8, 8), jnp.float32))
     got = np.asarray(call(x, y))
     want = np.asarray(call.interpret(x, y))
     np.testing.assert_allclose(got, want, atol=1e-6)
@@ -44,9 +42,7 @@ def test_composes_inside_jax_jit_with_ordinary_jnp_ops(rng):
     """A kernel result feeds jnp.sum under jax.jit with no tracer conflict."""
     x = rng.standard_normal((8, 8), dtype=np.float32)
     y = rng.standard_normal((8, 8), dtype=np.float32)
-    call = palladium.metal_call_jit(
-        _add_kernel, out_shape=jax.ShapeDtypeStruct((8, 8), jnp.float32)
-    )
+    call = palladium.metal_call(_add_kernel, out_shape=jax.ShapeDtypeStruct((8, 8), jnp.float32))
 
     @jax.jit
     def composed(a, b):
@@ -59,9 +55,7 @@ def test_composes_inside_jax_jit_with_ordinary_jnp_ops(rng):
 
 def test_repeated_calls_reuse_the_cached_kernel(rng):
     """A second call with the same shape/dtype hits the cache and still computes the right result."""
-    call = palladium.metal_call_jit(
-        _add_kernel, out_shape=jax.ShapeDtypeStruct((4, 4), jnp.float32)
-    )
+    call = palladium.metal_call(_add_kernel, out_shape=jax.ShapeDtypeStruct((4, 4), jnp.float32))
 
     @jax.jit
     def composed(a, b):
@@ -90,7 +84,7 @@ def test_multi_output_kernel(rng):
 
     x = rng.standard_normal((6, 6), dtype=np.float32)
     y = rng.standard_normal((6, 6), dtype=np.float32)
-    call = palladium.metal_call_jit(
+    call = palladium.metal_call(
         kernel,
         out_shape=(
             jax.ShapeDtypeStruct((6, 6), jnp.float32),
@@ -119,7 +113,7 @@ def test_math_mode_safe_is_actually_requested(rng):
         x = x_ref[...]
         o_ref[...] = jnp.where(x > 0.0, x + jnp.nan, x)
 
-    f = palladium.metal_call_jit(
+    f = palladium.metal_call(
         kernel,
         math_mode=mr.MathMode.SAFE,
         out_shape=jax.ShapeDtypeStruct((64,), jnp.float32),
@@ -138,8 +132,8 @@ def test_vmap_pipelined_matches_interpret_and_sequential(rng):
         o_ref[...] = jnp.tanh(x_ref[...]) * 2.0
 
     kwargs = {"out_shape": jax.ShapeDtypeStruct((16,), jnp.float32)}
-    f = palladium.metal_call_jit(kernel, **kwargs, vmap_method="pipelined")
-    f_seq = palladium.metal_call_jit(kernel, **kwargs, vmap_method="sequential")
+    f = palladium.metal_call(kernel, **kwargs, vmap_method="pipelined")
+    f_seq = palladium.metal_call(kernel, **kwargs, vmap_method="sequential")
     # A batch deeper than the handler's in-flight ring (8), so slot reuse
     # and backpressure inside the native loop are exercised.
     xs = rng.standard_normal((37, 16)).astype(np.float32)
@@ -165,7 +159,7 @@ def test_vmap_pipelined_broadcasts_unbatched_operands(rng):
     def kernel(x_ref, w_ref, o_ref):
         o_ref[...] = x_ref[...] * w_ref[...] + 1.0
 
-    f = palladium.metal_call_jit(
+    f = palladium.metal_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((16,), jnp.float32),
         vmap_method="pipelined",
@@ -183,7 +177,7 @@ def test_vmap_pipelined_multi_output(rng):
         s_ref[...] = x_ref[...] + x_ref[...]
         d_ref[...] = x_ref[...] * x_ref[...]
 
-    f = palladium.metal_call_jit(
+    f = palladium.metal_call(
         kernel,
         out_shape=(
             jax.ShapeDtypeStruct((8,), jnp.float32),
@@ -204,11 +198,11 @@ def test_vmap_works_by_default(rng):
         o_ref[...] = jnp.tanh(x_ref[...]) * 2.0
 
     kwargs = {"out_shape": jax.ShapeDtypeStruct((16,), jnp.float32)}
-    f = palladium.metal_call_jit(kernel, **kwargs)
+    f = palladium.metal_call(kernel, **kwargs)
     xs = rng.standard_normal((12, 16)).astype(np.float32)
 
     got = np.asarray(jax.vmap(f)(xs))
-    explicit = palladium.metal_call_jit(kernel, **kwargs, vmap_method="pipelined")
+    explicit = palladium.metal_call(kernel, **kwargs, vmap_method="pipelined")
     np.testing.assert_array_equal(got, np.asarray(jax.vmap(explicit)(xs)))
     np.testing.assert_array_equal(got, np.stack([np.asarray(f(x)) for x in xs]))
 
@@ -219,7 +213,7 @@ def test_nested_vmap_batches_outer_levels_sequentially(rng):
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 3.0
 
-    f = palladium.metal_call_jit(kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32))
+    f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32))
     xs = rng.standard_normal((3, 5, 8)).astype(np.float32)
     np.testing.assert_array_equal(np.asarray(jax.vmap(jax.vmap(f))(xs)), xs * 3.0)
 
@@ -230,7 +224,7 @@ def test_vmap_method_none_refuses_batching_in_palladium_terms():
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...]
 
-    f = palladium.metal_call_jit(
+    f = palladium.metal_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
         vmap_method=None,
@@ -249,7 +243,7 @@ def test_whole_batch_vmap_methods_rejected():
         o_ref[...] = x_ref[...]
 
     with pytest.raises(ValueError, match="pipelined"):
-        palladium.metal_call_jit(
+        palladium.metal_call(
             kernel,
             out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
             vmap_method="expand_dims",
@@ -268,8 +262,8 @@ def test_custom_vjp_pairs_forward_and_backward_kernels(rng):
         dx_ref[...] = jnp.dot(t, w_ref[...].T)
         dw_ref[...] = jnp.dot(x_ref[...].T, t)
 
-    fwd = palladium.metal_call_jit(fwd_kernel, out_shape=jax.ShapeDtypeStruct((m, n), jnp.float32))
-    bwd = palladium.metal_call_jit(
+    fwd = palladium.metal_call(fwd_kernel, out_shape=jax.ShapeDtypeStruct((m, n), jnp.float32))
+    bwd = palladium.metal_call(
         bwd_kernel,
         out_shape=(
             jax.ShapeDtypeStruct((m, k), jnp.float32),
@@ -307,7 +301,7 @@ def test_multiple_outputs_come_back_as_a_tuple_like_pallas_call():
         b_ref[...] = x_ref[...] * 2.0
 
     shape = jax.ShapeDtypeStruct((8,), jnp.float32)
-    call = palladium.metal_call_jit(two, out_shape=(shape, shape))
+    call = palladium.metal_call(two, out_shape=(shape, shape))
     x = jnp.ones(8, jnp.float32)
     outs = jax.jit(call)(x)
     assert isinstance(outs, tuple)

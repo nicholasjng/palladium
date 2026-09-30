@@ -116,7 +116,7 @@ def make_flow(
     Returns (n,3) augmented states. Parameters have shape (n,6*width+2);
     broadcast shared weights before calling. The checkpointed VJP differentiates
     the discrete RK4 scheme. Higher-order AD of the custom call is unsupported.
-    `ffi=True` dispatches the kernels through `metal_call_jit` from a CPU
+    `ffi=True` dispatches the kernels through `metal_call` from a CPU
     program instead of the mps platform's pallas_call lowering.
     """
     if min(n, width, steps, interval) < 1:
@@ -195,7 +195,7 @@ def make_flow(
 
     def call(kernel, **kwargs):
         if ffi:
-            return palladium.metal_call_jit(kernel, **kwargs)
+            return palladium.metal_call(kernel, **kwargs)
         return pl.pallas_call(kernel, interpret=interpret, **kwargs)
 
     forward = call(

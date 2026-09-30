@@ -62,7 +62,7 @@ def lv_kernel(x_ref, y_ref, a_ref, b_ref, c_ref, d_ref, xo_ref, yo_ref):
 
 
 @functools.cache
-def palladium_solver(n: int) -> palladium.MetalCallable:
+def palladium_solver(n: int) -> palladium.FfiCallable:
     spec_1 = pl.BlockSpec((1,), lambda i: (i,))
     return palladium.metal_call(
         lv_kernel,
@@ -79,11 +79,11 @@ def palladium_solver(n: int) -> palladium.MetalCallable:
 @mew.parametrize(SIZES, ids=IDS, tags="palladium", use_real_time=True, unit="ms")
 def bench_lv_palladium(state: mew.State, n: int) -> None:
     """Full solve on the GPU: trace/emit/compile primed outside the loop."""
-    solve = palladium_solver(n)
-    args = ensemble(n)
-    solve(*args)  # prime the shape cache and the Metal pipeline
+    solve = jax.jit(palladium_solver(n))
+    args = [jnp.asarray(a) for a in ensemble(n)]
+    jax.block_until_ready(solve(*args))  # prime the shape cache and the Metal pipeline
     for _ in state:
-        solve(*args)
+        jax.block_until_ready(solve(*args))
 
 
 @mew.parametrize(SIZES, ids=IDS, tags="diffrax", use_real_time=True, unit="ms")

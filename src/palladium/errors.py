@@ -1,7 +1,7 @@
 """Exception hierarchy: everything palladium raises derives from
 PalladiumError, split by stage (trace, emit, dispatch). TraceError also
 subclasses ValueError, DispatchError TypeError. `UnsupportedPrimitiveError.primitive`
-and `StackOverflowError.stack_bytes`/`.limit` carry the deciding value.
+carries the deciding value.
 """
 
 from __future__ import annotations
@@ -10,7 +10,6 @@ __all__ = [
     "DispatchError",
     "EmitError",
     "PalladiumError",
-    "StackOverflowError",
     "TraceError",
     "UnsupportedPrimitiveError",
 ]
@@ -45,32 +44,6 @@ class UnsupportedPrimitiveError(EmitError, NotImplementedError):
     def __init__(self, *args: object, primitive: str | None = None) -> None:
         super().__init__(*args)
         self.primitive = primitive
-
-
-class StackOverflowError(EmitError):
-    """Per-instance thread-local storage exceeds the per-thread stack.
-
-    Every loaded block and intermediate lives in thread-local memory, so a
-    kernel's live arrays are bounded by a few KB. Raised from `emit_msl`'s
-    accounting or by translating Metal's pipeline-creation failure.
-
-    Attributes
-    ----------
-    stack_bytes : int or None
-        Estimated per-thread bytes the kernel declares, when known.
-    limit : int or None
-        Budget it was measured against, when known.
-    """
-
-    def __init__(
-        self,
-        *args: object,
-        stack_bytes: int | None = None,
-        limit: int | None = None,
-    ) -> None:
-        super().__init__(*args)
-        self.stack_bytes = stack_bytes
-        self.limit = limit
 
 
 class DispatchError(PalladiumError, TypeError):

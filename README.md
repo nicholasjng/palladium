@@ -3,8 +3,9 @@
 Palladium translates a supported subset of JAX Pallas kernels to Metal. With
 the [jax-mps](https://github.com/tillahoffmann/jax-mps) plugin selected, it
 is the Pallas backend for the `mps` platform: a plain `pl.pallas_call` under
-`jax.jit` lowers to a Metal kernel. It also provides eager `metal_call` and a
-CPU-FFI `metal_call_jit` path that need no plugin.
+`jax.jit` lowers to a Metal kernel. Without the plugin, `palladium.metal_call`
+dispatches the same kernel to Metal from a CPU `jax.jit` program through a
+`jax.ffi` target.
 
 ## Example
 
@@ -39,7 +40,7 @@ forward call with a backward one through `palladium.with_vjp`,
 
 Palladium requires macOS on Apple silicon, Python 3.12+, CMake, Ninja,
 and the sibling [metal-runtime](https://github.com/nicholasjng/metal-runtime)
-checkout for its eager and CPU-FFI paths. In development, check the repositories
+checkout for the CPU-FFI path. In development, check the repositories
 out side by side and run:
 
 ```sh
@@ -52,7 +53,7 @@ platform name is `mps`; the plugin is not installed by this repository.
 
 ## Documentation
 
-- [Getting started](docs/getting-started.md): eager, FFI, and MPS call paths,
+- [Getting started](docs/getting-started.md): the mps and CPU-FFI call paths,
   with the CPU interpreter as a correctness reference.
 - [Supported JAX functionality](docs/supported-jax.md): Pallas constructs,
   primitives, dtypes, and transformation limits.

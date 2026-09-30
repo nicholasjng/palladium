@@ -1,4 +1,4 @@
-"""Example 7: the sbibm SIR simulator on the GPU, as an `sbi` simulator.
+"""The sbibm SIR simulator on the GPU, as an `sbi` simulator.
 
 Docs: fixed-step loops, docs/supported-jax.md (control flow).
 `sbi.inference.simulate_for_sbi` draws parameters from the prior and
@@ -22,8 +22,8 @@ Three simulators are timed on the same parameter draws:
 - SciPy: `solve_ivp` per draw, the idiomatic sbi ODE simulator, run
   through `simulate_for_sbi` with joblib workers. Needs `sbi` installed
   (`uv run --with sbi examples/sbi_sir.py`).
-- palladium: the Pallas kernel through `metal_call`, eager NumPy in and
-  out, the callable shape `simulate_for_sbi` expects.
+- palladium: the Pallas kernel through `metal_call`, NumPy in and out
+  around a jitted dispatch, the callable shape `simulate_for_sbi` expects.
 
 The output lists wall-clock time per simulator and the max abs
 deviation between simulators.
@@ -150,19 +150,21 @@ def sir_kernel(beta_ref, gamma_ref, out_ref):
 @functools.lru_cache(maxsize=8)
 def metal_call_for(n: int):
     point = pl.BlockSpec((1,), lambda i: (i,))
-    return palladium.metal_call(
-        sir_kernel,
-        grid=(n,),
-        in_specs=[point, point],
-        out_specs=pl.BlockSpec((1, OBSERVATIONS), lambda i: (i, 0)),
-        out_shape=jax.ShapeDtypeStruct((n, OBSERVATIONS), jnp.float32),
+    return jax.jit(
+        palladium.metal_call(
+            sir_kernel,
+            grid=(n,),
+            in_specs=[point, point],
+            out_specs=pl.BlockSpec((1, OBSERVATIONS), lambda i: (i, 0)),
+            out_shape=jax.ShapeDtypeStruct((n, OBSERVATIONS), jnp.float32),
+        )
     )
 
 
 def palladium_simulator(theta: np.ndarray) -> np.ndarray:
     theta = np.asarray(theta, np.float32)
     call = metal_call_for(theta.shape[0])
-    return call(np.ascontiguousarray(theta[:, 0]), np.ascontiguousarray(theta[:, 1]))
+    return np.asarray(call(np.ascontiguousarray(theta[:, 0]), np.ascontiguousarray(theta[:, 1])))
 
 
 # ------------------------------------------------------------------- sbi

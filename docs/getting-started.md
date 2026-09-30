@@ -1,17 +1,14 @@
 # Getting started
 
 Palladium accepts a function written for jax.experimental.pallas, traces its
-single pallas_call, and emits a Metal kernel. Choose an entry point based on
-where the call should run:
+single pallas_call, and emits a Metal kernel. Two entry points run it:
 
 | Entry point | Execution |
 |---|---|
 | pl.pallas_call on mps | palladium is the registered Pallas backend for jax-mps; composable with jax.jit |
-| metal_call | Eager Metal dispatch; NumPy inputs and outputs |
-| metal_call_jit | Metal dispatch through a CPU jax.ffi target; composable with jax.jit |
+| metal_call | Metal dispatch through a CPU jax.ffi target backed by metal-runtime; composable with jax.jit and jax.vmap, no plugin |
 
-The latter two use metal-runtime. The mps path requires jax-mps to be
-installed and selected. See the [README](../README.md) for the current install
+Both accept the same kernels. See the [README](../README.md) for the install
 requirements.
 
 ## First kernel
@@ -37,7 +34,7 @@ call = palladium.metal_call(
 )
 x = np.arange(n, dtype=np.float32)
 y = np.ones(n, dtype=np.float32)
-result = call(x, y)
+result = jax.jit(call)(x, y)
 ~~~
 
 Each program instance handles one element here. Keep blocks small: Pallas
@@ -59,15 +56,15 @@ Supply an independent reference= to .verify for those kernels. FAST math
 is the default, so transcendental results and reduction order can differ from
 the reference.
 
-.explain(*args) reports the grid, threadgroup, declared storage, emitted MSL
-size, and expected execution path. It traces and emits source but does not
-compile or dispatch. palladium.debug_msl returns the generated MSL directly.
+.explain(*args) reports the grid, threadgroup, declared storage, and emitted
+MSL size. It traces and emits source but does not compile or dispatch.
+palladium.debug_msl returns the generated MSL directly.
 
 ## Plain Pallas on jax-mps
 
 Importing palladium registers it as the Pallas backend for the mps platform:
 a plain `pl.pallas_call` inside `jax.jit` on a jax-mps device lowers to the
-Metal kernel `metal_call_jit` would build, with no wrapper call. Metal-side
+same Metal kernel `metal_call` would build, with no wrapper call. Metal-side
 options travel as `compiler_params`:
 
 ~~~python
@@ -85,21 +82,14 @@ backward implementation: `palladium.with_vjp(forward, backward)`,
 `with_auxiliary_vjp` for checkpointed adjoints, or `with_reference_vjp` to
 borrow JAX's pullback of a pure-JAX reference.
 
-## Iterating on the device
-
-A kernel that advances a state needs one dispatch per step, because a
-threadgroup barrier cannot synchronize the whole grid. `call.iterate(*arrays,
-steps=n)` encodes all `n` dispatches into one command buffer and feeds each
-step's outputs back into the next step's inputs without leaving the GPU
-(output j into input j by default, or explicit `feedback=[(output, input), ...]`
-pairs; inputs never fed back stay fixed). It returns the last step's outputs.
-
 ## JAX transformations
 
-metal_call_jit supports jax.jit and jax.vmap. Its default
+metal_call supports jax.jit and jax.vmap. Its default
 vmap_method="pipelined" handles the batch in one FFI call; nested batch
 levels and the sequential methods dispatch one element at a time. Put a
-batch axis in the Pallas grid when possible.
+batch axis in the Pallas grid when possible. A kernel that advances a state
+over many dispatches is an ordinary `lax.fori_loop` or `lax.scan` around the
+call under `jax.jit`.
 
 On mps, jax.vmap over a pallas_call is JAX's own batching. No path derives
 gradients from emitted MSL. Pair forward and backward calls with
@@ -107,5 +97,5 @@ jax.custom_vjp, or provide a pure-JAX reference VJP where supported. See the
 [supported functionality](supported-jax.md) for details.
 
 Unsupported kernel structure raises TraceError; unsupported lowering raises
-EmitError or UnsupportedPrimitiveError. Invalid runtime arguments raise
+EmitError or UnsupportedPrimitiveError. Unsupported input dtypes raise
 DispatchError. These errors derive from PalladiumError.

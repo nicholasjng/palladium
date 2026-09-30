@@ -404,7 +404,7 @@ def test_tensorops_explain_reports_group_scaled_dispatch():
 
 
 def test_tensorops_dot_is_used_by_jittable_metal_runtime_calls():
-    call = palladium.metal_call_jit(
+    call = palladium.metal_call(
         _dot,
         grid=(2, 2),
         in_specs=[

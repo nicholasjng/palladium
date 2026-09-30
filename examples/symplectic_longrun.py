@@ -1,4 +1,4 @@
-"""Example 6: long-horizon symplectic integration and its error floors.
+"""Long-horizon symplectic integration and its error floors.
 
 Docs: math modes, docs/performance.md (math mode).
 The Kepler two-body problem, q'' = -q/|q|^3, integrated for millions of
@@ -230,10 +230,11 @@ def palladium_run(math_mode, state0, on_mark):
         out_specs=(spec_1,) * 4,
         out_shape=(out,) * 4,
     )
-    f(*state0)  # trace + emit + Metal compile outside the clock
+    step = jax.jit(f)
+    jax.block_until_ready(step(*state0))  # trace + emit + Metal compile outside the clock
     state, t0 = state0, time.perf_counter()
     for chunk in range(1, CHUNKS + 1):
-        state = f(*state)
+        state = tuple(np.asarray(v) for v in step(*state))
         on_mark(chunk, state)
     return time.perf_counter() - t0
 

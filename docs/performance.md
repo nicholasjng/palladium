@@ -27,7 +27,7 @@ Checkpoint interval barely matters at this size: intervals 1, 4, and 8 ran in
 0.380, 0.388, and 0.408 ms. Pairing the Palladium forward kernel with JAX's
 reference VJP instead of the adjoint kernel ran at 15.029 ms, the same as
 plain JAX, so the backward kernel carries the speedup. The FFI row shows the
-same two kernels called from an XLA-on-CPU program with `metal_call_jit`:
+same two kernels called from an XLA-on-CPU program with `metal_call`:
 this needs neither jax-mps nor Xcode, and since XLA fuses the small
 optimizer glue better than MLX does, it lands within 25% of the mps-platform
 run on a different machine. Run the Mew benchmarks with
@@ -110,14 +110,7 @@ near the integrator's step-size error bound. Run
   Pallas grid.
 - Keep each instance's blocks and intermediates small: they occupy per-thread
   storage and can exceed Metal's stack limit.
-- `metal_call` uploads NumPy inputs on each call. Use
-  `call.pin(*arrays)` when inputs stay unchanged across repeated
-  dispatches, and `call.iterate(*arrays, steps=n)` for state-update
-  kernels (stencils, PDE steps, agent models): all `n` dispatches go into
-  one command buffer and each step's outputs refill the next step's inputs
-  on the device. `examples/reaction_diffusion.py` runs 2,000 Gray-Scott
-  steps this way in 20 ms on an M2.
-- `metal_call_jit` adds CPU-FFI setup and buffer wrapping. The
+- `metal_call` adds CPU-FFI setup and buffer wrapping. The
   measured passthrough overhead was 0.19 ms for 16 KB buffers and 0.25 ms for
   1 MB; the common path wraps eligible XLA memory without copying. These are
   end-to-end FFI costs, not bufferization-only timings.

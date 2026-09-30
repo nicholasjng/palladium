@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 import palladium
-from palladium.errors import DispatchError, TraceError
+from palladium.errors import TraceError
 
 F32 = jnp.float32
 
@@ -17,7 +17,7 @@ def _double_kernel(x_ref, o_ref):
     o_ref[...] = x_ref[...] * 2.0
 
 
-def test_eager_aliased_call_matches_interpret(rng):
+def test_aliased_call_matches_interpret(rng):
     f = palladium.metal_call(
         _double_kernel,
         out_shape=jax.ShapeDtypeStruct((64,), F32),
@@ -28,30 +28,6 @@ def test_eager_aliased_call_matches_interpret(rng):
     np.testing.assert_allclose(got, np.asarray(f.interpret(x)), rtol=1e-6)
     # The caller's array is copied at upload, so it must stay untouched.
     np.testing.assert_array_equal(x, x.copy())
-
-
-def test_eager_aliased_repeated_and_deferred_launches(rng):
-    """Slot reuse rewrites the shared buffer; results returned earlier
-    (or waited later) must survive as copies."""
-    from palladium.dispatch import bind
-    from palladium.emit import emit_msl
-    from palladium.trace import trace
-
-    call = pl.pallas_call(
-        _double_kernel,
-        out_shape=jax.ShapeDtypeStruct((256,), F32),
-        input_output_aliases={0: 0},
-    )
-    spec = trace(call, jax.ShapeDtypeStruct((256,), F32))
-    bound = bind(spec, emit_msl(spec), pipeline_depth=2)
-
-    xs = [rng.standard_normal(256).astype(np.float32) for _ in range(7)]
-    pendings = [bound.launch(x) for x in xs]
-    for x, pending in zip(xs, pendings, strict=True):
-        np.testing.assert_allclose(pending.wait(), x * 2.0, rtol=1e-6)
-    # In-place contract: the output buffer is the slot's input buffer.
-    last = pendings[-1]
-    assert any(last.out_bufs[0] is buf for slot in bound._slots for buf in slot.in_bufs)
 
 
 def test_aliased_kernel_grid_and_second_input(rng):
@@ -77,7 +53,7 @@ def test_aliased_kernel_grid_and_second_input(rng):
 
 
 def test_ffi_aliased_call_matches_interpret_under_jit(rng):
-    f = palladium.metal_call_jit(
+    f = palladium.metal_call(
         _double_kernel,
         out_shape=jax.ShapeDtypeStruct((64,), F32),
         input_output_aliases={0: 0},
@@ -88,7 +64,7 @@ def test_ffi_aliased_call_matches_interpret_under_jit(rng):
 
 
 def test_ffi_aliased_pipelined_vmap(rng):
-    f = palladium.metal_call_jit(
+    f = palladium.metal_call(
         _double_kernel,
         out_shape=jax.ShapeDtypeStruct((16,), F32),
         input_output_aliases={0: 0},
@@ -127,19 +103,3 @@ def test_mismatched_alias_pair_is_rejected(rng):
     )
     with pytest.raises((TraceError, ValueError)):
         f(rng.standard_normal(16).astype(np.float32))
-
-
-def test_pinned_is_rejected_for_aliased_kernels(rng):
-    from palladium.dispatch import bind
-    from palladium.emit import emit_msl
-    from palladium.trace import trace
-
-    call = pl.pallas_call(
-        _double_kernel,
-        out_shape=jax.ShapeDtypeStruct((8,), F32),
-        input_output_aliases={0: 0},
-    )
-    spec = trace(call, jax.ShapeDtypeStruct((8,), F32))
-    bound = bind(spec, emit_msl(spec))
-    with pytest.raises(DispatchError, match="pinned"):
-        bound.pinned(rng.standard_normal(8).astype(np.float32))
