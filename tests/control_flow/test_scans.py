@@ -190,7 +190,6 @@ def test_grid_blocked_dense_output(rng):
 
 
 def test_full_block_xs_reads_the_ref_without_a_stack_copy(rng):
-    """A block consumed only as scan xs is read through the ref without a per-thread stack copy."""
     n_ts = 16384  # 64KB as f32: alone past the per-thread stack
 
     def kernel(ts_ref, o_ref):
@@ -210,8 +209,6 @@ def test_full_block_xs_reads_the_ref_without_a_stack_copy(rng):
 
 
 def test_scan_const_blocks_keep_their_thread_local_copy(rng):
-    """A block closed over by the scan body keeps its thread-local cache copy."""
-
     def kernel(w_ref, ts_ref, o_ref):
         w = w_ref[...]  # const inside the body: copied
 

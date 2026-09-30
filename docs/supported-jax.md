@@ -1,9 +1,8 @@
 # Supported JAX functionality
 
 Palladium traces one Pallas kernel and lowers it to MSL. It requires
-`jax>=0.11,<0.12`; JAX 0.11.2 is tested. This page describes
-the supported kernel language and how each call path composes with JAX. Cases
-outside this subset raise an error during tracing, lowering, or compilation.
+`jax>=0.11,<0.12`; JAX 0.11.2 is tested. Cases outside the subset below
+raise an error during tracing, lowering, or compilation.
 
 ## Pallas kernels
 
@@ -40,18 +39,16 @@ read snapshots are preserved across later writes.
   `jnp.minmax`.
 - **Dot:** standard rank-2 matrix multiplication and rank-1 matvec, vecmat, or
   vecvec. Batched dots and other contraction axes are rejected.
-- **Control flow:** `fori_loop`, `scan` (including reverse
-  scans and stacked outputs), `while_loop`, `cond`, and
-  `switch`.
-- **Random:** 32-bit `random.bits` and `fold_in`, plus
-  key-data conversion, using Threefry-2x32-20.
+- **Control flow:** `fori_loop`, `scan` (including reverse scans and stacked
+  outputs), `while_loop`, `cond`, and `switch`.
+- **Random:** 32-bit `random.bits` and `fold_in`, plus key-data conversion,
+  using Threefry-2x32-20.
 - **Effects:** Ref reads and writes. Debug printing and arbitrary JAX
   effects are unsupported.
 
-On both paths, tiled matmuls on a 2D or 3D grid lower
-through Metal 4 TensorOps by default (`CompilerParams(dot_general="auto")`); dots the
-cooperative lowering does not recognize keep the one-thread-per-program
-emitter. `dot_general="tensorops"` requires the cooperative lowering and
+On both paths, tiled matmuls on a 2D or 3D grid lower through Metal 4
+TensorOps by default (`CompilerParams(dot_general="auto")`); other dots keep
+the one-thread-per-program emitter. `dot_general="tensorops"` requires the cooperative lowering and
 raises where it does not apply; `dot_general="default"` forces the primitive
 path. The lowering covers a standalone, tiled rank-2 matmul or matching rank-3
 batches of matrices. The batched form uses arrays
@@ -70,10 +67,10 @@ each query tile and runs the score and value matmuls with Metal TensorOps. Tile
 sizes and head dimensions must be multiples of 16, and both sequence lengths
 must divide evenly into their tiles. Short query sequences need padding and
 output cropping. Unsupported jaxpr forms and layouts raise `EmitError`.
-The mps lowering follows the same policy: cooperative kernels are sent to jax-mps with
-their scaled thread grid and required threadgroup, and run under `jax.jit` on the
-`mps` platform (verified on an M1 Pro with JAX 0.11.2 and the jax-mps
-`palladium-dispatch` handler).
+The mps lowering follows the same policy: cooperative kernels reach jax-mps
+with their scaled thread grid and required threadgroup, and run under `jax.jit`
+on the `mps` platform (tested on an M1 Pro with JAX 0.11.2 and the `palladium.dispatch` handler
+from the `palladium-dispatch` branch of jax-mps).
 
 The backend supports float32, float16, bfloat16, int32, uint32, and bool, with
 operation-specific limits:
@@ -99,12 +96,12 @@ for numeric comparisons and measurement caveats.
 | `pl.pallas_call` on `mps` | Yes: palladium is the registered Pallas backend for the platform (`palladium.CompilerParams` for options) | JAX's own `pallas_call` batching | `palladium.with_vjp` |
 | `metal_call` | Yes, through CPU FFI to Metal | One FFI call per batch; nested levels run one element at a time | `palladium.with_vjp` or `jax.custom_vjp` |
 
-The mps lowering uses FAST math. On other platforms a `pallas_call` keeps
-JAX's own behavior: `interpret=True` runs the Pallas interpreter.
-`metal_call` dispatches to Metal through the CPU FFI
-target and does not need jax-mps.
+The mps lowering supports FAST math only. On other platforms a `pallas_call`
+keeps JAX's own behavior: `interpret=True` runs the Pallas interpreter.
+`metal_call` dispatches to Metal through the CPU FFI target and does not need
+jax-mps.
 
-Unsupported primitives raise `UnsupportedPrimitiveError`;
-unsupported primitive cases raise `EmitError`. Unsupported Pallas
-call structure raises `TraceError`. See [getting started](getting-started.md)
+Unsupported primitives raise `UnsupportedPrimitiveError`; unsupported
+primitive cases raise `EmitError`. Unsupported Pallas call structure raises
+`TraceError`. See [getting started](getting-started.md)
 for diagnostics and examples.

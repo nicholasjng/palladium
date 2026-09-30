@@ -43,7 +43,6 @@ def _sum_and_diff_kernel(x_ref, y_ref, sum_ref, diff_ref):
 
 
 def test_multi_output_kernel(rng):
-    """Two output refs are each stored by `_rule_swap` and returned by dispatch."""
     f = palladium.metal_call(
         _sum_and_diff_kernel,
         out_shape=(

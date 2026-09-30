@@ -1,7 +1,6 @@
 """Pallas scratch refs use uninitialized, per-instance storage.
 
-Tests write each element before reading it. Shared threadgroup scratch is
-covered by tests/cooperative.
+Tests write each element before reading it.
 """
 
 import jax
@@ -36,8 +35,6 @@ def test_spec_captures_scratch():
 
 
 def test_scratch_roundtrip(rng):
-    """Write to scratch, read it back: the minimal end-to-end path."""
-
     def kernel(x_ref, o_ref, s_ref):
         s_ref[...] = x_ref[...] * 2.0
         o_ref[...] = s_ref[...] + 1.0

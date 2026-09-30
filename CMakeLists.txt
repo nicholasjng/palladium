@@ -4,15 +4,11 @@ project(palladium LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Emit compile_commands.json for clangd / IDE LSPs. Also force-set here
-# in case the project is built without scikit-build-core (e.g. raw
-# `cmake -B`).
+# compile_commands.json for clangd, also when built without scikit-build-core.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE INTERNAL "")
 
-# The file lands in ${CMAKE_BINARY_DIR}; with build-dir = "build/{wheel_tag}"
-# in pyproject.toml that path varies per ABI, so clangd's auto-discovery
-# (which probes ./build/ and the source root) won't find it. Symlink it to
-# the source root so IDE tooling picks it up without configuration.
+# build-dir = "build/{wheel_tag}" varies per ABI, out of clangd's search
+# path, so symlink the file to the source root.
 add_custom_target(
   symlink_compile_commands ALL
   COMMAND ${CMAKE_COMMAND} -E create_symlink
@@ -22,10 +18,8 @@ add_custom_target(
   COMMENT "Symlinking compile_commands.json to source root"
   VERBATIM)
 
-# find_package(Python) prefers PATH, not reliably the project venv.
-# Prefer $VIRTUAL_ENV/bin/python3 when set (scikit-build-core sets it to
-# the venv it's building for); override with -DPython_EXECUTABLE=...
-# otherwise.
+# find_package(Python) searches PATH, which may miss the project venv;
+# scikit-build-core sets $VIRTUAL_ENV. Override with -DPython_EXECUTABLE.
 if(NOT DEFINED Python_EXECUTABLE AND DEFINED ENV{VIRTUAL_ENV})
   set(_venv_python "$ENV{VIRTUAL_ENV}/bin/python3")
   if(EXISTS "${_venv_python}")
@@ -59,9 +53,6 @@ message(STATUS "jax.ffi.include_dir(): ${JAX_FFI_INCLUDE_DIR}")
 message(STATUS "metal_runtime.c_api.include_dir(): ${METAL_RUNTIME_INCLUDE_DIR}")
 message(STATUS "metal_runtime.c_api.library_dir(): ${METAL_RUNTIME_LIBRARY_DIR}")
 
-# The jax.ffi entry point (native/ffi/palladium_ffi.cpp): one generic
-# handler bridging metal-runtime's C API to XLA FFI. See that file's own
-# header comment for what it does.
 add_library(palladium_ffi SHARED native/ffi/palladium_ffi.cpp)
 target_include_directories(palladium_ffi PRIVATE
   "${JAX_FFI_INCLUDE_DIR}"
@@ -70,18 +61,13 @@ target_include_directories(palladium_ffi PRIVATE
 find_library(METAL_RUNTIME_C_LIB metal_runtime PATHS "${METAL_RUNTIME_LIBRARY_DIR}" REQUIRED)
 target_link_libraries(palladium_ffi PRIVATE "${METAL_RUNTIME_C_LIB}")
 
-# Two rpath entries, both needed: the absolute one resolves in an
-# editable/dev build, where palladium_ffi.dylib lives in the CMake build
-# dir with no fixed relationship to metal_runtime's install location;
-# the @loader_path one resolves in a real wheel install, where both
-# packages land as siblings under some site-packages whose absolute path
-# isn't known at build time. dyld tries each until one works.
+# The absolute rpath serves editable builds (dylib in the CMake build dir);
+# @loader_path serves wheel installs, where both packages are siblings in
+# site-packages.
 set_target_properties(palladium_ffi PROPERTIES
   INSTALL_RPATH "${METAL_RUNTIME_LIBRARY_DIR};@loader_path/../metal_runtime"
   BUILD_WITH_INSTALL_RPATH ON
 )
 
-# Ships inside the installed palladium package; see
-# src/palladium/ffi.py's _library_path() for how it's found at runtime
-# (the same importlib.resources pattern metal_runtime.c_api uses).
+# Found at runtime through importlib.resources (ffi._library_path).
 install(TARGETS palladium_ffi LIBRARY DESTINATION palladium)

@@ -43,18 +43,18 @@ can exceed Metal's per-thread stack limit.
 
 ## Check the result
 
-Every call exposes .interpret, which runs the same Pallas kernel through the
-CPU interpreter. Use it as the reference for independent-thread kernels:
+A metal_call exposes .interpret, which runs the same Pallas kernel through
+the CPU interpreter. Use it as the reference for independent-thread kernels:
 
 ~~~python
 np.testing.assert_allclose(call(x, y), call.interpret(x, y), rtol=1e-5)
 ~~~
 
-FAST math is the default, so transcendental results and reduction order can differ from
-the reference.
+FAST math is the default, so transcendental results and reduction order can
+differ from the reference.
 
 .explain(*args) reports the grid, threadgroup, declared storage, and emitted
-MSL size. It traces and emits source but does not compile or dispatch.
+MSL size without compiling or dispatching.
 palladium.debug_msl returns the generated MSL directly.
 
 ## Plain Pallas on jax-mps
@@ -70,11 +70,11 @@ call = pl.pallas_call(
     out_shape=...,
     compiler_params=palladium.CompilerParams(dot_general="tensorops", threadgroup=128),
 )
-jax.jit(call)(x)  # palladium.dispatch on mps; JAX's own lowering elsewhere
+jax.jit(call)(x)  # Metal on mps; JAX's own lowering elsewhere
 ~~~
 
-Other platforms keep JAX's behavior (interpret=True, or an error), and
-`interpret=True` is honored everywhere. Gradients pair a forward call with a
+Other platforms keep JAX's own behavior, and `interpret=True` runs the Pallas
+interpreter everywhere. Gradients pair a forward call with a
 backward implementation: `palladium.with_vjp(forward, backward)`. Pass
 `residuals=k` to keep the forward call's last `k` outputs (checkpoints, for
 example) for the backward pass instead of returning them.
@@ -88,8 +88,8 @@ over many dispatches is an ordinary `lax.fori_loop` or `lax.scan` around the
 call under `jax.jit`.
 
 On mps, jax.vmap over a pallas_call is JAX's own batching. No path derives
-gradients from emitted MSL. Pair forward and backward calls with
-jax.custom_vjp, or provide a pure-JAX reference VJP where supported. See the
+gradients from emitted MSL: pair forward and backward calls with
+palladium.with_vjp or jax.custom_vjp. See the
 [supported functionality](supported-jax.md) for details.
 
 Unsupported kernel structure raises TraceError; unsupported lowering raises

@@ -1,6 +1,5 @@
 """Long-horizon symplectic integration and its error floors.
 
-Docs: math modes, docs/performance.md (math mode).
 The Kepler two-body problem, q'' = -q/|q|^3, integrated for millions of
 steps. Initial conditions sit at perihelion of a unit-semi-major-axis
 orbit, so the invariants are known in closed form: E = -1/2 and
@@ -22,8 +21,7 @@ those accumulate as a random walk, error ~ eps * sqrt(steps). Verlet in
 float32 (FAST and SAFE) against Verlet in df32 (float32x2 compensated
 arithmetic, hand-written MSL: the Pallas/jnp frontend has no df32 dtype
 to trace through). The float32 lines leave the truncation floor and
-climb with slope 1/2; the df32 line stays on it. The compensated variant
-is limited by the integrator, the plain one by the hardware.
+climb with slope 1/2; the df32 line stays on it.
 """
 
 import time
@@ -231,7 +229,7 @@ def palladium_run(math_mode, state0, on_mark):
         compiler_params=palladium.CompilerParams(math_mode=math_mode),
     )
     step = jax.jit(f)
-    jax.block_until_ready(step(*state0))  # trace + emit + Metal compile outside the clock
+    jax.block_until_ready(step(*state0))  # compile outside the clock
     state, t0 = state0, time.perf_counter()
     for chunk in range(1, CHUNKS + 1):
         state = tuple(np.asarray(v) for v in step(*state))

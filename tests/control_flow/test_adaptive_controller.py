@@ -160,7 +160,6 @@ def _inputs(rng, n: int, stiff_fraction: float = 0.0):
 
 
 def test_matches_interpret_oracle(rng):
-    """The GPU agrees with the CPU oracle on a mild ensemble."""
     n = 256
     f = make_solver(n)
     args = _inputs(rng, n)

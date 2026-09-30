@@ -37,14 +37,15 @@ __all__ = [
 
 @dataclasses.dataclass(frozen=True)
 class ScratchInfo:
-    """An extra scratch buffer in a kernel without a backing caller array.
+    """A kernel scratch buffer with no backing caller array, private to one
+    program instance.
 
     Attributes
     ----------
-    shape: tuple of int
+    shape : tuple of int
         Buffer shape.
-    dtype: numpy.dtype
-        Buffer element type. Scratch is private to one program instance.
+    dtype : numpy.dtype
+        Buffer element type.
     """
 
     shape: tuple[int, ...]
@@ -90,7 +91,7 @@ class KernelSpec:
         Pallas grid; `(1,)` for gridless calls.
     inputs, outputs : tuple of BlockInfo
         Operand descriptions in jaxpr order.
-    scratch: tuple of ScratchInfo
+    scratch : tuple of ScratchInfo
         Scratch buffer descriptions, in jaxpr order after the operands.
     aliases : tuple of (int, int)
         Validated `input_output_aliases` pairs (input index, output index):
@@ -107,10 +108,9 @@ class KernelSpec:
 
 
 def _block_dim(dim: Any) -> int | None:
-    # JAX 0.11 stages BlockSpec shapes as BlockDim objects; squeezed dims
-    # vanish from the visible block. pl.Element, pl.Indirect, and
-    # pl.BoundedSlice also carry `block_size` but mean different indexing,
-    # so accepting them would lower wrong offsets silently.
+    # Squeezed dims vanish from the visible block. pl.Element, pl.Indirect,
+    # and pl.BoundedSlice also carry `block_size` but index differently, so
+    # accepting them would silently lower wrong offsets.
     if isinstance(dim, (int, np.integer)):
         return int(dim)
     if isinstance(dim, pl.Squeezed):

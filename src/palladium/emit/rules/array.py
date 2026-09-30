@@ -28,8 +28,8 @@ def _rule_reshape(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         _emit_permuted_copy(cursor, src, dst, tuple(perm))
         return
     if bool(src.shape) != bool(new_shape):
-        # Rank zero uses a scalar expression, while ranked values use
-        # indexable storage. A shape-only alias cannot cross that boundary.
+        # A shape-only alias cannot cross between a rank-0 scalar
+        # expression and indexable ranked storage.
         dst = declare(env, cursor, eqn.outvars[0])
         scalar = dataclasses.replace(src, expr=src.at("0"), shape=())
         cursor.copy(dst, scalar, 1)
@@ -115,7 +115,6 @@ def _rule_select_n(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         env.bind(eqn.outvars[0], cases[0])
         return
     if which.ctype == "bool":
-        # Boolean predicates take the elementwise template.
         _rule_elementwise(env, cursor, eqn)
         return
 

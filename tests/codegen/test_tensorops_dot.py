@@ -1,4 +1,4 @@
-"""Codegen contract for the opt-in cooperative TensorOps dot path."""
+"""Codegen contract for the cooperative TensorOps dot path."""
 
 import dataclasses
 

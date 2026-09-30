@@ -1,15 +1,15 @@
 # Performance and example results
 
-Palladium is aimed at kernels with substantial work per independent Pallas
-grid instance: an ODE trajectory, SDE path, or stencil cell. It fuses that work
-into one Metal dispatch. The model is one Metal thread per program instance;
-parallelism comes from the grid.
+Palladium targets kernels with substantial work per independent Pallas grid
+instance: an ODE trajectory, SDE path, or stencil cell, fused into one Metal
+dispatch. Each program instance is one Metal thread; parallelism comes from
+the grid.
 
 ## Recorded results
 
 These are local Apple-GPU runs, workload- and machine-specific, not general
 speedup guarantees. The Lotka-Volterra result used JAX 0.11.1 and did not
-record the GPU model; the CNF row is from September 2026 on current code.
+record the GPU model; the CNF row is from September 2026.
 
 | Workload | Palladium | Comparison |
 |---|---:|---:|
@@ -25,14 +25,14 @@ plain JAX on MPS, so the fused kernels add about 13 ms of Metal compilation.
 Checkpoint interval barely matters at this size: intervals 1, 4, and 8 ran in
 0.380, 0.388, and 0.408 ms. Pairing the Palladium forward kernel with JAX's
 reference VJP instead of the adjoint kernel ran at 15.029 ms, the same as
-plain JAX, so the backward kernel carries the speedup. The FFI row shows the
-same two kernels called from an XLA-on-CPU program with `metal_call`:
-this needs neither jax-mps nor Xcode, and since XLA fuses the small
-optimizer glue better than MLX does, it lands within 25% of the mps-platform
-run on a different machine. Run the Mew benchmarks with
+plain JAX, so the backward kernel carries the speedup. The FFI row calls the
+same two kernels from an XLA-on-CPU program with `metal_call`. It needs
+neither jax-mps nor Xcode and lands within 25% of the mps-platform run on a
+different machine, since XLA fuses the small optimizer glue better than MLX.
+Run the Mew benchmarks with
 `JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/`.
 See the reproducible scripts for [RK4](../benchmarks/bench_rk4_ensemble.py)
-and [CNF training](../benchmarks/bench_cnf_training.py). The experimental
+and [CNF training](../benchmarks/bench_cnf_training.py). The
 [Pallas attention benchmark](../benchmarks/bench_pallas_flash_attention.py)
 checks causal and noncausal Pallas TensorOps lowering against a NumPy reference
 and measures resident-buffer runs at sequence lengths from 1,024 to 4,096. It
@@ -60,13 +60,13 @@ tiles measured:
 With 32×32 query/key tiles on the same M1 Pro (JAX 0.11.2), the noncausal
 4,096 case measured 4.96 ms, so the tile choice matters more than the mask.
 
-Those M1 Pro rows predate the current schedule. The attention lowering now
-owns each score row by one SIMD group (lanes across columns, `simd_max` and
+The M1 Pro rows used an earlier attention schedule. The current lowering
+gives each score row to one SIMD group (lanes across columns, `simd_max` and
 `simd_sum` for the row reductions, scores read once into registers) and keeps
 the output accumulator in the value matmul's cooperative tensor instead of
 threadgroup memory, addressed through MPP element coordinates. Threadgroup
-memory per group fell from `BQ×BK + BQ×D + 2·BQ` to `BQ×BK + 3·BQ` floats, which
-makes 128-wide key tiles affordable. On an M2 (8-core GPU) through
+memory per group is `BQ×BK + 3·BQ` floats instead of `BQ×BK + BQ×D + 2·BQ`,
+which makes 128-wide key tiles affordable. On an M2 (8-core GPU) through
 metal-runtime, f32, `[1, 4096, 4, 64]`, medians of resident-buffer runs:
 
 | Tiles (q×k) | Before | After |
@@ -80,13 +80,12 @@ metal-runtime, f32, `[1, 4096, 4, 64]`, medians of resident-buffer runs:
 
 At `[1, 1024, 4, 64]` the 32×128 tiles measured 0.96 ms against 2.1 ms before.
 Wide key tiles amortize the three barriers per key step; 64×128 exceeds the
-32 KB threadgroup budget. Staging the query tile in threadgroup memory was
-measured and rejected: it costs 1.5x at 4,096 through lost occupancy.
+32 KB threadgroup budget. Staging the query tile in threadgroup memory costs
+1.5x at 4,096 through lost occupancy.
 
 These are steady-state medians with resident inputs; the generated kernel
-passed the benchmark's NumPy correctness check for both mask modes. Causal and
-noncausal timings are within the variation between runs, with no consistent
-overhead from causal masking at these sizes.
+passed the benchmark's NumPy correctness check for both mask modes. In the M1
+Pro table, causal and noncausal timings are within run-to-run variation.
 
 A separate JAX 0.11.2 forward-only probe ran 4,096 CNF trajectories for 64
 RK4 steps through CPU FFI to Metal. Warm medians were 0.510 ms at width 4,
@@ -102,19 +101,17 @@ near the integrator's step-size error bound. Run
 
 ## Costs and practical choices
 
-- A blocking Metal dispatch has measured at about 136 μs on M1 Pro, regardless
-  of kernel size. Pipelined dispatches overlap this queue latency; very short
+- A blocking Metal dispatch measured about 136 μs on M1 Pro, regardless of
+  kernel size. Pipelined dispatches overlap this queue latency; very short
   kernels benefit from fusing work in each instance or batching work in the
   Pallas grid.
 - Keep each instance's blocks and intermediates small: they occupy per-thread
   storage and can exceed Metal's stack limit.
-- `metal_call` adds CPU-FFI setup and buffer wrapping. The
-  measured passthrough overhead was 0.19 ms for 16 KB buffers and 0.25 ms for
-  1 MB; the common path wraps eligible XLA memory without copying. These are
-  end-to-end FFI costs, not bufferization-only timings.
-- Use static `fori_loop` or `scan` when practical. A
-  data-dependent `while_loop` is correct, but instances may finish
-  at different times.
+- `metal_call` adds CPU-FFI setup and buffer wrapping. The measured
+  end-to-end passthrough overhead was 0.19 ms for 16 KB buffers and 0.25 ms
+  for 1 MB; the common path wraps eligible XLA memory without copying.
+- Prefer static `fori_loop` or `scan`. A data-dependent `while_loop` is
+  correct, but instances may finish at different times.
 
 For comparisons, warm compilation first, synchronize every sample, and
 interleave candidates (A, B, A, B) to reduce thermal bias. Report the device,

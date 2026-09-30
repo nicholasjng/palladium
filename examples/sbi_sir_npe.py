@@ -1,6 +1,5 @@
 """Neural posterior estimation on GPU-simulated SIR data.
 
-Docs: examples/sbi_sir.py for the simulator.
 Simulation-based inference is simulate, train a neural posterior
 estimator on the (theta, x) pairs, then sample it at the observation.
 The GPU touches only the first stage. This example measures two things:

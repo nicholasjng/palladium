@@ -1,6 +1,5 @@
 """Per-thread adaptivity vs vmap lockstep.
 
-Docs: divergent while-loops, docs/supported-jax.md (control flow).
 vmap over an adaptive Diffrax solve forces the whole batch into
 lockstep: every trajectory takes (and rejects) the steps its worst
 neighbour needs. The example measures that cost on the CPU by salting a
@@ -124,8 +123,6 @@ def palladium_solver(n, pcoeff=PCOEFF, icoeff=ICOEFF):
             dt = dt * jnp.clip(factor, FACTORMIN, FACTORMAX)
             steps = steps + jnp.where(accept, 1.0, 0.0)
             rejected = rejected + jnp.where(accept, 0.0, 1.0)
-            # was_real & accept would stage a boolean `and`, which has no
-            # emitter rule; nested wheres keep both branches numeric.
             real = real + jnp.where(was_real, jnp.where(accept, 1.0, 0.0), 0.0)
             return (
                 t2,
@@ -221,7 +218,7 @@ def main():
         outs = jax.block_until_ready(solve(*args))
         return tuple(np.asarray(o) for o in outs), time.perf_counter() - t0
 
-    timed(x0, v0, mild)  # trace + emit + Metal compile outside the clock
+    timed(x0, v0, mild)  # compile outside the clock
     (_, _, _, steps_mild_gpu, _, real_mild_gpu), t_mild_gpu = timed(x0, v0, mild)
     (_, _, _, steps_mixed_gpu, rejected_mixed_gpu, real_mixed_gpu), t_mixed_gpu = timed(
         x0, v0, mixed

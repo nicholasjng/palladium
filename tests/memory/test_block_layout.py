@@ -1,4 +1,4 @@
-"""Grids and blocks: `_rule_program_id` and `_block_offset`.
+"""Grids and blocks: `_rule_program_id` and `block_offset`.
 
 Each program instance's Refs point at its own block, so the emitted pointers
 carry per-thread offsets computed from the BlockSpec index map.

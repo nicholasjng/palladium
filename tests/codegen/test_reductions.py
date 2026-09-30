@@ -51,8 +51,6 @@ def test_mean_matches_numpy(rng):
 
 
 def test_mse_loss_matches_numpy(rng):
-    """mean((pred - target) ** 2) matches numpy."""
-
     def kernel(pred_ref, target_ref, o_ref):
         diff = pred_ref[...] - target_ref[...]
         o_ref[...] = jnp.mean(diff**2)
@@ -94,7 +92,7 @@ def test_softmax_stability_matches_numpy(rng):
         e = jnp.exp(x)
         o_ref[...] = e / jnp.sum(e, axis=1, keepdims=True)
 
-    x = (rng.standard_normal((4, 6), dtype=np.float32)) * 50.0  # large enough to overflow raw exp
+    x = (rng.standard_normal((4, 6), dtype=np.float32)) * 50.0
     f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((4, 6), jnp.float32))
     got = f(x)
     xs = x - x.max(axis=1, keepdims=True)

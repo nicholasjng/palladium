@@ -64,7 +64,7 @@ def test_where_asymmetric_branches(rng):
 
 
 def test_select_n_accepts_integer_predicate(rng):
-    """Integer indices select among all cases, not just false/true."""
+    """Integer indices select among all cases, not only false/true."""
 
     def kernel(i_ref, x_ref, o_ref):
         idx = i_ref[...]

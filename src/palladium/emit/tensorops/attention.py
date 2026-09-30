@@ -484,8 +484,8 @@ def _emit(plan: _AttentionPlan, spec: KernelSpec, kernel_name: str | None):
         (1, heads * dim),
     ).emit(cursor, "value_view")
     # The accumulator is the value matmul's cooperative tensor, held in
-    # threadgroup registers for the whole key loop. MPP reports each element's
-    # coordinate as (column, row); the rescale and final store rely on it.
+    # per-thread registers for the whole key loop. MPP reports each element's
+    # coordinate as (column, row).
     acc = value_op.emit_cooperative_destination(
         cursor, score_tile, value_view, name="acc", element_type="float"
     )
@@ -544,10 +544,9 @@ def _emit(plan: _AttentionPlan, spec: KernelSpec, kernel_name: str | None):
         value_op.emit_run(cursor, score_tile, value_tile, acc)
         cursor.barrier()
 
-    # Small tiles leave some slots unowned. They report another lane's
-    # coordinates, so storing them would overwrite that lane's output. When
-    # the slots exactly cover the tile, the constant first test folds the
-    # check away. The rescale needs no guard: it only updates this lane's slots.
+    # Small tiles leave some slots unowned; they report another lane's
+    # coordinates, so storing them would overwrite that lane's output. The
+    # constant first test folds the guard away when slots cover the tile.
     fully_owned = f"{acc.expr}.get_capacity() * {SIMDGROUPS * lanes} == {tile_q * dim}"
     with (
         cursor.loop(f"{acc.expr}.get_capacity()", "_i") as i,

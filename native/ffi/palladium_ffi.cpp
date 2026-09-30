@@ -1,12 +1,9 @@
-// jax.ffi entry point: one generic XLA FFI handler for every palladium
-// kernel, registered as "palladium_dispatch" on the "cpu" platform. MSL
-// source, entry point name, and grid travel as FFI Attrs (baked into
-// the HLO at trace time, free per call); buffers arrive as
+// One generic XLA FFI handler for every palladium kernel, registered as
+// "palladium_dispatch" on the "cpu" platform. MSL source, entry point, and
+// grid travel as FFI Attrs baked into the HLO; buffers arrive as
 // RemainingArgs/RemainingRets, so one handler covers any input/output
-// count. Bridges through metal-runtime's C API (c_api.h) only, no
-// Metal/Obj-C type here. XLA:CPU runs FFI handlers on its own compute
-// thread pool with no opt-out trait, so KernelCache below is
-// mutex-guarded the same way metal-runtime's own caches are.
+// count. Uses only metal-runtime's C API (c_api.h). XLA:CPU runs FFI
+// handlers on its own thread pool, so KernelCache is mutex-guarded.
 
 #include <cstdlib>
 #include <list>
@@ -21,16 +18,9 @@
 
 namespace {
 
-// Compiles lazily, once per (msl_source, function_name) pair, holds the
-// MRLibrary/MRPipeline for the process lifetime. mr_compile_library
-// itself doesn't cache (unlike the Python bindings' library_for()), so
-// this exists because nothing upstream provides it.
-// Compiled kernels are keyed by (source, entry point, math mode) and each
-// holds a Metal library and pipeline for the process lifetime. A long-lived
-// process tracing many shapes (a server with dynamic batch sizes) would grow
-// without bound, so the cache is an LRU with a cap. The default is generous
-// relative to any realistic working set of distinct shapes; PALLADIUM_KERNEL_
-// CACHE_SIZE overrides it, and 0 disables eviction entirely.
+// LRU of compiled (MRLibrary, MRPipeline) pairs keyed by (source digest,
+// entry point, math mode); mr_compile_library does not cache.
+// PALLADIUM_KERNEL_CACHE_SIZE overrides the cap, and 0 disables eviction.
 constexpr size_t kDefaultKernelCacheSize = 256;
 
 static size_t kernel_cache_capacity() {
@@ -75,10 +65,8 @@ public:
       }
     }
 
-    // Compiled outside the lock: holding it across a compile/build would
-    // serialize threads compiling *different* kernels. A race
-    // double-compiles; the loser is released below. Same trade-off as
-    // runtime.h's library_for().
+    // Compiled outside the lock so threads compiling different kernels do
+    // not serialize. A race double-compiles; the loser is released below.
     char *err = nullptr;
     MRLibrary *library = nullptr;
     if (mr_compile_library(msl_source.data(), msl_source.size(), math_mode,
@@ -125,10 +113,8 @@ private:
     order_.splice(order_.begin(), order_, it->second);
   }
 
-  // Called with mutex_ held. Releasing a library/pipeline still referenced by
-  // an in-flight dispatch would be a use-after-free, but mr_dispatch retains
-  // what it needs for the lifetime of the command buffer, so an evicted entry
-  // stays alive until that work drains.
+  // Called with mutex_ held. Safe during in-flight work: the command buffer
+  // retains the library and pipeline it uses.
   void evict_if_needed() {
     const size_t cap = capacity_;
     if (cap == 0)
@@ -148,7 +134,6 @@ private:
   std::unordered_map<std::string, Iter> entries_;
 };
 
-// Wraps one FFI buffer via mr_wrap_buffer, appending to `wrapped`/`offsets`.
 // Returns false and fills `error` on failure; caller must not dispatch.
 bool wrap_one(xla::ffi::AnyBuffer buf, std::vector<MRBuffer *> &wrapped,
               std::vector<size_t> &offsets, std::string *error) {
@@ -226,19 +211,15 @@ xla::ffi::Error PalladiumDispatch(std::string_view source_id,
   desc.grid_x = (size_t)grid_x;
   desc.grid_y = (size_t)grid_y;
   desc.grid_z = (size_t)grid_z;
-  // threadgroup_x == 0 lets the runtime choose (c_api.cpp). Kernels
-  // using palladium.threadgroup_memory must pass an explicit size;
-  // ffi.py rejects them otherwise, mirroring palladium.bind.
+  // threadgroup_x == 0 lets the runtime choose.
   desc.threadgroup_x = (size_t)threadgroup_x;
   desc.threadgroup_y = (size_t)threadgroup_y;
   desc.threadgroup_z = (size_t)threadgroup_z;
 
-  // One grid dispatch per batch element, offset elem_strides[i] * element
-  // bytes into each buffer (stride 0 = shared across elements), all
-  // encoded into one command buffer: the ~130us fixed dispatch cost is
-  // paid once per FFI call instead of once per element, and the GPU runs
-  // the elements back to back. mr_batch_add copies the descriptor, so the
-  // offsets array is rewritten in place between adds.
+  // One grid dispatch per batch element, offset element * elem_strides[i]
+  // bytes into each buffer (stride 0 = shared), all in one command buffer
+  // so the ~130us fixed dispatch cost is paid once per FFI call.
+  // mr_batch_add copies the descriptor, so offsets is rewritten in place.
   char *err = nullptr;
   MRBatch *batch = nullptr;
   auto fail = [&](const char *what) {
@@ -271,9 +252,8 @@ xla::ffi::Error PalladiumDispatch(std::string_view source_id,
   mr_release_batch(batch);
   batch = nullptr;
 
-  // Only outputs need flushing back (no-op on the zero-copy path).
-  // Inputs are read-only to the kernel. One flush per whole buffer, after
-  // the loop: every batch element wrote its slice into the same wrapping.
+  // Flush outputs only (no-op on the zero-copy path), once per buffer
+  // after the whole batch.
   for (size_t i = n_inputs; i < wrapped.size(); ++i) {
     if (mr_buffer_flush_to(wrapped[i], &err) != MR_OK) {
       xla::ffi::Error e =
