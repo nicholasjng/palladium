@@ -101,13 +101,23 @@ def reference_flow(states, parameters, *, steps=16, reverse=True):
 
 
 def make_flow(
-    n, *, width=4, steps=16, interval=4, variant="reverse", reverse=True, interpret=False
+    n,
+    *,
+    width=4,
+    steps=16,
+    interval=4,
+    variant="reverse",
+    reverse=True,
+    interpret=False,
+    ffi=False,
 ):
     """Integrate data to base (reverse=True) or base to data.
 
     Returns (n,3) augmented states. Parameters have shape (n,6*width+2);
     broadcast shared weights before calling. The checkpointed VJP differentiates
     the discrete RK4 scheme. Higher-order AD of the custom call is unsupported.
+    `ffi=True` dispatches the kernels through `metal_call_jit` from a CPU
+    program instead of the mps platform's pallas_call lowering.
     """
     if min(n, width, steps, interval) < 1:
         raise ValueError("n, width, steps and interval must be positive")
@@ -182,9 +192,14 @@ def make_flow(
     checkpoint_spec = pl.BlockSpec((1, 3 * checkpoints), lambda i: (i, 0))
     shape = jax.ShapeDtypeStruct((n, 3), jnp.float32)
     saves = variant == "reverse"
-    forward = pl.pallas_call(
+
+    def call(kernel, **kwargs):
+        if ffi:
+            return palladium.metal_call_jit(kernel, **kwargs)
+        return pl.pallas_call(kernel, interpret=interpret, **kwargs)
+
+    forward = call(
         forward_kernel,
-        interpret=interpret,
         grid=(n,),
         in_specs=(state_spec, params_spec),
         out_specs=(state_spec, checkpoint_spec) if saves else state_spec,
@@ -196,9 +211,8 @@ def make_flow(
         return forward
     if variant == "reference":
         return palladium.with_reference_vjp(forward, reference)
-    backward = pl.pallas_call(
+    backward = call(
         backward_kernel,
-        interpret=interpret,
         grid=(n,),
         in_specs=(state_spec, params_spec, checkpoint_spec, state_spec),
         out_specs=(state_spec, params_spec),
