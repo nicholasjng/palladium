@@ -136,3 +136,17 @@ def typed_expression(op: str, ctype: str) -> str | None:
         expr = f"(uint({{b}}) < 32u ? (uint({{a}}) {symbol} (uint({{b}}) & 31u)) : 0u)"
         return f"as_type<int>({expr})" if ctype == "int" else expr
     return None
+
+
+def format_scalar(op: str, ctype: str, operands: tuple[str, ...]) -> str:
+    """`op` applied to scalar C `operands` in `ctype`, from the typed or
+    table template; raises EmitError for an unknown op or wrong arity."""
+    template = typed_expression(op, ctype) or ELEMENTWISE.get(op)
+    if template is None:
+        raise EmitError(f"no scalar template for primitive {op!r}")
+    names = PRIMITIVE_INVARS[: len(operands)]
+    if template_fields(template) != set(names):
+        raise EmitError(
+            f"{op} takes {len(template_fields(template))} operands, got {len(operands)}"
+        )
+    return template.format(**dict(zip(names, operands, strict=True)))

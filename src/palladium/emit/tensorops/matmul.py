@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
-import string
 
 from jax.extend.core import Literal, Var
 
 from palladium.emit.addressing import block_offset
 from palladium.emit.core import CTYPES, Cursor, CVal, Environment
-from palladium.emit.numeric import ELEMENTWISE, typed_expression
+from palladium.emit.numeric import ELEMENTWISE, format_scalar, typed_expression
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
 
@@ -511,16 +510,9 @@ def _elementwise_expression(eqn, ctype: str, operands: tuple[str, ...]) -> str:
         if len(operands) != 1 or tuple(eqn.params["broadcast_dimensions"]) not in ((1,), (1, 2)):
             raise EmitError("tensorops matmul only supports column and singleton-batch broadcasts")
         return operands[0]
-    template = typed_expression(eqn.primitive.name, ctype) or ELEMENTWISE.get(eqn.primitive.name)
-    if template is None:
-        raise EmitError(
-            f"tensorops matmul epilogue primitive {eqn.primitive.name!r} is unsupported"
-        )
-    names = string.ascii_lowercase[: len(operands)]
-    fields = {field for _, field, _, _ in string.Formatter().parse(template) if field}
-    if len(names) != len(eqn.invars) or fields != set(names):
+    if len(operands) != len(eqn.invars):
         raise EmitError(f"{eqn.primitive.name} epilogue has unsupported arity")
-    return template.format(**dict(zip(names, operands, strict=True)))
+    return format_scalar(eqn.primitive.name, ctype, operands)
 
 
 def _is_tile_shape(shape: tuple[int, ...], rank: int, tm: int, tn: int) -> bool:

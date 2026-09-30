@@ -60,8 +60,7 @@ def _rule_cumulative(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
             cursor.emit(f"{dst.at(flat)} = {acc};")
 
 
-for _name in _CUMULATIVE:
-    rule(_name)(_rule_cumulative)
+rule(*_CUMULATIVE)(_rule_cumulative)
 
 
 @rule("concatenate")

@@ -100,10 +100,9 @@ def _fuses_into_consumer(env: Environment, var, shape: tuple[int, ...], ops: lis
     """Whether `var` can stay an expression: it is consumed exactly once, by
     an elementwise equation of the same shape at this jaxpr level, and its
     own operands are addressable by the same flat index."""
-    consumers = env.consumers.get(var, [])
-    if len(consumers) != 1 or consumers[0] is None:
+    consumer = env.sole_consumer(var)
+    if consumer is None:
         return False
-    consumer = consumers[0]
     name = consumer.primitive.name
     if RULES.get(name) is not _rule_elementwise:
         return False
@@ -164,10 +163,6 @@ def _template(cursor: Cursor, eqn: JaxprEqn, opname: str, ops: list[CVal], ctype
         # Reinterprets bits without a numeric conversion (unlike
         # convert_element_type's cast); Metal's equivalent is as_type<T>.
         template = f"as_type<{ctype}>({{a}})"
-    elif opname == "select_n":
-        if (pred_type := ops[0].ctype) != "bool":
-            raise EmitError(f"select_n requires predicate of type bool, got {pred_type}")
-        template = ELEMENTWISE[opname]
     else:
         template = ELEMENTWISE[opname]
 
@@ -235,8 +230,9 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         cursor.emit(assign(idx_vars))
 
 
+# select_n has its own rule in array.py, which falls back to this one.
 for _name in [
-    *ELEMENTWISE,
+    *(name for name in ELEMENTWISE if name != "select_n"),
     *HELPERS,
     "round",
     "integer_pow",

@@ -9,6 +9,7 @@ from jax.extend.core import Jaxpr, JaxprEqn
 
 from palladium.emit.addressing import ref_view
 from palladium.emit.core import Cursor, Environment, declare, emit_jaxpr, rule, shaped
+from palladium.emit.rules.control import _consumed_only_as_scan_xs
 from palladium.errors import EmitError
 
 
@@ -24,41 +25,24 @@ def _rule_get(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """
     indexer_args = eqn.params["tree"].unflatten(eqn.invars[1:])
     src = env.val(eqn.invars[0])
-    out_aval = shaped(eqn.outvars[0].aval)
-    from palladium.emit.rules.control import _consumed_only_as_scan_xs
-
-    if (
-        not indexer_args
-        and src.readonly
+    out_shape = tuple(int(d) for d in shaped(eqn.outvars[0].aval).shape)
+    if indexer_args:
+        (indexer,) = indexer_args
+        src = ref_view(env, src, indexer)
+    viewable = (
+        src.readonly
         and src.index_map is None
         and src.space == "device"
         and src.shape
-        and out_aval.shape
-        and math.prod(src.shape) == math.prod(tuple(int(d) for d in out_aval.shape))
-        and _consumed_only_as_scan_xs(env, eqn.outvars[0])
-    ):
-        env.bind(
-            eqn.outvars[0],
-            dataclasses.replace(src, shape=tuple(int(d) for d in out_aval.shape)),
+        and math.prod(src.shape) == math.prod(out_shape)
+        and (
+            bool(indexer_args)
+            or (bool(out_shape) and _consumed_only_as_scan_xs(env, eqn.outvars[0]))
         )
+    )
+    if viewable:
+        env.bind(eqn.outvars[0], dataclasses.replace(src, shape=out_shape))
         return
-    if indexer_args:
-        (indexer,) = indexer_args
-        view = ref_view(env, src, indexer)
-        aval = shaped(eqn.outvars[0].aval)
-        if (
-            view.readonly
-            and view.index_map is None
-            and view.space == "device"
-            and view.shape
-            and math.prod(view.shape) == math.prod(tuple(int(d) for d in aval.shape))
-        ):
-            env.bind(
-                eqn.outvars[0],
-                dataclasses.replace(view, shape=tuple(int(d) for d in aval.shape)),
-            )
-            return
-        src = view
     dst = declare(env, cursor, eqn.outvars[0])
     cursor.copy(dst, src, dst.size)
 
@@ -104,13 +88,8 @@ def _inline_jit(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         env.bind(outvar, val)
 
 
-@rule("random_wrap")
+@rule("random_wrap", "random_unwrap")
 def _rule_random_wrap(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """`jax.random.wrap_key_data`: a type-level wrap of uint32[2] key data; pure alias."""
-    env.bind(eqn.outvars[0], env.val(eqn.invars[0]))
-
-
-@rule("random_unwrap")
-def _rule_random_unwrap(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """`jax.random.key_data`: the inverse of `random_wrap`; pure alias."""
+    """`jax.random.wrap_key_data` and `key_data`: type-level wraps of
+    uint32[2] key data; pure aliases."""
     env.bind(eqn.outvars[0], env.val(eqn.invars[0]))

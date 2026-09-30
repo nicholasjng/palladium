@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
-import string
 
 from jax.extend.core import JaxprEqn, Literal, Var
 
-from palladium.emit.core import Cursor, CVal, Environment, shaped
-from palladium.emit.numeric import ELEMENTWISE, typed_expression
+from palladium.emit.core import Cursor, CVal, literal, shaped
+from palladium.emit.numeric import format_scalar
 from palladium.errors import EmitError
 
 
@@ -40,17 +39,9 @@ def elementwise_expression(
         if len(matches) != 1:
             raise EmitError(f"{opname} equation has unbound or ambiguous cooperative operands")
         operands.append(matches[0])
-    operands = tuple(operands)
     if opname == "max" and len(operands) == 2:
         return f"max({operands[0]}, {operands[1]})"
-    template = typed_expression(opname, ctype) or ELEMENTWISE.get(opname)
-    if template is None:
-        raise EmitError(f"unsupported cooperative elementwise primitive {opname!r}")
-    fields = {field for _, field, _, _ in string.Formatter().parse(template) if field}
-    names = string.ascii_lowercase[: len(operands)]
-    if len(operands) != len(eqn.invars) or fields != set(names):
-        raise EmitError(f"{opname} equation has unsupported arity")
-    return template.format(**dict(zip(names, operands, strict=True)))
+    return format_scalar(opname, ctype, tuple(operands))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -181,7 +172,7 @@ def emit_online_softmax_simd(
                 atom,
                 "old_sum"
                 if any(atom is carry for carry in plan.body_invars)
-                else Environment().val(atom).expr,
+                else literal(atom).expr,
             )
             for atom in plan.nonempty.invars
         )
