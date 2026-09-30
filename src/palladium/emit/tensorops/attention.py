@@ -545,11 +545,13 @@ def _emit(plan: _AttentionPlan, spec: KernelSpec, kernel_name: str | None):
         cursor.barrier()
 
     # Small tiles leave some slots unowned. They report another lane's
-    # coordinates, so storing them would overwrite that lane's output. The
-    # rescale needs no guard because it only updates this lane's slots.
+    # coordinates, so storing them would overwrite that lane's output. When
+    # the slots exactly cover the tile, the constant first test folds the
+    # check away. The rescale needs no guard: it only updates this lane's slots.
+    fully_owned = f"{acc.expr}.get_capacity() * {SIMDGROUPS * lanes} == {tile_q * dim}"
     with (
         cursor.loop(f"{acc.expr}.get_capacity()", "_i") as i,
-        cursor.block(f"if ({acc.expr}.is_valid_element({i}))"),
+        cursor.block(f"if ({fully_owned} || {acc.expr}.is_valid_element({i}))"),
     ):
         cursor.emit(f"const auto acc_index = {acc.expr}.get_multidimensional_index({i});")
         cursor.emit("const int row = acc_index[1];")
