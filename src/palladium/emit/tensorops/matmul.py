@@ -10,29 +10,25 @@ from jax.extend.core import Literal, Var
 from palladium.emit.core import CTYPES, ELEMENTWISE, Cursor, CVal, Environment, _block_offset
 from palladium.emit.numeric import typed_expression
 from palladium.errors import EmitError
+from palladium.trace import KernelSpec
 
 from ._shared import (
     _index_map_is,
     _kernel_source,
+    _shape,
     _TensorOpsMatmul,
     _TensorView,
 )
-from .ir import KernelIR
-from .plan import Distribution, ProgramScope
 
 _K_TILE = 128
 
 
-def lower_matmul_ir(kernel: KernelIR, kernel_name: str | None = None) -> tuple[str, int]:
-    """Lower a tiled rank-2 or batched dot and its epilogue from tensorops IR.
+def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str, int]:
+    """Lower a tiled rank-2 or batched dot and its epilogue.
 
-    The dot, epilogue, and output store are selected from the imported
-    operation graph and validated against Pallas block maps.
+    The dot, epilogue, and output store are selected from the top-level
+    equations and validated against Pallas block maps.
     """
-    plan = kernel.plan
-    spec = plan.spec
-    if plan.scope is not ProgramScope.THREADGROUP:
-        raise EmitError("tensorops cooperative matmul requires threadgroup program scope")
     if (
         len(spec.inputs) < 2
         or len(spec.outputs) != 1
@@ -44,23 +40,15 @@ def lower_matmul_ir(kernel: KernelIR, kernel_name: str | None = None) -> tuple[s
     ):
         raise EmitError("tensorops matmul requires a full-block matmul with one output")
 
-    operations = kernel.body.operations
-    dots = [op for op in operations if op.name == "dot_general"]
-    stores = [op for op in operations if op.name == "swap"]
+    dots = [eqn for eqn in spec.jaxpr.eqns if eqn.primitive.name == "dot_general"]
+    stores = [eqn for eqn in spec.jaxpr.eqns if eqn.primitive.name == "swap"]
     if len(dots) != 1 or len(stores) != 1:
         raise EmitError("tensorops matmul requires one dot and one output store")
-    dot_op, store_op = dots[0], stores[0]
-    dot = dot_op.equation
-    store = store_op.equation
+    (dot,), (store,) = dots, stores
     if len(store.invars) != 2 or store.params["tree"].flatten_up_to(()) != []:
         raise EmitError("tensorops matmul currently supports only a full-block output store")
     if store.invars[0] is not spec.jaxpr.invars[-1]:
         raise EmitError("tensorops matmul store must target its output ref")
-    if (
-        dot_op.results[0].layout is None
-        or dot_op.results[0].layout.distribution is not Distribution.TENSOROPS
-    ):
-        raise EmitError("tensorops layout assignment did not give the dot TensorOps ownership")
 
     producers = {
         variable: eqn
@@ -429,10 +417,6 @@ def lower_matmul_ir(kernel: KernelIR, kernel_name: str | None = None) -> tuple[s
 
     source = _kernel_source(kernel_name or spec.name, params, cursor.lines)
     return source, cursor.threadgroup_bytes
-
-
-def _shape(atom) -> tuple[int, ...]:
-    return tuple(int(size) for size in getattr(atom.aval, "shape", ()))
 
 
 def _full_get(eqn, ref: Var):

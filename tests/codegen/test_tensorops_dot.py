@@ -439,3 +439,92 @@ def test_tensorops_dot_rejects_unblocked_single_program_matmul():
 
     with pytest.raises(EmitError, match="full-block matmul"):
         palladium.emit_msl(spec, dot_general="tensorops")
+
+
+def _tensorops_relu_dot(a_ref, b_ref, out_ref):
+    out_ref[...] = jnp.maximum(jnp.matmul(a_ref[...], b_ref[...]), 0.0)
+
+
+def _tensorops_chained_dot(a_ref, b_ref, out_ref):
+    out_ref[...] = jnp.maximum(jnp.matmul(a_ref[...], b_ref[...]), 0.0) + 1.0
+
+
+def _tensorops_matmul_spec(kernel=_dot, m=32, n=64, k=16, tm=16, tn=32, dtype=jnp.float32):
+    in_specs = [
+        pl.BlockSpec((tm, k), lambda i, j: (i, 0)),
+        pl.BlockSpec((k, tn), lambda i, j: (0, j)),
+    ]
+    args = [
+        jax.ShapeDtypeStruct((m, k), dtype),
+        jax.ShapeDtypeStruct((k, n), dtype),
+    ]
+    call = pl.pallas_call(
+        kernel,
+        grid=((m + tm - 1) // tm, (n + tn - 1) // tn),
+        in_specs=in_specs,
+        out_specs=pl.BlockSpec((tm, tn), lambda i, j: (i, j)),
+        out_shape=jax.ShapeDtypeStruct((m, n), dtype),
+    )
+    return palladium.trace(call, *args)
+
+
+def test_tensorops_matmul_lowering_emits_full_tiles():
+    spec = _tensorops_matmul_spec()
+    source, stats = palladium.emit.emit_msl_stats(spec, dot_general="tensorops")
+
+    assert "threadgroup_position_in_grid" in source
+    assert "execution_simdgroups<4>" in source
+    assert "matmul2d_descriptor desc(16, 32, 16" in source
+    assert "device float* arg0 [[buffer(0)]]" in source
+    assert "const device float*" not in source
+    assert stats.threadgroup_bytes == 0
+
+
+def test_tensorops_matmul_accumulates_k_in_tensorops_tiles_and_handles_tail():
+    source = palladium.emit_msl(_tensorops_matmul_spec(k=144), dot_general="tensorops")
+
+    assert "matmul2d_descriptor desc(16, 32, 128, false, false, false," in source
+    assert "mode::multiply_accumulate" in source
+    assert "for (int k_start = 0; k_start < 144; k_start += 128)" in source
+    assert "min(128, 144 - k_start)" in source
+    assert "op.run(a_k, b_k, cTc);" in source
+    assert "cTc[init0] = 0.0f;" in source
+
+
+def test_tensorops_matmul_masks_partial_output_tiles():
+    source = palladium.emit_msl(
+        _tensorops_matmul_spec(_tensorops_relu_dot, m=30, n=45, k=32), dot_general="tensorops"
+    )
+
+    assert "min(16, 30 - (int)_pid.x * 16)" in source
+    assert "min(32, 45 - (int)_pid.y * 32)" in source
+    assert "cTc.store(c_edge);" in source
+    assert "if (row < min(16, 30 - (int)_pid.x * 16)" in source
+    assert "threadgroup float edge_result[512];" in source
+    assert "cTc[element1] = tensorops_epilogue2;" in source
+    assert "(arg2 + (int)_pid.x * 720 + (int)_pid.y * 32)[row * 45 + column]" in (source)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "metal_type"),
+    ((jnp.float16, "half"), (jnp.bfloat16, "bfloat")),
+)
+def test_tensorops_matmul_accepts_half_precision_buffer_types(dtype, metal_type):
+    source = palladium.emit_msl(_tensorops_matmul_spec(k=32, dtype=dtype), dot_general="tensorops")
+
+    assert f"device {metal_type}* arg0 [[buffer(0)]]" in source
+    assert f"device {metal_type}* arg2 [[buffer(2)]]" in source
+    # Products accumulate in float and narrow on the per-element store.
+    assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in (source)
+    assert "threadgroup float dot_result[512];" in source
+    assert f"= {metal_type}(dot_result[element]);" in source
+
+
+def test_tensorops_matmul_lowering_composes_chained_epilogues():
+    chained, stats = palladium.emit.emit_msl_stats(
+        _tensorops_matmul_spec(_tensorops_chained_dot), dot_general="tensorops"
+    )
+    assert "threadgroup float tensorops_value_0[512];" not in chained
+    assert "cTc[element1] = tensorops_epilogue3;" in chained
+    assert "fmax" in chained
+    assert stats.threadgroup_bytes == 0

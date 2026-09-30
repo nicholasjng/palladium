@@ -1,4 +1,4 @@
-"""IR-driven lowering for cooperative Pallas online-softmax attention."""
+"""Cooperative lowering for Pallas online-softmax attention."""
 
 from __future__ import annotations
 
@@ -23,16 +23,15 @@ from ._shared import (
     SIMDGROUPS,
     _index_map_is,
     _kernel_source,
+    _shape,
     _TensorOpsMatmul,
     _TensorView,
 )
-from .ir import IROperation, KernelIR
-from .plan import Distribution, ProgramScope
 
 
 @dataclasses.dataclass(frozen=True)
-class _IRAttentionPlan:
-    """IR operations and static geometry needed by the cooperative emitter."""
+class _AttentionPlan:
+    """Matched equations and static geometry needed by the cooperative emitter."""
 
     scan: JaxprEqn
     query_length: int
@@ -49,45 +48,26 @@ class _IRAttentionPlan:
     final_div: JaxprEqn
 
 
-def lower_attention_ir(kernel: KernelIR, kernel_name: str | None = None) -> tuple[str, int]:
-    """Lower a supported online-softmax scan from its imported IR."""
-    if kernel.plan.scope is not ProgramScope.THREADGROUP:
-        raise EmitError("tensorops attention lowering requires threadgroup program scope")
-    spec = kernel.plan.spec
-    scans = [op for op in kernel.body.operations if op.name == "scan"]
+def lower_attention(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str, int]:
+    """Lower a supported online-softmax scan."""
+    scans = [eqn for eqn in spec.jaxpr.eqns if eqn.primitive.name == "scan"]
     if len(scans) != 1:
         raise EmitError("tensorops attention requires one top-level scan region")
-    scan_ir = scans[0]
-    body = scan_ir.equation.params["jaxpr"]
+    (scan,) = scans
+    body = scan.params["jaxpr"]
     if isinstance(body, ClosedJaxpr):
         body = body.jaxpr
     if not isinstance(body, Jaxpr):
-        raise EmitError("tensorops attention scan has no imported jaxpr body")
-    body_ir = scan_ir.regions[0] if scan_ir.regions else None
-    if body_ir is None:
-        raise EmitError("tensorops attention scan body is missing from the imported IR")
-    body_ops = {id(operation.equation): operation for operation in body_ir.operations}
-    plan = _analyze_attention(spec, scan_ir, body, body_ops)
-    return _emit(plan, spec, kernel_name)
+        raise EmitError("tensorops attention scan has no jaxpr body")
+    return _emit(_analyze_attention(spec, scan, body), spec, kernel_name)
 
 
-def _shape(atom) -> tuple[int, ...]:
-    shape = getattr(atom.aval, "shape", ())
-    return tuple(int(dimension) for dimension in shape)
-
-
-def _analyze_attention(
-    spec: KernelSpec,
-    scan_ir: IROperation,
-    body: Jaxpr,
-    body_ops: dict[int, IROperation],
-) -> _IRAttentionPlan:
-    scan = scan_ir.equation
+def _analyze_attention(spec: KernelSpec, scan: JaxprEqn, body: Jaxpr) -> _AttentionPlan:
     if scan.params.get("reverse") or scan.params.get("unroll") != 1:
         raise EmitError("tensorops attention requires a forward, single-step scan")
     if len(spec.inputs) != 3 or len(spec.outputs) != 1 or spec.scratch or spec.aliases:
         raise EmitError("tensorops attention requires Q, K, V, and one non-aliased output")
-    if len(spec.grid) != 3 or len(body_ops) != len(body.eqns):
+    if len(spec.grid) != 3:
         raise EmitError("tensorops attention requires a complete three-dimensional Pallas grid")
 
     query, key, value = spec.inputs
@@ -153,15 +133,7 @@ def _analyze_attention(
     )
     for dot, shapes in zip(dots, expected, strict=True):
         if tuple(_shape(atom) for atom in (*dot.invars, *dot.outvars)) != shapes:
-            raise EmitError(
-                "tensorops attention dot shapes do not match the imported tile geometry"
-            )
-        operation = body_ops[id(dot)]
-        if any(
-            result.layout is None or result.layout.distribution is not Distribution.TENSOROPS
-            for result in operation.results
-        ):
-            raise EmitError("tensorops attention dot result does not have TensorOps ownership")
+            raise EmitError("tensorops attention dot shapes do not match the tile geometry")
 
     producers = {
         variable: eqn for eqn in body.eqns for variable in eqn.outvars if isinstance(variable, Var)
@@ -318,7 +290,7 @@ def _analyze_attention(
     )
     score_op = _TensorOpsMatmul.from_eqn(score_dot, producers, name="score_op", accumulate=False)
     value_op = _TensorOpsMatmul.from_eqn(value_dot, producers, name="value_op", accumulate=True)
-    return _IRAttentionPlan(
+    return _AttentionPlan(
         scan,
         query_length,
         key_length,
@@ -449,7 +421,7 @@ def _validate_causal_positions(
         raise EmitError("tensorops causal query positions must use the query-tile grid axis")
 
 
-def _emit(plan: _IRAttentionPlan, spec: KernelSpec, kernel_name: str | None):
+def _emit(plan: _AttentionPlan, spec: KernelSpec, kernel_name: str | None):
     scan = plan.scan
     query_length, key_length = plan.query_length, plan.key_length
     heads, dim = plan.heads, plan.dim

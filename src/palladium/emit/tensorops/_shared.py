@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import dataclasses
 
-from jax.core import ShapedArray
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var, subjaxprs
 
 from palladium.emit.core import Cursor, CVal
@@ -33,20 +32,8 @@ def _kernel_source(name: str, parameters: tuple[str, ...], body: list[str]) -> s
     )
 
 
-def _shape(value: Var | Literal) -> tuple[int, ...]:
-    """Return a statically shaped aval's dimensions."""
-    aval = value.aval
-    if not isinstance(aval, ShapedArray):
-        raise EmitError(f"TensorOps requires a statically shaped value, got {aval}")
-    return tuple(int(dim) for dim in aval.shape)
-
-
-def _dtype_name(value: Var | Literal) -> str:
-    """Return a statically shaped aval's dtype name."""
-    aval = value.aval
-    if not isinstance(aval, ShapedArray):
-        raise EmitError(f"TensorOps requires a statically typed value, got {aval}")
-    return aval.dtype.name
+def _shape(atom: Var | Literal) -> tuple[int, ...]:
+    return tuple(int(size) for size in getattr(atom.aval, "shape", ()))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -201,14 +188,11 @@ def _index_map_is(info: BlockInfo, axes: tuple[int | None, ...]) -> bool:
     return True
 
 
-def has_dot_general(jaxpr: Jaxpr) -> bool:
-    """Whether a jaxpr contains a dot, including in nested control flow."""
-    return any(eqn.primitive.name == "dot_general" for eqn in jaxpr.eqns) or any(
-        has_dot_general(child) for child in subjaxprs(jaxpr)
+def _contains(jaxpr: Jaxpr, primitive: str) -> bool:
+    """Whether a jaxpr stages `primitive`, including in nested control flow."""
+    return any(eqn.primitive.name == primitive for eqn in jaxpr.eqns) or any(
+        _contains(child, primitive) for child in subjaxprs(jaxpr)
     )
-
-
-COOPERATIVE_MARKER = "threadgroup_position_in_grid"
 
 
 def emits_cooperative(msl_source: str) -> bool:
@@ -218,7 +202,7 @@ def emits_cooperative(msl_source: str) -> bool:
     so the source itself, not the selection policy, decides the launch
     geometry.
     """
-    return COOPERATIVE_MARKER in msl_source
+    return "threadgroup_position_in_grid" in msl_source
 
 
 def cooperative_launch(
@@ -239,9 +223,8 @@ def uses_tensorops(spec: KernelSpec, dot_general: str) -> bool:
     """Whether this kernel's requested policy selects cooperative TensorOps.
 
     "tensorops" requires it, "default" never selects it, and "auto" selects
-    it for dots on a 2D or 3D grid. Hand-written kernels bound without a
-    jaxpr never use it.
+    it for dots on a 2D or 3D grid.
     """
-    if spec.jaxpr is None or not has_dot_general(spec.jaxpr):
+    if not _contains(spec.jaxpr, "dot_general"):
         return False
     return dot_general == "tensorops" or (dot_general == "auto" and len(spec.grid) in (2, 3))

@@ -642,21 +642,17 @@ def emit_msl_stats(
         from palladium.emit.tensorops import uses_tensorops
 
         if uses_tensorops(spec, dot_general):
-            from palladium.emit.tensorops import ProgramScope, compile_kernel
+            from palladium.emit.tensorops import compile_kernel
 
             try:
-                compilation = compile_kernel(
-                    spec, kernel_name, scope=ProgramScope.THREADGROUP, dot_general=dot_general
-                )
+                source, threadgroup_bytes = compile_kernel(spec, kernel_name)
             except EmitError:
                 # "auto" only takes dots the cooperative lowering recognizes;
                 # anything else keeps the one-thread-per-program emitter.
                 if dot_general != "auto":
                     raise
             else:
-                return compilation.source, EmitStats(
-                    thread_bytes=0, threadgroup_bytes=compilation.threadgroup_bytes
-                )
+                return source, EmitStats(thread_bytes=0, threadgroup_bytes=threadgroup_bytes)
 
     name = kernel_name or spec.name
     if len(spec.grid) > 3:
