@@ -8,13 +8,12 @@ parallelism comes from the grid.
 ## Recorded results
 
 These are local Apple-GPU runs, workload- and machine-specific, not general
-speedup guarantees. The Lotka-Volterra results used JAX 0.11.1 and did not
+speedup guarantees. The Lotka-Volterra result used JAX 0.11.1 and did not
 record the GPU model; the CNF row is from September 2026 on current code.
 
 | Workload | Palladium | Comparison |
 |---|---:|---:|
 | Lotka–Volterra, 100,000 trajectories × 500 RK4 steps, MPS custom call | 1.059 ms | 63.008 ms for `jit(vmap(scan))` on MPS |
-| Lotka–Volterra training, 4,096 trajectories × 100 steps, full Adam update | 0.482 ms, reverse VJP, checkpoint interval 10 | 39.173 ms for pure JAX on MPS |
 | 2D CNF, 256 points, width 4, 16 RK4 steps, full optimizer update (M1 Pro, JAX 0.11.2, plain `pallas_call` on mps) | 0.388 ms, reverse VJP, interval 4 | 15.023 ms for JAX on MPS; 1.061 ms for JAX on CPU |
 | The same update on the CPU platform, kernels through the FFI bridge (M2, JAX 0.11.2, no plugin) | 0.475 ms, reverse VJP, interval 4 | 0.958 ms for JAX on CPU |
 
@@ -32,9 +31,8 @@ this needs neither jax-mps nor Xcode, and since XLA fuses the small
 optimizer glue better than MLX does, it lands within 25% of the mps-platform
 run on a different machine. Run the Mew benchmarks with
 `JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/`.
-See the reproducible scripts for [RK4](../benchmarks/bench_jax_mps_rk4.py),
-[ODE training](../benchmarks/bench_mps_training.py), and
-[CNF training](../benchmarks/bench_cnf_training.py). The experimental
+See the reproducible scripts for [RK4](../benchmarks/bench_rk4_ensemble.py)
+and [CNF training](../benchmarks/bench_cnf_training.py). The experimental
 [Pallas attention benchmark](../benchmarks/bench_pallas_flash_attention.py)
 checks causal and noncausal Pallas TensorOps lowering against a NumPy reference
 and measures resident-buffer runs at sequence lengths from 1,024 to 4,096. It
