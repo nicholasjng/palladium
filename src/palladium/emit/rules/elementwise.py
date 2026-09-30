@@ -9,6 +9,7 @@ from palladium.emit.core import CTYPES, RULES, Cursor, CVal, Environment, declar
 from palladium.emit.numeric import (
     ELEMENTWISE,
     PRIMITIVE_INVARS,
+    enclosed,
     template_fields,
     typed_expression,
     unwrapped,
@@ -198,7 +199,7 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         }
         env.bind(
             eqn.outvars[0],
-            CVal("", out_shape, out_ctype, lazy=f"({template.format(**inputs)})"),
+            CVal("", out_shape, out_ctype, lazy=enclosed(template.format(**inputs))),
         )
         return
 
