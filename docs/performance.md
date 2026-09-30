@@ -37,6 +37,10 @@ needs an MSL 4-capable runtime. The [MLX SDPA comparison](../benchmarks/bench_at
 times the same kernel as a plain `pl.pallas_call` under `jax.jit` on mps against
 `jax.nn.dot_product_attention`, which jax-mps routes to MLX's fused kernel; run it
 with the same `mew run --random-interleaving` command as the other benchmarks.
+The [SIR simulator comparison](../benchmarks/bench_sir_simulators.py) times the
+`examples/sbi_sir.py` kernel against vectorized NumPy and against torch on CPU,
+eager on MPS, and `torch.compile` with the Metal backend; it needs
+`uv run --with torch` and reports the compiling first call as a counter.
 
 On an M1 Pro, f32 runs with shape `[1, sequence, 4, 64]` and 32×64 query/key
 tiles measured:
