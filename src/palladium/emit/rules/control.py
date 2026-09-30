@@ -1,5 +1,4 @@
-"""Control flow and thread-coordinate primitives: program_id, barriers,
-scan, while, and cond."""
+"""Control flow primitives: program_id, scan, while, and cond."""
 
 from __future__ import annotations
 
@@ -10,8 +9,6 @@ from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.emit.core import (
     _PID,
-    _TID,
-    _TPT,
     CTYPES,
     Cursor,
     CVal,
@@ -32,35 +29,6 @@ def _rule_program_id(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """
     axis: int = eqn.params["axis"]
     env.bind(eqn.outvars[0], CVal(f"(int){_PID[axis]}", (), "int"))
-
-
-@rule("palladium_barrier")
-def _rule_barrier(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """`palladium.barrier()` -> `threadgroup_barrier(mem_flags::mem_threadgroup)`.
-
-    Emitted where the kernel placed it; no barrier placement is inferred.
-    The primitive carries a JAX effect so DCE keeps it.
-    """
-    cursor.barrier()
-
-
-@rule("palladium_thread_index")
-def _rule_thread_index(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """Linearize the threadgroup coordinates, x fastest, as int32.
-
-    Pure aliasing; the (int) cast keeps index arithmetic signed.
-    """
-    env.bind(eqn.outvars[0], CVal(f"(int){_TID}", (), "int"))
-
-
-@rule("palladium_threads_per_threadgroup")
-def _rule_threads_per_threadgroup(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """Product of the actual threadgroup dimensions, as int32.
-
-    For the final group of a non-uniform dispatch this is smaller than
-    the requested size, so cooperative loops bound themselves with it.
-    """
-    env.bind(eqn.outvars[0], CVal(f"(int){_TPT}", (), "int"))
 
 
 @rule("scan")

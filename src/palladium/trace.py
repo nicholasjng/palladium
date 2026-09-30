@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any, Literal as TLiteral
+from typing import Any
 
 import jax
 import jax.experimental.pallas as pl
@@ -44,16 +44,11 @@ class ScratchInfo:
     shape: tuple of int
         Buffer shape.
     dtype: numpy.dtype
-        Buffer element type.
-    space: str
-        Metal address space: `"thread"` (private to one program instance,
-        the default) or `"threadgroup"` (shared across the group, via
-        `palladium.threadgroup_memory`). Both are compile-time-sized arrays.
+        Buffer element type. Scratch is private to one program instance.
     """
 
     shape: tuple[int, ...]
     dtype: np.dtype
-    space: TLiteral["thread", "threadgroup"] = "thread"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -79,54 +74,6 @@ class BlockInfo:
     index_map_jaxpr: ClosedJaxpr
     # Unsqueezed layout, preserving the original axis positions.
     full_block_shape: tuple[int | None, ...]
-
-
-_COOPERATIVE_PRIMITIVES = frozenset(
-    {"palladium_thread_index", "palladium_threads_per_threadgroup", "palladium_barrier"}
-)
-
-
-def _primitive_names(jaxpr: Jaxpr) -> set[str]:
-    names = {eqn.primitive.name for eqn in jaxpr.eqns}
-    for child in subjaxprs(jaxpr):
-        names.update(_primitive_names(child))
-    return names
-
-
-def _validate_barriers(jaxpr: Jaxpr) -> None:
-    """Reject barriers in control flow whose uniformity across lanes cannot
-    be established (a divergent barrier hangs the GPU). Kernel inputs and
-    Ref reads are assumed to vary by lane. Does not prove race freedom."""
-    if "palladium_barrier" not in _primitive_names(jaxpr):
-        return
-    varying = set(jaxpr.invars)
-    for eqn in jaxpr.eqns:
-        name = eqn.primitive.name
-        dependent = any(isinstance(v, Var) and v in varying for v in eqn.invars)
-        children = []
-        for value in eqn.params.values():
-            values = value if isinstance(value, (tuple, list)) else (value,)
-            for child in values:
-                if isinstance(child, ClosedJaxpr):
-                    child = child.jaxpr
-                if isinstance(child, Jaxpr):
-                    children.append(child)
-        has_barrier = any("palladium_barrier" in _primitive_names(c) for c in children)
-        if has_barrier and name == "cond":
-            pred = eqn.invars[0]
-            if isinstance(pred, Var) and pred in varying:
-                raise TraceError("barrier in a condition that may vary across threadgroup lanes")
-        if has_barrier and name == "while":
-            # A while's carried state can change the trip count by lane;
-            # static-count fori_loop/scan is the supported loop form.
-            raise TraceError("barrier in while: convergence is unproven; use a static-count scan")
-        for child in children:
-            _validate_barriers(child)
-        child_varies = any(
-            _primitive_names(c) & {"program_id", "palladium_thread_index", "get"} for c in children
-        )
-        if name in ("program_id", "palladium_thread_index", "get") or dependent or child_varies:
-            varying.update(eqn.outvars)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -157,43 +104,6 @@ class KernelSpec:
     outputs: tuple[BlockInfo, ...]
     scratch: tuple[ScratchInfo, ...]
     aliases: tuple[tuple[int, int], ...] = ()
-
-    @property
-    def uses_threadgroup(self) -> bool:
-        """Whether cooperative instructions or shared scratch make the
-        threadgroup size part of the kernel's contract."""
-        return bool(_primitive_names(self.jaxpr) & _COOPERATIVE_PRIMITIVES) or any(
-            info.space == "threadgroup" for info in self.scratch
-        )
-
-    @property
-    def lane_scratch_extents(self) -> tuple[int, ...]:
-        """Leading extents of threadgroup scratch indexed directly by
-        `thread_index()`; other index expressions are the author's
-        responsibility."""
-        lane_vars = {
-            v
-            for e in self.jaxpr.eqns
-            if e.primitive.name == "palladium_thread_index"
-            for v in e.outvars
-        }
-        scratch_vars = dict(
-            zip(self.jaxpr.invars[len(self.inputs) + len(self.outputs) :], self.scratch)
-        )
-        bounds = []
-        for eqn in self.jaxpr.eqns:
-            if eqn.primitive.name not in ("get", "swap"):
-                continue
-            info = scratch_vars.get(eqn.invars[0])
-            if info is None or info.space != "threadgroup":
-                continue
-            start = 1 if eqn.primitive.name == "get" else 2
-            indexers = eqn.params["tree"].unflatten(eqn.invars[start:])
-            for indexer in indexers:
-                for axis, index in enumerate(indexer.indices):
-                    if isinstance(index, Var) and index in lane_vars:
-                        bounds.append(info.shape[axis])
-        return tuple(bounds)
 
 
 def _block_dim(dim: Any) -> int | None:
@@ -343,22 +253,10 @@ def _calls_program_id(jaxpr: Jaxpr, axis: int) -> bool:
 
 
 def _scratch_infos(scratch_avals: Any) -> list[ScratchInfo]:
-    # Any memory_space other than the THREADGROUP sentinel is thread-private.
-    from palladium.threadgroup import THREADGROUP
-
-    infos = []
-    for aval in scratch_avals:
-        space: TLiteral["thread", "threadgroup"] = (
-            "threadgroup" if getattr(aval, "memory_space", None) is THREADGROUP else "thread"
-        )
-        infos.append(
-            ScratchInfo(
-                shape=tuple(int(d) for d in aval.shape),
-                dtype=np.dtype(aval.dtype),
-                space=space,
-            )
-        )
-    return infos
+    return [
+        ScratchInfo(shape=tuple(int(d) for d in aval.shape), dtype=np.dtype(aval.dtype))
+        for aval in scratch_avals
+    ]
 
 
 def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
@@ -434,7 +332,6 @@ def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
     if aliases:
         _validate_aliases(kernel_jaxpr, aliases, inputs, outputs)
     _validate_parallel_writes(kernel_jaxpr, outputs, grid, n_in)
-    _validate_barriers(kernel_jaxpr)
 
     return KernelSpec(
         name=params.get("name") or "palladium_kernel",

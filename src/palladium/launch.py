@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import math
 import operator
-from typing import Any, Literal
+from typing import Any
 
 from jax._src.pallas import core as pallas_core
 from metal_runtime import MathMode
@@ -34,7 +34,8 @@ class CompilerParams(pallas_core.CompilerParams):
         "auto" (TensorOps for tiled matmuls and attention, the default),
         "tensorops" to require it, or "default" for the primitive path.
     threadgroup : int, tuple, or None
-        Explicit threadgroup size; required by cooperative kernels.
+        Explicit threadgroup size; None lets the runtime choose. TensorOps
+        kernels fix their own and reject a different one.
     math_mode : metal_runtime.MathMode
         FAST (the default), RELAXED, or SAFE; SAFE keeps IEEE ordering, as
         compensated arithmetic needs. The mps path supports FAST only.
@@ -42,7 +43,7 @@ class CompilerParams(pallas_core.CompilerParams):
 
     BACKEND: str = "palladium"
     dot_general: str = "auto"
-    threadgroup: int | tuple[int, ...] | str | None = None
+    threadgroup: int | tuple[int, ...] | None = None
     math_mode: MathMode = MathMode.FAST
 
     def __post_init__(self) -> None:
@@ -64,19 +65,10 @@ def device_limits() -> dict[str, Any]:
         return {}
 
 
-def normalize_threadgroup(
-    threadgroup: int | tuple[int, ...] | Literal["simdgroup", "threadgroup"] | None,
-) -> tuple[int, ...] | None:
-    """Normalize a `threadgroup=` argument to a tuple of ints, shared by every
-    entry point. None means the runtime chooses; `"simdgroup"` resolves to
-    the device's SIMD width (a reduction over one SIMD group pays no
-    cross-simdgroup latency)."""
+def normalize_threadgroup(threadgroup: int | tuple[int, ...] | None) -> tuple[int, ...] | None:
+    """A `threadgroup=` value as a tuple of ints; None lets the runtime choose."""
     if threadgroup is None:
         return None
-    if threadgroup == "simdgroup":
-        return (simdgroup_width(),)
-    if isinstance(threadgroup, str):
-        raise ValueError("unknown threadgroup policy; expected 'simdgroup'")  # noqa: TRY004
     try:
         values = (threadgroup,) if isinstance(threadgroup, int) else tuple(threadgroup)
         result = tuple(operator.index(t) for t in values)
@@ -94,57 +86,12 @@ def simdgroup_width() -> int:
 
 
 def check_threadgroup(spec: KernelSpec, threadgroup: tuple[int, ...] | None) -> None:
-    """Validate launch geometry: cooperative requirements and lane-indexed
-    scratch bounds always, device resource limits when a device is present.
-    Explicit group sizes are checked for independent kernels too."""
-    if spec.uses_threadgroup and threadgroup is None:
+    """Reject an explicit threadgroup over the device's thread limit."""
+    max_threads = device_limits().get("max_threads_per_threadgroup")
+    if threadgroup and max_threads and math.prod(threadgroup) > max_threads:
         raise EmitError(
-            f"kernel {spec.name!r} uses cooperative instructions or shared scratch; "
-            "pass an explicit threadgroup= size"
-        )
-    limits = device_limits()
-    shared_bytes = sum(
-        math.prod(s.shape) * s.dtype.itemsize for s in spec.scratch if s.space == "threadgroup"
-    )
-    budget = limits.get("max_threadgroup_memory_length")
-    if budget and shared_bytes > budget:
-        raise EmitError(
-            f"kernel {spec.name!r} declares {shared_bytes} bytes of "
-            f"threadgroup_memory, over this device's "
-            f"max_threadgroup_memory_length of {budget}. Shrink the "
-            "threadgroup_memory request, or split the reduction across "
-            "more, smaller threadgroups."
-        )
-
-    max_threads = limits.get("max_threads_per_threadgroup")
-    if threadgroup and max_threads:
-        total = 1
-        for t in threadgroup:
-            total *= t
-        if total > max_threads:
-            raise EmitError(
-                f"threadgroup={threadgroup} is {total} threads, over this "
-                f"device's max_threads_per_threadgroup of {max_threads}"
-            )
-
-    if threadgroup:
-        actual = math.prod(
-            min(g, t)
-            for g, t in zip(
-                spec.grid + (1,) * (3 - len(spec.grid)), threadgroup + (1,) * (3 - len(threadgroup))
-            )
-        )
-        if any(actual > extent for extent in spec.lane_scratch_extents):
-            raise EmitError(
-                f"threadgroup has up to {actual} lanes but a directly lane-indexed "
-                f"scratch dimension is smaller: {spec.lane_scratch_extents}"
-            )
-    if spec.uses_threadgroup and not limits.get("supports_non_uniform_threadgroups", True):
-        raise EmitError(  # pragma: no cover - all Apple silicon supports this
-            f"kernel {spec.name!r} uses threads_per_threadgroup() to bound a "
-            "cooperative loop, which is only correct when the device "
-            "dispatches non-uniform threadgroups; this device reports it does "
-            "not, so the final partial group would read unwritten slots."
+            f"threadgroup={threadgroup} is {math.prod(threadgroup)} threads, over this "
+            f"device's max_threads_per_threadgroup of {max_threads}"
         )
 
 

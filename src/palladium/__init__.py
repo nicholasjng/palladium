@@ -23,12 +23,6 @@ from palladium.errors import (
 )
 from palladium.ffi import metal_call
 from palladium.launch import CompilerParams
-from palladium.threadgroup import (
-    barrier,
-    thread_index,
-    threadgroup_memory,
-    threads_per_threadgroup,
-)
 from palladium.trace import BlockInfo, KernelSpec, ScratchInfo, trace
 from palladium.vjp import with_vjp
 
@@ -43,13 +37,9 @@ __all__ = [
     "ScratchInfo",
     "TraceError",
     "UnsupportedPrimitiveError",
-    "barrier",
     "debug_msl",
     "emit_msl",
     "metal_call",
-    "thread_index",
-    "threadgroup_memory",
-    "threads_per_threadgroup",
     "trace",
     "with_vjp",
 ]

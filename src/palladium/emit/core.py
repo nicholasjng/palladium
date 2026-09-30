@@ -144,8 +144,6 @@ CTYPE_BYTES = {
 }
 
 _PID = ("_pid.x", "_pid.y", "_pid.z")
-_TID = "(_tid.x + _tpt.x * (_tid.y + _tpt.y * _tid.z))"
-_TPT = "(_tpt.x * _tpt.y * _tpt.z)"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -427,8 +425,6 @@ class Environment:
         # never scan-ys streaming targets, since reads through the twin
         # var are invisible here.
         self.no_stream_refs = no_stream_refs
-        # Per-emission scratch for rules that memoize per-eqn analyses,
-        # conventionally keyed ("name", id(eqn)).
         # Per jaxpr level, populated before each (sub-)jaxpr is walked;
         # Vars are unique objects per jaxpr, so levels never collide.
         self.consumers: dict[Var, list[JaxprEqn | None]] = {}
@@ -664,9 +660,6 @@ def emit_msl_stats(
         ctype = CTYPES[info.dtype.name]
         params.append(f"{qual} {ctype}* arg{k} [[buffer({k})]]")
     params.append("uint3 _pid [[thread_position_in_grid]]")
-    if spec.uses_threadgroup:
-        params.append("uint3 _tid [[thread_position_in_threadgroup]]")
-        params.append("uint3 _tpt [[threads_per_threadgroup]]")
 
     env = Environment(
         no_stream_refs=frozenset(
@@ -740,10 +733,8 @@ def emit_msl_stats(
         ctype = CTYPES[info.dtype.name]
         shape = info.shape
         size = math.prod(info.shape)
-        # MSL requires threadgroup variables at kernel scope, which is
-        # where these land.
-        cursor.account(ctype, size, info.space)
-        scratch_op = f"{info.space} {ctype} scratch{k}"
+        cursor.account(ctype, size, "thread")
+        scratch_op = f"{ctype} scratch{k}"
         scratch_op += f"[{size}];" if shape else ";"
         cursor.emit(scratch_op)
         ref_vals.append(
@@ -751,7 +742,6 @@ def emit_msl_stats(
                 expr=f"scratch{k}",
                 shape=shape,
                 ctype=ctype,
-                space=info.space,
                 readonly=False,
                 align=0,
             )
