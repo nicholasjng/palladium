@@ -8,18 +8,24 @@ parallelism comes from the grid.
 ## Recorded results
 
 These are local Apple-GPU runs, workload- and machine-specific, not general
-speedup guarantees. The training results used JAX 0.11.1; the GPU model was
-not recorded consistently.
+speedup guarantees. The Lotka-Volterra results used JAX 0.11.1 and did not
+record the GPU model; the CNF row is from September 2026 on current code.
 
 | Workload | Palladium | Comparison |
 |---|---:|---:|
 | Lotka–Volterra, 100,000 trajectories × 500 RK4 steps, MPS custom call | 1.059 ms | 63.008 ms for `jit(vmap(scan))` on MPS |
 | Lotka–Volterra training, 4,096 trajectories × 100 steps, full Adam update | 0.482 ms, reverse VJP, checkpoint interval 10 | 39.173 ms for pure JAX on MPS |
-| 2D CNF, 256 points, width 4, 16 RK4 steps, full optimizer update | 0.504 ms, reverse VJP, interval 4 | 17.609 ms for JAX on MPS; 1.392 ms for JAX on CPU |
+| 2D CNF, 256 points, width 4, 16 RK4 steps, full optimizer update (M1 Pro, JAX 0.11.2, plain `pallas_call` on mps) | 0.388 ms, reverse VJP, interval 4 | 15.023 ms for JAX on MPS; 1.061 ms for JAX on CPU |
 
 Training measurements are warmed, synchronized medians over 15 samples with
 rotating variant order. Updates start from identical optimizer states; input
-transfer and first-call compilation are excluded. Run the Mew benchmarks with
+transfer and first-call compilation are excluded. For the CNF row, compiling
+the jitted update took 102 ms with Palladium's two kernels against 89 ms for
+plain JAX on MPS, so the fused kernels add about 13 ms of Metal compilation.
+Checkpoint interval barely matters at this size: intervals 1, 4, and 8 ran in
+0.380, 0.388, and 0.408 ms. Pairing the Palladium forward kernel with JAX's
+reference VJP instead of the adjoint kernel ran at 15.029 ms, the same as
+plain JAX, so the backward kernel carries the speedup. Run the Mew benchmarks with
 `JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/`.
 See the reproducible scripts for [RK4](../benchmarks/bench_jax_mps_rk4.py),
 [ODE training](../benchmarks/bench_mps_training.py), and
