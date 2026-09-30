@@ -51,7 +51,7 @@ def rk4_step(x, y, a, b, c, d):
 def lv_kernel(x_ref, y_ref, a_ref, b_ref, c_ref, d_ref, xo_ref, yo_ref):
     params = a_ref[...], b_ref[...], c_ref[...], d_ref[...]
     x, y = jax.lax.fori_loop(
-        0, STEPS, lambda _, xy: rk4_step(*xy, *params), (x_ref[...], y_ref[...])
+        0, STEPS, lambda _, xy: rk4_step(xy[0], xy[1], *params), (x_ref[...], y_ref[...])
     )
     xo_ref[...] = x
     yo_ref[...] = y

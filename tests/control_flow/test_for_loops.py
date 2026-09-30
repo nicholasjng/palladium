@@ -26,7 +26,7 @@ def test_euler_logistic(rng):
     want = np.asarray(f.interpret(y0, r))
     np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-6)
     # The logistic flow moves toward the y=1 fixed point.
-    assert np.all(np.abs(got - 1.0) < np.abs(y0 - 1.0))  # ty: ignore[unsupported-operator]
+    assert np.all(np.abs(got - 1.0) < np.abs(y0 - 1.0))
 
 
 def test_tuple_carry(rng):

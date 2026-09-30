@@ -167,15 +167,15 @@ def emit_online_softmax_simd(
             ((plan.score_max.outvars[0], "block_max"), (max_carry, "old_max")),
         )
         cursor.emit(f"const {ctype} new_max = {new_max};")
-        nonempty_bindings = tuple(
-            (
-                atom,
-                "old_sum"
-                if any(atom is carry for carry in plan.body_invars)
-                else literal(atom).expr,
-            )
-            for atom in plan.nonempty.invars
-        )
+
+        def nonempty_operand(atom) -> str:
+            if any(atom is carry for carry in plan.body_invars):
+                return "old_sum"
+            if not isinstance(atom, Literal):
+                raise EmitError("online softmax must compare the running sum with a constant")
+            return literal(atom).expr
+
+        nonempty_bindings = tuple((atom, nonempty_operand(atom)) for atom in plan.nonempty.invars)
         nonempty = elementwise_expression(plan.nonempty, "bool", nonempty_bindings)
         cursor.emit(f"const {ctype} old_scale = {nonempty} ? exp(old_max - new_max) : 0.0f;")
         cursor.emit(f"{ctype} lane_sum = 0.0f;")
