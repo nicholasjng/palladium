@@ -1,7 +1,9 @@
-"""jax.ffi bridge: registers palladium kernels as a real JAX primitive,
-composable with jax.jit, through metal-runtime's C API (`native/ffi/`).
+"""`metal_call`: a Pallas kernel dispatched to Metal from the CPU platform.
 
-`PALLADIUM_FFI_LIBRARY` overrides the path for an out-of-tree build.
+The kernel is registered as a jax.ffi target backed by metal-runtime's C
+API (`native/ffi/`), so it composes with jax.jit and jax.vmap and needs no
+PJRT plugin. `PALLADIUM_FFI_LIBRARY` overrides the handler path for an
+out-of-tree build.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import numpy as np
 from palladium._callable import CallOptions, PallasCallable
 from palladium.diagnostics import simdgroup_width
 
-__all__ = ["FfiCallable", "metal_call_jit"]
+__all__ = ["FfiCallable", "metal_call"]
 
 
 _TARGET_NAME = "palladium_dispatch"
@@ -100,16 +102,6 @@ class FfiCallable(PallasCallable):
             self._build_pipelined() if options.vmap_method in ("pipelined", None) else None
         )
 
-    def pin(self, *args) -> Callable[[], Any]:
-        """Not available: under `jax.jit` XLA owns the operand buffers. Use
-        `metal_call(...).pin`, or keep inputs as device arrays."""
-        raise NotImplementedError(
-            "FfiCallable.pin is not available: under jax.jit, XLA owns "
-            "operand buffers, so there is nothing for palladium to pin "
-            "across calls. Use palladium.metal_call(...).pin for the eager "
-            "path, or keep inputs as device arrays and let jit reuse them."
-        )
-
     def __call__(self, *args):
         """Dispatch via jax.ffi; traceable and jittable."""
         _register()
@@ -135,7 +127,7 @@ class FfiCallable(PallasCallable):
                 raise ValueError(
                     "jax.vmap over this kernel needs a vmap_method, and this "
                     "one was built with vmap_method=None. Pass "
-                    "metal_call_jit(..., vmap_method='pipelined') for one FFI "
+                    "metal_call(..., vmap_method='pipelined') for one FFI "
                     "call over the whole batch, or 'sequential' for one "
                     "dispatch per element. jax.ffi's own whole-batch methods "
                     "(expand_dims, broadcast_all) are not usable here: the "
@@ -226,8 +218,8 @@ class FfiCallable(PallasCallable):
         return tuple(outs) if len(out_structs) > 1 else outs
 
 
-def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
-    """`pl.pallas_call`, dispatched to the Apple GPU, composable with `jax.jit`.
+def metal_call(kernel: Callable, **pallas_kwargs) -> FfiCallable:
+    """`pl.pallas_call`, dispatched to the Apple GPU from the CPU platform.
 
     Parameters
     ----------
@@ -237,18 +229,25 @@ def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
         The usual `pl.pallas_call` keywords (out_shape, grid, in_specs,
         out_specs, ...), plus `math_mode` (`metal_runtime.MathMode`, FAST
         by default; SAFE for compensated arithmetic), `threadgroup` (int
-        or tuple; None lets the runtime choose), `cache_size` (256 by
-        default), `dot_general` ("auto", "default", or "tensorops"; see
-        `metal_call`), and `vmap_method`: 'pipelined' (the default) runs
-        the whole batch in one FFI call, 'sequential' and
-        'sequential_unrolled' dispatch per element, None rejects
-        `jax.vmap`. A batch dimension in the Pallas grid is one dispatch
-        total and beats all of them.
+        or tuple; None lets the runtime choose), `cache_size` (traced
+        shapes kept, 256 by default), `dot_general` ("auto", "default", or
+        "tensorops"), and `vmap_method` ("pipelined" by default: one FFI
+        call per batch; "sequential" or "sequential_unrolled" dispatch per
+        element; None rejects vmap).
+
+    Notes
+    -----
+    FAST math reorders float arithmetic and approximates transcendentals,
+    so results are not bit-equal to the `interpret` oracle: ~1e-6 relative
+    for f32 elementwise work, up to ~1e-4 through exp/log-heavy kernels and
+    reductions. Use SAFE for IEEE ordering, and always for compensated
+    arithmetic (FAST deletes the error terms).
 
     Returns
     -------
     FfiCallable
-        Traceable and jittable.
+        Composable with `jax.jit` and `jax.vmap`; NumPy inputs are accepted
+        and outputs are JAX arrays. `.interpret` is the CPU oracle.
     """
     return FfiCallable(
         kernel, pallas_kwargs, CallOptions.split(pallas_kwargs, vmap_method="pipelined")

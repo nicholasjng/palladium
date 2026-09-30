@@ -7,7 +7,6 @@ import pytest
 
 import palladium
 from palladium import DispatchError, EmitError, TraceError, UnsupportedPrimitiveError
-from palladium.errors import StackOverflowError
 
 F32 = jnp.float32
 
@@ -45,7 +44,7 @@ def test_explain_ffi_matches_metal_call():
     def kernel(q_ref, k_ref, o_ref):
         o_ref[...] = jnp.dot(q_ref[...], k_ref[...] * 2.0)
 
-    call = palladium.metal_call_jit(kernel, out_shape=_shaped(8, 8))
+    call = palladium.metal_call(kernel, out_shape=_shaped(8, 8))
     assert call.explain(_shaped(8, 8), _shaped(8, 8)).grid == (1,)
 
 
@@ -65,19 +64,7 @@ def test_all_errors_are_palladium_errors():
     assert issubclass(TraceError, ValueError)
     assert issubclass(DispatchError, TypeError)
     assert issubclass(UnsupportedPrimitiveError, NotImplementedError)
-    assert issubclass(StackOverflowError, EmitError)
     assert issubclass(UnsupportedPrimitiveError, EmitError)
-
-
-def test_backend_diagnostics_name_their_dispatch_route():
-    def copy_kernel(x, out):
-        out[...] = x[...] * 2
-
-    arg = _shaped(4)
-    eager = palladium.metal_call(copy_kernel, out_shape=arg)
-    ffi = palladium.metal_call_jit(copy_kernel, out_shape=arg)
-    assert eager.explain(arg).execution_path == "metal"
-    assert ffi.explain(arg).execution_path == "cpu-ffi-to-metal"
 
 
 def test_multiple_pallas_calls_rejected():
@@ -92,28 +79,3 @@ def test_multiple_pallas_calls_rejected():
 
     with pytest.raises(TraceError, match="2 pallas_call"):
         palladium.trace(two_calls, _shaped(8))
-
-
-def test_float64_input_rejected_with_hint():
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...]
-
-    call = palladium.metal_call(kernel, out_shape=_shaped(8))
-    with pytest.raises(DispatchError, match="float64.*jax_enable_x64"):
-        call(np.zeros(8, dtype=np.float64))
-
-
-def test_bound_kernel_rejects_dtype_and_shape_mismatch(rng):
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...] + 1.0
-
-    call = palladium.metal_call(kernel, out_shape=_shaped(8))
-    x = rng.standard_normal(8, dtype=np.float32)
-    np.testing.assert_allclose(call(x), x + 1.0, rtol=1e-6)
-    (bound,) = call.cache.values()
-    with pytest.raises(DispatchError, match="dtype float64 does not match"):
-        bound(x.astype(np.float64))
-    with pytest.raises(DispatchError, match="expected shape"):
-        bound(x[:4])
-    with pytest.raises(DispatchError, match="takes 1 arrays"):
-        bound(x, x)

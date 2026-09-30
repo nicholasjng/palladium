@@ -12,15 +12,17 @@ import palladium
 # --- thread safety -----------------------------------------------------------
 
 
-def test_concurrent_first_calls_compile_once_per_shape(monkeypatch, rng):
-    calls = []
-    real_bind = palladium.bind
+def test_concurrent_first_calls_emit_once_per_shape(monkeypatch, rng):
+    import palladium._callable as callable_module
 
-    def counting_bind(*args, **kwargs):
-        calls.append(1)
-        return real_bind(*args, **kwargs)
+    emits = []
+    real_emit = callable_module.emit_msl
 
-    monkeypatch.setattr(palladium, "bind", counting_bind)
+    def counting_emit(*args, **kwargs):
+        emits.append(1)
+        return real_emit(*args, **kwargs)
+
+    monkeypatch.setattr(callable_module, "emit_msl", counting_emit)
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2.0 + 1.0
@@ -44,21 +46,19 @@ def test_concurrent_first_calls_compile_once_per_shape(monkeypatch, rng):
         results = list(pool.map(work, range(n_threads)))
     for i, out in enumerate(results):
         np.testing.assert_allclose(out, inputs[i] * 2.0 + 1.0, rtol=1e-6)
-    assert len(calls) == 2, f"expected 2 compiles, bind ran {len(calls)} times"
-    assert len(call.cache) == 1 and len(call16.cache) == 1
+    assert len(emits) == 2, f"expected 2 emits, emit_msl ran {len(emits)} times"
+    assert len(call._cache) == 1 and len(call16._cache) == 1
 
 
-def test_concurrent_calls_on_one_bound_kernel(rng):
+def test_concurrent_calls_on_one_compiled_kernel(rng):
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] + 1.0
 
     call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((64,), jnp.float32))
-    warm = rng.standard_normal(64, dtype=np.float32)
-    call(warm)  # compile once; the threads below share one BoundKernel
-    (bound,) = call.cache.values()
+    call(rng.standard_normal(64, dtype=np.float32))  # compile once
     inputs = [rng.standard_normal(64, dtype=np.float32) for _ in range(32)]
     with ThreadPoolExecutor(8) as pool:
-        results = list(pool.map(lambda a: np.asarray(bound(a)), inputs))
+        results = list(pool.map(lambda a: np.asarray(call(a)), inputs))
     for a, out in zip(inputs, results, strict=True):
         np.testing.assert_allclose(out, a + 1.0, rtol=1e-6)
 
@@ -118,48 +118,11 @@ def test_dtype_int32_reduction():
     np.testing.assert_array_equal(np.asarray(call(x)), [x.sum()])
 
 
-def test_bfloat16_eager_roundtrip_is_bit_lossless():
-    # NumPy cannot pass ml_dtypes arrays over DLPack, so the eager path
-    # ships bf16 bytes as uint16 and relabels (dispatch._to_native). A
-    # copy kernel must round-trip every bit pattern, including the NaN
-    # payload a numeric conversion would normalize.
-    import ml_dtypes
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...]
-
-    call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.bfloat16))
-    bits = np.array(
-        [0x0000, 0x8000, 0x3F80, 0x0001, 0x7F80, 0xFF80, 0x7FC1, 0x4049],
-        dtype=np.uint16,
-    )  # +0, -0, 1.0, subnormal, +inf, -inf, NaN with payload, pi-ish
-    x = bits.view(ml_dtypes.bfloat16)
-    got = call(x)
-    assert isinstance(got, np.ndarray)  # single out_shape: never a tuple
-    assert got.dtype == x.dtype
-    np.testing.assert_array_equal(np.asarray(got).view(np.uint16), bits)
-
-
-def test_bfloat16_eager_compute_and_pin(rng):
-    import ml_dtypes
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...] * 2.0 + 1.0
-
-    call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((16,), jnp.bfloat16))
-    x = rng.standard_normal(16).astype(ml_dtypes.bfloat16)
-    want = np.asarray(call.interpret(x)).astype(np.float32)
-    got = np.asarray(call(x)).astype(np.float32)
-    np.testing.assert_allclose(got, want, rtol=2e-2, atol=2e-2)
-    pinned = call.pin(x)
-    np.testing.assert_allclose(np.asarray(pinned()).astype(np.float32), want, rtol=2e-2, atol=2e-2)
-
-
-def test_bfloat16_dispatches_through_ffi():
+def test_bfloat16_round_trips_through_the_handler():
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] + jnp.bfloat16(1.0)
 
-    call = palladium.metal_call_jit(kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.bfloat16))
+    call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.bfloat16))
     x = jnp.arange(8, dtype=jnp.bfloat16)
     np.testing.assert_array_equal(
         np.asarray(call(x)).astype(np.float32), np.arange(1, 9, dtype=np.float32)

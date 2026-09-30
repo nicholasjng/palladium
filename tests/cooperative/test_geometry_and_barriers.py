@@ -18,8 +18,7 @@ def metal_device():
         pytest.skip(str(exc))
 
 
-@pytest.mark.parametrize("factory", [palladium.metal_call, palladium.metal_call_jit])
-def test_thread_indices_without_scratch_2d(metal_device, factory):
+def test_thread_indices_without_scratch_2d(metal_device):
     def kernel(out, sizes):
         out[0, 0] = palladium.thread_index()
         sizes[0, 0] = palladium.threads_per_threadgroup()
@@ -27,7 +26,7 @@ def test_thread_indices_without_scratch_2d(metal_device, factory):
     shape = (7, 5)
     spec = pl.BlockSpec((1, 1), lambda i, j: (i, j))
     out = jax.ShapeDtypeStruct(shape, np.int32)
-    call = factory(
+    call = palladium.metal_call(
         kernel, grid=shape, threadgroup=(4, 3), out_specs=(spec, spec), out_shape=(out, out)
     )
     actual, sizes = call()

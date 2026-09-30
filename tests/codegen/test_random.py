@@ -85,8 +85,8 @@ def test_per_thread_independent_streams():
     )
     key = jax.random.key(7)
     kd = np.asarray(jax.random.key_data(key))
-    got = f(kd)
-    assert isinstance(got, np.ndarray)
+    got = np.asarray(f(kd))
+    assert not isinstance(got, tuple)
     want = np.stack(
         [np.asarray(jax.random.uniform(jax.random.fold_in(key, i), (4,))) for i in range(8)]
     )

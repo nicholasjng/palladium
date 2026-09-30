@@ -1,4 +1,4 @@
-"""Example 3: SDE Monte Carlo on the GPU.
+"""SDE Monte Carlo on the GPU.
 
 Docs: in-kernel RNG, docs/supported-jax.md (JAX operations).
 Prices a European call under geometric Brownian motion: N paths x M
@@ -126,9 +126,9 @@ def run_pallas(seed):
         out_specs=pl.BlockSpec((1,), lambda i: (i,)),
         out_shape=jax.ShapeDtypeStruct((N_PATHS,), jnp.float32),
     )
-    f(seed)  # trace + emit + Metal compile outside the clock
+    jax.block_until_ready(f(seed))  # trace + emit + Metal compile outside the clock
     t0 = time.perf_counter()
-    payoff = f(seed)
+    payoff = np.asarray(f(seed))
     t_gpu = time.perf_counter() - t0
     return payoff, t_gpu
 

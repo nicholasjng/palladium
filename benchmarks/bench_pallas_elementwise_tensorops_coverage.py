@@ -16,8 +16,6 @@ import numpy as np
 from jax.experimental import pallas as pl
 
 import palladium
-from palladium.dispatch import bind
-from palladium.emit.tensorops import ProgramScope, compile_kernel
 
 M, N = 65, 97
 TM, TN = 16, 32
@@ -50,8 +48,9 @@ def bench_pallas_elementwise_tensorops_coverage(state: mew.State) -> None:
     values.setflags(write=False)
     row_bias.setflags(write=False)
     scalar_bias.setflags(write=False)
-    staged = pl.pallas_call(
+    call = palladium.metal_call(
         _elementwise,
+        dot_general="tensorops",
         grid=((M + TM - 1) // TM, (N + TN - 1) // TN),
         in_specs=[
             pl.BlockSpec((TM, TN), lambda i, j: (i, j)),
@@ -61,14 +60,12 @@ def bench_pallas_elementwise_tensorops_coverage(state: mew.State) -> None:
         out_specs=pl.BlockSpec((TM, TN), lambda i, j: (i, j)),
         out_shape=jax.ShapeDtypeStruct((M, N), jnp.float32),
     )
-    spec = palladium.trace(staged, values, row_bias, scalar_bias)
-    compilation = compile_kernel(spec, scope=ProgramScope.THREADGROUP)
-    kernel = bind(spec, compilation.source, threadgroup=(128, 1, 1))
-    actual = kernel(values, row_bias, scalar_bias)
+    run = jax.jit(call)
+    resident = [jnp.asarray(a) for a in (values, row_bias, scalar_bias)]
+    actual = np.asarray(run(*resident))
     expected = np.maximum(values, 0.0) * 2.0 + row_bias[None, :] + scalar_bias
     np.testing.assert_allclose(actual, expected, rtol=2e-5, atol=2e-5)
     state.set_counter("max_abs_error", float(np.max(np.abs(actual - expected))))
-    state.set_counter("threadgroup_bytes", compilation.threadgroup_bytes)
-    pinned = kernel.pinned(values, row_bias, scalar_bias)
+    state.set_counter("threadgroup_bytes", call.explain(*resident).threadgroup_bytes)
     for _ in state:
-        pinned()
+        jax.block_until_ready(run(*resident))

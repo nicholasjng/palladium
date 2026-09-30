@@ -174,9 +174,9 @@ def test_implicit_threadgroup_is_rejected():
 
 
 def test_ffi_path_requires_an_explicit_threadgroup():
-    """metal_call_jit enforces the same explicit-threadgroup contract as bind()."""
+    """metal_call enforces the same explicit-threadgroup contract as bind()."""
     n = 64
-    f = palladium.metal_call_jit(
+    f = palladium.metal_call(
         _block_sum_kernel,
         grid=(n,),
         in_specs=[pl.BlockSpec((1,), lambda i: (i,))],
@@ -189,7 +189,7 @@ def test_ffi_path_requires_an_explicit_threadgroup():
 
 
 def _block_sum_jit(n, threadgroup=TG, extent=TG):
-    return palladium.metal_call_jit(
+    return palladium.metal_call(
         _block_sum_kernel,
         grid=(n,),
         in_specs=[pl.BlockSpec((1,), lambda i: (i,))],
@@ -279,7 +279,7 @@ def test_vmap_over_a_cooperative_kernel(vmap_method, n):
     """
     batch = 4
     xb = np.stack([np.arange(n, dtype=np.float32) * (j + 1) for j in range(batch)])
-    f = palladium.metal_call_jit(
+    f = palladium.metal_call(
         _block_sum_kernel,
         grid=(n,),
         in_specs=[pl.BlockSpec((1,), lambda i: (i,))],
@@ -296,7 +296,7 @@ def test_vmap_over_a_cooperative_kernel(vmap_method, n):
 def test_vmap_over_a_cooperative_kernel_still_needs_a_threadgroup():
     """Batching must not become a way around the explicit-size contract."""
     n = 64
-    f = palladium.metal_call_jit(
+    f = palladium.metal_call(
         _block_sum_kernel,
         grid=(n,),
         in_specs=[pl.BlockSpec((1,), lambda i: (i,))],

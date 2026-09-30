@@ -1,7 +1,6 @@
-"""The consumer-facing conveniences layered over the core pipeline.
-
-`verify`, stack/threadgroup accounting in `explain`, device-derived
-threadgroup sizing, structured error fields, and bounded kernel caches.
+"""The conveniences layered over the core pipeline: `verify`, storage
+accounting in `explain`, device-derived threadgroup sizing, structured
+error fields, and the bounded per-shape cache.
 """
 
 import jax
@@ -13,9 +12,7 @@ from jax.experimental import pallas as pl
 import palladium
 from palladium.diagnostics import device_limits, normalize_threadgroup, simdgroup_width
 from palladium.errors import (
-    DispatchError,
     EmitError,
-    StackOverflowError,
     UnsupportedPrimitiveError,
 )
 from palladium.threadgroup import (
@@ -118,12 +115,6 @@ def test_verify_works_on_cooperative_kernels_with_a_reference():
     np.testing.assert_allclose(f.verify(x, reference=reference), reference(x))
 
 
-def test_verify_on_the_ffi_path(rng):
-    f = palladium.metal_call_jit(_tanh_kernel, out_shape=jax.ShapeDtypeStruct((64,), jnp.float32))
-    x = jnp.asarray(rng.standard_normal(64, dtype=np.float32))
-    np.testing.assert_array_equal(np.asarray(f.verify(x)), np.asarray(f(x)))
-
-
 # --- explain / accounting ------------------------------------------------
 
 
@@ -150,21 +141,6 @@ def test_explain_reports_threadgroup_memory_against_the_device_budget():
     assert d.threadgroup_bytes == TG * 4
     assert d.threadgroup_limit == device_limits()["max_threadgroup_memory_length"]
     assert "shared=" in str(d)
-
-
-def test_stack_overflow_carries_the_measured_size():
-    """StackOverflowError carries the measured stack size."""
-    n = 200_000
-    f = palladium.metal_call(
-        lambda x_ref, o_ref: o_ref.__setitem__(..., x_ref[...] * 2.0),
-        out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
-    )
-    with pytest.raises(StackOverflowError, match="grid and BlockSpecs") as excinfo:
-        f(np.zeros(n, dtype=np.float32))
-
-    stack_bytes = excinfo.value.stack_bytes
-    assert stack_bytes is not None
-    assert stack_bytes >= n * 4
 
 
 # --- threadgroup sizing --------------------------------------------------
@@ -232,26 +208,18 @@ def _key(n):
     return (((n,), np.dtype(np.float32).str),)
 
 
-def test_eager_cache_evicts_least_recently_used(rng):
-    """The surviving cache keys are the most recently used, not the most recently inserted."""
+def test_cache_is_bounded(rng):
+    """Under JAX's trace caching a hit need not re-enter Python, so the
+    bound is on entries, not on recency."""
     # out_shape is fixed while the input length is free, so every n is a new key.
     f = palladium.metal_call(
         _sum_kernel, out_shape=jax.ShapeDtypeStruct((1,), jnp.float32), cache_size=2
     )
     for n in (8, 16, 24):
         f(rng.standard_normal(n, dtype=np.float32))
-    assert list(f.cache) == [_key(16), _key(24)]
-
-    f(rng.standard_normal(16, dtype=np.float32))  # hit: promotes 16 over 24
+    assert list(f._cache) == [_key(16), _key(24)]
     f(rng.standard_normal(32, dtype=np.float32))
-    assert list(f.cache) == [_key(16), _key(32)]
-
-    g = palladium.metal_call_jit(
-        _sum_kernel, out_shape=jax.ShapeDtypeStruct((1,), jnp.float32), cache_size=1
-    )
-    g(jnp.zeros(8, jnp.float32))
-    g(jnp.zeros(16, jnp.float32))
-    assert list(g._cache) == [_key(16)]
+    assert list(f._cache) == [_key(24), _key(32)]
 
 
 def test_cache_size_zero_disables_eviction(rng):
@@ -260,74 +228,4 @@ def test_cache_size_zero_disables_eviction(rng):
     )
     for n in (8, 16, 24, 32):
         f(rng.standard_normal(n, dtype=np.float32))
-    assert list(f.cache) == [_key(n) for n in (8, 16, 24, 32)]
-
-
-# --- pin parity ----------------------------------------------------------
-
-
-def test_ffi_pin_refuses_with_a_reason():
-    """pin on the FFI path refuses with a reason."""
-    f = palladium.metal_call_jit(_tanh_kernel, out_shape=jax.ShapeDtypeStruct((64,), jnp.float32))
-    with pytest.raises(NotImplementedError, match="XLA owns"):
-        f.pin(jnp.zeros(64, jnp.float32))
-
-
-# --- device-resident iteration ---------------------------------------------
-
-
-def _step_call(n):
-    def kernel(x_ref, y_ref, scale_ref, xo_ref, yo_ref):
-        x, y, scale = x_ref[...], y_ref[...], scale_ref[...]
-        xo_ref[...] = y * scale
-        yo_ref[...] = x + 1.0
-
-    point = pl.BlockSpec((1,), lambda i: (i,))
-    return palladium.metal_call(
-        kernel,
-        grid=(n,),
-        in_specs=[point, point, point],
-        out_specs=(point, point),
-        out_shape=(jax.ShapeDtypeStruct((n,), jnp.float32),) * 2,
-    )
-
-
-def test_iterate_matches_repeated_calls(rng):
-    n = 256
-    call = _step_call(n)
-    x = rng.standard_normal(n).astype(np.float32)
-    y = rng.standard_normal(n).astype(np.float32)
-    scale = np.full(n, 0.5, np.float32)
-    want_x, want_y = x, y
-    for _ in range(7):
-        want_x, want_y = call(want_x, want_y, scale)
-    got_x, got_y = call.iterate(x, y, scale, steps=7)
-    np.testing.assert_array_equal(got_x, want_x)
-    np.testing.assert_array_equal(got_y, want_y)
-
-
-def test_iterate_honors_explicit_feedback_pairs(rng):
-    """Feed output 1 into input 0 and output 0 into input 1; the scale
-    input is never refilled."""
-    n = 64
-    call = _step_call(n)
-    x = rng.standard_normal(n).astype(np.float32)
-    y = rng.standard_normal(n).astype(np.float32)
-    scale = np.full(n, 2.0, np.float32)
-    want_x, want_y = x, y
-    for _ in range(3):
-        out0, out1 = call(want_x, want_y, scale)
-        want_x, want_y = out1, out0
-    got = call.iterate(x, y, scale, steps=3, feedback=[(1, 0), (0, 1)])
-    # The last step is not swapped: outputs come back in kernel order.
-    np.testing.assert_array_equal(got[0], want_y)
-    np.testing.assert_array_equal(got[1], want_x)
-
-
-def test_iterate_rejects_a_mismatched_feedback_pair():
-    call = _step_call(16)
-    arrays = (np.zeros(16, np.float32),) * 3
-    with pytest.raises(DispatchError, match="feedback pair"):
-        call.iterate(*arrays, steps=2, feedback=[(0, 5)])
-    with pytest.raises(ValueError, match="steps"):
-        call.iterate(*arrays, steps=0)
+    assert list(f._cache) == [_key(n) for n in (8, 16, 24, 32)]

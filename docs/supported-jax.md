@@ -48,7 +48,7 @@ read snapshots are preserved across later writes.
 - **Effects:** Ref reads and writes, plus Palladium's explicit cooperative
   barrier effect. Debug printing and arbitrary JAX effects are unsupported.
 
-For `metal_call` and `metal_call_jit`, tiled matmuls on a 2D or 3D grid lower
+On both paths, tiled matmuls on a 2D or 3D grid lower
 through Metal 4 TensorOps by default (`dot_general="auto"`); dots the
 cooperative lowering does not recognize keep the one-thread-per-program
 emitter. `dot_general="tensorops"` requires the cooperative lowering and
@@ -111,13 +111,12 @@ reference instead.
 | Path | JIT | vmap | Gradients |
 |---|---|---|---|
 | `pl.pallas_call` on `mps` | Yes: palladium is the registered Pallas backend for the platform (`palladium.CompilerParams` for options) | JAX's own `pallas_call` batching | `palladium.with_vjp`, `with_auxiliary_vjp`, or `with_reference_vjp` |
-| `metal_call_jit` | Yes, through CPU FFI to Metal | Pipelined by default; sequential methods also available | Pair with `custom_vjp` |
-| `metal_call` | Eager NumPy interface | Not a JAX transformation | No automatic differentiation |
+| `metal_call` | Yes, through CPU FFI to Metal | Pipelined by default; sequential methods also available | Pair with `custom_vjp` or the `with_*vjp` helpers |
 
 The mps lowering uses FAST math. On other platforms a `pallas_call` keeps
 JAX's own behavior: `interpret=True` runs the Pallas interpreter, which
 models cooperative kernels as threadgroups of one and computes different
-results for them. `metal_call_jit` dispatches to Metal through the CPU FFI
+results for them. `metal_call` dispatches to Metal through the CPU FFI
 target and does not need jax-mps.
 
 Unsupported primitives raise `UnsupportedPrimitiveError`;

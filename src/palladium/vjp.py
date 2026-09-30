@@ -1,7 +1,7 @@
 """Gradients for Palladium calls. No path derives a derivative from emitted
 MSL, so a forward call is paired with a backward implementation through
 `jax.custom_vjp`. Forward and backward are ordinary JAX callables: a plain
-`pl.pallas_call`, `metal_call_jit`, or any JAX function.
+`pl.pallas_call`, `metal_call`, or any JAX function.
 """
 
 from __future__ import annotations

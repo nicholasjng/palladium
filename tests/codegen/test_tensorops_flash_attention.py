@@ -10,6 +10,7 @@ from jax.experimental import pallas as pl
 from jax.extend.core import Jaxpr
 
 import palladium
+from palladium.diagnostics import explain_spec
 from palladium.emit import EmitError
 from palladium.workloads.pallas_flash_attention import (
     attention_kernel,
@@ -179,7 +180,7 @@ def test_tensorops_attention_matches_sam2_token_to_image_shape():
 
 
 def test_tensorops_attention_explain_scales_batch_axis_for_cooperative_groups():
-    diagnostics = palladium.explain_spec(_spec(), dot_general="tensorops")
+    diagnostics = explain_spec(_spec(), dot_general="tensorops")
 
     assert diagnostics.grid == (128, 2, 2)
     assert diagnostics.threadgroup == (128, 1, 1)
