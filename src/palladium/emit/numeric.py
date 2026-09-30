@@ -2,6 +2,7 @@
 dtype-aware variants shared by the rules and the TensorOps lowerings."""
 
 import functools
+import re
 import string
 
 from palladium.errors import EmitError
@@ -26,6 +27,32 @@ def unwrapped(expr: str) -> str:
             # The leading paren closes early: shapes like (a) * (b).
             return expr
     return expr[1:-1]
+
+
+_CALLEE = re.compile(r"[A-Za-z_][\w:<>]*\(")
+_OPERAND = re.compile(r"[\w.$]+(\[[^\[\]]*\])?")
+
+
+def _closes_last(expr: str, start: int) -> bool:
+    """Whether the paren opened at `start` is closed by the final character."""
+    depth = 0
+    for i in range(start, len(expr)):
+        depth += expr[i] == "("
+        depth -= expr[i] == ")"
+        if depth == 0:
+            return i == len(expr) - 1
+    return False
+
+
+def enclosed(expr: str) -> str:
+    """`expr`, parenthesized unless it already binds as one operand: an
+    identifier, literal, or indexed name, a call, or one bracketed group."""
+    if _OPERAND.fullmatch(expr) or (expr.startswith("(") and _closes_last(expr, 0)):
+        return expr
+    call = _CALLEE.match(expr)
+    if call and _closes_last(expr, call.end() - 1):
+        return expr
+    return f"({expr})"
 
 
 ELEMENTWISE: dict[str, str] = {

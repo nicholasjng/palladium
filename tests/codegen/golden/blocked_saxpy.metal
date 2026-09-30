@@ -20,7 +20,7 @@ kernel void palladium_kernel(
     }
     float t4[8];
     for (uint _i5 = 0; _i5 < 8; ++_i5) {
-        t4[_i5] = ((2.5f * t0[_i5])) + t2[_i5];
+        t4[_i5] = (2.5f * t0[_i5]) + t2[_i5];
     }
     for (uint _i6 = 0; _i6 < 8; ++_i6) {
         arg2_offset[_i6] = t4[_i6];
