@@ -16,6 +16,7 @@ record the GPU model; the CNF row is from September 2026 on current code.
 | Lotka–Volterra, 100,000 trajectories × 500 RK4 steps, MPS custom call | 1.059 ms | 63.008 ms for `jit(vmap(scan))` on MPS |
 | Lotka–Volterra training, 4,096 trajectories × 100 steps, full Adam update | 0.482 ms, reverse VJP, checkpoint interval 10 | 39.173 ms for pure JAX on MPS |
 | 2D CNF, 256 points, width 4, 16 RK4 steps, full optimizer update (M1 Pro, JAX 0.11.2, plain `pallas_call` on mps) | 0.388 ms, reverse VJP, interval 4 | 15.023 ms for JAX on MPS; 1.061 ms for JAX on CPU |
+| The same update on the CPU platform, kernels through the FFI bridge (M2, JAX 0.11.2, no plugin) | 0.475 ms, reverse VJP, interval 4 | 0.958 ms for JAX on CPU |
 
 Training measurements are warmed, synchronized medians over 15 samples with
 rotating variant order. Updates start from identical optimizer states; input
@@ -25,7 +26,11 @@ plain JAX on MPS, so the fused kernels add about 13 ms of Metal compilation.
 Checkpoint interval barely matters at this size: intervals 1, 4, and 8 ran in
 0.380, 0.388, and 0.408 ms. Pairing the Palladium forward kernel with JAX's
 reference VJP instead of the adjoint kernel ran at 15.029 ms, the same as
-plain JAX, so the backward kernel carries the speedup. Run the Mew benchmarks with
+plain JAX, so the backward kernel carries the speedup. The FFI row shows the
+same two kernels called from an XLA-on-CPU program with `metal_call_jit`:
+this needs neither jax-mps nor Xcode, and since XLA fuses the small
+optimizer glue better than MLX does, it lands within 25% of the mps-platform
+run on a different machine. Run the Mew benchmarks with
 `JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/`.
 See the reproducible scripts for [RK4](../benchmarks/bench_jax_mps_rk4.py),
 [ODE training](../benchmarks/bench_mps_training.py), and

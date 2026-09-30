@@ -1,6 +1,8 @@
 """Benchmark complete CNF training updates with Mew.
 
 Run with ``JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/``.
+The ``cpu-reverse-k4-ffi`` case runs the same two kernels through the CPU
+FFI bridge, so the rest of the update is XLA on CPU; it needs no plugin.
 """
 
 import time
@@ -19,11 +21,18 @@ CASES = [
     {"platform": "mps", "variant": "reference", "interval": 1},
 ]
 CASES += [{"platform": "mps", "variant": "reverse", "interval": interval} for interval in INTERVALS]
-IDS = [f"{case['platform']}-{case['variant']}-k{case['interval']}" for case in CASES]
+CASES = [{**case, "ffi": False} for case in CASES]
+CASES.append({"platform": "cpu", "variant": "reverse", "interval": 4, "ffi": True})
+IDS = [
+    f"{case['platform']}-{case['variant']}-k{case['interval']}" + ("-ffi" if case["ffi"] else "")
+    for case in CASES
+]
 
 
 @mew.parametrize(CASES, ids=IDS, tags="cnf-training", use_real_time=True, unit="ms")
-def bench_cnf_training(state: mew.State, platform: str, variant: str, interval: int) -> None:
+def bench_cnf_training(
+    state: mew.State, platform: str, variant: str, interval: int, ffi: bool
+) -> None:
     with jax.default_device(jax.devices(platform)[0]):
         initial = initial_state(WIDTH)
         data = mixture_data(N)
@@ -33,6 +42,7 @@ def bench_cnf_training(state: mew.State, platform: str, variant: str, interval: 
             steps=STEPS,
             interval=interval,
             variant=variant,
+            ffi=ffi,
         )
         jax.block_until_ready((initial, data))
         start = time.perf_counter()
