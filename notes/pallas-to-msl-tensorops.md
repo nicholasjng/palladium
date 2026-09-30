@@ -17,6 +17,12 @@
 
 ## First implementation slice
 
+> 2026-09-30: the plan/import/layout passes and the standalone row-reduction
+> and pointwise lowerings were removed. Only kernels with a dot reach
+> TensorOps, so those lowerings were unreachable and the layout pass only
+> re-derived what the lowerings check. `compile_kernel(spec)` now picks
+> `lower_attention` (a scan) or `lower_matmul`, both matching on the jaxpr.
+
 The TensorOps API is `plan_kernel` -> `import_kernel` -> `assign_layouts` ->
 `compile_kernel` (`src/palladium/emit/tensorops`). The importer retains nested jaxpr
 regions, including scans. The initial layout pass labels dot results as
