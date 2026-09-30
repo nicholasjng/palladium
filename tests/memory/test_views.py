@@ -10,14 +10,6 @@ from jax.experimental import pallas as pl
 import palladium
 
 
-@pytest.fixture
-def metal_device():
-    try:
-        mr.device_name()
-    except mr.DeviceError as exc:
-        pytest.skip(str(exc))
-
-
 def copy_kernel(x, out):
     out[...] = x[...] * 2
 

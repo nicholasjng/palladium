@@ -33,27 +33,28 @@ def _residual_dot(a_ref, b_ref, residual_ref, out_ref):
     out_ref[...] = jnp.matmul(a_ref[...], b_ref[...]) + residual_ref[...]
 
 
+def _chained_dot(a_ref, b_ref, out_ref):
+    out_ref[...] = jnp.maximum(jnp.matmul(a_ref[...], b_ref[...]), 0.0) + 1.0
+
+
 def _bias_dot(a_ref, b_ref, bias_ref, out_ref):
     out_ref[...] = jnp.matmul(a_ref[...], b_ref[...]) + bias_ref[...]
 
 
-def _blocked_dot(m=32, n=64, k=16, tm=16, tn=32):
+def _blocked_dot(kernel=_dot, m=32, n=64, k=16, tm=16, tn=32, dtype=jnp.float32):
     call = pl.pallas_call(
-        _dot,
-        grid=(m // tm, n // tn),
+        kernel,
+        grid=((m + tm - 1) // tm, (n + tn - 1) // tn),
         in_specs=[
             pl.BlockSpec((tm, k), lambda i, j: (i, 0)),
             pl.BlockSpec((k, tn), lambda i, j: (0, j)),
         ],
         out_specs=pl.BlockSpec((tm, tn), lambda i, j: (i, j)),
-        out_shape=jax.ShapeDtypeStruct((m, n), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((m, n), dtype),
     )
-    spec = palladium.trace(
-        call,
-        jax.ShapeDtypeStruct((m, k), jnp.float32),
-        jax.ShapeDtypeStruct((k, n), jnp.float32),
+    return palladium.trace(
+        call, jax.ShapeDtypeStruct((m, k), dtype), jax.ShapeDtypeStruct((k, n), dtype)
     )
-    return spec
 
 
 def _blocked_dot_rhs_transposed(m=32, n=64, k=16, tm=16, tn=32):
@@ -89,24 +90,6 @@ def _blocked_dot_lhs_transposed(m=32, n=64, k=16, tm=16, tn=32):
         call,
         jax.ShapeDtypeStruct((k, m), jnp.float32),
         jax.ShapeDtypeStruct((k, n), jnp.float32),
-    )
-
-
-def _blocked_relu_dot():
-    call = pl.pallas_call(
-        _relu_dot,
-        grid=(2, 2),
-        in_specs=[
-            pl.BlockSpec((16, 16), lambda i, j: (i, 0)),
-            pl.BlockSpec((16, 32), lambda i, j: (0, j)),
-        ],
-        out_specs=pl.BlockSpec((16, 32), lambda i, j: (i, j)),
-        out_shape=jax.ShapeDtypeStruct((32, 64), jnp.float32),
-    )
-    return palladium.trace(
-        call,
-        jax.ShapeDtypeStruct((32, 16), jnp.float32),
-        jax.ShapeDtypeStruct((16, 64), jnp.float32),
     )
 
 
@@ -222,7 +205,7 @@ def test_tensorops_dot_uses_one_threadgroup_per_pallas_program():
 
 
 def test_tensorops_dot_fuses_relu_epilogue_in_cooperative_tensor():
-    msl, stats = palladium.emit.emit_msl_stats(_blocked_relu_dot(), dot_general="tensorops")
+    msl, stats = palladium.emit.emit_msl_stats(_blocked_dot(_relu_dot), dot_general="tensorops")
 
     assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in msl
     assert "op.run(a_k, b_k, cTc);" in msl
@@ -441,35 +424,8 @@ def test_tensorops_dot_rejects_unblocked_single_program_matmul():
         palladium.emit_msl(spec, dot_general="tensorops")
 
 
-def _tensorops_relu_dot(a_ref, b_ref, out_ref):
-    out_ref[...] = jnp.maximum(jnp.matmul(a_ref[...], b_ref[...]), 0.0)
-
-
-def _tensorops_chained_dot(a_ref, b_ref, out_ref):
-    out_ref[...] = jnp.maximum(jnp.matmul(a_ref[...], b_ref[...]), 0.0) + 1.0
-
-
-def _tensorops_matmul_spec(kernel=_dot, m=32, n=64, k=16, tm=16, tn=32, dtype=jnp.float32):
-    in_specs = [
-        pl.BlockSpec((tm, k), lambda i, j: (i, 0)),
-        pl.BlockSpec((k, tn), lambda i, j: (0, j)),
-    ]
-    args = [
-        jax.ShapeDtypeStruct((m, k), dtype),
-        jax.ShapeDtypeStruct((k, n), dtype),
-    ]
-    call = pl.pallas_call(
-        kernel,
-        grid=((m + tm - 1) // tm, (n + tn - 1) // tn),
-        in_specs=in_specs,
-        out_specs=pl.BlockSpec((tm, tn), lambda i, j: (i, j)),
-        out_shape=jax.ShapeDtypeStruct((m, n), dtype),
-    )
-    return palladium.trace(call, *args)
-
-
 def test_tensorops_matmul_lowering_emits_full_tiles():
-    spec = _tensorops_matmul_spec()
+    spec = _blocked_dot()
     source, stats = palladium.emit.emit_msl_stats(spec, dot_general="tensorops")
 
     assert "threadgroup_position_in_grid" in source
@@ -481,7 +437,7 @@ def test_tensorops_matmul_lowering_emits_full_tiles():
 
 
 def test_tensorops_matmul_accumulates_k_in_tensorops_tiles_and_handles_tail():
-    source = palladium.emit_msl(_tensorops_matmul_spec(k=144), dot_general="tensorops")
+    source = palladium.emit_msl(_blocked_dot(k=144), dot_general="tensorops")
 
     assert "matmul2d_descriptor desc(16, 32, 128, false, false, false," in source
     assert "mode::multiply_accumulate" in source
@@ -492,9 +448,7 @@ def test_tensorops_matmul_accumulates_k_in_tensorops_tiles_and_handles_tail():
 
 
 def test_tensorops_matmul_masks_partial_output_tiles():
-    source = palladium.emit_msl(
-        _tensorops_matmul_spec(_tensorops_relu_dot, m=30, n=45, k=32), dot_general="tensorops"
-    )
+    source = palladium.emit_msl(_blocked_dot(_relu_dot, m=30, n=45, k=32), dot_general="tensorops")
 
     assert "min(16, 30 - (int)_pid.x * 16)" in source
     assert "min(32, 45 - (int)_pid.y * 32)" in source
@@ -510,7 +464,7 @@ def test_tensorops_matmul_masks_partial_output_tiles():
     ((jnp.float16, "half"), (jnp.bfloat16, "bfloat")),
 )
 def test_tensorops_matmul_accepts_half_precision_buffer_types(dtype, metal_type):
-    source = palladium.emit_msl(_tensorops_matmul_spec(k=32, dtype=dtype), dot_general="tensorops")
+    source = palladium.emit_msl(_blocked_dot(k=32, dtype=dtype), dot_general="tensorops")
 
     assert f"device {metal_type}* arg0 [[buffer(0)]]" in source
     assert f"device {metal_type}* arg2 [[buffer(2)]]" in source
@@ -522,7 +476,7 @@ def test_tensorops_matmul_accepts_half_precision_buffer_types(dtype, metal_type)
 
 def test_tensorops_matmul_lowering_composes_chained_epilogues():
     chained, stats = palladium.emit.emit_msl_stats(
-        _tensorops_matmul_spec(_tensorops_chained_dot), dot_general="tensorops"
+        _blocked_dot(_chained_dot), dot_general="tensorops"
     )
     assert "threadgroup float tensorops_value_0[512];" not in chained
     assert "cTc[element1] = tensorops_epilogue3;" in chained
