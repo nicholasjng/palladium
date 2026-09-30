@@ -299,3 +299,17 @@ def test_custom_vjp_pairs_forward_and_backward_kernels(rng):
     dx_ref, dw_ref = ref(x, w)
     np.testing.assert_allclose(np.asarray(dx), np.asarray(dx_ref), rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(np.asarray(dw), np.asarray(dw_ref), rtol=1e-4, atol=1e-4)
+
+
+def test_multiple_outputs_come_back_as_a_tuple_like_pallas_call():
+    def two(x_ref, a_ref, b_ref):
+        a_ref[...] = x_ref[...] + 1.0
+        b_ref[...] = x_ref[...] * 2.0
+
+    shape = jax.ShapeDtypeStruct((8,), jnp.float32)
+    call = palladium.metal_call_jit(two, out_shape=(shape, shape))
+    x = jnp.ones(8, jnp.float32)
+    outs = jax.jit(call)(x)
+    assert isinstance(outs, tuple)
+    np.testing.assert_array_equal(np.asarray(outs[0]), 2.0 * np.ones(8))
+    np.testing.assert_array_equal(np.asarray(outs[1]), 2.0 * np.ones(8))
