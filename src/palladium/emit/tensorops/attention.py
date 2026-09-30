@@ -544,7 +544,13 @@ def _emit(plan: _AttentionPlan, spec: KernelSpec, kernel_name: str | None):
         value_op.emit_run(cursor, score_tile, value_tile, acc)
         cursor.barrier()
 
-    with cursor.loop(f"{acc.expr}.get_capacity()", "_i") as i:
+    # Small tiles leave some slots unowned. They report another lane's
+    # coordinates, so storing them would overwrite that lane's output. The
+    # rescale needs no guard because it only updates this lane's slots.
+    with (
+        cursor.loop(f"{acc.expr}.get_capacity()", "_i") as i,
+        cursor.block(f"if ({acc.expr}.is_valid_element({i}))"),
+    ):
         cursor.emit(f"const auto acc_index = {acc.expr}.get_multidimensional_index({i});")
         cursor.emit("const int row = acc_index[1];")
         cursor.emit("const int column = acc_index[0];")
