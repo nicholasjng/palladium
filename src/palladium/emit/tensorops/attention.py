@@ -86,7 +86,7 @@ def _analyze_attention(spec: KernelSpec, scan: JaxprEqn, body: Jaxpr) -> _Attent
         raise EmitError("tensorops attention Q, K, V, and output shapes are incompatible")
     q_block = query.full_block_shape
     k_block = key.full_block_shape
-    if q_block is None or k_block is None or value.full_block_shape != k_block:
+    if value.full_block_shape != k_block:
         raise EmitError("tensorops attention requires explicit query and key/value block shapes")
     q_block = tuple(1 if size is None else int(size) for size in q_block)
     k_block = tuple(1 if size is None else int(size) for size in k_block)

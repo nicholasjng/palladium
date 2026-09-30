@@ -82,7 +82,7 @@ def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     length: int = eqn.params["length"]
     body: Jaxpr = eqn.params["jaxpr"]
     reverse: bool = eqn.params.get("reverse", False)
-    shape = _scan_shape(env, eqn)
+    shape = _scan_shape(eqn)
     num_carry = shape.num_carry
 
     const_vals = [env.val(v) for v in eqn.invars[: shape.num_consts]]
@@ -130,25 +130,13 @@ class ScanShape:
 
     num_consts: int
     num_carry: int
-    num_xs: int
 
     @property
     def first_xs(self) -> int:
         return self.num_consts + self.num_carry
 
 
-def _scan_shape(env: Environment, eqn: JaxprEqn) -> ScanShape:
-    """The operand split for `eqn`, memoized per emission."""
-    key = ("scan_shape", id(eqn))
-    shape = env.rule_cache.get(key)
-    if shape is None:
-        shape = _split_scan_operands(eqn, eqn.params["jaxpr"], eqn.params["length"])
-        env.rule_cache[key] = shape
-    assert isinstance(shape, ScanShape)
-    return shape
-
-
-def _split_scan_operands(eqn: JaxprEqn, body: Jaxpr, length: int) -> ScanShape:
+def _scan_shape(eqn: JaxprEqn) -> ScanShape:
     """Structurally classify scan operands into (consts, carries, xs) and
     outputs into (carries, ys).
 
@@ -158,6 +146,7 @@ def _split_scan_operands(eqn: JaxprEqn, body: Jaxpr, length: int) -> ScanShape:
     lead the outvars and trail-align against the body's x slices, so the
     counts fall out of pairwise aval comparison.
     """
+    body, length = eqn.params["jaxpr"], eqn.params["length"]
 
     def sig(atom: Var | Literal) -> tuple[tuple[int, ...], str]:
         # Consts may be Refs, whose aval is not a ShapedArray but still
@@ -200,7 +189,7 @@ def _split_scan_operands(eqn: JaxprEqn, body: Jaxpr, length: int) -> ScanShape:
             raise EmitError(
                 "unrecognized scan structure: carry avals disagree between eqn and body"
             )
-    return ScanShape(num_consts, num_carry, num_xs)
+    return ScanShape(num_consts, num_carry)
 
 
 def _xs_slice(xs: CVal, body_invar: Var, idx: str) -> CVal:
@@ -225,7 +214,7 @@ def _consumed_only_as_scan_xs(env: Environment, var: Var) -> bool:
         if eqn.primitive.name != "scan":
             return False
         try:
-            shape = _scan_shape(env, eqn)
+            shape = _scan_shape(eqn)
         except EmitError:
             # Malformed scan: fall back to the copy; the scan rule will
             # raise the real diagnostic when it gets there.

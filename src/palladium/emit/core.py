@@ -429,7 +429,6 @@ class Environment:
         self.no_stream_refs = no_stream_refs
         # Per-emission scratch for rules that memoize per-eqn analyses,
         # conventionally keyed ("name", id(eqn)).
-        self.rule_cache: dict[object, object] = {}
         # Per jaxpr level, populated before each (sub-)jaxpr is walked;
         # Vars are unique objects per jaxpr, so levels never collide.
         self.consumers: dict[Var, list[JaxprEqn | None]] = {}
@@ -596,10 +595,7 @@ def _flat_index(terms: list[tuple[str, int]]) -> str:
 
 def _full_block_shape(info: BlockInfo) -> tuple[int, ...]:
     """block_shape with squeezed dims restored as 1, rank-matched to array."""
-    if info.full_block_shape is not None:
-        return tuple(1 if dim is None else dim for dim in info.full_block_shape)
-    missing = len(info.array_shape) - len(info.block_shape)
-    return (1,) * missing + info.block_shape
+    return tuple(1 if dim is None else dim for dim in info.full_block_shape)
 
 
 def emit_msl_stats(
@@ -692,8 +688,6 @@ def emit_msl_stats(
         edge = any(a % b for a, b in zip(info.array_shape, full))
         if strided or edge:
             dims = info.full_block_shape
-            if dims is None:
-                dims = (None,) * (len(info.array_shape) - len(info.block_shape)) + info.block_shape
             pids = [
                 CVal(f"(int){_PID[d]}", (), "int")
                 for d in range(len(info.index_map_jaxpr.jaxpr.invars))

@@ -70,20 +70,12 @@ class BlockInfo:
     dtype: np.dtype
     index_map_jaxpr: ClosedJaxpr
     # Unsqueezed layout, preserving the original axis positions.
-    full_block_shape: tuple[int | None, ...] | None = None
+    full_block_shape: tuple[int | None, ...]
 
 
-@dataclasses.dataclass(frozen=True)
-class ExecutionRequirements:
-    """Cooperative instructions, independent of scratch allocation."""
-
-    thread_index: bool = False
-    group_size: bool = False
-    barrier: bool = False
-
-    @property
-    def cooperative(self) -> bool:
-        return self.thread_index or self.group_size or self.barrier
+_COOPERATIVE_PRIMITIVES = frozenset(
+    {"palladium_thread_index", "palladium_threads_per_threadgroup", "palladium_barrier"}
+)
 
 
 def _primitive_names(jaxpr: Jaxpr) -> set[str]:
@@ -161,22 +153,9 @@ class KernelSpec:
     @property
     def uses_threadgroup(self) -> bool:
         """Whether cooperative instructions or shared scratch make the
-        threadgroup size part of the kernel's contract; `bind` then
-        requires an explicit one."""
-        return self.execution.cooperative or any(
+        threadgroup size part of the kernel's contract."""
+        return bool(_primitive_names(self.jaxpr) & _COOPERATIVE_PRIMITIVES) or any(
             info.space == "threadgroup" for info in self.scratch
-        )
-
-    @property
-    def execution(self) -> ExecutionRequirements:
-        # `bind` callers may supply hand-written MSL without a jaxpr.
-        if self.jaxpr is None:
-            return ExecutionRequirements()
-        names = _primitive_names(self.jaxpr)
-        return ExecutionRequirements(
-            thread_index="palladium_thread_index" in names,
-            group_size="palladium_threads_per_threadgroup" in names,
-            barrier="palladium_barrier" in names,
         )
 
     @property
@@ -184,8 +163,6 @@ class KernelSpec:
         """Leading extents of threadgroup scratch indexed directly by
         `thread_index()`; other index expressions are the author's
         responsibility."""
-        if self.jaxpr is None:
-            return ()
         lane_vars = {
             v
             for e in self.jaxpr.eqns
@@ -209,14 +186,6 @@ class KernelSpec:
                     if isinstance(index, Var) and index in lane_vars:
                         bounds.append(info.shape[axis])
         return tuple(bounds)
-
-    @property
-    def num_programs(self) -> int:
-        """Total number of program instances, one Metal thread each."""
-        n = 1
-        for g in self.grid:
-            n *= g
-        return n
 
 
 def _block_dim(dim: Any) -> int | None:

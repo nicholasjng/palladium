@@ -53,8 +53,8 @@ def threadgroup_memory(shape: tuple[int, ...], dtype: Any) -> pl.MemoryRef:
     trailing Ref argument. The allocation is compile-time sized and shared,
     not per-thread: a `(64,)` request is 64 elements for the whole group.
     Indexing it by `thread_index()` is safe only when the threadgroup size
-    does not exceed the leading extent, so `bind` requires an explicit
-    `threadgroup=` for these kernels.
+    does not exceed the leading extent, so these kernels require an
+    explicit `threadgroup=`.
 
     Parameters
     ----------

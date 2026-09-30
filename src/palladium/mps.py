@@ -151,21 +151,6 @@ class MpsDispatchDescriptor:
             del payload["threadgroup"]
         return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
-    @classmethod
-    def from_json(cls, value: str) -> MpsDispatchDescriptor:
-        """Parse and validate a descriptor."""
-        raw = json.loads(value)
-        if raw.get("version") != _DESCRIPTOR_VERSION:
-            raise ValueError(
-                f"unsupported Palladium MPS descriptor version {raw.get('version')!r}; "
-                f"expected {_DESCRIPTOR_VERSION}"
-            )
-        for name in ("grid", "threadgroup"):
-            if raw.get(name) is not None:
-                raw[name] = tuple(raw[name])
-        raw.setdefault("threadgroup", None)
-        return cls(**raw)
-
 
 def lower_dispatch(ctx, *args, descriptor: MpsDispatchDescriptor):
     """Emit the `palladium.dispatch` custom call for a lowering context."""

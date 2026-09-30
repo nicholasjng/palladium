@@ -43,7 +43,6 @@ def test_gridded_spec_and_loop_staging(rng):
     spec = trace(f, x)
 
     assert spec.grid == (16,)
-    assert spec.num_programs == 16
     assert spec.inputs[0].block_shape == (8,)
     assert spec.inputs[0].array_shape == (128,)
     names = [e.primitive.name for e in spec.jaxpr.eqns]
