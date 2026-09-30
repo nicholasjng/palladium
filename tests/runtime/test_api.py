@@ -1,28 +1,19 @@
 """The conveniences layered over the core pipeline: storage accounting in
-`explain`, device-derived threadgroup sizing, structured
-error fields, and the bounded per-shape cache.
+`explain`, the device thread limit, structured error fields, and the
+bounded per-shape cache.
 """
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from jax.experimental import pallas as pl
 
 import palladium
 from palladium.errors import (
     EmitError,
     UnsupportedPrimitiveError,
 )
-from palladium.launch import device_limits, normalize_threadgroup, simdgroup_width
-from palladium.threadgroup import (
-    barrier,
-    thread_index,
-    threadgroup_memory,
-    threads_per_threadgroup,
-)
-
-TG = 32
+from palladium.launch import device_limits
 
 
 def _tanh_kernel(x_ref, o_ref):
@@ -33,46 +24,6 @@ def _tanh_call(**kwargs):
     return palladium.metal_call(
         _tanh_kernel, out_shape=jax.ShapeDtypeStruct((64,), jnp.float32), **kwargs
     )
-
-
-def _block_sum_kernel(x_ref, o_ref, s_ref):
-    t = thread_index()
-    s_ref[t] = x_ref[0]
-    barrier()
-    n = threads_per_threadgroup()
-    o_ref[0] = jax.lax.fori_loop(0, n, lambda i, a: a + s_ref[i], jnp.float32(0.0))
-
-
-def _block_sum_call(n, threadgroup=TG, extent=TG):
-    return palladium.metal_call(
-        _block_sum_kernel,
-        grid=(n,),
-        in_specs=[pl.BlockSpec((1,), lambda i: (i,))],
-        out_specs=pl.BlockSpec((1,), lambda i: (i,)),
-        out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
-        scratch_shapes=[threadgroup_memory((extent,), jnp.float32)],
-        compiler_params=palladium.CompilerParams(threadgroup=threadgroup),
-    )
-
-
-# --- cooperative execution ------------------------------------------
-
-
-def test_cooperative_kernel_matches_an_explicit_reference():
-    n = 100
-    f = _block_sum_call(n)
-    x = np.arange(n, dtype=np.float32)
-
-    def reference(a):
-        out = np.empty_like(a)
-        for start in range(0, len(a), TG):
-            out[start : start + TG] = a[start : start + TG].sum()
-        return out
-
-    np.testing.assert_allclose(f(x), reference(x))
-
-
-# --- explain / accounting ------------------------------------------------
 
 
 def test_explain_reports_per_thread_stack():
@@ -93,43 +44,9 @@ def test_stack_estimate_scales_with_block_size():
     assert big.thread_bytes == small.thread_bytes * 8
 
 
-def test_explain_reports_threadgroup_memory_against_the_device_budget():
-    d = _block_sum_call(64).explain(jax.ShapeDtypeStruct((64,), jnp.float32))
-    assert d.threadgroup_bytes == TG * 4
-    assert d.threadgroup_limit == device_limits()["max_threadgroup_memory_length"]
-    assert "shared=" in str(d)
-
-
-# --- threadgroup sizing --------------------------------------------------
-
-
-def test_simdgroup_sentinel_resolves_to_the_simd_width():
-    assert normalize_threadgroup("simdgroup") == (simdgroup_width(),)
-    assert simdgroup_width() == 32  # every Apple GPU family to date
-
-
-def test_simdgroup_sentinel_runs_a_cooperative_kernel():
-    n = 96
-    f = _block_sum_call(n, threadgroup="simdgroup")
-    x = np.arange(n, dtype=np.float32)
-    expected = np.empty_like(x)
-    for start in range(0, n, simdgroup_width()):
-        expected[start : start + simdgroup_width()] = x[start : start + simdgroup_width()].sum()
-    np.testing.assert_allclose(f(x), expected, rtol=1e-6)
-
-
-def test_threadgroup_memory_over_device_budget_is_rejected():
-    """The device budget is checked before Metal rejects the pipeline with a vaguer message."""
-    limit = device_limits()["max_threadgroup_memory_length"]
-    too_many = limit // 4 + 1024  # in f32 elements
-    f = _block_sum_call(64, threadgroup=TG, extent=too_many)
-    with pytest.raises(EmitError, match="max_threadgroup_memory_length"):
-        f(np.zeros(64, dtype=np.float32))
-
-
 def test_threadgroup_over_device_thread_limit_is_rejected():
     limit = device_limits()["max_threads_per_threadgroup"]
-    f = _block_sum_call(64, threadgroup=limit * 2)
+    f = _tanh_call(compiler_params=palladium.CompilerParams(threadgroup=limit * 2))
     with pytest.raises(EmitError, match="max_threads_per_threadgroup"):
         f(np.zeros(64, dtype=np.float32))
 

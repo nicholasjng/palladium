@@ -13,7 +13,7 @@ outside this subset raise an error during tracing, lowering, or compilation.
 | Grid | Rank 1–3, or gridless for one program instance |
 | Blocks | Contiguous or strided `BlockSpec` tiles, squeezed axes, partial edge tiles; `pl.Element`, `pl.Indirect`, and `pl.BoundedSlice` are unsupported |
 | Ref indexing | Full refs, scalar indices, `pl.dslice`, positive static slice strides |
-| Scratch | Per-instance `pl.MemorySpace` scratch and explicit shared `palladium.threadgroup_memory` |
+| Scratch | Per-instance `pl.MemorySpace` scratch |
 | Captures | Python scalar constants; captured arrays are unsupported, so pass them as operands |
 | Outputs | Multiple outputs and Pallas input/output aliases, subject to backend limitations |
 
@@ -45,8 +45,8 @@ read snapshots are preserved across later writes.
   `switch`.
 - **Random:** 32-bit `random.bits` and `fold_in`, plus
   key-data conversion, using Threefry-2x32-20.
-- **Effects:** Ref reads and writes, plus Palladium's explicit cooperative
-  barrier effect. Debug printing and arbitrary JAX effects are unsupported.
+- **Effects:** Ref reads and writes. Debug printing and arbitrary JAX
+  effects are unsupported.
 
 On both paths, tiled matmuls on a 2D or 3D grid lower
 through Metal 4 TensorOps by default (`CompilerParams(dot_general="auto")`); dots the
@@ -92,21 +92,6 @@ preserve NaNs and signed-zero ties; FAST permits compiler reassociation and
 does not promise those IEEE edge semantics. See [performance guidance](performance.md)
 for numeric comparisons and measurement caveats.
 
-## Cooperative kernels
-
-`thread_index()`, `threads_per_threadgroup()`,
-`barrier()`, and shared scratch support one to three dimensions.
-Any cooperative operation requires an explicit
-`CompilerParams(threadgroup=...)`.
-Thread indices are linearized with x fastest. Barriers must be reached
-uniformly; a conservative analysis rejects divergent barrier control flow.
-Palladium checks direct top-level `scratch[thread_index()]` bounds,
-but does not prove general shared-memory race freedom.
-
-The Pallas CPU interpreter runs each program instance as a group of one. It
-cannot validate cooperative results; compare these kernels with an independent
-reference instead.
-
 ## JAX transformations and backends
 
 | Path | JIT | vmap | Gradients |
@@ -115,9 +100,8 @@ reference instead.
 | `metal_call` | Yes, through CPU FFI to Metal | One FFI call per batch; nested levels run one element at a time | `palladium.with_vjp` or `jax.custom_vjp` |
 
 The mps lowering uses FAST math. On other platforms a `pallas_call` keeps
-JAX's own behavior: `interpret=True` runs the Pallas interpreter, which
-models cooperative kernels as threadgroups of one and computes different
-results for them. `metal_call` dispatches to Metal through the CPU FFI
+JAX's own behavior: `interpret=True` runs the Pallas interpreter.
+`metal_call` dispatches to Metal through the CPU FFI
 target and does not need jax-mps.
 
 Unsupported primitives raise `UnsupportedPrimitiveError`;

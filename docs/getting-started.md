@@ -50,10 +50,7 @@ CPU interpreter. Use it as the reference for independent-thread kernels:
 np.testing.assert_allclose(call(x, y), call.interpret(x, y), rtol=1e-5)
 ~~~
 
-Cooperative kernels use multiple threads in a threadgroup; the interpreter
-models only one thread per instance and is not a valid reference for them.
-Compare those kernels against an independent reference. FAST math
-is the default, so transcendental results and reduction order can differ from
+FAST math is the default, so transcendental results and reduction order can differ from
 the reference.
 
 .explain(*args) reports the grid, threadgroup, declared storage, and emitted

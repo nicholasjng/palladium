@@ -37,8 +37,8 @@ class KernelDiagnostics:
         the grid and BlockSpecs) when pipeline creation fails for stack
         space. Metal publishes no ceiling for it.
     threadgroup_bytes : int
-        Per-group `threadgroup`-space storage, 0 unless the kernel uses
-        `palladium.threadgroup_memory`.
+        Per-group `threadgroup`-space storage, 0 unless the kernel lowers
+        through TensorOps.
     threadgroup_limit : int or None
         The device's `max_threadgroup_memory_length`, when a device is
         present. `threadgroup_bytes` must fit under it.
@@ -91,7 +91,7 @@ def explain_spec(
         thread_bytes=stats.thread_bytes,
         threadgroup_bytes=stats.threadgroup_bytes,
         threadgroup_limit=device_limits().get("max_threadgroup_memory_length"),
-        cooperative=spec.uses_threadgroup or emits_cooperative(msl),
+        cooperative=emits_cooperative(msl),
     )
 
 
