@@ -201,7 +201,7 @@ class FfiCallable(PallasCallable):
             for info in spec.outputs
         ]
         result_shape_dtypes = out_structs[0] if len(out_structs) == 1 else out_structs
-        return jax.ffi.ffi_call(
+        outs = jax.ffi.ffi_call(
             _TARGET_NAME,
             result_shape_dtypes=result_shape_dtypes,
             vmap_method=vmap_method,
@@ -222,6 +222,8 @@ class FfiCallable(PallasCallable):
             batch_size=1 if axis_size is None else int(axis_size),
             elem_strides=np.asarray(in_strides + out_strides, dtype=np.int64),
         )
+        # ffi_call returns a list for several outputs; pallas_call a tuple.
+        return tuple(outs) if len(out_structs) > 1 else outs
 
 
 def metal_call_jit(kernel: Callable, **pallas_kwargs) -> FfiCallable:
