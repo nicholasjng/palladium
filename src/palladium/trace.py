@@ -37,15 +37,19 @@ __all__ = [
 
 @dataclasses.dataclass(frozen=True)
 class ScratchInfo:
-    """A kernel scratch buffer with no backing caller array, private to one
-    program instance.
+    """Describe an uninitialized scratch buffer private to one Pallas program.
 
     Attributes
     ----------
     shape : tuple of int
-        Buffer shape.
+        Logical buffer dimensions; () denotes scalar scratch.
     dtype : numpy.dtype
-        Buffer element type.
+        Element dtype, which must be supported by the selected emitter.
+
+    Notes
+    -----
+    Scratch has no caller-owned array and must be written before it is read. The primitive
+    emitter allocates it in thread-local storage.
     """
 
     shape: tuple[int, ...]
@@ -54,19 +58,28 @@ class ScratchInfo:
 
 @dataclasses.dataclass(frozen=True)
 class BlockInfo:
-    """One kernel operand: the block a single program instance sees.
+    """Describe the logical tile and physical array layout of one kernel operand.
 
     Attributes
     ----------
     block_shape : tuple of int
-        Kernel-visible block shape, squeezed dims removed.
+        Kernel-visible shape with squeezed axes removed; () denotes a scalar block.
     array_shape : tuple of int
-        Full array shape.
+        Full backing array shape in row-major order.
     dtype : numpy.dtype
-        Element type, shared by block and array.
+        Shared element dtype of the block and backing array.
     index_map_jaxpr : ClosedJaxpr
-        Staged BlockSpec index map: grid indices to block index, in
-        units of blocks.
+        Staged map from grid coordinates to block indices, measured in blocks rather
+        than elements.
+    full_block_shape : tuple of int or None
+        Block dimensions in original array-axis order. None marks a squeezed axis, which
+        occupies one physical element.
+
+    Notes
+    -----
+    Partial edge tiles and strided blocks retain the backing array shape so emission can
+    guard loads and stores. Only blocked and squeezed Pallas dimensions are normalized by
+    tracing.
     """
 
     block_shape: tuple[int, ...]
@@ -79,23 +92,32 @@ class BlockInfo:
 
 @dataclasses.dataclass(frozen=True)
 class KernelSpec:
-    """A traced pallas_call, reduced to what MSL emission needs.
+    """Hold the backend-independent kernel body and layout metadata consumed by emission.
 
     Attributes
     ----------
     name : str
-        Kernel name, used as the MSL function name.
+        Kernel name used as the default MSL function identifier.
     jaxpr : Jaxpr
-        The kernel body: a stateful jaxpr over Refs.
+        Stateful kernel body with Ref operands in input, output, then scratch order.
     grid : tuple of int
-        Pallas grid; `(1,)` for gridless calls.
-    inputs, outputs : tuple of BlockInfo
-        Operand descriptions in jaxpr order.
+        Static program grid; tracing normalizes a gridless call to (1,). Metal emission
+        supports at most three axes.
+    inputs : tuple of BlockInfo
+        Input operands in jaxpr order.
+    outputs : tuple of BlockInfo
+        Output operands in jaxpr order.
     scratch : tuple of ScratchInfo
-        Scratch buffer descriptions, in jaxpr order after the operands.
-    aliases : tuple of (int, int)
-        Validated `input_output_aliases` pairs (input index, output index):
-        the two refs share one buffer, so the kernel updates in place.
+        Per-program scratch operands, after inputs and outputs.
+    aliases : tuple of tuple of int, optional
+        Validated (input index, output index) pairs sharing a buffer. Defaults to no
+        aliases.
+
+    Notes
+    -----
+    Prefer ``trace`` to constructing this record directly: the dataclass itself does not
+    validate layouts, aliases, or write safety. Alias validation requires identical layouts
+    and input reads before output writes; the mps dispatch path rejects aliases.
     """
 
     name: str
@@ -111,6 +133,7 @@ def _block_dim(dim: Any) -> int | None:
     # Squeezed dims vanish from the visible block. pl.Element, pl.Indirect,
     # and pl.BoundedSlice also carry `block_size` but index differently, so
     # accepting them would silently lower wrong offsets.
+    """Normalize blocked/squeezed extents, rejecting dimension kinds with different indexing semantics."""
     if isinstance(dim, (int, np.integer)):
         return int(dim)
     if isinstance(dim, pl.Squeezed):
@@ -125,6 +148,7 @@ def _block_dim(dim: Any) -> int | None:
 
 
 def _block_infos(block_mappings: list[Any]) -> tuple[BlockInfo, ...]:
+    """Preserve each block mapping's visible and unsqueezed shapes, dtype, and staged index map."""
     infos = []
     for bm in block_mappings:
         dims = [_block_dim(d) for d in bm.block_shape]
@@ -196,6 +220,7 @@ def _depends_on(jaxpr: Jaxpr, seeds: set[Var], targets: Sequence[Var | Literal])
 
 
 def _map_uses_axis(index_map: ClosedJaxpr, axis: int) -> bool:
+    """Check coarse dependency of map outputs on a grid axis; an absent axis is unused."""
     inner = index_map.jaxpr
     if axis >= len(inner.invars):
         return False
@@ -247,12 +272,14 @@ def _validate_parallel_writes(
 
 
 def _calls_program_id(jaxpr: Jaxpr, axis: int) -> bool:
+    """Find a program_id call for an axis in this jaxpr or any nested region."""
     return any(
         eqn.primitive.name == "program_id" and eqn.params["axis"] == axis for eqn in jaxpr.eqns
     ) or any(_calls_program_id(child, axis) for child in subjaxprs(jaxpr))
 
 
 def _scratch_infos(scratch_avals: Any) -> list[ScratchInfo]:
+    """Preserve scratch operand order while normalizing static shapes and NumPy dtypes."""
     return [
         ScratchInfo(shape=tuple(int(d) for d in aval.shape), dtype=np.dtype(aval.dtype))
         for aval in scratch_avals
@@ -260,27 +287,33 @@ def _scratch_infos(scratch_avals: Any) -> list[ScratchInfo]:
 
 
 def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
-    """Extract a KernelSpec from a function that calls `pl.pallas_call`.
+    """Extract one Pallas kernel specification using only input shapes and dtypes.
 
     Parameters
     ----------
     pallas_fn : callable
-        The wrapped callable returned by `pl.pallas_call(...)`, or any
-        function that invokes exactly one pallas_call.
-    *example_args
-        Arrays or `jax.ShapeDtypeStruct`s fixing shapes and dtypes; no
-        data is read.
+        Callable returned by ``pl.pallas_call``, or a wrapper containing exactly one
+        such call. JIT wrappers are traversed.
+    *example_args : array-like or jax.ShapeDtypeStruct
+        Inputs fixing shapes and dtypes; no input data is read or dispatched.
 
     Returns
     -------
     KernelSpec
+        Kernel jaxpr, normalized grid, operand layouts, scratch, and validated aliases.
 
     Raises
     ------
     TraceError
-        If tracing finds zero or more than one pallas_call equation, for
-        PrefetchScalarGridSpec kernels, or when the kernel body carries
-        effects palladium cannot perform on the GPU (debug prints, callbacks).
+        No call or multiple calls are found, or the kernel uses scalar prefetch,
+        unsupported block dimensions, foreign effects, invalid aliases, or provably
+        colliding writes.
+
+    Notes
+    -----
+    Only JIT wrappers are searched for calls; arbitrary nested control-flow wrappers are not
+    traversed. Write checks reject obvious collisions but do not prove index-map
+    injectivity. This adapter depends on JAX 0.11 Pallas internals.
     """
     closed = jax.make_jaxpr(pallas_fn)(*example_args)
     eqns = _pallas_call_eqns(closed.jaxpr)
@@ -298,8 +331,32 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
 
 
 def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
-    """Build a KernelSpec from a pallas_call equation's parameters, as found
-    by `trace` or received by a lowering rule."""
+    """Normalize the parameters of a staged Pallas equation into a kernel specification.
+
+    Parameters
+    ----------
+    pallas_params : mapping of str to object
+        JAX 0.11 ``pallas_call`` parameters, including ``jaxpr`` and ``grid_mapping``.
+
+    Returns
+    -------
+    KernelSpec
+        Validated specification with a gridless call normalized to one program.
+
+    Raises
+    ------
+    TraceError
+        Unsupported effects, prefetch, block dimensions, aliases, or obvious parallel
+        write collisions are detected.
+    KeyError
+        Required JAX equation parameters are absent.
+
+    Notes
+    -----
+    This is the common adapter for offline tracing and mps lowering. It consumes JAX
+    internal metadata rather than user-facing Pallas keyword arguments; it does not perform
+    MSL primitive validation.
+    """
     params = dict(pallas_params)
     grid_mapping = params["grid_mapping"]
 

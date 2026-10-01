@@ -26,16 +26,45 @@ _FLAT_READERS = frozenset(
 
 
 def lowers_elementwise(eqn: JaxprEqn) -> bool:
-    """Whether `eqn` lowers through `_rule_elementwise`, which reads each
-    operand by flat index. A two-case select on a bool predicate does too."""
+    """Determine whether an equation uses ordinary per-element scalar emission.
+
+    Parameters
+    ----------
+    eqn : JaxprEqn
+        Staged equation to inspect or lower.
+
+    Returns
+    -------
+    bool
+        True for registered elementwise rules or a two-case boolean select; False for
+        other select forms.
+    """
     if eqn.primitive.name == "select_n":
         return len(eqn.invars) == 3 and shaped(eqn.invars[0].aval).dtype == np.bool_
     return RULES.get(eqn.primitive.name) is _rule_elementwise
 
 
 def reads_by_flat_index(env: Environment, var) -> bool:
-    """Whether every consumer reads `var` element by element through its
-    flat index, so it may be a lazy expression with no storage."""
+    """Check whether all uses of a value preserve lazy flat-index evaluation.
+
+    Parameters
+    ----------
+    env : Environment
+        Bindings and def-use information for the current jaxpr.
+    var : Var
+        Variable considered for an unmaterialized expression.
+
+    Returns
+    -------
+    bool
+        True only for a nonescaping, used variable whose consumers are elementwise or
+        supported reduction/prefix readers.
+
+    Notes
+    -----
+    Unknown, unused, and returned values fail this check. It classifies consumers; separate
+    fusion checks decide whether evaluation would be duplicated.
+    """
     uses = env.consumer_eqns(var)
     return (
         bool(uses)

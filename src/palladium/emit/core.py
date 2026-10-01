@@ -27,6 +27,23 @@ from palladium.errors import EmitError, UnsupportedPrimitiveError
 def shaped(aval: object) -> ShapedArray:
     # Every non-Ref value in a Pallas kernel jaxpr is shaped; Refs never
     # pass through declare() or val().
+    """Narrow an abstract value to the shaped values handled by ordinary emission.
+
+    Parameters
+    ----------
+    aval : object
+        Non-Ref JAX abstract value.
+
+    Returns
+    -------
+    ShapedArray
+        The same abstract value, with its shaped type established.
+
+    Raises
+    ------
+    AssertionError
+        The value is not a ShapedArray, for example a Ref abstract value.
+    """
     assert isinstance(aval, ShapedArray), aval
     return aval
 
@@ -42,7 +59,23 @@ CTYPES: dict[np.dtype, str] = {
 
 
 def msl_type(dtype: DTypeLike) -> str:
-    """The MSL type name for a supported dtype; KeyError otherwise."""
+    """Map a supported NumPy or JAX dtype to its Metal scalar type.
+
+    Parameters
+    ----------
+    dtype : dtype-like
+        One of float32, float16, bfloat16, int32, uint32, or bool.
+
+    Returns
+    -------
+    str
+        MSL spelling of the scalar element type.
+
+    Raises
+    ------
+    KeyError
+        The normalized dtype is unsupported.
+    """
     return CTYPES[np.dtype(dtype)]
 
 
@@ -62,38 +95,46 @@ PID = ("_pid.x", "_pid.y", "_pid.z")
 
 @dataclasses.dataclass(frozen=True)
 class CVal:
-    """A jaxpr atom lowered to C.
+    """Represent a lowered jaxpr value together with its storage and addressing facts.
 
     Attributes
     ----------
     expr : str
-        C identifier, literal, or expression; any valid rvalue.
+        MSL identifier, pointer, literal, or scalar expression.
     shape : tuple of int
-        Logical shape; `()` for scalars.
+        Logical dimensions; () is a scalar.
     ctype : str
-        MSL type name, a value of CTYPES (`"float"`, not `"float32"`).
-    space : str
-        Metal address space of the storage behind `expr`: `"thread"` for
-        emitter-declared locals, `"threadgroup"` for per-threadgroup
-        locals, `"device"` for operand refs and views of them. Pointer
-        casts must carry it; a mis-qualified cast is invalid MSL.
-    readonly : bool
-        True for `const device` input refs and views of them. Only
-        readonly device storage may be aliased instead of copied by
-        `get`: nothing can write through the ref, so a view has snapshot
-        semantics.
-    transposed : bool
-        Rank-2 lazy transpose: `expr` is the untransposed source storage
-        and `shape` the permuted logical shape, so element `(i, j)` lives
-        at `expr[j * shape[0] + i]`. Set only when every consumer is a
-        `dot_general` rhs, so no flat-indexing consumer can misread it.
-    align : int
-        Guaranteed element alignment: the offset from a 16-byte-aligned
-        base is a known multiple of this many elements. 0 means exactly
-        aligned (the gcd identity, assumed for declared thread locals);
-        an N-element vectorized load requires `align % N == 0`. Composed
-        through views as the gcd of the base alignment and every offset
-        term's provable multiple.
+        MSL scalar type name from CTYPES.
+    space : {"thread", "threadgroup", "device"}, optional
+        Storage address space, default "thread"; pointer casts must preserve it.
+    readonly : bool, optional
+        Whether backing storage is immutable, default False. Only immutable device reads
+        may safely alias a Ref snapshot.
+    transposed : bool, optional
+        Lazy rank-2 transpose, default False. The expression retains source storage
+        while shape records the logical transpose; only supported dot consumers may read
+        it.
+    align : int, optional
+        Provable element-offset multiple relative to a 16-byte-aligned base. Zero
+        denotes exact base alignment and is the gcd identity.
+    index_map : str or None, optional
+        Physical element-index template using $i for the logical flat index.
+        Noncontiguous Ref reads must materialize it.
+    valid : str or None, optional
+        Bounds-predicate template using $i; guarded reads pad and guarded writes skip
+        invalid lanes.
+    scalar_storage : bool, optional
+        Whether a ranked one-element value is stored in a scalar variable, default
+        False; no pointer or subscript may be formed for it.
+    lazy : str or None, optional
+        Unmaterialized scalar-expression template using $i, restricted to consumers that
+        preserve flat-index semantics.
+
+    Notes
+    -----
+    This record describes emitter invariants rather than validating them. In particular, a
+    lazy transpose is not safe for arbitrary flat-index consumers and guarded device storage
+    must retain its bounds predicate.
     """
 
     expr: str
@@ -118,12 +159,39 @@ class CVal:
 
     @property
     def size(self) -> int:
-        """Element count; 1 for scalars."""
+        """Return the logical number of elements represented by this value.
+
+        Returns
+        -------
+        int
+            Product of dimensions; a scalar has one element.
+        """
         return math.prod(self.shape)
 
     def slot(self, index: str, shape: tuple[int, ...]) -> CVal:
-        """A view of `shape` at element offset `index * prod(shape)`;
-        alignment composes as gcd with the slot size.
+        """Create a contiguous view of one stacked slot without copying storage.
+
+        Parameters
+        ----------
+        index : str
+            MSL slot index, multiplied by the number of elements in the slot.
+        shape : tuple of int
+            Logical shape of one slot; () describes one scalar element.
+
+        Returns
+        -------
+        CVal
+            View with a pointer offset and alignment reduced by the slot size.
+
+        Raises
+        ------
+        AssertionError
+            The source is scalar or marked as lazily transposed.
+
+        Notes
+        -----
+        The caller must ensure the slot lies in storage and uses a pointer-compatible source.
+        This helper emits no bounds check.
         """
         assert self.shape and not self.transposed, self
         size = math.prod(shape)
@@ -135,8 +203,24 @@ class CVal:
         )
 
     def at(self, index: str) -> str:
-        """`expr` for scalars, `expr[index]` for arrays; lazy and
-        index-mapped values substitute `index` for `$i`."""
+        """Render an element expression without applying a bounds predicate.
+
+        Parameters
+        ----------
+        index : str
+            MSL logical flat-index expression.
+
+        Returns
+        -------
+        str
+            Scalar expression, indexed storage access, or substituted lazy/index-map
+            template.
+
+        Notes
+        -----
+        Scalars and scalar-backed one-element arrays ignore the index. Use ``read`` for a
+        guarded load; ``at`` also serves as a store destination.
+        """
         if self.lazy is not None:
             return self.lazy.replace("$i", index if index.isidentifier() else f"({index})")
         if self.index_map is not None:
@@ -146,6 +230,24 @@ class CVal:
         return f"{self.expr}[{index}]"
 
     def read(self, index: str) -> str:
+        """Render a load expression with Pallas-compatible padding for invalid lanes.
+
+        Parameters
+        ----------
+        index : str
+            MSL logical flat-index expression.
+
+        Returns
+        -------
+        str
+            Element expression guarded by ``valid``, when present.
+
+        Notes
+        -----
+        Invalid floating lanes use NaN, signed integers use INT_MIN, unsigned integers use zero,
+        and booleans use false. Without ``valid`` this is identical to ``at``; no new bounds
+        check is inferred.
+        """
         value = self.at(index)
         if self.valid is None:
             return value
@@ -162,20 +264,22 @@ class CVal:
 
 @dataclasses.dataclass(frozen=True)
 class EmitStats:
-    """Per-program-instance storage one emitted kernel declares.
+    """Record the storage explicitly declared by one emitted kernel.
 
     Attributes
     ----------
     thread_bytes : int
-        Bytes of `thread`-space storage: loaded blocks, intermediates,
-        scratch. Bounded by the per-thread stack, for which Metal
-        publishes no figure; shrink this when pipeline creation fails.
+        Primitive-emitter thread-local bytes per program, including input snapshots,
+        temporaries, and scratch.
     threadgroup_bytes : int
-        Bytes of `threadgroup`-space storage, shared per group. Budget:
-        `metal_runtime.device_info()["max_threadgroup_memory_length"]`.
+        Shared bytes per cooperative group, compared with the device shared-memory
+        limit.
 
-    Neither figure is liveness-aware: MSL declarations are function
-    scoped, and Metal's own pipeline check is equally conservative.
+    Notes
+    -----
+    Counts are not liveness-aware and do not include compiler-generated temporaries or MPP
+    register use. Metal publishes no per-thread stack ceiling; reducing thread_bytes can
+    help when pipeline creation fails.
     """
 
     thread_bytes: int
@@ -183,9 +287,25 @@ class EmitStats:
 
 
 class Cursor:
-    """The write position into one kernel's MSL text: emitted lines,
-    indentation, the unique-name counter, helpers, and storage totals.
-    Independent of jaxpr bindings.
+    """Accumulate MSL statements, helper functions, unique names, and storage estimates.
+
+    Attributes
+    ----------
+    lines : list of str
+        Statements with indentation applied as they are emitted.
+    indent : int
+        Indentation depth, initially one for a kernel body.
+    thread_bytes : int
+        Total declared thread-local bytes.
+    threadgroup_bytes : int
+        Total declared shared bytes.
+    helpers : dict of str to str
+        Helper source by function name, retained in first-use order.
+
+    Notes
+    -----
+    Each kernel uses a fresh cursor so names are deterministic. This object emits source
+    only; it has no JAX symbol bindings and performs no Metal compilation.
     """
 
     def __init__(self) -> None:
@@ -199,12 +319,50 @@ class Cursor:
         self.helpers: dict[str, str] = {}
 
     def require(self, name: str, source: str) -> str:
-        """Register helper function `source` under `name`; returns `name`."""
+        """Register a helper function once and return its call name.
+
+        Parameters
+        ----------
+        name : str
+            Helper function identifier.
+        source : str
+            Complete helper declaration and body.
+
+        Returns
+        -------
+        str
+            The supplied function name.
+
+        Notes
+        -----
+        For repeated names the first source wins; conflicting definitions are not checked.
+        """
         self.helpers.setdefault(name, source)
         return name
 
     def account(self, ctype: str, count: int, space: str = "thread") -> None:
-        """Record `count` elements of `ctype` declared in `space`."""
+        """Add a typed allocation to the declared-storage estimate.
+
+        Parameters
+        ----------
+        ctype : str
+            MSL scalar type name, such as "float", "half", "bfloat", "int", "uint", or
+            "bool".
+        count : int
+            Element count; zero or negative counts are accounted as one element.
+        space : str, optional
+            "threadgroup" records shared bytes; any other value records thread bytes.
+
+        Raises
+        ------
+        KeyError
+            The scalar type has no known byte size.
+
+        Notes
+        -----
+        This updates counters without emitting or validating an allocation. Prefer ``allocate``
+        when declaring new storage.
+        """
         nbytes = CTYPE_BYTES[ctype] * max(count, 1)
         if space == "threadgroup":
             self.threadgroup_bytes += nbytes
@@ -220,7 +378,39 @@ class Cursor:
         space: str = "thread",
         prefix: str = "t",
     ) -> CVal:
-        """Declare typed local storage, account for it, and return its CVal."""
+        """Declare local typed storage and return its lowered value.
+
+        Parameters
+        ----------
+        ctype : str
+            MSL scalar type name, such as "float", "half", "bfloat", "int", "uint", or
+            "bool".
+        shape : tuple of int
+            Positive dimensions, or () for a scalar.
+        name : str or None, optional
+            Explicit identifier, or None for a fresh name.
+        space : {"thread", "threadgroup"}, optional
+            Allocation address space, default "thread".
+        prefix : str, optional
+            Fresh-name prefix when name is omitted, default "t".
+
+        Returns
+        -------
+        CVal
+            Uninitialized storage with accounting recorded. Ranked one-element values use
+            scalar storage.
+
+        Raises
+        ------
+        EmitError
+            The scalar type or address space is unsupported, or any dimension is
+            nonpositive.
+
+        Notes
+        -----
+        Explicit names must be valid unique MSL identifiers. This emits a declaration only;
+        reads before initialization remain invalid.
+        """
         if ctype not in CTYPE_BYTES:
             raise EmitError(f"cannot allocate unsupported C type {ctype!r}")
         if space not in ("thread", "threadgroup"):
@@ -240,16 +430,54 @@ class Cursor:
         return CVal(name, shape, ctype, space=space, scalar_storage=scalar)
 
     def emit(self, line: str) -> None:
-        """Append one MSL line at the current indentation."""
+        """Append an MSL statement at the current indentation depth.
+
+        Parameters
+        ----------
+        line : str
+            Statement text without indentation or a trailing newline.
+
+        Notes
+        -----
+        The text is appended verbatim after indentation. Syntax and embedded newlines are not
+        validated.
+        """
         self.lines.append("    " * self.indent + line)
 
     def fresh(self, prefix: str = "t") -> str:
-        """Return a new unique C identifier, deterministic per Cursor."""
+        """Generate a deterministic identifier unique to this cursor.
+
+        Parameters
+        ----------
+        prefix : str, optional
+            Identifier prefix, default "t"; callers must supply a valid MSL prefix.
+
+        Returns
+        -------
+        str
+            Prefix followed by the next cursor-wide integer, shared across all prefixes.
+        """
         return f"{prefix}{next(self._names)}"
 
     @contextlib.contextmanager
     def block(self, header: str) -> Iterator[None]:
-        """Emit a braced, indented block: `with cursor.block("for (...)"):`."""
+        """Open a braced MSL block and indent statements emitted inside it.
+
+        Parameters
+        ----------
+        header : str
+            Block header such as ``for (...)`` or ``if (...)``, without an opening brace.
+
+        Yields
+        ------
+        None
+            Statements inside the context are written one indentation level deeper.
+
+        Notes
+        -----
+        Closing syntax is emitted on normal context exit. Do not reuse a cursor after an
+        exception interrupts a block.
+        """
         self.emit(header + " {")
         self.indent += 1
         yield
@@ -258,12 +486,27 @@ class Cursor:
 
     @contextlib.contextmanager
     def loop(self, count: int | str, prefix: str = "_i", reverse: bool = False) -> Iterator[str]:
-        """Emit a counted for-loop over `[0, count)`; yields the index name.
+        """Emit a counted loop and expose its index to nested emission.
 
-        Reverse loops use a signed index, since a uint would wrap past
-        zero. `count` is inlined verbatim; pass `f"{n}u"` where an
-        unsigned literal is needed. A count of 1 emits no loop and
-        yields "0".
+        Parameters
+        ----------
+        count : int or str
+            Exclusive upper bound; MSL expressions are inserted verbatim.
+        prefix : str, optional
+            Loop-index prefix, default "_i".
+        reverse : bool, optional
+            Traverse count - 1 down to zero with a signed index, default False.
+
+        Yields
+        ------
+        str
+            Loop index name, or literal "0" when the integer count equals one.
+
+        Notes
+        -----
+        A count of one removes the loop entirely. A zero count emits a loop whose body does not
+        execute. Forward indices are unsigned, so callers must use a nonnegative bound; reverse
+        indices are signed to terminate at zero.
         """
         if count == 1:
             yield "0"
@@ -279,9 +522,20 @@ class Cursor:
 
     @contextlib.contextmanager
     def loop_nest(self, shape: tuple[int, ...], prefix: str = "_i") -> Iterator[list[str]]:
-        """Emit nested counted loops over `shape`; yields one index per dim.
+        """Emit nested loops over logical dimensions and expose their indices.
 
-        Size-1 dimensions get the literal index "0" and no loop.
+        Parameters
+        ----------
+        shape : tuple of int
+            Static extents from outermost to innermost loop.
+        prefix : str, optional
+            Index-name prefix, default "_i".
+
+        Yields
+        ------
+        list of str
+            One index per dimension; unit extents use literal "0". An empty shape yields an
+            empty list.
         """
         indices: list[str] = []
         with contextlib.ExitStack() as stack:
@@ -299,17 +553,62 @@ class Cursor:
         name: str | None = None,
         prefix: str = "_i",
     ) -> Iterator[str]:
-        """Emit `for (uint i = start; i < stop; i += step)` for cooperative work."""
+        """Emit a loop that assigns strided work to cooperative threads.
+
+        Parameters
+        ----------
+        start : str
+            MSL starting index.
+        stop : str
+            MSL exclusive upper bound.
+        step : str
+            MSL positive increment.
+        name : str or None, optional
+            Explicit loop identifier, or None for a fresh name.
+        prefix : str, optional
+            Fresh-index prefix, default "_i".
+
+        Yields
+        ------
+        str
+            Unsigned loop-index identifier.
+
+        Notes
+        -----
+        Expressions are inserted verbatim without validation; a zero step would produce a
+        nonterminating loop.
+        """
         idx = name or self.fresh(prefix)
         with self.block(f"for (uint {idx} = {start}; {idx} < {stop}; {idx} += {step})"):
             yield idx
 
     def barrier(self) -> None:
-        """Emit a barrier covering threadgroup memory."""
+        """Emit a threadgroup barrier fencing shared-memory accesses.
+
+        Notes
+        -----
+        All threads in the group must reach the barrier uniformly. This helper does not analyze
+        surrounding control flow or fence device memory.
+        """
         self.emit("threadgroup_barrier(mem_flags::mem_threadgroup);")
 
     def copy(self, dst: CVal, src: CVal, count: int) -> None:
-        """Emit `count` element assignments dst[i] = src[i] as a loop."""
+        """Emit element assignments while preserving guarded load and store behavior.
+
+        Parameters
+        ----------
+        dst : CVal
+            Writable destination value or view.
+        src : CVal
+            Source value or view; reads apply any padding predicate.
+        count : int
+            Number of logical elements to copy, within both values.
+
+        Notes
+        -----
+        Invalid destination lanes are skipped; invalid source lanes use dtype-specific padding.
+        The copy is sequential and does not implement overlapping-region memmove semantics.
+        """
         with self.loop(count) as i:
             assignment = f"{dst.at(i)} = {src.read(i)};"
             if dst.valid is None:
@@ -320,15 +619,36 @@ class Cursor:
 
 
 class Environment:
-    """The symbol table for one kernel: jaxpr Var bindings and def-use info.
+    """Track jaxpr value bindings and use information for safe local emission.
+
+    Parameters
+    ----------
+    no_stream_refs : frozenset of Var, optional
+        Refs sharing buffers through input/output aliases; these cannot be direct
+        streaming destinations.
+    fuse_loads : bool, optional
+        Permit eligible single-read immutable input blocks to stay as device views,
+        default False.
 
     Attributes
     ----------
-    bindings : dict
-        Maps jaxpr Vars to their lowered CVals.
-    consumers, producers : dict
-        Var -> consuming eqns (None marks a jaxpr outvar) and
-        Var -> defining eqn, for rules that need lookahead.
+    bindings : dict of Var to CVal
+        Lowered values indexed by jaxpr variable.
+    consumers : dict of Var to list
+        Consuming equations at the current jaxpr level; None marks an escaping output.
+    producers : dict of Var to JaxprEqn
+        Defining equations used for lookahead.
+    jit_outputs : dict of Var to Var
+        Connections from inlined JIT outputs to their outer variables.
+    no_stream_refs : frozenset of Var
+        Refs excluded from early writes into output storage.
+    fuse_loads : bool
+        Whether eligible input snapshots may become immutable device views.
+
+    Notes
+    -----
+    The jaxpr walker rebuilds use maps for each level because JIT bodies can reuse the same
+    Var identities. Sharing an Environment between concurrent emissions is unsupported.
     """
 
     def __init__(
@@ -350,28 +670,95 @@ class Environment:
         self.jit_outputs: dict[Var, Var] = {}
 
     def val(self, atom: Atom) -> CVal:
-        """Resolve a jaxpr atom: Vars from bindings, Literals formatted
-        in place."""
+        """Resolve a jaxpr variable or format an inline literal.
+
+        Parameters
+        ----------
+        atom : Var or Literal
+            Atom at the current jaxpr level.
+
+        Returns
+        -------
+        CVal
+            Bound value, or a typed scalar constant for a literal.
+
+        Raises
+        ------
+        KeyError
+            A variable has not been bound or a literal dtype is unsupported.
+        """
         if isinstance(atom, Literal):
             return literal(atom)
         return self.bindings[atom]
 
     def bind(self, var: Var, cval: CVal) -> CVal:
-        """Bind `var` to an existing CVal: aliasing, no declaration."""
+        """Associate a jaxpr variable with an existing lowered value.
+
+        Parameters
+        ----------
+        var : Var
+            Variable whose current binding is replaced, if present.
+        cval : CVal
+            Storage or expression to reuse without allocation.
+
+        Returns
+        -------
+        CVal
+            The supplied value, enabling binding and returning in one operation.
+        """
         self.bindings[var] = cval
         return cval
 
     def consumer_eqns(self, var: Var) -> list[JaxprEqn]:
-        """Consuming equations at `var`'s jaxpr level, without the outvar marker."""
+        """Return consuming equations at a variable's own jaxpr level.
+
+        Parameters
+        ----------
+        var : Var
+            Variable to query.
+
+        Returns
+        -------
+        list of JaxprEqn
+            Consumers in use order, excluding the escape marker; empty for unknown or unused
+            variables.
+        """
         return [e for e in self.consumers.get(var, []) if e is not None]
 
     def escapes(self, var: Var) -> bool:
-        """Whether `var` is an outvar of its (sub-)jaxpr level."""
+        """Determine whether a variable is returned from its jaxpr level.
+
+        Parameters
+        ----------
+        var : Var
+            Variable to query.
+
+        Returns
+        -------
+        bool
+            True if its consumer list includes an output marker; False for unknown
+            variables.
+        """
         return None in self.consumers.get(var, ())
 
     def sole_consumer(self, var: Var) -> JaxprEqn | None:
-        """The single consuming equation, or None when `var` escapes,
-        is unused, or has several consumers."""
+        """Find the only use of a variable when it stays within its jaxpr level.
+
+        Parameters
+        ----------
+        var : Var
+            Variable to query.
+
+        Returns
+        -------
+        JaxprEqn or None
+            Single consuming equation; None for an unused, escaping, or multiply used value.
+
+        Notes
+        -----
+        Repeated appearances in one equation count as multiple uses, preventing unsafe
+        duplication of lazy expressions.
+        """
         uses = self.consumers.get(var, [])
         if len(uses) == 1 and uses[0] is not None:
             return uses[0]
@@ -379,7 +766,29 @@ class Environment:
 
 
 def literal(atom: Literal) -> CVal:
-    """A jaxpr Literal as a typed C constant."""
+    """Format a scalar jaxpr literal with its Metal element type.
+
+    Parameters
+    ----------
+    atom : Literal
+        Scalar literal of a supported dtype.
+
+    Returns
+    -------
+    CVal
+        Rank-zero constant, including explicit INFINITY or NAN spellings when needed.
+
+    Raises
+    ------
+    KeyError
+        The literal dtype has no Metal scalar mapping.
+
+    Notes
+    -----
+    Floating constants use a float32-roundtripping decimal; bfloat values receive an
+    explicit narrowing constructor. Captured array constants are handled separately and
+    rejected by the walker.
+    """
     ctype = msl_type(shaped(atom.aval).dtype)
     v = atom.val
     if math.isinf(v):
@@ -396,8 +805,33 @@ def literal(atom: Literal) -> CVal:
 
 
 def declare(env: Environment, cursor: Cursor, var: Var) -> CVal:
-    """Emit thread-local storage for `var` and bind it in `env`; use
-    `env.bind` for aliasing."""
+    """Allocate thread-local storage for a variable and bind it in the environment.
+
+    Parameters
+    ----------
+    env : Environment
+        Bindings and def-use information for the current jaxpr.
+    cursor : Cursor
+        Destination for generated MSL statements and storage accounting.
+    var : Var
+        Shaped jaxpr variable whose dtype and shape determine the declaration.
+
+    Returns
+    -------
+    CVal
+        Fresh uninitialized storage already bound to the variable.
+
+    Raises
+    ------
+    EmitError
+        Local dimensions are nonpositive.
+    KeyError
+        The dtype is unsupported.
+
+    Notes
+    -----
+    Use ``env.bind`` when reusing a value or view; this helper always allocates new storage.
+    """
     aval = shaped(var.aval)
     ctype = msl_type(aval.dtype)
     shape = tuple(int(d) for d in aval.shape)
@@ -418,7 +852,23 @@ RULES: dict[str, RuleFn] = {}
 
 
 def rule(*names: str) -> Callable[[RuleFn], RuleFn]:
-    """Register a lowering rule for one or more primitive names."""
+    """Register one primitive-lowering implementation under one or more names.
+
+    Parameters
+    ----------
+    *names : str
+        Primitive names to map to the decorated function.
+
+    Returns
+    -------
+    callable
+        Decorator preserving a rule with signature ``(env, cursor, eqn) -> None``.
+
+    Notes
+    -----
+    Registration mutates the process-wide RULES dictionary. Existing names are replaced; an
+    empty name list leaves the decorated function unregistered.
+    """
 
     def register(fn: RuleFn) -> RuleFn:
         for n in names:
@@ -429,18 +879,38 @@ def rule(*names: str) -> Callable[[RuleFn], RuleFn]:
 
 
 def emit_jaxpr(env: Environment, cursor: Cursor, jaxpr: Jaxpr, in_vals: list[CVal]) -> list[CVal]:
-    """Walk a jaxpr, dispatching each equation to its rule in RULES.
+    """Walk a jaxpr and dispatch each equation to its registered MSL rule.
 
-    `in_vals` binds `jaxpr.invars` in order; returns the values of
-    `jaxpr.outvars`. Consumer and producer maps are recorded before any
-    rule runs, so rules can look ahead.
+    Parameters
+    ----------
+    env : Environment
+        Bindings and def-use information for the current jaxpr.
+    cursor : Cursor
+        Destination for generated MSL statements and storage accounting.
+    jaxpr : Jaxpr
+        Kernel body or nested region to emit.
+    in_vals : list of CVal
+        Values matching jaxpr input variables in order.
+
+    Returns
+    -------
+    list of CVal
+        Lowered output atoms in jaxpr output order; empty for a state-only body.
 
     Raises
     ------
     EmitError
-        If the jaxpr captures arrays as constvars.
+        Captured array constants or unsupported primitive cases are encountered.
     UnsupportedPrimitiveError
-        If an equation's primitive has no rule.
+        An equation has no rule in RULES.
+    ValueError
+        Input arity differs from the jaxpr input count.
+
+    Notes
+    -----
+    Consumer and producer maps are populated before any rule runs. Bindings and cursor state
+    are mutated; emission failures may leave partial statements, so discard the cursor on
+    error.
     """
     if jaxpr.constvars:
         raise EmitError(

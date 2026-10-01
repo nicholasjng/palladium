@@ -1,6 +1,8 @@
-"""Exception hierarchy: everything palladium raises derives from
-PalladiumError, split by stage (trace, emit, dispatch). TraceError also
-subclasses ValueError, DispatchError TypeError.
+"""Palladium-defined validation errors, grouped by trace, emit, and dispatch stage.
+
+JAX, option validation, Metal compilation, and runtime execution may raise
+additional exception types. TraceError is also a ValueError and DispatchError
+is also a TypeError.
 """
 
 from __future__ import annotations
@@ -15,29 +17,70 @@ __all__ = [
 
 
 class PalladiumError(Exception):
-    """Base class for all palladium errors."""
+    """Represent a Palladium tracing, emission, or dispatch validation failure.
+
+    Parameters
+    ----------
+    *args : object
+        Exception message and optional context forwarded to the base exception.
+
+    Notes
+    -----
+    Catch this base class to handle Palladium-defined errors. JAX validation, native
+    compilation, and runtime libraries may raise their own exceptions.
+    """
 
 
 class TraceError(PalladiumError, ValueError):
-    """The pallas_call cannot be traced into a KernelSpec (invalid or
-    unsupported structure: zero or multiple pallas_calls, scalar
-    prefetch, unknown block dim types)."""
+    """Report a Pallas call that cannot be normalized into a kernel specification.
+
+    Parameters
+    ----------
+    *args : object
+        Exception message and optional context forwarded to the base exception.
+
+    Notes
+    -----
+    Also a ValueError. Covers unsupported call structure, effects, block dimensions, invalid
+    aliases, and obvious parallel write races.
+    """
 
 
 class EmitError(PalladiumError):
-    """The emitter cannot lower this kernel (unsupported or invalid
-    input: shapes, dtypes, primitive parameters, memory layout)."""
+    """Report a kernel construct that cannot be emitted as valid Metal source.
+
+    Parameters
+    ----------
+    *args : object
+        Exception message and optional context forwarded to the base exception.
+
+    Notes
+    -----
+    Covers unsupported primitive cases, shapes, addressing, and resource validation. Missing
+    primitive rules use UnsupportedPrimitiveError.
+    """
 
 
 class UnsupportedPrimitiveError(EmitError, NotImplementedError):
-    """The kernel stages a primitive with no registered lowering rule (the
-    primitive is missing, not an unsupported case of an existing rule).
-    Extensible via `rule`.
+    """Report a staged JAX primitive with no registered MSL lowering.
+
+    Parameters
+    ----------
+    *args : object
+        Exception message and optional context.
+    primitive : str or None, optional
+        Missing primitive name, default None.
 
     Attributes
     ----------
     primitive : str or None
-        Name of the missing primitive, for callers branching on it.
+        Name for callers to inspect without parsing the message.
+
+    Notes
+    -----
+    Also an EmitError and NotImplementedError. Unsupported parameter combinations of an
+    existing rule raise EmitError instead. Emitter extensions can register a new rule with
+    ``palladium.emit.core.rule``.
     """
 
     def __init__(self, *args: object, primitive: str | None = None) -> None:
@@ -46,4 +89,15 @@ class UnsupportedPrimitiveError(EmitError, NotImplementedError):
 
 
 class DispatchError(PalladiumError, TypeError):
-    """A `metal_call` argument has a dtype palladium cannot lower."""
+    """Report an input dtype unsupported by the CPU-to-Metal callable.
+
+    Parameters
+    ----------
+    *args : object
+        Exception message and optional context forwarded to the base exception.
+
+    Notes
+    -----
+    Also a TypeError. Native Metal compilation and dispatch failures are reported by the
+    runtime rather than this dtype-validation exception.
+    """

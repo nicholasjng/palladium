@@ -43,9 +43,32 @@ _PARAMETER = re.compile(
 
 
 def split_kernel_source(msl_source: str) -> tuple[str, list[str], str]:
-    """Split emitted MSL into (header, parameter lines, body): everything
-    before the kernel, the raw parameter declarations, and the kernel's
-    statements without braces."""
+    """Separate a Palladium kernel into its header, parameter declarations, and body.
+
+    Parameters
+    ----------
+    msl_source : str
+        Complete source using the signature and brace formatting produced by Palladium.
+
+    Returns
+    -------
+    header : str
+        Text before ``kernel void``.
+    params : list of str
+        Stripped parameter declarations without trailing commas.
+    body : str
+        Statements without the signature or outer braces.
+
+    Raises
+    ------
+    ValueError
+        The kernel marker or expected signature delimiter is missing.
+
+    Notes
+    -----
+    This is a parser for the emitter format, not arbitrary MSL. It assumes one kernel with
+    the final closing brace at the end of the source.
+    """
     kernel = msl_source.find("kernel void ")
     if kernel < 0:
         raise ValueError("source is not a Palladium MSL kernel")
@@ -63,12 +86,28 @@ def split_kernel_source(msl_source: str) -> tuple[str, list[str], str]:
 
 
 def kernel_prologue(params: list[str]) -> str:
-    """Bind the emitter's parameter names inside an MLX custom kernel.
+    """Bind emitter parameters to MLX custom-kernel buffers and Metal builtins.
 
-    MLX declares buffers as `arg<N>_base` in operand-then-result order and
-    exposes Metal builtins under their attribute names; each emitted
-    parameter becomes one declaration. Buffer names are taken from the
-    source, not assumed (the attention lowering names its buffers).
+    Parameters
+    ----------
+    params : list of str
+        Parameter declarations returned by ``split_kernel_source``.
+
+    Returns
+    -------
+    str
+        MSL declarations binding buffers by index and builtins by attribute name; empty
+        for no parameters.
+
+    Raises
+    ------
+    ValueError
+        A declaration does not match the expected parameter format.
+
+    Notes
+    -----
+    MLX buffers are named ``arg<N>_base`` in input-then-output order. Names in the original
+    source need not follow the arg<N> convention.
     """
     lines = []
     for param in params:
@@ -95,14 +134,30 @@ def _aval_to_ir_type(aval):
 
 @dataclasses.dataclass(frozen=True)
 class MpsDispatchDescriptor:
-    """Static ABI sent from the JAX lowering to jax-mps. No process-local
-    handles, so it can live in ``backend_config`` and be cached by PJRT.
+    """Carry a serializable Metal dispatch recipe from JAX lowering to jax-mps.
 
-    The handler concatenates ``header``, MLX's generated signature,
-    ``prologue`` (bindings of the emitter's parameter names), and ``body``.
-    ``grid`` is in threads; cooperative kernels carry the scaled grid and
-    their required ``threadgroup``. Operand and result shapes come from the
-    custom call's types.
+    Attributes
+    ----------
+    version : int
+        Descriptor ABI version; ``from_spec`` currently produces version 2.
+    header : str
+        Includes, namespaces, and helper functions preceding the kernel.
+    prologue : str
+        Bindings from MLX argument bases and builtins to emitter parameter names.
+    body : str
+        Kernel statements without the signature or outer braces.
+    grid : tuple of int
+        Three-dimensional thread grid, including cooperative group scaling.
+    threadgroup : tuple of int or None
+        Explicit group dimensions or None for the handler default.
+    math_mode : int
+        Native ABI math-mode ordinal; the current mps lowering supplies FAST (2).
+
+    Notes
+    -----
+    The JSON payload contains no process-local handles and can be cached in StableHLO
+    backend_config. Shapes and layouts travel in custom-call types. The dataclass does not
+    itself validate backend option support.
     """
 
     version: int
@@ -122,6 +177,37 @@ class MpsDispatchDescriptor:
         threadgroup: tuple[int, ...] | None,
         math_mode: int,
     ) -> MpsDispatchDescriptor:
+        """Build a dispatch descriptor from emitted source and launch options.
+
+        Parameters
+        ----------
+        spec : KernelSpec
+            Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
+        msl_source : str
+            Complete source produced by a Palladium emitter.
+        threadgroup : tuple of int or None, optional
+            One to three positive dimensions, or None for runtime selection. Cooperative
+            kernels require their fixed group size.
+        math_mode : int
+            ABI math-mode ordinal, stored verbatim; the mps lowering separately enforces
+            FAST.
+
+        Returns
+        -------
+        MpsDispatchDescriptor
+            Versioned source fragments, parameter bindings, and resolved geometry.
+
+        Raises
+        ------
+        ValueError
+            Source is not in the expected emitter format, parameters are unrecognized, or a
+            cooperative group does not match.
+
+        Notes
+        -----
+        This splits source without compiling it. Buffer bindings use emitted buffer indices, so
+        named attention buffers and primitive arg buffers share the same ABI.
+        """
         header, params, body = split_kernel_source(msl_source)
         grid, group = launch_geometry(spec, msl_source, threadgroup)
         return cls(
@@ -135,7 +221,14 @@ class MpsDispatchDescriptor:
         )
 
     def to_json(self) -> str:
-        """The stable, language-neutral custom-call payload."""
+        """Serialize the descriptor as a deterministic custom-call payload.
+
+        Returns
+        -------
+        str
+            Compact JSON with sorted keys. An automatic threadgroup is omitted rather than
+            encoded as null.
+        """
         payload = dataclasses.asdict(self)
         # LLVM JSON distinguishes a missing field from null: absence means the
         # handler's default launch policy, an array is an explicit size.
@@ -145,7 +238,27 @@ class MpsDispatchDescriptor:
 
 
 def lower_dispatch(ctx, *args, descriptor: MpsDispatchDescriptor):
-    """Emit the `palladium.dispatch` custom call for a lowering context."""
+    """Emit the StableHLO custom call consumed by the jax-mps dispatch handler.
+
+    Parameters
+    ----------
+    ctx : LoweringRuleContext
+        JAX lowering context supplying input and output abstract values.
+    *args : ir.Value
+        Lowered input operands in kernel order.
+    descriptor : MpsDispatchDescriptor
+        Static source and launch payload for ``palladium.dispatch``.
+
+    Returns
+    -------
+    sequence of ir.Value
+        Custom-call results with row-major operand and result layouts.
+
+    Notes
+    -----
+    This constructs IR only. Runtime execution requires a jax-mps build implementing the
+    descriptor ABI; it does not use or register the CPU FFI target.
+    """
     result_types = [_aval_to_ir_type(aval) for aval in ctx.avals_out]
     operand_layouts = [_layout(len(aval.shape)) for aval in ctx.avals_in]
     result_layouts = [_layout(len(aval.shape)) for aval in ctx.avals_out]

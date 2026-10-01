@@ -115,15 +115,34 @@ def _adoptable(env: Environment, var, value: CVal) -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class ScanShape:
-    """The operand split of one scan eqn: `eqn.invars` is consts,
-    carries, xs in that order (xs from index `first_xs`), and
-    `eqn.outvars` is carries then stacked ys."""
+    """Record the constant and carry split of a staged scan equation.
+
+    Attributes
+    ----------
+    num_consts : int
+        Leading invariant inputs to the scan body.
+    num_carry : int
+        Mutable loop-carry inputs following constants.
+
+    Notes
+    -----
+    Scanned xs follow constants and carries. Outputs contain carries followed by stacked ys;
+    the record does not itself validate the equation.
+    """
 
     num_consts: int
     num_carry: int
 
     @property
     def first_xs(self) -> int:
+        """Return the first scanned-input position in the scan operand list.
+
+        Returns
+        -------
+        int
+            Number of constant and carry inputs combined; also the end position when no xs
+            are present.
+        """
         return self.num_consts + self.num_carry
 
 
@@ -215,14 +234,36 @@ def _consumed_only_as_scan_xs(env: Environment, var: Var) -> bool:
 
 
 def _nbytes(var: Var) -> int:
+    """Return the logical byte size of a shaped variable; scalars count as one element."""
     aval = shaped(var.aval)
     return math.prod(aval.shape) * aval.dtype.itemsize
 
 
 def store_or_declare(env: Environment, cursor: Cursor, var: Var, *, min_bytes: int = 0) -> CVal:
-    """Storage for `var`: its output ref when `store_target` allows and the
-    value is at least `min_bytes`, so the swap skips its copy, else a
-    thread-local declaration."""
+    """Reuse a safe output Ref or allocate thread-local result storage.
+
+    Parameters
+    ----------
+    env : Environment
+        Bindings and def-use information for the current jaxpr.
+    cursor : Cursor
+        Destination for generated MSL statements and storage accounting.
+    var : Var
+        Result variable to bind.
+    min_bytes : int, optional
+        Minimum result size for attempting a direct store, default zero.
+
+    Returns
+    -------
+    CVal
+        Bound writable destination, either an eligible device Ref or fresh local
+        storage.
+
+    Notes
+    -----
+    Aliased, indexed, readonly, multiply used, and layout-incompatible targets fall back to
+    local storage. The final store can skip a redundant self-copy.
+    """
     target = store_target(env, var) if _nbytes(var) >= min_bytes else None
     if target is None:
         return declare(env, cursor, var)
@@ -231,14 +272,26 @@ def store_or_declare(env: Environment, cursor: Cursor, var: Var, *, min_bytes: i
 
 
 def store_target(env: Environment, outvar: Var) -> CVal | None:
-    """The device ref a value can be computed into directly, or None to
-    use thread-local storage.
+    """Find an output Ref into which a result may be computed directly.
 
-    Writing the ref earlier than its swap is unobservable
-    only while the ref feeds nothing but that one full-block swap and
-    shares its buffer with no other ref (`env.no_stream_refs`). The swap
-    then degenerates to a self-copy, which `_rule_swap` skips. An output
-    of an inlined jit body follows to the outer Var it binds.
+    Parameters
+    ----------
+    env : Environment
+        Bindings and def-use information for the current jaxpr.
+    outvar : Var
+        Result feeding a full-block output swap, possibly through an inlined JIT result.
+
+    Returns
+    -------
+    CVal or None
+        Compatible writable device Ref, or None when early writes could be observed or
+        the layout is unsuitable.
+
+    Notes
+    -----
+    The target must have one full-block store and no other uses, and must not share storage
+    with an aliased Ref. Small results escaping an inlined JIT body retain local storage to
+    avoid slower device writes.
     """
     outer = env.jit_outputs.get(outvar)
     if outer is not None and env.consumers.get(outvar) == [None]:

@@ -14,7 +14,30 @@ from palladium.errors import EmitError
 def row_reduction_expression(
     eqn: JaxprEqn, input_shape: tuple[int, int], left: str, right: str
 ) -> str:
-    """Return one combine expression for a recognized row reduction."""
+    """Render the scalar combine operation of a validated matrix-row reduction.
+
+    Parameters
+    ----------
+    eqn : JaxprEqn
+        Staged equation to inspect or lower.
+    input_shape : tuple of int
+        Expected score matrix shape (rows, columns).
+    left : str
+        Left scalar operand.
+    right : str
+        Right scalar operand.
+
+    Returns
+    -------
+    str
+        Scalar maximum or sum expression.
+
+    Raises
+    ------
+    EmitError
+        The equation is not reduce_max or reduce_sum over axis one with a row-vector
+        result.
+    """
     expected = (input_shape[0],)
     if (
         eqn.primitive.name not in ("reduce_max", "reduce_sum")
@@ -31,7 +54,33 @@ def row_reduction_expression(
 def elementwise_expression(
     eqn: JaxprEqn, ctype: str, bindings: tuple[tuple[object, str], ...]
 ) -> str:
-    """Lower one scalar equation instance from its jaxpr-atom bindings."""
+    """Render one cooperative scalar equation using explicit atom bindings.
+
+    Parameters
+    ----------
+    eqn : JaxprEqn
+        Staged equation to inspect or lower.
+    ctype : str
+        MSL scalar type name, such as "float", "half", "bfloat", "int", "uint", or
+        "bool".
+    bindings : tuple of tuple of (object, str)
+        Pairs of jaxpr atoms and MSL expressions, matched by identity.
+
+    Returns
+    -------
+    str
+        Scalar expression for the equation.
+
+    Raises
+    ------
+    EmitError
+        An input binding is absent or ambiguous, or no supported scalar template exists.
+
+    Notes
+    -----
+    Each input needs exactly one identity match. Helper-only operations are unavailable
+    because this helper does not register functions on a cursor.
+    """
     opname = eqn.primitive.name
     operands = []
     for input_atom in eqn.invars:
@@ -46,7 +95,40 @@ def elementwise_expression(
 
 @dataclasses.dataclass(frozen=True)
 class OnlineSoftmaxPlan:
-    """Jaxpr equations that update one row of a streaming softmax tile."""
+    """Keep the matched equations needed to update streaming softmax row state.
+
+    Attributes
+    ----------
+    body_invars : tuple of Var or Literal
+        Scan-body inputs used to identify row carries.
+    score_scale : JaxprEqn
+        Score scaling equation.
+    score_mask : JaxprEqn or None
+        Causal <= mask, or None for noncausal attention.
+    score_max : JaxprEqn
+        Per-row maximum reduction.
+    running_max : JaxprEqn
+        Update combining old and current maxima.
+    nonempty : JaxprEqn
+        Test that the previous running sum is nonempty.
+    probability_center : JaxprEqn
+        Subtract running maximum from scores.
+    probability_exp : JaxprEqn
+        Exponentiate centered scores.
+    probability_sum : JaxprEqn
+        Sum probabilities within each row.
+    sum_scale : JaxprEqn
+        Rescale the previous running sum.
+    sum_update : JaxprEqn
+        Add the current probability sum.
+    accumulator_scale : JaxprEqn
+        Rescale the previous weighted-value accumulator.
+
+    Notes
+    -----
+    Constructed by the attention dataflow recognizer. Equations must refer to the same scan
+    body; arbitrary equation collections are not validated by this dataclass.
+    """
 
     body_invars: tuple[Var | Literal, ...]
     score_scale: JaxprEqn
@@ -83,16 +165,47 @@ def emit_online_softmax_simd(
     simdgroups: int,
     causal_offsets: tuple[str, str] | None = None,
 ) -> None:
-    """Emit one online-softmax step with rows owned by SIMD groups.
+    """Emit one streaming softmax update with rows distributed across SIMD groups.
 
-    SIMD group `sg` owns rows sg, sg + simdgroups, ...; within a row, lane
-    `lane` owns columns lane, lane + lanes, .... Each lane reads its scores
-    once into registers, the row max and probability sum are SIMD
-    reductions, and probabilities are written back in place for the value
-    matmul. Lane 0 commits the row carries and the accumulator rescale
-    factor to `row_scale`; the caller applies it to the accumulator after
-    a barrier. Rows are disjoint across groups, so the step itself needs no
-    barrier.
+    Parameters
+    ----------
+    cursor : Cursor
+        Destination for generated MSL statements and storage accounting.
+    plan : OnlineSoftmaxPlan
+        Matched equations defining the row-state update.
+    scores : CVal
+        Writable (rows, columns) score tile, overwritten with probabilities.
+    row_max : CVal
+        Writable (rows,) running maxima.
+    row_sum : CVal
+        Writable (rows,) running probability sums.
+    row_scale : CVal
+        Writable (rows,) rescale factors for the value accumulator.
+    scale : str
+        MSL score-scale expression.
+    rows : int
+        Positive number of score rows.
+    columns : int
+        Positive number of score columns.
+    lanes : int
+        SIMD-group width used by the caller.
+    simdgroups : int
+        Number of SIMD groups sharing the row work.
+    causal_offsets : tuple of str or None, optional
+        Absolute key and query tile starts, in that order. Required exactly when the
+        plan has a causal mask.
+
+    Raises
+    ------
+    EmitError
+        Tile/carry shapes disagree, causal offsets and mask presence differ, or the mask
+        is not <=.
+
+    Notes
+    -----
+    Each group owns disjoint rows and lane zero commits row state. The caller must insert a
+    barrier before other threads consume row_scale or probabilities. Partial lane columns
+    are guarded; all-masked prior state is handled by the nonempty test.
     """
     score_storage = scores
     if score_storage.shape != (rows, columns):
@@ -217,7 +330,34 @@ def emit_online_softmax_simd(
 def accumulator_rescale_expression(
     plan: OnlineSoftmaxPlan, ctype: str, element: str, factor: str, *, rows: int, width: int
 ) -> str:
-    """The per-element accumulator rescale from the plan's scale equation."""
+    """Render the planned per-element rescaling of the weighted-value accumulator.
+
+    Parameters
+    ----------
+    plan : OnlineSoftmaxPlan
+        Recognized softmax plan whose accumulator equation identifies the carry.
+    ctype : str
+        MSL scalar type name, such as "float", "half", "bfloat", "int", "uint", or
+        "bool".
+    element : str
+        MSL accumulator element.
+    factor : str
+        MSL row rescale factor.
+    rows : int
+        Accumulator row count.
+    width : int
+        Accumulator column count.
+
+    Returns
+    -------
+    str
+        Scalar expression applying the plan rescale equation.
+
+    Notes
+    -----
+    The plan must already contain the recognized (rows, width) carry; mismatched plans are
+    not repaired by this helper.
+    """
     carry = next(
         atom
         for atom in plan.body_invars

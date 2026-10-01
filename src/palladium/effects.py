@@ -15,8 +15,25 @@ __all__ = ["eqn_reads_ref", "eqn_writes_ref", "foreign_effects"]
 
 
 def foreign_effects(jaxpr: Jaxpr) -> list[Effect]:
-    """Effects in `jaxpr` that palladium cannot perform on the GPU (anything
-    but Ref state effects), in a deterministic order."""
+    """Find effects that cannot execute inside a Palladium GPU kernel.
+
+    Parameters
+    ----------
+    jaxpr : Jaxpr
+        Kernel body whose aggregate effect set includes effects from nested control
+        flow.
+
+    Returns
+    -------
+    list of Effect
+        Non-Ref effects sorted by type name and string representation; empty for a pure
+        Ref-state kernel.
+
+    Notes
+    -----
+    Ref effects are allowed by this gate; primitive and addressing support are validated
+    during emission.
+    """
     return sorted(
         (e for e in jaxpr.effects if not isinstance(e, RefEffect)),
         key=lambda e: (type(e).__name__, str(e)),
@@ -24,7 +41,26 @@ def foreign_effects(jaxpr: Jaxpr) -> list[Effect]:
 
 
 def eqn_reads_ref(eqn: JaxprEqn, ref: Var) -> bool:
-    """Whether `eqn` may read `ref`, including inside sub-jaxprs."""
+    """Determine whether an equation may read a particular Ref.
+
+    Parameters
+    ----------
+    eqn : JaxprEqn
+        Staged equation to inspect or lower.
+    ref : Var
+        Ref variable matched by identity against the equation effect set.
+
+    Returns
+    -------
+    bool
+        True when an aggregate Ref effect identifies a read, including nested control
+        flow.
+
+    Notes
+    -----
+    Write and accumulation effects are excluded from the read query. The query uses staged
+    effects rather than inspecting generated source.
+    """
     return any(
         isinstance(e, RefEffect)
         and not isinstance(e, (WriteEffect, AccumEffect))
@@ -34,5 +70,24 @@ def eqn_reads_ref(eqn: JaxprEqn, ref: Var) -> bool:
 
 
 def eqn_writes_ref(eqn: JaxprEqn, ref: Var) -> bool:
-    """Whether `eqn` may write `ref`, including inside sub-jaxprs."""
+    """Determine whether an equation may write a particular Ref.
+
+    Parameters
+    ----------
+    eqn : JaxprEqn
+        Staged equation to inspect or lower.
+    ref : Var
+        Ref variable matched by identity against the equation effect set.
+
+    Returns
+    -------
+    bool
+        True when an aggregate Ref effect identifies a write, including nested control
+        flow.
+
+    Notes
+    -----
+    Both write and accumulation effects count as writes. The query uses staged effects
+    rather than inspecting generated source.
+    """
     return any(isinstance(e, (WriteEffect, AccumEffect)) and e.input is ref for e in eqn.effects)

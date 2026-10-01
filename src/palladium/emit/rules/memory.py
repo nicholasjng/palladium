@@ -47,6 +47,7 @@ def _rule_get(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 
 
 def _read_once(env: Environment, var, shape: tuple[int, ...]) -> bool:
+    """Allow a readonly device view for scan-only xs or eligible single-use fused loads."""
     if _consumed_only_as_scan_xs(env, var):
         return True
     if not env.fuse_loads:

@@ -51,23 +51,43 @@ except _metadata.PackageNotFoundError:  # pragma: no cover - source tree without
 
 
 def debug_msl(kernel: Callable, *example_args, **pallas_kwargs) -> str:
-    """Trace `kernel` through pallas_call and return the emitted MSL.
+    """Return the Metal source for a Pallas kernel specialized to example inputs.
 
     Parameters
     ----------
     kernel : callable
-        A Pallas kernel function (operates on Refs).
-    *example_args
-        Arrays or `jax.ShapeDtypeStruct`s fixing input shapes; no data is
-        read and nothing is compiled or dispatched.
-    **pallas_kwargs
-        The usual `pl.pallas_call` keywords (out_shape, grid, ...), with
-        options in `compiler_params=palladium.CompilerParams(...)`.
+        Pallas kernel operating on input and output Refs.
+    *example_args : array-like or jax.ShapeDtypeStruct
+        Input shapes and dtypes used for tracing; array contents are not read.
+    **pallas_kwargs : dict
+        Keywords for ``pl.pallas_call``, including required ``out_shape`` and optional
+        grid, BlockSpecs, scratch, aliases, and ``CompilerParams``.
 
     Returns
     -------
     str
-        The MSL source Palladium would compile for these shapes.
+        Complete MSL source; emission does not compile or dispatch the kernel.
+
+    Raises
+    ------
+    TraceError
+        The Pallas call has unsupported structure, effects, aliases, or provably
+        colliding writes.
+    EmitError
+        The kernel uses unsupported shapes, addressing, effects, or primitive
+        parameters.
+    UnsupportedPrimitiveError
+        A staged primitive has no registered lowering rule.
+
+    Notes
+    -----
+    This helper traces and emits only. It does not validate backend-specific launch options
+    or compile Metal source. Captured arrays must be passed as kernel operands.
+
+    See Also
+    --------
+    trace : Extract a reusable kernel specification.
+    emit_msl : Emit source from an existing specification.
     """
     import jax.experimental.pallas as pl
 

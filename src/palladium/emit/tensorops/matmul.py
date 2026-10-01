@@ -24,10 +24,36 @@ _K_TILE = 128
 
 
 def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str, int]:
-    """Lower a tiled rank-2 or batched dot and its epilogue.
+    """Recognize a tiled matrix product and emit its cooperative TensorOps kernel.
 
-    The dot, epilogue, and output store are selected from the top-level
-    equations and validated against Pallas block maps.
+    Parameters
+    ----------
+    spec : KernelSpec
+        Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
+    kernel_name : str or None, optional
+        MSL function name override; None uses ``spec.name``. The name must be a valid
+        MSL identifier.
+
+    Returns
+    -------
+    source : str
+        Complete MSL using one threadgroup per Pallas program.
+    threadgroup_bytes : int
+        Explicitly declared shared storage per group.
+
+    Raises
+    ------
+    EmitError
+        The kernel dataflow, types, layouts, tiles, or device shared-memory budget do
+        not match the supported cooperative form.
+
+    Notes
+    -----
+    Supports rank-2 matrices or matching rank-3 batches on a 2D or 3D grid, matching
+    float32/float16/bfloat16 buffers, and recognized scalar epilogues. Requires one dot, one
+    full-block output store, no scratch or aliases, and the full K extent in each Pallas
+    tile. K is processed in internal chunks with tail guards; partial M/N edge tiles are
+    masked. Rank-2 operands may be transposed; batch broadcasting is rejected.
     """
     if (
         len(spec.inputs) < 2
@@ -420,6 +446,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
 
 
 def _full_get(eqn, ref: Var):
+    """Require a full-block read of the expected Ref, raising EmitError for other read forms."""
     if (
         eqn is None
         or eqn.primitive.name != "get"
@@ -515,4 +542,5 @@ def _elementwise_expression(eqn, ctype: str, operands: tuple[str, ...], cursor) 
 
 
 def _is_tile_shape(shape: tuple[int, ...], rank: int, tm: int, tn: int) -> bool:
+    """Accept a matrix tile or its leading-singleton batch form for rank-three operands."""
     return shape == (tm, tn) or (rank == 3 and shape == (1, tm, tn))

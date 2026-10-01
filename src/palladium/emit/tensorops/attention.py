@@ -49,7 +49,36 @@ class _AttentionPlan:
 
 
 def lower_attention(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str, int]:
-    """Lower a supported online-softmax scan."""
+    """Recognize a tiled online-softmax scan and emit cooperative attention.
+
+    Parameters
+    ----------
+    spec : KernelSpec
+        Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
+    kernel_name : str or None, optional
+        MSL function name override; None uses ``spec.name``. The name must be a valid
+        MSL identifier.
+
+    Returns
+    -------
+    source : str
+        Complete MSL using one threadgroup per Pallas program.
+    threadgroup_bytes : int
+        Explicitly declared shared storage per group.
+
+    Raises
+    ------
+    EmitError
+        The kernel dataflow, types, layouts, tiles, or device shared-memory budget do
+        not match the supported cooperative form.
+
+    Notes
+    -----
+    Requires rank-4 float32 Q/K/V, a standard 3D grid, one forward scan, and one non-aliased
+    output. Tiles and head dimensions must be multiples of 16 and lengths must tile evenly.
+    Noncausal query and key lengths may differ; causal lengths must match. Dataflow and mask
+    positions are validated, not only primitive names.
+    """
     scans = [eqn for eqn in spec.jaxpr.eqns if eqn.primitive.name == "scan"]
     if len(scans) != 1:
         raise EmitError("tensorops attention requires one top-level scan region")
@@ -63,6 +92,7 @@ def lower_attention(spec: KernelSpec, kernel_name: str | None = None) -> tuple[s
 
 
 def _analyze_attention(spec: KernelSpec, scan: JaxprEqn, body: Jaxpr) -> _AttentionPlan:
+    """Match attention dataflow and layouts, rejecting unsupported scans, masks, tiles, or operands."""
     if scan.params.get("reverse") or scan.params.get("unroll") != 1:
         raise EmitError("tensorops attention requires a forward, single-step scan")
     if len(spec.inputs) != 3 or len(spec.outputs) != 1 or spec.scratch or spec.aliases:
@@ -307,6 +337,7 @@ def _analyze_attention(spec: KernelSpec, scan: JaxprEqn, body: Jaxpr) -> _Attent
 
 
 def _one(eqns, name, shape, predicate, role):
+    """Find exactly one equation matching a role, shape, and predicate, or raise EmitError."""
     matches = [
         eqn
         for eqn in eqns
@@ -421,6 +452,7 @@ def _validate_causal_positions(
 
 
 def _emit(plan: _AttentionPlan, spec: KernelSpec, kernel_name: str | None):
+    """Emit one cooperative attention program from a validated plan and enforce shared-memory limits."""
     scan = plan.scan
     query_length, key_length = plan.query_length, plan.key_length
     heads, dim = plan.heads, plan.dim

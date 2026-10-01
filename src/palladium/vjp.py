@@ -15,16 +15,44 @@ __all__ = ["with_vjp"]
 
 
 def _as_tuple(value: Any) -> tuple[Any, ...]:
+    """Preserve tuple outputs and wrap any other value as a single output; do not flatten pytrees."""
     return value if isinstance(value, tuple) else (value,)
 
 
 def with_vjp(forward: Callable, backward: Callable, *, residuals: int = 0) -> Callable:
-    """Pair `forward` with an explicit backward callable.
+    """Attach an explicit reverse-mode derivative to a forward callable.
 
-    The last `residuals` outputs of `forward` (checkpoints, say) are kept
-    for the backward pass and not returned. `backward` receives the forward
-    primals, then those residuals, then one cotangent per returned output,
-    and returns one cotangent per primal, in order.
+    Parameters
+    ----------
+    forward : callable
+        JAX-compatible forward function accepting positional primals and returning one
+        array or a tuple of outputs.
+    backward : callable
+        Receives the original primals, saved residual outputs, then one cotangent per
+        public output. Returns one cotangent per primal in the same order.
+    residuals : int, optional
+        Number of trailing forward outputs to save for the backward pass and hide from
+        the public result. Defaults to zero.
+
+    Returns
+    -------
+    callable
+        Function decorated with ``jax.custom_vjp``. With residuals, one remaining public
+        output is unwrapped from its tuple.
+
+    Raises
+    ------
+    ValueError
+        ``residuals`` is negative, or at call time leaves no public forward outputs.
+    TypeError
+        The backward callable returns the wrong number of input cotangents.
+
+    Notes
+    -----
+    Forward and backward may be Pallas, FFI, or ordinary JAX callables. This supplies
+    reverse mode only; JAX forward-mode differentiation through ``custom_vjp`` is
+    unsupported. The calling convention expects arrays or flat tuples of outputs; arbitrary
+    output pytrees are not flattened.
     """
     if residuals < 0:
         raise ValueError("residuals must be nonnegative")

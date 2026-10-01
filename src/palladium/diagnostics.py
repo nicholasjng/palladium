@@ -21,28 +21,33 @@ __all__ = ["KernelDiagnostics", "explain_spec", "log_compile"]
 
 @dataclasses.dataclass(frozen=True)
 class KernelDiagnostics:
-    """How one traced kernel will execute.
+    """Describe the launch and declared storage of an emitted kernel.
 
     Attributes
     ----------
     name : str
-        MSL function name (`spec.name`).
+        MSL function name.
     grid : tuple of int
-        Threads dispatched per Metal grid axis (x, y, z).
+        Metal thread grid padded to x, y, z; cooperative grids include group scaling.
     threadgroup : tuple of int or None
-        Fixed threadgroup size; None lets the runtime choose.
+        Fixed group dimensions, or None for runtime selection.
     msl_lines : int
-        Line count of the emitted source.
-    thread_bytes : int
-        Per-instance `thread`-space storage; the figure to shrink (via
-        the grid and BlockSpecs) when pipeline creation fails for stack
-        space. Metal publishes no ceiling for it.
-    threadgroup_bytes : int
-        Per-group `threadgroup`-space storage, 0 unless the kernel lowers
-        through TensorOps.
-    threadgroup_limit : int or None
-        The device's `max_threadgroup_memory_length`, when a device is
-        present. `threadgroup_bytes` must fit under it.
+        Line count of the complete emitted source.
+    thread_bytes : int, optional
+        Declared thread-local bytes per program, default zero. Metal does not publish a
+        corresponding stack ceiling.
+    threadgroup_bytes : int, optional
+        Declared shared bytes per cooperative group, default zero.
+    threadgroup_limit : int or None, optional
+        Device shared-memory limit, or None when unavailable.
+    cooperative : bool, optional
+        Whether one threadgroup executes each program, default False.
+
+    Notes
+    -----
+    Byte counts describe emitted declarations and are not liveness-aware. Compiler register
+    allocation and temporary storage may differ; a missing device limit does not imply
+    unlimited resources.
     """
 
     name: str
@@ -55,6 +60,13 @@ class KernelDiagnostics:
     cooperative: bool = False
 
     def __str__(self) -> str:
+        """Format a compact launch and storage report for logs.
+
+        Returns
+        -------
+        str
+            Single-line report; unknown limits and automatic group dimensions are omitted.
+        """
         parts = [f"palladium kernel {self.name}: grid={self.grid}"]
         if self.threadgroup is not None:
             parts.append(f"threadgroup={self.threadgroup}")
@@ -69,6 +81,7 @@ class KernelDiagnostics:
 
 
 def _human(nbytes: int) -> str:
+    """Format bytes as B or one-decimal KB; values below 1024 stay in bytes."""
     if nbytes < 1024:
         return f"{nbytes}B"
     return f"{nbytes / 1024:.1f}KB"
@@ -80,7 +93,40 @@ def explain_spec(
     *,
     dot_general: str = "auto",
 ) -> KernelDiagnostics:
-    """Diagnostics for a traced spec: emits MSL, compiles nothing."""
+    """Emit a traced kernel and report its geometry and declared storage.
+
+    Parameters
+    ----------
+    spec : KernelSpec
+        Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
+    threadgroup : tuple of int or None, optional
+        One to three positive dimensions, or None for runtime selection. Cooperative
+        kernels require their fixed group size.
+    dot_general : {"auto", "default", "tensorops"}, optional
+        Use cooperative TensorOps when recognized, force primitive emission, or require
+        TensorOps, respectively. The default is "auto".
+
+    Returns
+    -------
+    KernelDiagnostics
+        Emission statistics and available device limits; no compilation or dispatch
+        occurs.
+
+    Raises
+    ------
+    EmitError
+        The kernel uses unsupported shapes, addressing, effects, or primitive
+        parameters.
+    UnsupportedPrimitiveError
+        A staged primitive has no registered lowering rule.
+    ValueError
+        The policy is unknown or an explicit cooperative threadgroup does not match.
+
+    Notes
+    -----
+    An unavailable Metal device leaves the shared-memory limit unknown. Resource counts
+    describe declarations rather than compiler-measured stack or register use.
+    """
     msl, stats = emit_msl_stats(spec, dot_general=dot_general)
     grid, group = launch_geometry(spec, msl, threadgroup)
     check_threadgroup(spec, group)
@@ -97,6 +143,7 @@ def explain_spec(
 
 
 def _explain_enabled() -> bool:
+    """Treat any PALLADIUM_EXPLAIN value except empty or "0" as enabled."""
     return os.environ.get("PALLADIUM_EXPLAIN", "") not in ("", "0")
 
 
@@ -105,7 +152,24 @@ def log_compile(
     threadgroup: tuple[int, ...] | None = None,
     dot_general: str = "auto",
 ) -> None:
-    """One stderr line per compiled kernel when PALLADIUM_EXPLAIN is set;
-    called on the cache-miss path only."""
+    """Print kernel diagnostics when the explain environment flag is enabled.
+
+    Parameters
+    ----------
+    spec : KernelSpec
+        Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
+    threadgroup : tuple of int or None, optional
+        One to three positive dimensions, or None for runtime selection. Cooperative
+        kernels require their fixed group size.
+    dot_general : {"auto", "default", "tensorops"}, optional
+        Use cooperative TensorOps when recognized, force primitive emission, or require
+        TensorOps, respectively. The default is "auto".
+
+    Notes
+    -----
+    ``PALLADIUM_EXPLAIN`` enables logging for any value except the empty string and "0".
+    This function emits source again when enabled; it does not deduplicate logs. The caller
+    invokes it on cache misses to obtain one line per specialization.
+    """
     if _explain_enabled():
         print(explain_spec(spec, threadgroup, dot_general=dot_general), file=sys.stderr)

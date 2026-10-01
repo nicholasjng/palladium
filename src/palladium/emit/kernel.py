@@ -36,35 +36,44 @@ def emit_msl_stats(
     *,
     dot_general: str = "auto",
 ) -> tuple[str, EmitStats]:
-    """Assemble the full MSL source for a KernelSpec, with its storage stats.
-
-    Signature convention: operands in jaxpr order (inputs then outputs)
-    bound to `[[buffer(k)]]`, then `uint3 _pid [[thread_position_in_grid]]`,
-    one thread per program instance. TensorOps kernels use their own
-    signature.
+    """Generate a complete Metal kernel and estimate its declared storage.
 
     Parameters
     ----------
     spec : KernelSpec
-        Traced kernel, from `palladium.trace`.
-    kernel_name : str, optional
-        Overrides `spec.name` as the MSL function name.
-    dot_general : str
-        "auto" tries the cooperative TensorOps lowering and falls back
-        to this emitter; "tensorops" requires it; "default" skips it.
+        Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
+    kernel_name : str or None, optional
+        MSL function name override; None uses ``spec.name``. The name must be a valid
+        MSL identifier.
+    dot_general : {"auto", "default", "tensorops"}, optional
+        Use cooperative TensorOps when recognized, force primitive emission, or require
+        TensorOps, respectively. The default is "auto".
 
     Returns
     -------
-    tuple of (str, EmitStats)
-        Complete, self-contained MSL source, and the per-instance
-        storage the kernel declares.
+    source : str
+        Self-contained MSL, with input then output buffers and the required program-
+        position builtin.
+    stats : EmitStats
+        Declared thread-local and threadgroup storage, without compiler liveness
+        analysis.
 
     Raises
     ------
     EmitError
-        For grids over rank 3 or unsupported addressing forms.
+        The kernel uses unsupported shapes, addressing, effects, or primitive
+        parameters.
     UnsupportedPrimitiveError
-        If the kernel stages a primitive with no registered rule.
+        A staged primitive has no registered lowering rule.
+    ValueError
+        The dot policy is unknown.
+
+    Notes
+    -----
+    Primitive emission rejects grids above rank three and captured arrays. At 512 or more
+    declared thread-local bytes it re-emits with eligible input loads fused into their
+    consumers. Cooperative emission reports shared storage and zero declared thread-local
+    bytes; register use inside MPP operations is not included.
     """
     if dot_general not in DOT_GENERAL_POLICIES:
         raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
@@ -88,6 +97,7 @@ def emit_msl_stats(
 def _assemble(
     spec: KernelSpec, kernel_name: str | None, *, fuse_loads: bool
 ) -> tuple[str, EmitStats]:
+    """Assemble primitive MSL and storage totals, optionally fusing eligible immutable input loads."""
     name = kernel_name or spec.name
     if len(spec.grid) > 3:
         raise EmitError(f"grid {spec.grid} has rank > 3; Metal grids are 3D")
@@ -218,5 +228,43 @@ def emit_msl(
     *,
     dot_general: str = "auto",
 ) -> str:
-    """Assemble the full MSL source for a KernelSpec; see `emit_msl_stats`."""
+    """Generate a complete Metal kernel from a traced Pallas specification.
+
+    Parameters
+    ----------
+    spec : KernelSpec
+        Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
+    kernel_name : str or None, optional
+        MSL function name override; None uses ``spec.name``. The name must be a valid
+        MSL identifier.
+    dot_general : {"auto", "default", "tensorops"}, optional
+        Use cooperative TensorOps when recognized, force primitive emission, or require
+        TensorOps, respectively. The default is "auto".
+
+    Returns
+    -------
+    str
+        Complete MSL source; emission does not compile or dispatch the kernel.
+
+    Raises
+    ------
+    EmitError
+        The kernel uses unsupported shapes, addressing, effects, or primitive
+        parameters.
+    UnsupportedPrimitiveError
+        A staged primitive has no registered lowering rule.
+    ValueError
+        The dot policy is unknown.
+
+    Notes
+    -----
+    Primitive emission maps one Metal thread to each program. Recognized TensorOps kernels
+    map one threadgroup to each program; launch them with the matching geometry. "auto"
+    falls back when cooperative recognition raises EmitError, while "tensorops" propagates
+    that error for kernels containing dots. No device compilation occurs.
+
+    See Also
+    --------
+    emit_msl_stats : Return source together with declared storage estimates.
+    """
     return emit_msl_stats(spec, kernel_name, dot_general=dot_general)[0]

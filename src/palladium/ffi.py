@@ -41,6 +41,7 @@ _MATH_MODE_ORDINALS = {"safe": 0, "relaxed": 1, "fast": 2}
 
 
 def _library_path() -> Path:
+    """Resolve the native FFI library or its environment override; reject a missing packaged build."""
     override = os.environ.get("PALLADIUM_FFI_LIBRARY")
     if override:
         return Path(override)
@@ -76,8 +77,23 @@ def _register() -> None:
 
 
 def check_dtypes(args: tuple) -> None:
-    """Reject unsupported dtypes before tracing; they otherwise surface
-    as a KeyError inside emit."""
+    """Reject unsupported input dtypes before they reach MSL emission.
+
+    Parameters
+    ----------
+    args : tuple of array-like
+        Objects exposing a ``dtype`` attribute, including shape-only examples.
+
+    Raises
+    ------
+    DispatchError
+        An argument is not float32, float16, bfloat16, int32, uint32, or bool.
+
+    Notes
+    -----
+    An empty argument tuple passes. This checks inputs only; individual primitives may
+    support fewer dtypes.
+    """
     for i, a in enumerate(args):
         dtype = np.dtype(a.dtype)
         if dtype not in CTYPES:
@@ -98,15 +114,32 @@ _CACHE_SIZE = 256
 
 
 class FfiCallable:
-    """A palladium kernel registered as a jax.ffi target, dispatched inside
-    XLA's execution so it composes under `jax.jit`. Tracing and MSL emission
-    are cached per input shape/dtype. Not differentiable by itself (`ffi_call`
-    has no JVP/transpose rule); pair with a backward kernel via `with_vjp`.
+    """Specialize a Pallas kernel by input shape and dispatch it through CPU FFI.
+
+    Parameters
+    ----------
+    kernel : callable
+        Pallas kernel operating on input, output, and optional scratch Refs.
+    pallas_kwargs : dict of str to object
+        Keywords for ``pl.pallas_call``, excluding ``interpret``. Prefer ``metal_call``
+        as the constructor.
 
     Attributes
     ----------
     interpret : callable
-        The same pallas_call with `interpret=True`: the CPU oracle.
+        The same Pallas call with ``interpret=True``; provides an interpreter reference
+        without native Metal dispatch.
+
+    Raises
+    ------
+    TypeError
+        The compiler options are not ``CompilerParams``.
+
+    Notes
+    -----
+    A bounded per-instance LRU caches specifications and MSL for up to 256 input shape/dtype
+    signatures. Native pipeline compilation has a separate cache. The CPU FFI call has no
+    automatic JVP or transpose rule; pair it with a backward callable through ``with_vjp``.
     """
 
     def __init__(self, kernel: Callable, pallas_kwargs: dict[str, Any]):
@@ -161,14 +194,37 @@ class FfiCallable:
         return entry
 
     def explain(self, *args) -> KernelDiagnostics:
-        """Report launch geometry and emitted MSL size for these inputs.
-        Emits MSL; compiles and dispatches nothing.
+        """Report launch geometry, declared storage, and source size without Metal compilation.
 
         Parameters
         ----------
-        *args
-            Arrays or `jax.ShapeDtypeStruct`s fixing input shapes; no
-            data is read.
+        *args : array-like or jax.ShapeDtypeStruct
+            Input shape and dtype examples. Array contents are not read.
+
+        Returns
+        -------
+        KernelDiagnostics
+            Geometry and storage estimates for the selected emitter and launch options.
+
+        Raises
+        ------
+        DispatchError
+            An input dtype is unsupported.
+        TraceError
+            Tracing rejects the Pallas call.
+        EmitError
+            The kernel uses unsupported shapes, addressing, effects, or primitive
+            parameters.
+        UnsupportedPrimitiveError
+            A staged primitive has no registered lowering rule.
+        ValueError
+            The explicit group is incompatible with cooperative emission.
+
+        Notes
+        -----
+        This retraces and emits rather than using the dispatch cache. Device queries may supply
+        limits; without a device, limits remain unknown. Declared storage is an estimate, not a
+        Metal compiler resource measurement.
         """
         check_dtypes(args)
         return explain_spec(
@@ -178,7 +234,38 @@ class FfiCallable:
         )
 
     def __call__(self, *args):
-        """Dispatch via jax.ffi; traceable and jittable."""
+        """Dispatch the specialized kernel and return its JAX outputs.
+
+        Parameters
+        ----------
+        *args : array-like
+            Input arrays with supported dtypes and shapes matching the Pallas layout.
+
+        Returns
+        -------
+        jax.Array or tuple of jax.Array
+            One array for a single output, otherwise a tuple in declared output order.
+
+        Raises
+        ------
+        DispatchError
+            An input dtype cannot be lowered.
+        FileNotFoundError
+            The native FFI library is missing and no valid override is configured.
+        TraceError
+            The call has unsupported structure or unsafe aliases or writes.
+        EmitError
+            The kernel uses unsupported shapes, addressing, effects, or primitive
+            parameters.
+        UnsupportedPrimitiveError
+            A staged primitive has no registered lowering rule.
+
+        Notes
+        -----
+        The first use registers the native handler and specializes the kernel. Under ``jax.jit``
+        dispatch executes as part of the compiled CPU program; compilation and device failures
+        surface through the runtime.
+        """
         _register()
         return self._pipelined(*args)
 
@@ -266,30 +353,39 @@ class FfiCallable:
 
 
 def metal_call(kernel: Callable, **pallas_kwargs) -> FfiCallable:
-    """`pl.pallas_call`, dispatched to the Apple GPU from the CPU platform.
+    """Create a Pallas callable that dispatches Metal kernels from the JAX CPU backend.
 
     Parameters
     ----------
     kernel : callable
-        A Pallas kernel function (operates on Refs).
-    **pallas_kwargs
-        The usual `pl.pallas_call` keywords (out_shape, grid, in_specs,
-        out_specs, ...). Metal-side options travel as
-        `compiler_params=palladium.CompilerParams(...)`, as on mps.
+        Pallas kernel operating on Refs, with outputs written in place.
+    **pallas_kwargs : dict
+        Arguments for ``pl.pallas_call``, including required ``out_shape``, optional
+        grid, BlockSpecs, scratch, aliases, and ``compiler_params=CompilerParams(...)``.
+        Do not pass ``interpret``; use the returned ``interpret`` callable.
 
     Returns
     -------
     FfiCallable
-        Composable with `jax.jit` and `jax.vmap` (one FFI call per batch);
-        NumPy inputs are accepted and outputs are JAX arrays. `.interpret`
-        is the CPU oracle.
+        Callable accepting NumPy or JAX arrays and returning a JAX array, or a tuple for
+        multiple outputs. Supports ``jax.jit`` and ``jax.vmap``.
+
+    Raises
+    ------
+    TypeError
+        ``compiler_params`` is not a Palladium ``CompilerParams`` instance.
 
     Notes
     -----
-    FAST math reorders float arithmetic and approximates transcendentals,
-    so results are not bit-equal to the `interpret` oracle: ~1e-6 relative
-    for f32 elementwise work, up to ~1e-4 through exp/log-heavy kernels and
-    reductions. Use SAFE for IEEE ordering, and always for compensated
-    arithmetic (FAST deletes the error terms).
+    Tracing, dtype validation, and Metal compilation are deferred until use. This path
+    requires the native FFI library and a Metal device, but does not require jax-mps. One
+    vmap level batches dispatches in one native call; outer levels run sequentially.
+    Gradients require an explicit backward implementation via ``with_vjp``. FAST math is the
+    default; use SAFE for compensated arithmetic and strict NaN or signed-zero behavior.
+
+    See Also
+    --------
+    FfiCallable.explain : Inspect launch geometry and storage before dispatch.
+    with_vjp : Attach an explicit reverse-mode derivative.
     """
     return FfiCallable(kernel, pallas_kwargs)
