@@ -15,6 +15,7 @@ from palladium.emit.addressing import (
 )
 from palladium.emit.core import (
     PID,
+    REGISTER_BYTES,
     Cursor,
     CVal,
     EmitError,
@@ -79,15 +80,9 @@ def emit_msl_stats(
             return source, EmitStats(thread_bytes=0, threadgroup_bytes=threadgroup_bytes)
 
     source, stats = _assemble(spec, kernel_name, fuse_loads=False)
-    if stats.thread_bytes >= _REGISTER_BYTES:
+    if stats.thread_bytes >= REGISTER_BYTES:
         source, stats = _assemble(spec, kernel_name, fuse_loads=True)
     return source, stats
-
-
-# Per-thread storage above which copied input blocks spill out of registers.
-# Below it, copying a block first measured faster than reading it in place;
-# above it, reading in place won by up to 2.9x (M2, blocked elementwise).
-_REGISTER_BYTES = 512
 
 
 def _assemble(

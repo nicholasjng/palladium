@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import dataclasses
-
 import numpy as np
 from jax.extend.core import JaxprEqn
 
@@ -19,7 +17,7 @@ from palladium.emit.numeric import (
     typed_expression,
     unwrapped,
 )
-from palladium.emit.rules.control import store_target
+from palladium.emit.rules.control import store_or_declare
 from palladium.errors import EmitError
 
 _FLAT_READERS = frozenset(
@@ -150,12 +148,7 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         )
         return
 
-    target = store_target(env, eqn.outvars[0])
-    if target is not None:
-        # Compute straight into the output ref; the swap then skips its copy.
-        dst = env.bind(eqn.outvars[0], dataclasses.replace(target, shape=out_shape or (1,)))
-    else:
-        dst = declare(env, cursor, eqn.outvars[0])
+    dst = store_or_declare(env, cursor, eqn.outvars[0])
     rank = len(dst.shape)
     dst_strides = element_strides(dst.shape)
 

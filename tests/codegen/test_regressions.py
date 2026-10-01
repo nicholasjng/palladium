@@ -146,3 +146,14 @@ def test_sum_of_squares_needs_no_block_array():
         out_shape=jax.ShapeDtypeStruct((1,), jnp.float32),
     )
     assert "[256]" not in msl
+
+
+def test_where_at_the_end_computes_into_the_output():
+    # jnp.where's select sits in an inlined jit body; its result is still
+    # stored straight to the output ref once the block is large.
+    def kernel(x_ref, o_ref):
+        o_ref[...] = jnp.where(x_ref[...] > 0.0, x_ref[...], 0.0)
+
+    shape = jax.ShapeDtypeStruct((256,), jnp.float32)
+    msl = palladium.debug_msl(kernel, shape, out_shape=shape)
+    assert "[256]" not in msl

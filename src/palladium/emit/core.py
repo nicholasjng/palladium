@@ -346,6 +346,8 @@ class Environment:
         # cached jit body is shared, Vars and all, by every call to it.
         self.consumers: dict[Var, list[JaxprEqn | None]] = {}
         self.producers: dict[Var, JaxprEqn] = {}
+        # Outputs of the jit body being inlined, to the outer Vars they bind.
+        self.jit_outputs: dict[Var, Var] = {}
 
     def val(self, atom: Atom) -> CVal:
         """Resolve a jaxpr atom: Vars from bindings, Literals formatted
@@ -402,6 +404,12 @@ def declare(env: Environment, cursor: Cursor, var: Var) -> CVal:
     cval = cursor.allocate(ctype, shape)
     env.bind(var, cval)
     return cval
+
+
+# Per-thread storage above which copied input blocks spill out of registers.
+# Below it, copying a block first measured faster than reading it in place;
+# above it, reading in place won by up to 2.9x (M2, blocked elementwise).
+REGISTER_BYTES = 512
 
 
 RuleFn = Callable[[Environment, Cursor, JaxprEqn], None]

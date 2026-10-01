@@ -10,6 +10,7 @@ from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.emit.core import (
     PID,
+    REGISTER_BYTES,
     Cursor,
     CVal,
     Environment,
@@ -213,6 +214,22 @@ def _consumed_only_as_scan_xs(env: Environment, var: Var) -> bool:
     return True
 
 
+def _nbytes(var: Var) -> int:
+    aval = shaped(var.aval)
+    return math.prod(aval.shape) * aval.dtype.itemsize
+
+
+def store_or_declare(env: Environment, cursor: Cursor, var: Var, *, min_bytes: int = 0) -> CVal:
+    """Storage for `var`: its output ref when `store_target` allows and the
+    value is at least `min_bytes`, so the swap skips its copy, else a
+    thread-local declaration."""
+    target = store_target(env, var) if _nbytes(var) >= min_bytes else None
+    if target is None:
+        return declare(env, cursor, var)
+    shape = tuple(int(d) for d in shaped(var.aval).shape)
+    return env.bind(var, dataclasses.replace(target, shape=shape or (1,)))
+
+
 def store_target(env: Environment, outvar: Var) -> CVal | None:
     """The device ref a value can be computed into directly, or None to
     use thread-local storage.
@@ -220,8 +237,14 @@ def store_target(env: Environment, outvar: Var) -> CVal | None:
     Writing the ref earlier than its swap is unobservable
     only while the ref feeds nothing but that one full-block swap and
     shares its buffer with no other ref (`env.no_stream_refs`). The swap
-    then degenerates to a self-copy, which `_rule_swap` skips.
+    then degenerates to a self-copy, which `_rule_swap` skips. An output
+    of an inlined jit body follows to the outer Var it binds.
     """
+    outer = env.jit_outputs.get(outvar)
+    if outer is not None and env.consumers.get(outvar) == [None]:
+        # Writing a ref inside a loop that also reads device memory measured
+        # slower while the thread-local copy still fits in registers.
+        return store_target(env, outer) if _nbytes(outvar) >= REGISTER_BYTES else None
     swap = env.sole_consumer(outvar)
     if (
         swap is None

@@ -8,8 +8,9 @@ from collections.abc import Callable
 from jax.extend.core import JaxprEqn
 
 from palladium.emit.addressing import element_strides, flat_index
-from palladium.emit.core import Cursor, CVal, Environment, declare, rule
+from palladium.emit.core import REGISTER_BYTES, Cursor, CVal, Environment, declare, rule
 from palladium.emit.numeric import extremum, extremum_identity
+from palladium.emit.rules.control import store_or_declare
 from palladium.errors import EmitError
 
 
@@ -171,7 +172,7 @@ def _emit_reduce(
     kept_dims = [d for d in range(rank) if d not in axes]
     reduced_dims = [d for d in range(rank) if d in axes]
 
-    dst = declare(env, cursor, eqn.outvars[0])
+    dst = store_or_declare(env, cursor, eqn.outvars[0], min_bytes=REGISTER_BYTES)
     src_strides = element_strides(src.shape)
     dst_strides = element_strides(dst.shape)
 

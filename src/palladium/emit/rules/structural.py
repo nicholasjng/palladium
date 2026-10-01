@@ -10,8 +10,9 @@ from __future__ import annotations
 from jax.extend.core import JaxprEqn
 
 from palladium.emit.addressing import element_strides, flat_index
-from palladium.emit.core import Cursor, Environment, declare, rule
+from palladium.emit.core import REGISTER_BYTES, Cursor, Environment, declare, rule
 from palladium.emit.numeric import extremum, extremum_identity
+from palladium.emit.rules.control import store_or_declare
 from palladium.errors import EmitError
 
 _CUMULATIVE = {
@@ -36,7 +37,7 @@ def _rule_iota(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 def _rule_cumulative(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """Serial prefix scan along one axis for every other index."""
     src = env.val(eqn.invars[0])
-    dst = declare(env, cursor, eqn.outvars[0])
+    dst = store_or_declare(env, cursor, eqn.outvars[0], min_bytes=REGISTER_BYTES)
     axis = int(eqn.params["axis"])
     reverse = bool(eqn.params.get("reverse", False))
     template, identity = _CUMULATIVE[eqn.primitive.name]

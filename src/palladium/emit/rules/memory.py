@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import math
 
-from jax.extend.core import Jaxpr, JaxprEqn
+from jax.extend.core import Jaxpr, JaxprEqn, Var
 
 from palladium.emit.addressing import ref_view
 from palladium.emit.core import Cursor, Environment, declare, emit_jaxpr, rule, shaped
@@ -92,6 +92,9 @@ def _inline_jit(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         raise EmitError("jit with consts is unsupported")
 
     invals = [env.val(invar) for invar in eqn.invars]
+    for inner_out, outer_out in zip(body.outvars, eqn.outvars, strict=True):
+        if isinstance(inner_out, Var) and body.outvars.count(inner_out) == 1:
+            env.jit_outputs[inner_out] = outer_out
     outvals = emit_jaxpr(env, cursor, body, invals)
 
     for outvar, val in zip(eqn.outvars, outvals, strict=True):
