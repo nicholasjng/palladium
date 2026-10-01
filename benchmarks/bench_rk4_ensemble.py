@@ -29,12 +29,41 @@ IDS = [f"{case['path']}-n{case['n']}" for case in CASES]
 
 
 def ensemble(n: int, seed: int = 17) -> tuple[np.ndarray, ...]:
+    """Sample a reproducible float32 Lotka-Volterra initial-state and parameter ensemble.
+
+    Parameters
+    ----------
+    n : int
+        Number of ensemble members or examples.
+    seed : int, optional
+        Deterministic random seed, default 17.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Six vectors in (x0, y0, a, b, c, d) order, each of length n.
+    """
     rng = np.random.default_rng(seed)
     bounds = ((0.8, 1.2), (0.8, 1.2), (0.9, 1.3), (0.3, 0.5), (0.08, 0.12), (0.3, 0.5))
     return tuple(rng.uniform(low, high, n).astype(np.float32) for low, high in bounds)
 
 
 def rk4_step(x, y, a, b, c, d):
+    """Advance one or many Lotka-Volterra systems by the fixed benchmark time step.
+
+    Parameters
+    ----------
+    x, y : scalar or array-like
+        Prey and predator populations with broadcast-compatible shapes.
+    a, b, c, d : scalar or array-like
+        Growth, predation, predator-growth, and decay rates.
+
+    Returns
+    -------
+    tuple
+        Updated prey and predator values after one DT-sized classical RK4 step.
+    """
+
     def rhs(x, y):
         return a * x - b * x * y, c * x * y - d * y
 
@@ -49,6 +78,21 @@ def rk4_step(x, y, a, b, c, d):
 
 
 def lv_kernel(x_ref, y_ref, a_ref, b_ref, c_ref, d_ref, xo_ref, yo_ref):
+    """Integrate each program's Lotka-Volterra system for the fixed benchmark horizon.
+
+    Parameters
+    ----------
+    x_ref, y_ref : Ref
+        Initial population blocks.
+    a_ref, b_ref, c_ref, d_ref : Ref
+        Per-system model parameter blocks.
+    xo_ref, yo_ref : Ref
+        Final population output blocks.
+
+    Notes
+    -----
+    STEPS and DT are module constants; no intermediate trajectory is returned.
+    """
     params = a_ref[...], b_ref[...], c_ref[...], d_ref[...]
     x, y = jax.lax.fori_loop(
         0, STEPS, lambda _, xy: rk4_step(xy[0], xy[1], *params), (x_ref[...], y_ref[...])
@@ -59,6 +103,25 @@ def lv_kernel(x_ref, y_ref, a_ref, b_ref, c_ref, d_ref, xo_ref, yo_ref):
 
 @functools.cache
 def make_solver(path: str, n: int):
+    """Build a cached jitted ensemble solver with a downstream population reduction.
+
+    Parameters
+    ----------
+    path : {"palladium", "palladium-ffi", "jax-mps", "jax-cpu"}
+        Benchmark implementation; the caller selects the corresponding default device.
+    n : int
+        Number of ensemble members or examples.
+
+    Returns
+    -------
+    callable
+        Function of the six ensemble arrays returning the sum of both final populations.
+
+    Notes
+    -----
+    Palladium paths place one trajectory in each grid program; JAX paths use vmap of a scan.
+    The cache key includes path and ensemble size; compilation occurs on first use.
+    """
     if path.startswith("palladium"):
         spec = pl.BlockSpec((1,), lambda i: (i,))
         out = jax.ShapeDtypeStruct((n,), jnp.float32)
@@ -83,6 +146,23 @@ def make_solver(path: str, n: int):
 
 @mew.parametrize(CASES, ids=IDS, tags="rk4-ensemble", use_real_time=True, unit="ms")
 def bench_rk4_ensemble(state: mew.State, path: str, n: int) -> None:
+    """Validate and time a synchronized ensemble solve plus downstream JAX reduction.
+
+    Parameters
+    ----------
+    state : mew.State
+        Benchmark iteration controller and destination for timing counters or skip
+        reasons.
+    path : str
+        One of the implementation labels in PATHS.
+    n : int
+        Number of ensemble members or examples.
+
+    Notes
+    -----
+    Missing JAX platforms are skipped. First-call setup is reported separately; three warm-
+    ups precede timed iterations, with inputs resident on the selected device.
+    """
     platform = PATHS[path]
     try:
         device = jax.devices(platform)[0]

@@ -85,6 +85,31 @@ def bench_pallas_flash_attention(
     tile_q: int,
     tile_k: int,
 ) -> None:
+    """Validate and time emitted TensorOps attention on resident Metal buffers.
+
+    Parameters
+    ----------
+    state : mew.State
+        Benchmark iteration controller and destination for timing counters or skip
+        reasons.
+    sequence_length : int
+        Shared Q/K/V length, divisible by the query and key tile sizes.
+    causal : bool
+        Apply causal masking.
+    head_dim : int
+        Features per attention head, divisible by sixteen for TensorOps.
+    tile_q : int
+        Query rows per program; cooperative emission requires a positive multiple of
+        sixteen.
+    tile_k : int
+        Keys processed per scan step; key length must divide evenly into tiles and
+        cooperative emission requires a multiple of sixteen.
+
+    Notes
+    -----
+    Skips when no Metal device is available. Tracing/emission/compilation is recorded
+    separately; correctness is checked with NumPy before timing direct runtime dispatches.
+    """
     try:
         mr.device_info()
     except mr.DeviceError as error:

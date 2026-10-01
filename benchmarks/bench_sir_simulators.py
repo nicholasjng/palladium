@@ -123,6 +123,24 @@ def _candidate(name: str):
 
 @mew.parametrize(CASES, ids=IDS, tags="sir-simulators", use_real_time=True, unit="ms")
 def bench_sir_simulators(state: mew.State, candidate: str, draws: int) -> None:
+    """Validate and time a full SIR batch using NumPy, Palladium, or Torch.
+
+    Parameters
+    ----------
+    state : mew.State
+        Benchmark iteration controller and destination for timing counters or skip
+        reasons.
+    candidate : str
+        Implementation name from CANDIDATES, including Torch eager/compiled variants.
+    draws : int
+        Number of shared prior draws to simulate.
+
+    Notes
+    -----
+    Missing Torch or its required MPS device produces a skip. The first-call counter
+    includes compilation; NumPy reference checking and one additional warm-up precede timed
+    calls. Host array conversion is included in simulator timing.
+    """
     try:
         simulate = _candidate(candidate)
     except ImportError:

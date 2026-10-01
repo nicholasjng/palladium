@@ -39,6 +39,28 @@ IDS = [
 def bench_cnf_training(
     state: mew.State, platform: str, variant: str, interval: int, ffi: bool
 ) -> None:
+    """Validate and time a complete compiled CNF training update.
+
+    Parameters
+    ----------
+    state : mew.State
+        Benchmark iteration controller and destination for timing counters or skip
+        reasons.
+    platform : {"cpu", "mps"}
+        JAX device platform.
+    variant : {"jax", "reference", "reverse"}
+        Forward/backward implementation strategy.
+    interval : int
+        Positive checkpoint spacing for the reverse variant.
+    ffi : bool
+        Use CPU-to-Metal FFI instead of plain Pallas when True.
+
+    Notes
+    -----
+    Compilation and first execution are reported separately, and results are checked against
+    ordinary JAX before warm-up and timing. Every timed iteration starts from the same
+    optimizer state; it measures one update, not cumulative training.
+    """
     with jax.default_device(jax.devices(platform)[0]):
         initial = initial_state(WIDTH)
         data = mixture_data(N)

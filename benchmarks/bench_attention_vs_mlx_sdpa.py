@@ -117,6 +117,36 @@ def bench_attention_vs_mlx_sdpa(
     tile_k: int,
     causal: bool,
 ) -> None:
+    """Compare synchronized MPS attention implementations with a shared NumPy reference.
+
+    Parameters
+    ----------
+    state : mew.State
+        Benchmark iteration controller and destination for timing counters or skip
+        reasons.
+    candidate : {"palladium", "mlx-sdpa", "jnp-softmax"}
+        Attention implementation to benchmark.
+    sequence : int
+        Shared query/key sequence length.
+    heads : int
+        Number of attention heads.
+    head_dim : int
+        Features per attention head, divisible by sixteen for TensorOps.
+    tile_q : int
+        Query rows per program; cooperative emission requires a positive multiple of
+        sixteen.
+    tile_k : int
+        Keys processed per scan step; key length must divide evenly into tiles and
+        cooperative emission requires a multiple of sixteen.
+    causal : bool
+        Apply causal attention masking to the selected implementation.
+
+    Notes
+    -----
+    Requires jax-mps and skips when its device is unavailable. Compilation and correctness
+    checking precede three warm-ups and timing; every timed call waits for completion on
+    resident inputs.
+    """
     try:
         device = jax.devices("mps")[0]
     except (RuntimeError, IndexError):
