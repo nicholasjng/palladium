@@ -124,3 +124,13 @@ def test_a_jitted_helper_fuses_on_every_call():
     )
     twice = palladium.debug_msl(kernel, shape, out_shape=shape)
     assert twice.count("float t") <= once.count("float t") + 1
+
+
+def test_scalar_fill_of_where_is_not_materialized():
+    def kernel(x_ref, o_ref):
+        o_ref[...] = jnp.where(x_ref[...] > 0.0, x_ref[...], 0.0)
+
+    shape = jax.ShapeDtypeStruct((64,), jnp.float32)
+    msl = palladium.debug_msl(kernel, shape, out_shape=shape)
+    # A materialized broadcast is the only loop named _b.
+    assert "for (uint _b" not in msl

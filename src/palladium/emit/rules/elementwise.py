@@ -23,6 +23,14 @@ from palladium.emit.rules.control import store_target
 from palladium.errors import EmitError
 
 
+def lowers_elementwise(eqn: JaxprEqn) -> bool:
+    """Whether `eqn` lowers through `_rule_elementwise`, which reads each
+    operand by flat index. A two-case select on a bool predicate does too."""
+    if eqn.primitive.name == "select_n":
+        return len(eqn.invars) == 3 and shaped(eqn.invars[0].aval).dtype == np.bool_
+    return RULES.get(eqn.primitive.name) is _rule_elementwise
+
+
 def _fuses_into_consumer(env: Environment, var, shape: tuple[int, ...], ops: list[CVal]) -> bool:
     """Whether `var` can stay an expression: it is consumed exactly once, by
     an elementwise equation of the same shape at this jaxpr level, and its
@@ -42,13 +50,7 @@ def _fuses_into_consumer(env: Environment, var, shape: tuple[int, ...], ops: lis
     if consumer is None or consumer.invars.count(var) != 1:
         return False
     name = consumer.primitive.name
-    # A two-case select on a bool predicate lowers through this rule too.
-    boolean_select = (
-        name == "select_n"
-        and len(consumer.invars) == 3
-        and shaped(consumer.invars[0].aval).dtype == np.bool_
-    )
-    if RULES.get(name) is not _rule_elementwise and not boolean_select:
+    if not lowers_elementwise(consumer):
         return False
     consumer_shape = tuple(int(d) for d in shaped(consumer.outvars[0].aval).shape)
     if consumer_shape != shape or not shape:
