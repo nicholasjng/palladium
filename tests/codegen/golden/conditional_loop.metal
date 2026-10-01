@@ -15,29 +15,25 @@ kernel void palladium_kernel(
     for (uint _i3 = 0; _i3 < 64; ++_i3) {
         t2[_i3] = arg0[_i3];
     }
-    float t4[64];
-    for (uint _i5 = 0; _i5 < 64; ++_i5) {
-        t4[_i5] = t2[_i5];
-    }
-    for (uint _s6 = 0; _s6 < 20; ++_s6) {
-        float t7[64];
+    for (uint _s4 = 0; _s4 < 20; ++_s4) {
+        float t5[64];
+        for (uint _i6 = 0; _i6 < 64; ++_i6) {
+            t5[_i6] = t2[_i6] + t0[_i6];
+        }
+        bool t7[64];
         for (uint _i8 = 0; _i8 < 64; ++_i8) {
-            t7[_i8] = t4[_i8] + t0[_i8];
+            t7[_i8] = t5[_i8] <= 1.0f;
         }
-        bool t9[64];
+        float t9[64];
         for (uint _i10 = 0; _i10 < 64; ++_i10) {
-            t9[_i10] = t7[_i10] <= 1.0f;
+            t9[_i10] = t7[_i10] ? t5[_i10] : t2[_i10];
         }
-        float t11[64];
-        for (uint _i12 = 0; _i12 < 64; ++_i12) {
-            t11[_i12] = t9[_i12] ? t7[_i12] : t4[_i12];
-        }
-        for (uint _i13 = 0; _i13 < 64; ++_i13) {
-            float _cb14 = t11[_i13];
-            t4[_i13] = _cb14;
+        for (uint _i11 = 0; _i11 < 64; ++_i11) {
+            float _cb12 = t9[_i11];
+            t2[_i11] = _cb12;
         }
     }
-    for (uint _i15 = 0; _i15 < 64; ++_i15) {
-        arg2[_i15] = t4[_i15];
+    for (uint _i13 = 0; _i13 < 64; ++_i13) {
+        arg2[_i13] = t2[_i13];
     }
 }

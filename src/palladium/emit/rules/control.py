@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import re
 
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
 
@@ -62,8 +63,13 @@ def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         eqn.outvars[:num_carry],
         strict=True,
     ):
-        dst = declare(env, cursor, outvar)
-        cursor.copy(dst, env.val(invar), dst.size)
+        init = env.val(invar)
+        if _adoptable(env, invar, init):
+            # The initial value is dead after the scan: update it in place.
+            dst = env.bind(outvar, init)
+        else:
+            dst = declare(env, cursor, outvar)
+            cursor.copy(dst, init, dst.size)
         carries.append(dst)
 
     ys_targets = []
@@ -86,6 +92,24 @@ def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         for target, y in zip(ys_targets, outs[num_carry:], strict=True):
             cursor.copy(target.slot(idx, (y.size,)), y, y.size)
         _copy_back_carries(cursor, outs[:num_carry], carries)
+
+
+def _adoptable(env: Environment, var, value: CVal) -> bool:
+    """Whether a scan carry may take over `value`'s storage: thread-local
+    variables read by nothing but this scan and aliased by no other binding."""
+    if (
+        not isinstance(var, Var)
+        or env.sole_consumer(var) is None
+        or value.space != "thread"
+        or value.readonly
+        or value.lazy is not None
+        or value.index_map is not None
+        or value.transposed
+        or not value.expr.isidentifier()
+    ):
+        return False
+    name = re.compile(rf"\b{value.expr}\b")
+    return sum(bool(name.search(bound.expr)) for bound in env.bindings.values()) == 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -306,8 +330,13 @@ def _rule_while(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     body_consts = [env.val(v) for v in eqn.invars[cond_nconsts : cond_nconsts + body_nconsts]]
     carries = []
     for invar, outvar in zip(eqn.invars[cond_nconsts + body_nconsts :], eqn.outvars, strict=True):
-        dst = declare(env, cursor, outvar)
-        cursor.copy(dst, env.val(invar), dst.size)
+        init = env.val(invar)
+        if _adoptable(env, invar, init):
+            # The initial value is dead after the scan: update it in place.
+            dst = env.bind(outvar, init)
+        else:
+            dst = declare(env, cursor, outvar)
+            cursor.copy(dst, init, dst.size)
         carries.append(dst)
 
     with cursor.block("while (true)"):
