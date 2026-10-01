@@ -17,11 +17,33 @@ FRAGMENT = mr.Fragment("df32", PRELUDE)
 
 
 def kernel(source: str, function_name: str, **kwargs) -> mr.Kernel:
-    """Build an `mr.Kernel` from `source` with `PRELUDE` prepended.
+    """Compile handwritten MSL with the compensated float32-pair arithmetic prelude.
 
-    `math_mode` defaults to SAFE, which the prelude requires: FAST
-    reassociates away its compensation terms, and any other mode fails to
-    compile. Other keywords are forwarded to `mr.Kernel`.
+    Parameters
+    ----------
+    source : str
+        MSL kernel source referencing df32 arithmetic.
+    function_name : str
+        Kernel entry point.
+    **kwargs : dict
+        Keywords forwarded to metal_runtime.Kernel; math_mode defaults to SAFE.
+
+    Returns
+    -------
+    metal_runtime.Kernel
+        Compiled kernel with the df32 fragment assembled before the supplied source.
+
+    Raises
+    ------
+    metal_runtime.CompileError
+        The source fails compilation, including when a non-SAFE math mode violates the
+        prelude requirement.
+
+    Notes
+    -----
+    Buffers store high/low float32 pairs in a trailing dimension of size two. This helper
+    compiles handwritten Metal; Pallas does not expose a df32 dtype. SAFE is required
+    because reassociation removes compensation terms.
     """
     kwargs.setdefault("math_mode", mr.MathMode.SAFE)
     assembled = mr.assemble(FRAGMENT, mr.Fragment(function_name, source))

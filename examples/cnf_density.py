@@ -26,10 +26,46 @@ import palladium
 
 
 def parameter_count(width):
+    """Return the flattened parameter count of the time-dependent two-output MLP.
+
+    Parameters
+    ----------
+    width : int
+        Hidden-unit count.
+
+    Returns
+    -------
+    int
+        Six parameters per hidden unit plus two output biases.
+
+    Notes
+    -----
+    This arithmetic helper does not validate width; construction helpers require it to be
+    positive.
+    """
     return 6 * width + 2
 
 
 def init_parameters(width=4, seed=17):
+    """Initialize reproducible float32 CNF weights with zero output biases.
+
+    Parameters
+    ----------
+    width : int, optional
+        Positive hidden-layer width, default 4.
+    seed : int, optional
+        Deterministic random seed, default 17.
+
+    Returns
+    -------
+    jax.Array
+        Flat parameter vector of length 6 * width + 2.
+
+    Raises
+    ------
+    ValueError
+        The hidden width is less than one.
+    """
     if width < 1:
         raise ValueError("width must be positive")
     rng = np.random.default_rng(seed)
@@ -39,10 +75,28 @@ def init_parameters(width=4, seed=17):
 
 
 def field_and_divergence(state, parameters, time):
-    """Scalar tuple implementation shared by JAX and Pallas.
+    """Evaluate a time-dependent vector field and its analytic spatial divergence.
 
-    Each hidden unit has weights (x, y, t), bias, and two output weights.
-    The final two parameters are output biases.
+    Parameters
+    ----------
+    state : tuple
+        Scalar augmented state (x, y, log-density increment); only x and y enter the
+        field.
+    parameters : sequence
+        Flat weights: each unit stores (wx, wy, wt, bias, ux, uy), followed by two
+        output biases.
+    time : scalar
+        Current integration time.
+
+    Returns
+    -------
+    tuple
+        Velocity components vx, vy, and positive divergence.
+
+    Notes
+    -----
+    Tuple/scalar arithmetic is shared by JAX and Pallas. The parameter length must be 6 *
+    width + 2; this helper does not validate malformed vectors.
     """
     x, y = state[:2]
     vx, vy = parameters[-2], parameters[-1]
@@ -56,6 +110,25 @@ def field_and_divergence(state, parameters, time):
 
 
 def rk4_step(state, parameters, time, dt):
+    """Advance the augmented CNF state with one classical RK4 step.
+
+    Parameters
+    ----------
+    state : tuple
+        Three scalar state components (x, y, log-density increment).
+    parameters : sequence
+        Flat vector-field weights.
+    time : scalar
+        Time at the start of the step.
+    dt : scalar
+        Signed step size; density evaluation uses a negative step.
+
+    Returns
+    -------
+    tuple
+        Updated state, integrating negative divergence in the third component.
+    """
+
     def rhs(value, t):
         vx, vy, divergence = field_and_divergence(value, parameters, t)
         return vx, vy, -divergence
@@ -74,9 +147,28 @@ def rk4_step(state, parameters, time, dt):
 
 
 def reference_flow(states, parameters, *, steps=16):
-    """Vectorized JAX baseline, independent of the scalar Pallas step code.
-    Integrates from t=1 to 0; per-example augmented states (n,3) and
-    weights (n,p).
+    """Integrate a batch of augmented states from time one to zero using vectorized JAX.
+
+    Parameters
+    ----------
+    states : jax.Array
+        Augmented states of shape (n, 3).
+    parameters : jax.Array
+        Per-example weights of shape (n, 6 * width + 2); broadcast shared weights before
+        calling.
+    steps : int, optional
+        Positive number of fixed RK4 steps from time one to zero, default 16.
+
+    Returns
+    -------
+    jax.Array
+        Final augmented states of shape (n, 3).
+
+    Notes
+    -----
+    This independent vectorized RK4 implementation serves as the numerical and gradient
+    reference. It expects positive steps and compatible parameter shapes; unlike make_flow
+    it does not validate those arguments.
     """
     dt = -1.0 / steps
     start = 1.0
@@ -127,13 +219,42 @@ def _with_reference_vjp(forward, reference):
 
 
 def make_flow(n, *, width=4, steps=16, interval=4, variant="reverse", call=pl.pallas_call):
-    """Integrate data (t=1) to base (t=0); returns (n,3) augmented states.
+    """Build a fixed-size reverse-time CNF integrator with a selected gradient implementation.
 
-    Parameters have shape (n,6*width+2); broadcast shared weights before
-    calling. `variant` is "reverse" (checkpointed adjoint kernel),
-    "reference" (forward kernel, JAX's VJP of `reference_flow`), or "jax"
-    (no kernels). `call` builds the kernels: `pl.pallas_call` on mps, or
-    `palladium.metal_call` from the CPU platform.
+    Parameters
+    ----------
+    n : int
+        Number of ensemble members or examples.
+    width : int, optional
+        Positive hidden-layer width, default 4.
+    steps : int, optional
+        Positive number of fixed RK4 steps from time one to zero, default 16.
+    interval : int, optional
+        Positive checkpoint spacing in RK4 steps, default 4.
+    variant : {"reverse", "reference", "jax"}, optional
+        Checkpointed Pallas adjoint, Pallas forward with the reference VJP, or ordinary
+        JAX only. Default "reverse".
+    call : callable, optional
+        Pallas kernel factory, default pl.pallas_call; use palladium.metal_call on the
+        CPU backend.
+
+    Returns
+    -------
+    callable
+        Function (states, parameters) -> (n, 3) final states. Inputs are (n, 3) states
+        and (n, 6 * width + 2) per-example weights.
+
+    Raises
+    ------
+    ValueError
+        Any size/step/interval argument is nonpositive or variant is unknown.
+
+    Notes
+    -----
+    Shared weights must be broadcast by the caller. A final partial checkpoint segment is
+    guarded, and intervals larger than the total step count are supported. The reverse
+    variant hides checkpoint outputs and differentiates the discrete RK4 map through
+    explicit replay.
     """
     if min(n, width, steps, interval) < 1:
         raise ValueError("n, width, steps and interval must be positive")
@@ -231,7 +352,26 @@ def make_flow(n, *, width=4, steps=16, interval=4, variant="reverse", call=pl.pa
 
 
 def make_log_prob(n, **kwargs):
-    """Gaussian base density minus the reverse-time log-density increment."""
+    """Build a CNF log-density callable for a shared parameter vector.
+
+    Parameters
+    ----------
+    n : int
+        Number of ensemble members or examples.
+    **kwargs : dict
+        Options forwarded to ``make_flow``, such as width, steps, checkpoint interval,
+        variant, and call factory.
+
+    Returns
+    -------
+    callable
+        Function (parameters, points) -> (n,) log densities for points of shape (n, 2).
+
+    Notes
+    -----
+    Density evaluation appends a zero divergence state, broadcasts weights, and subtracts
+    the reverse-time log-density increment from a standard-normal base log density.
+    """
     flow = make_flow(n, **kwargs)
 
     def log_prob(parameters, points):
@@ -245,6 +385,30 @@ def make_log_prob(n, **kwargs):
 
 
 def make_training_step(n, *, learning_rate=0.01, **kwargs):
+    """Build a jitted Adam update and mean negative-log-likelihood evaluation.
+
+    Parameters
+    ----------
+    n : int
+        Number of ensemble members or examples.
+    learning_rate : float, optional
+        Adam update scale, default 0.01.
+    **kwargs : dict
+        Options forwarded to ``make_flow``, such as width, steps, checkpoint interval,
+        variant, and call factory.
+
+    Returns
+    -------
+    update : callable
+        Function (optimizer_state, points) -> (new_state, pre_update_loss).
+    loss : callable
+        Jitted function (parameters, points) -> scalar mean negative log density.
+
+    Notes
+    -----
+    Use initial_state to create the parameter, first-moment, second-moment, and step-count
+    tuple. Data shape is fixed to (n, 2).
+    """
     log_prob = make_log_prob(n, **kwargs)
 
     def loss(parameters, points):
@@ -266,6 +430,21 @@ def make_training_step(n, *, learning_rate=0.01, **kwargs):
 
 
 def initial_state(width=4, seed=17):
+    """Create the parameter and zero-moment state for the example Adam optimizer.
+
+    Parameters
+    ----------
+    width : int, optional
+        Positive hidden-layer width, default 4.
+    seed : int, optional
+        Deterministic random seed, default 17.
+
+    Returns
+    -------
+    tuple
+        Parameters, first moment, second moment, and int32 step count, in update-call
+        order.
+    """
     parameters = init_parameters(width, seed)
     return (
         parameters,
@@ -276,7 +455,21 @@ def initial_state(width=4, seed=17):
 
 
 def mixture_data(n, seed=17):
-    """Equal mixture of two known axis-aligned Gaussians."""
+    """Sample the fixed two-component Gaussian mixture used for CNF training.
+
+    Parameters
+    ----------
+    n : int
+        Number of ensemble members or examples.
+    seed : int, optional
+        Deterministic random seed, default 17.
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 points of shape (n, 2), with equally likely components and fixed axis
+        scales.
+    """
     rng = np.random.default_rng(seed)
     means = np.array([[-1.3, -0.4], [1.3, 0.4]])
     samples = means[rng.integers(2, size=n)] + rng.normal(size=(n, 2)) * [0.45, 0.65]
@@ -284,6 +477,18 @@ def mixture_data(n, seed=17):
 
 
 def mixture_log_prob(points):
+    """Evaluate the exact log density of the training mixture with a stable log-sum-exp.
+
+    Parameters
+    ----------
+    points : jax.Array
+        Points of shape (n, 2), with floating dtype.
+
+    Returns
+    -------
+    jax.Array
+        One log density per point, shape (n,).
+    """
     means = jnp.array([[-1.3, -0.4], [1.3, 0.4]], points.dtype)
     scales = jnp.array([0.45, 0.65], points.dtype)
     component = (
@@ -295,6 +500,9 @@ def mixture_log_prob(points):
 
 
 def main():
+    """Train the example CNF from command-line options and print held-out and refinement
+    diagnostics.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n", type=int, default=256)
     parser.add_argument("--width", type=int, default=4)

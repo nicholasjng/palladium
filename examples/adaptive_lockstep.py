@@ -33,6 +33,30 @@ SAFETY, FACTORMIN, FACTORMAX = 0.9, 0.2, 10.0
 
 
 def solve_batch(mu, solver=None):
+    """Time a warmed vectorized Diffrax solve of the Van der Pol ensemble.
+
+    Parameters
+    ----------
+    mu : array-like
+        One oscillator stiffness parameter per trajectory.
+    solver : diffrax.AbstractSolver or None, optional
+        ODE solver, default Tsit5.
+
+    Returns
+    -------
+    seconds : float
+        Elapsed wall time for the second synchronized solve, excluding first-call
+        compilation.
+    steps : numpy.ndarray
+        Attempted step counts per trajectory.
+    accepted : numpy.ndarray
+        Accepted step counts per trajectory.
+
+    Notes
+    -----
+    The integration interval, initial state, tolerances, and step limit are module
+    constants. Adaptive trajectories are batched with vmap for the lockstep comparison.
+    """
     solver = solver or diffrax.Tsit5()
 
     def rhs(t, u, mu):
@@ -66,6 +90,30 @@ def solve_batch(mu, solver=None):
 
 
 def palladium_solver(n, pcoeff=PCOEFF, icoeff=ICOEFF):
+    """Construct a per-program adaptive Van der Pol solver with a fixed iteration budget.
+
+    Parameters
+    ----------
+    n : int
+        Number of ensemble members or examples.
+    pcoeff : float, optional
+        Proportional step-controller coefficient, default PCOEFF (0.4).
+    icoeff : float, optional
+        Integral step-controller coefficient, default ICOEFF (0.3).
+
+    Returns
+    -------
+    FfiCallable
+        Function of initial x, v, and mu arrays returning times, x, v, accepted counts,
+        rejected counts, and accepted pre-completion counts.
+
+    Notes
+    -----
+    Runs Bogacki-Shampine 3(2) with FSAL under RELAXED math. Completion clamps dt to zero;
+    the accepted counter includes padded iterations while the final counter excludes them.
+    Inspect returned times to detect trajectories that exhaust MAX_STEPS before T1.
+    """
+
     def vdp_adaptive_kernel(
         x0_ref,
         v0_ref,
@@ -180,6 +228,9 @@ def palladium_solver(n, pcoeff=PCOEFF, icoeff=ICOEFF):
 
 
 def main():
+    """Compare mild and stiff ensemble timings and step-controller statistics for Diffrax and
+    Metal.
+    """
     rng = np.random.default_rng(3)
     mild = rng.uniform(0.5, 2.0, N).astype(np.float32)
 

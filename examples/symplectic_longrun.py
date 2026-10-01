@@ -105,9 +105,27 @@ kernel void kepler_verlet_df32(
 
 
 def ensemble(n, seed=17):
-    """Perihelion start on a unit-semi-major-axis Kepler orbit:
-    q = (1 - e, 0), p = (0, sqrt((1 + e) / (1 - e))), for which
-    E = -1/2 and L = sqrt(1 - e^2) hold exactly, for every e."""
+    """Construct float32 perihelion states for unit-semi-major-axis Kepler orbits.
+
+    Parameters
+    ----------
+    n : int
+        Number of ensemble members or examples.
+    seed : int, optional
+        Retained for call compatibility; unused because eccentricities are
+        deterministic.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        qx, qy, px, py arrays of shape (n,), with eccentricities linearly spaced from
+        zero to 0.4.
+
+    Notes
+    -----
+    Before float32 rounding the analytic energy is -1/2 and angular momentum is sqrt(1 -
+    e**2).
+    """
     e = np.linspace(0.0, 0.4, n)
     return (
         (1.0 - e).astype(np.float32),
@@ -118,8 +136,25 @@ def ensemble(n, seed=17):
 
 
 def energy(qx, qy, px, py):
-    """Evaluated in float64 whatever the integration ran in: this
-    measures the state's error, not the measurement's."""
+    """Measure Kepler energy in float64 independently of the integration precision.
+
+    Parameters
+    ----------
+    qx, qy : array-like
+        Position components with matching shapes.
+    px, py : array-like
+        Momentum components with matching shapes.
+
+    Returns
+    -------
+    numpy.ndarray
+        Specific energy, kinetic minus inverse radius, with the component-axis removed.
+
+    Notes
+    -----
+    Inputs are promoted before measurement. The origin is singular and is not specially
+    guarded.
+    """
     q = np.stack([qx, qy]).astype(np.float64)
     p = np.stack([px, py]).astype(np.float64)
     return 0.5 * np.sum(p * p, axis=0) - 1.0 / np.sqrt(np.sum(q * q, axis=0))
@@ -129,25 +164,101 @@ def energy(qx, qy, px, py):
 
 
 def accel_np(q):
+    """Compute the central Kepler acceleration in NumPy.
+
+    Parameters
+    ----------
+    q : numpy.ndarray
+        Positions with leading component axis of length two.
+
+    Returns
+    -------
+    numpy.ndarray
+        Acceleration -q / |q|**3 with the same shape as q.
+
+    Notes
+    -----
+    Zero radius is singular and is not guarded.
+    """
     r2 = np.sum(q * q, axis=0)
     return -q / (r2 * np.sqrt(r2))
 
 
 def verlet_step(q, p, h):
+    """Advance positions and momenta by one velocity-Verlet kick-drift-kick step.
+
+    Parameters
+    ----------
+    q : numpy.ndarray
+        Positions with leading component axis of length two.
+    p : numpy.ndarray
+        Momenta matching q.
+    h : float
+        Signed time step.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Updated positions and momenta.
+
+    Notes
+    -----
+    Second-order symplectic update. Orbits must avoid the singular origin.
+    """
     p = p + 0.5 * h * accel_np(q)
     q = q + h * p
     return q, p + 0.5 * h * accel_np(q)
 
 
 def heun_step(q, p, h):
-    """Order 2, explicit, and not symplectic: the control."""
+    """Advance positions and momenta by one explicit Heun step.
+
+    Parameters
+    ----------
+    q : numpy.ndarray
+        Positions with leading component axis of length two.
+    p : numpy.ndarray
+        Momenta matching q.
+    h : float
+        Signed time step.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Updated positions and momenta.
+
+    Notes
+    -----
+    Second-order nonsymplectic control for the conservation comparison. Orbits must avoid
+    the singular origin.
+    """
     kq1, kp1 = p, accel_np(q)
     kq2, kp2 = p + h * kp1, accel_np(q + h * kq1)
     return q + 0.5 * h * (kq1 + kq2), p + 0.5 * h * (kp1 + kp2)
 
 
 def yoshida4_step(q, p, h):
-    """Triple-jump composition of Verlet: order 4, still symplectic."""
+    """Advance positions and momenta by one fourth-order Yoshida composition step.
+
+    Parameters
+    ----------
+    q : numpy.ndarray
+        Positions with leading component axis of length two.
+    p : numpy.ndarray
+        Momenta matching q.
+    h : float
+        Signed time step.
+
+    Returns
+    -------
+    tuple of numpy.ndarray
+        Updated positions and momenta.
+
+    Notes
+    -----
+    Uses three Verlet substeps, including a negative middle substep. Orbits must avoid the
+    singular origin.
+    """
     cbrt2 = 2.0 ** (1.0 / 3.0)
     w1 = 1.0 / (2.0 - cbrt2)
     for w in (w1, -cbrt2 * w1, w1):
@@ -156,10 +267,26 @@ def yoshida4_step(q, p, h):
 
 
 def envelope(step_fn, h, orbits):
-    """Per-orbit max |E - E_exact| for one e=0.3 orbit in float64.
+    """Measure per-orbit peak energy error for a fixed eccentric Kepler initial state.
 
-    The envelope, not a point sample: a sample at one instant can land
-    anywhere inside the oscillation.
+    Parameters
+    ----------
+    step_fn : callable
+        Integrator with signature (q, p, h) -> (q, p).
+    h : float
+        Positive step size smaller than one orbital period.
+    orbits : int
+        Number of approximate orbital periods to integrate.
+
+    Returns
+    -------
+    numpy.ndarray
+        Peak absolute energy deviation from -1/2 in each period, shape (orbits,).
+
+    Notes
+    -----
+    Uses float64 states at eccentricity 0.3. Each period has floor(2*pi/h) steps, and the
+    peak samples every step rather than only the end of a period.
     """
     q = np.array([[0.7], [0.0]])
     p = np.array([[0.0], [np.sqrt(1.3 / 0.7)]])
@@ -175,6 +302,7 @@ def envelope(step_fn, h, orbits):
 
 
 def part_a():
+    """Print CPU float64 energy envelopes comparing Verlet, Heun, and Yoshida integration."""
     print("Part A -- float64 on the CPU, one e=0.3 orbit")
     print("          per-orbit peak |E + 1/2|, first orbit vs last")
     print()
@@ -200,6 +328,25 @@ def part_a():
 
 
 def verlet_kernel(qx_ref, qy_ref, px_ref, py_ref, qxo, qyo, pxo, pyo):
+    """Advance each program's Kepler state by one fixed-size chunk of Verlet steps.
+
+    Parameters
+    ----------
+    qx_ref, qy_ref : Ref
+        Initial float32 position blocks.
+    px_ref, py_ref : Ref
+        Initial float32 momentum blocks.
+    qxo, qyo : Ref
+        Output position blocks.
+    pxo, pyo : Ref
+        Output momentum blocks.
+
+    Notes
+    -----
+    Step size H and iteration count CHUNK are module constants. The central force is
+    singular at zero radius; example trajectories stay away from it.
+    """
+
     def accel(qx, qy):
         r2 = qx * qx + qy * qy
         inv_r3 = -1.0 / (r2 * jnp.sqrt(r2))
@@ -218,6 +365,28 @@ def verlet_kernel(qx_ref, qy_ref, px_ref, py_ref, qxo, qyo, pxo, pyo):
 
 
 def palladium_run(math_mode, state0, on_mark):
+    """Time chunked Pallas float32 integration and report state after each chunk.
+
+    Parameters
+    ----------
+    math_mode : metal_runtime.MathMode
+        Compilation math mode for the float32 kernel.
+    state0 : tuple of numpy.ndarray
+        Four initial float32 component arrays (qx, qy, px, py), each of length N.
+    on_mark : callable
+        Called after every chunk with (one_based_chunk_index, component_arrays).
+
+    Returns
+    -------
+    float
+        Elapsed wall time for CHUNKS chunks and callbacks, excluding warm-up
+        compilation.
+
+    Notes
+    -----
+    The state is converted to NumPy after each chunk and fed into the next dispatch;
+    transfers and callbacks are included in the elapsed time.
+    """
     spec_1 = pl.BlockSpec((1,), lambda i: (i,))
     out = jax.ShapeDtypeStruct((N,), jnp.float32)
     f = palladium.metal_call(
@@ -238,6 +407,27 @@ def palladium_run(math_mode, state0, on_mark):
 
 
 def df32_run(state0, on_mark):
+    """Time chunked handwritten compensated df32 integration and report state after each chunk.
+
+    Parameters
+    ----------
+    state0 : tuple of numpy.ndarray
+        Four initial float32 component arrays (qx, qy, px, py), each of length N.
+    on_mark : callable
+        Called after every chunk with (one_based_chunk_index, component_arrays).
+
+    Returns
+    -------
+    float
+        Elapsed wall time for CHUNKS chunks and callbacks, excluding warm-up
+        compilation.
+
+    Notes
+    -----
+    Chunking limits individual GPU dispatch duration. The df32 path preserves both limbs
+    between chunks but passes only high limbs to the measurement callback; it always
+    compiles with SAFE math.
+    """
     kernel = df32_kernel(DF32_KERNEL, "kepler_verlet_df32")
     # Two limbs per component. The low limbs start at zero: the initial
     # conditions are exactly the float32 ones the other runs use, so the
@@ -263,6 +453,20 @@ def df32_run(state0, on_mark):
 
 
 def part_b():
+    """Compare long-horizon energy-error growth for float32 FAST/SAFE and compensated df32.
+
+    Returns
+    -------
+    rows : dict
+        RMS energy-error samples by implementation label, one per chunk.
+    slopes : dict
+        Log-error versus log-step slopes fitted over the final decade.
+
+    Notes
+    -----
+    Prints measurements at selected chunk indices. Module constants control ensemble size,
+    step size, and horizon.
+    """
     state0 = ensemble(N)
     e0 = energy(*state0)  # the float32 start state's true energy, per member
     print(f"Part B -- velocity-Verlet on the GPU, {N} trajectories, h={H}")
@@ -312,6 +516,9 @@ def part_b():
 
 
 def main():
+    """Run integrator and precision comparisons and check the compensated path's measured error
+    advantage.
+    """
     print("Kepler two-body, long-horizon energy conservation")
     print("=" * 70)
     print()

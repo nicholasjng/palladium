@@ -51,19 +51,69 @@ PRIOR_SCALE = np.array([0.5, 0.2], np.float32)
 
 
 def sample_prior(n: int, seed: int = 17) -> np.ndarray:
+    """Draw reproducible lognormal infection and recovery rates for the SIR task.
+
+    Parameters
+    ----------
+    n : int
+        Number of ensemble members or examples.
+    seed : int, optional
+        Deterministic random seed, default 17.
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 (beta, gamma) draws of shape (n, 2).
+    """
     rng = np.random.default_rng(seed)
     return np.exp(PRIOR_LOC + PRIOR_SCALE * rng.standard_normal((n, 2))).astype(np.float32)
 
 
 def observe(fractions: np.ndarray, seed: int = 29) -> np.ndarray:
-    """sbibm's observation model: Binomial(1000, I/N) counts at each time."""
+    """Draw binomial observation counts from simulated infected fractions.
+
+    Parameters
+    ----------
+    fractions : numpy.ndarray
+        Infection probabilities, typically shape (n, OBSERVATIONS).
+    seed : int, optional
+        Deterministic observation seed, default 29.
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 counts with the same shape, using TOTAL_COUNT trials.
+
+    Notes
+    -----
+    Probabilities are clipped to [0, 1] before sampling; NaNs remain invalid. Reusing the
+    default seed makes repeated identical calls reproducible.
+    """
     rng = np.random.default_rng(seed)
     return rng.binomial(TOTAL_COUNT, np.clip(fractions, 0.0, 1.0)).astype(np.float32)
 
 
 # ------------------------------------------------------------------ NumPy
 def numpy_simulator(theta: np.ndarray) -> np.ndarray:
-    """Vectorized RK4 over the batch; the same scheme as the kernel."""
+    """Integrate a batch of SIR draws using vectorized float32 NumPy RK4.
+
+    Parameters
+    ----------
+    theta : numpy.ndarray
+        Positive infection/recovery rates (beta, gamma) of shape (n, 2).
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 infected fractions of shape (n, OBSERVATIONS), including the initial
+        time.
+
+    Notes
+    -----
+    Uses the same fixed step and observation schedule as the Pallas kernel. Observation
+    counts are sampled separately by observe; rates are expected to be finite and compatible
+    with the example model.
+    """
     beta = theta[:, 0].astype(np.float32)
     gamma = theta[:, 1].astype(np.float32)
     s = np.full_like(beta, POPULATION - INITIAL_INFECTED)
@@ -89,7 +139,25 @@ def numpy_simulator(theta: np.ndarray) -> np.ndarray:
 
 # ------------------------------------------------------------------ SciPy
 def scipy_simulator(theta: np.ndarray) -> np.ndarray:
-    """One `solve_ivp` call per draw: the idiomatic sbi user simulator."""
+    """Integrate SIR draws with independent adaptive SciPy solves.
+
+    Parameters
+    ----------
+    theta : numpy.ndarray
+        Positive infection/recovery rates (beta, gamma) of shape (n, 2).
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 infected fractions of shape (n, OBSERVATIONS), including the initial
+        time.
+
+    Notes
+    -----
+    Uses one solve_ivp call per draw, float64 integration, and the same observation times as
+    the fixed-step implementations. Observation counts are sampled separately by observe;
+    rates are expected to be finite and compatible with the example model.
+    """
     from scipy.integrate import solve_ivp
 
     times = np.arange(OBSERVATIONS) * DAYS_BETWEEN_OBSERVATIONS
@@ -115,6 +183,23 @@ def scipy_simulator(theta: np.ndarray) -> np.ndarray:
 
 # -------------------------------------------------------------- palladium
 def sir_kernel(beta_ref, gamma_ref, out_ref):
+    """Write a fixed observation schedule of infected fractions for each SIR program.
+
+    Parameters
+    ----------
+    beta_ref : Ref
+        One-element infection-rate block.
+    gamma_ref : Ref
+        One-element recovery-rate block.
+    out_ref : Ref
+        Writable (1, OBSERVATIONS) float32 block.
+
+    Notes
+    -----
+    Uses fixed-step RK4 and module constants for population, initial infection, and sample
+    spacing. It writes the pre-interval fraction, beginning at time zero; binomial
+    observation noise is added on the host.
+    """
     beta, gamma = beta_ref[...], gamma_ref[...]
     population = jnp.float32(POPULATION)
 
@@ -145,6 +230,24 @@ def sir_kernel(beta_ref, gamma_ref, out_ref):
 
 @functools.lru_cache(maxsize=8)
 def metal_call_for(n: int):
+    """Construct and cache a jitted SIR callable for a fixed batch size.
+
+    Parameters
+    ----------
+    n : int
+        Number of ensemble members or examples.
+
+    Returns
+    -------
+    callable
+        Function of contiguous beta and gamma vectors returning (n, OBSERVATIONS) JAX
+        fractions.
+
+    Notes
+    -----
+    The LRU retains at most eight batch-size callables. Native compilation remains lazy
+    until first execution.
+    """
     point = pl.BlockSpec((1,), lambda i: (i,))
     return jax.jit(
         palladium.metal_call(
@@ -158,6 +261,26 @@ def metal_call_for(n: int):
 
 
 def palladium_simulator(theta: np.ndarray) -> np.ndarray:
+    """Evaluate the batched SIR kernel on Metal and return NumPy infected fractions.
+
+    Parameters
+    ----------
+    theta : numpy.ndarray
+        Positive infection/recovery rates (beta, gamma) of shape (n, 2).
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 infected fractions of shape (n, OBSERVATIONS), including the initial
+        time.
+
+    Notes
+    -----
+    Casts inputs to float32, makes contiguous rate arrays, and caches jitted callables by
+    batch size. Requires a Metal device and the native FFI handler. Observation counts are
+    sampled separately by observe; rates are expected to be finite and compatible with the
+    example model.
+    """
     theta = np.asarray(theta, np.float32)
     call = metal_call_for(theta.shape[0])
     return np.asarray(call(np.ascontiguousarray(theta[:, 0]), np.ascontiguousarray(theta[:, 1])))
@@ -165,8 +288,26 @@ def palladium_simulator(theta: np.ndarray) -> np.ndarray:
 
 # ------------------------------------------------------------------- sbi
 def as_sbi_simulator(fractions):
-    """Wrap a fraction simulator into the callable `simulate_for_sbi` wants:
-    a parameter batch in, the observation batch out, as torch tensors."""
+    """Adapt a fraction simulator to the Torch observation interface used by sbi.
+
+    Parameters
+    ----------
+    fractions : callable
+        Function taking NumPy (n, 2) rates and returning (n, OBSERVATIONS) infection
+        probabilities.
+
+    Returns
+    -------
+    callable
+        Function accepting Torch or array-like rates and returning float32 Torch
+        observation counts.
+
+    Notes
+    -----
+    Torch inputs are detached and copied to CPU NumPy. Observation sampling uses observe's
+    fixed default seed on every call; the wrapper is intended for this reproducible
+    benchmark, not differentiable simulation.
+    """
     import torch
 
     def simulator(theta):
@@ -177,6 +318,24 @@ def as_sbi_simulator(fractions):
 
 
 def run_sbi(n: int, scipy_n: int, workers: int) -> None:
+    """Print end-to-end sbi simulation timings for the three fraction-simulator
+    implementations.
+
+    Parameters
+    ----------
+    n : int
+        Number of ensemble members or examples.
+    scipy_n : int
+        Positive reduced draw count used for SciPy timings before extrapolating to n.
+    workers : int
+        Positive joblib worker count for the parallel SciPy case.
+
+    Notes
+    -----
+    Requires optional sbi and Torch packages. Each candidate is warmed up; reported
+    durations extrapolate smaller SciPy batches linearly and include host observation
+    sampling.
+    """
     import torch
     from sbi.inference import simulate_for_sbi
     from sbi.utils import process_prior, process_simulator
@@ -226,6 +385,7 @@ def run_sbi(n: int, scipy_n: int, workers: int) -> None:
 
 
 def main() -> None:
+    """Compare SIR simulators and optional sbi integration using command-line batch sizes."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--n", type=int, default=100_000, help="parameter draws")
     parser.add_argument(

@@ -51,6 +51,18 @@ SIMULATORS = (
 
 
 def make_prior():
+    """Construct the processed independent lognormal SIR prior used by sbi.
+
+    Returns
+    -------
+    torch.distributions.Distribution
+        Two-dimensional positive (beta, gamma) prior compatible with sbi sampling.
+
+    Notes
+    -----
+    Requires optional Torch and sbi dependencies; distribution parameters are imported from
+    sbi_sir.
+    """
     import torch
     from sbi.utils import process_prior
 
@@ -64,6 +76,33 @@ def make_prior():
 
 
 def simulate(prior, fractions, n, seed):
+    """Draw a reproducible sbi dataset and measure the complete simulation call.
+
+    Parameters
+    ----------
+    prior : distribution
+        Processed prior accepted by simulate_for_sbi.
+    fractions : callable
+        NumPy rate-to-infected-fraction simulator.
+    n : int
+        Number of ensemble members or examples.
+    seed : int
+        Seed passed to simulate_for_sbi.
+
+    Returns
+    -------
+    theta : torch.Tensor
+        Sampled rates of shape (n, 2).
+    x : torch.Tensor
+        Observed counts of shape (n, OBSERVATIONS).
+    seconds : float
+        Elapsed simulation wall time, including any first-call setup.
+
+    Notes
+    -----
+    Uses the complete batch in one simulator call. Observation randomness follows the fixed
+    seed in as_sbi_simulator independently of the prior seed.
+    """
     from sbi.inference import simulate_for_sbi
 
     simulator = as_sbi_simulator(fractions)
@@ -75,6 +114,28 @@ def simulate(prior, fractions, n, seed):
 
 
 def train_npe(prior, theta, x, *, seed, max_epochs):
+    """Train an sbi neural posterior estimator on CPU Torch and measure training time.
+
+    Parameters
+    ----------
+    prior : distribution
+        Processed SIR prior.
+    theta : torch.Tensor
+        Training rate draws of shape (n, 2).
+    x : torch.Tensor
+        Matching simulated observations.
+    seed : int
+        Torch initialization seed.
+    max_epochs : int
+        Training epoch limit; the trainer may stop earlier.
+
+    Returns
+    -------
+    posterior : object
+        Posterior constructed from the trained density estimator.
+    seconds : float
+        Wall time of training, excluding posterior construction.
+    """
     import torch
     from sbi.inference import NPE
 
@@ -87,11 +148,33 @@ def train_npe(prior, theta, x, *, seed, max_epochs):
 
 
 def observation(theta_true, seed=101):
+    """Simulate one reproducible SIR observation for fixed ground-truth rates.
+
+    Parameters
+    ----------
+    theta_true : array-like
+        Two rates (beta, gamma).
+    seed : int, optional
+        Binomial observation seed, default 101.
+
+    Returns
+    -------
+    numpy.ndarray
+        Float32 observation counts of shape (OBSERVATIONS,).
+
+    Notes
+    -----
+    Uses the Palladium GPU fraction simulator and therefore requires a working Metal FFI
+    installation.
+    """
     fractions = palladium_simulator(np.asarray([theta_true], np.float32))
     return observe(fractions, seed=seed)[0]
 
 
 def main() -> None:
+    """Compare posterior fits across simulators and report simulation cost and predictive
+    checks.
+    """
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--n", type=int, default=20_000, help="Palladium draws for the main NPE")
     parser.add_argument("--compare-n", type=int, default=2_000, help="draws per simulator for C2ST")

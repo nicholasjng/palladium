@@ -67,12 +67,51 @@ kernel void gbm_paths(
 
 
 def black_scholes_call(s0, k, t, r, sigma):
+    """Evaluate the Black-Scholes European call-price reference.
+
+    Parameters
+    ----------
+    s0 : float
+        Positive initial asset price.
+    k : float
+        Positive strike price.
+    t : float
+        Positive time to maturity.
+    r : float
+        Continuously compounded risk-free rate.
+    sigma : float
+        Positive volatility.
+
+    Returns
+    -------
+    float or numpy.ndarray
+        Discounted call price, following NumPy broadcasting of the inputs.
+
+    Notes
+    -----
+    This example reference assumes positive maturity and volatility; zero-limit cases are
+    not handled separately.
+    """
     d1 = (np.log(s0 / k) + (r + sigma**2 / 2) * t) / (sigma * np.sqrt(t))
     d2 = d1 - sigma * np.sqrt(t)
     return s0 * norm.cdf(d1) - k * np.exp(-r * t) * norm.cdf(d2)
 
 
 def run_handwritten():
+    """Run and time the warmed handwritten PCG-hash Metal geometric-Brownian payoff kernel.
+
+    Returns
+    -------
+    payoff : numpy.ndarray
+        Undiscounted terminal call payoffs, shape (N_PATHS,).
+    seconds : float
+        Elapsed synchronized execution time after one warm-up.
+
+    Notes
+    -----
+    Model parameters and path/step counts are module constants. The Pallas timing includes
+    conversion to NumPy; handwritten timing measures mr.run before reading its buffer.
+    """
     dt = T / N_STEPS
     kernel = mr.Kernel(GBM_MSL, "gbm_paths")
     payoff = mr.Buffer.zeros([N_PATHS])
@@ -91,6 +130,20 @@ def run_handwritten():
 
 
 def pallas_gbm_kernel(seed_ref, o_ref):
+    """Write one terminal call payoff per program using path- and step-specific random keys.
+
+    Parameters
+    ----------
+    seed_ref : Ref
+        Shared two-word uint32 Threefry key data.
+    o_ref : Ref
+        Writable one-element float32 payoff block.
+
+    Notes
+    -----
+    Uses global model and step-count constants. Uniform values used by log are floored away
+    from zero, preventing an infinite Box-Muller draw. The output is not discounted.
+    """
     dt = T / N_STEPS
     drift_dt = (R - SIGMA**2 / 2) * dt
     vol_sqdt = SIGMA * jnp.sqrt(dt)
@@ -115,6 +168,25 @@ def pallas_gbm_kernel(seed_ref, o_ref):
 
 
 def run_pallas(seed):
+    """Run and time the warmed Pallas Threefry geometric-Brownian payoff kernel.
+
+    Parameters
+    ----------
+    seed : numpy.ndarray
+        Two uint32 words of Threefry key data, shared across paths.
+
+    Returns
+    -------
+    payoff : numpy.ndarray
+        Undiscounted terminal call payoffs, shape (N_PATHS,).
+    seconds : float
+        Elapsed synchronized execution time after one warm-up.
+
+    Notes
+    -----
+    Model parameters and path/step counts are module constants. The Pallas timing includes
+    conversion to NumPy; handwritten timing measures mr.run before reading its buffer.
+    """
     f = palladium.metal_call(
         pallas_gbm_kernel,
         grid=(N_PATHS,),
@@ -130,6 +202,29 @@ def run_pallas(seed):
 
 
 def report(label, payoff, t_gpu):
+    """Print Monte Carlo price, standard error, and throughput and check the analytic
+    reference.
+
+    Parameters
+    ----------
+    label : str
+        Implementation label.
+    payoff : numpy.ndarray
+        N_PATHS undiscounted payoff samples.
+    t_gpu : float
+        Positive measured duration in seconds.
+
+    Raises
+    ------
+    AssertionError
+        The discounted price differs from Black-Scholes by five or more estimated
+        standard errors.
+
+    Notes
+    -----
+    The report uses module constants for the model, path count, and work estimate; the
+    sample standard deviation uses one degree-of-freedom correction.
+    """
     price = float(np.exp(-R * T) * payoff.mean())
     stderr = float(np.exp(-R * T) * payoff.std(ddof=1) / np.sqrt(N_PATHS))
     exact = black_scholes_call(S0, K, T, R, SIGMA)
@@ -142,6 +237,9 @@ def report(label, payoff, t_gpu):
 
 
 def main():
+    """Run both payoff implementations and report their prices, reference checks, and timing
+    ratio.
+    """
     print(f"GBM European call, {N_PATHS:,} paths x {N_STEPS} steps ({mr.device_name()})")
     p_hand, t_hand = run_handwritten()
     report("hand-written MSL (pcg_hash)", p_hand, t_hand)
