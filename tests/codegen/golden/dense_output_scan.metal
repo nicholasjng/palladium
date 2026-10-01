@@ -17,7 +17,7 @@ kernel void palladium_kernel(
     }
     for (uint _s4 = 0; _s4 < 16; ++_s4) {
         float t5;
-        t5 = 0.10000000149011612f * arg1[_s4];
+        t5 = 0.1f * arg1[_s4];
         float t6[4];
         for (uint _i7 = 0; _i7 < 4; ++_i7) {
             t6[_i7] = t2[_i7] + (t5 * t2[_i7]);

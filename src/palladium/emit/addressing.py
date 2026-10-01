@@ -43,6 +43,10 @@ class CExpr:
     def mul(cls, left: CExpr, right: CExpr) -> CExpr:
         if (left.op == "raw" and left.value == 0) or (right.op == "raw" and right.value == 0):
             return cls.raw(0)
+        if left.op == "raw" and left.value == 1:
+            return right
+        if right.op == "raw" and right.value == 1:
+            return left
         return cls("mul", args=(left, right))
 
     def render(self) -> str:

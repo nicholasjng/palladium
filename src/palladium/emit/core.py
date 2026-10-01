@@ -385,7 +385,8 @@ def literal(atom: Literal) -> CVal:
     elif math.isnan(v):
         expr = "NAN"
     else:
-        expr = f"{float(v)!r}f" if ctype in ("float", "half", "bfloat") else str(int(v))
+        # The shortest decimal that rounds back to the same float32.
+        expr = f"{np.float32(v)!s}f" if ctype in ("float", "half", "bfloat") else str(int(v))
     if ctype == "bfloat":
         # MSL does not implicitly narrow float to bfloat.
         expr = f"bfloat({expr})"
