@@ -181,7 +181,12 @@ def _emit_reduce(
         with cursor.loop_nest(tuple(src.shape[d] for d in reduced_dims), "_d") as reduced:
             index = dict(zip(kept_dims, kept)) | dict(zip(reduced_dims, reduced))
             src_idx = flat_index([(index[d], src_strides[d]) for d in range(rank)])
-            cursor.emit(f"{acc} = {combine(acc, src.at(src_idx))};")
+            value = src.at(src_idx)
+            if src.lazy is not None:
+                # A fused input is an expression: evaluate it once.
+                value = cursor.fresh("_x")
+                cursor.emit(f"{src.ctype} {value} = {src.at(src_idx)};")
+            cursor.emit(f"{acc} = {combine(acc, value)};")
         dst_idx = flat_index(list(zip(kept, dst_strides)))
         cursor.emit(f"{dst.at(dst_idx)} = {acc};")
 

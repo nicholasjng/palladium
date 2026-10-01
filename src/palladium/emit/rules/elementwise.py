@@ -22,6 +22,10 @@ from palladium.emit.numeric import (
 from palladium.emit.rules.control import store_target
 from palladium.errors import EmitError
 
+_FLAT_READERS = frozenset(
+    {"reduce_sum", "reduce_max", "reduce_min", "cumsum", "cumprod", "cummax", "cummin"}
+)
+
 
 def lowers_elementwise(eqn: JaxprEqn) -> bool:
     """Whether `eqn` lowers through `_rule_elementwise`, which reads each
@@ -50,6 +54,9 @@ def _fuses_into_consumer(env: Environment, var, shape: tuple[int, ...], ops: lis
     if consumer is None or consumer.invars.count(var) != 1:
         return False
     name = consumer.primitive.name
+    if name in _FLAT_READERS:
+        # These read each input element once, by flat index.
+        return bool(shape) and all(op.shape in ((), shape) and not op.transposed for op in ops)
     if not lowers_elementwise(consumer):
         return False
     consumer_shape = tuple(int(d) for d in shaped(consumer.outvars[0].aval).shape)

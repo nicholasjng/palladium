@@ -52,6 +52,11 @@ def _rule_cumulative(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
             idx.insert(axis, k)
             flat = flat_index(list(zip(idx, strides, strict=True)))
             value = src.at(flat)
+            if src.lazy is not None:
+                # A fused input is an expression: evaluate it once.
+                value_name = cursor.fresh("_x")
+                cursor.emit(f"{src.ctype} {value_name} = {value};")
+                value = value_name
             if template in ("max", "min"):
                 combined = extremum(template, dst.ctype, acc, value)
             else:

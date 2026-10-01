@@ -134,3 +134,15 @@ def test_scalar_fill_of_where_is_not_materialized():
     msl = palladium.debug_msl(kernel, shape, out_shape=shape)
     # A materialized broadcast is the only loop named _b.
     assert "for (uint _b" not in msl
+
+
+def test_sum_of_squares_needs_no_block_array():
+    def kernel(x_ref, o_ref):
+        o_ref[0] = jnp.sum(x_ref[...] * x_ref[...])
+
+    msl = palladium.debug_msl(
+        kernel,
+        jax.ShapeDtypeStruct((256,), jnp.float32),
+        out_shape=jax.ShapeDtypeStruct((1,), jnp.float32),
+    )
+    assert "[256]" not in msl
