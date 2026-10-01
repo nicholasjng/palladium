@@ -106,3 +106,21 @@ def test_regressions_against_interpret(kind):
         np.asarray(call(x), dtype=np.float32),
         np.asarray(call.interpret(x), dtype=np.float32),
     )
+
+
+def test_a_jitted_helper_fuses_on_every_call():
+    # jit bodies are cached and shared by every call, Vars included, so the
+    # second walk once saw the first walk's consumers and fused nothing.
+    @jax.jit
+    def act(v):
+        return jnp.tanh(v * 2.0 + 1.0) * 3.0 - v
+
+    def kernel(x_ref, o_ref):
+        o_ref[...] = act(act(x_ref[...]))
+
+    shape = jax.ShapeDtypeStruct((64,), jnp.float32)
+    once = palladium.debug_msl(
+        lambda x_ref, o_ref: o_ref.__setitem__(..., act(x_ref[...])), shape, out_shape=shape
+    )
+    twice = palladium.debug_msl(kernel, shape, out_shape=shape)
+    assert twice.count("float t") <= once.count("float t") + 1

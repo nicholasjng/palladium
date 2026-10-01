@@ -342,8 +342,8 @@ class Environment:
         # Read input blocks in place instead of copying them to thread
         # storage, where each element is read once.
         self.fuse_loads = fuse_loads
-        # Per jaxpr level, populated before each (sub-)jaxpr is walked;
-        # Vars are unique objects per jaxpr, so levels never collide.
+        # Per jaxpr level, rebuilt before each (sub-)jaxpr is walked: a
+        # cached jit body is shared, Vars and all, by every call to it.
         self.consumers: dict[Var, list[JaxprEqn | None]] = {}
         self.producers: dict[Var, JaxprEqn] = {}
 
@@ -441,6 +441,8 @@ def emit_jaxpr(env: Environment, cursor: Cursor, jaxpr: Jaxpr, in_vals: list[CVa
         )
     for var, cval in zip(jaxpr.invars, in_vals, strict=True):
         env.bind(var, cval)
+    for var in (*jaxpr.invars, *(ov for eqn in jaxpr.eqns for ov in eqn.outvars)):
+        env.consumers[var] = []
     for eqn in jaxpr.eqns:
         for iv in eqn.invars:
             if isinstance(iv, Var):
