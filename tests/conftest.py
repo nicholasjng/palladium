@@ -28,7 +28,7 @@ def pytest_collection_modifyitems(config, items):
     import metal_runtime as mr
 
     try:
-        mr.device_name()
+        mr.device_info()["name"]
     except mr.DeviceError as e:  # pragma: no cover - CI without a GPU
         skip = pytest.mark.skip(reason=f"no Metal device: {e}")
         for item in items:
@@ -47,6 +47,6 @@ def metal_device():
     import metal_runtime as mr
 
     try:
-        mr.device_name()
+        mr.device_info()["name"]
     except mr.DeviceError as exc:
         pytest.skip(str(exc))

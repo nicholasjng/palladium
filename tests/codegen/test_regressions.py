@@ -98,7 +98,7 @@ def test_regressions_against_interpret(kind):
     """Compare literal, scalar-reshape, zero-power, and scratch-swap regressions with the
     interpreter."""
     try:
-        mr.device_name()
+        mr.device_info()["name"]
     except mr.DeviceError as exc:
         pytest.skip(str(exc))
     kernel, arg, kwargs = _case(kind)

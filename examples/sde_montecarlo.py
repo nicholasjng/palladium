@@ -240,7 +240,7 @@ def main():
     """Run both payoff implementations and report their prices, reference checks, and timing
     ratio.
     """
-    print(f"GBM European call, {N_PATHS:,} paths x {N_STEPS} steps ({mr.device_name()})")
+    print(f"GBM European call, {N_PATHS:,} paths x {N_STEPS} steps ({mr.device_info()['name']})")
     p_hand, t_hand = run_handwritten()
     report("hand-written MSL (pcg_hash)", p_hand, t_hand)
 
