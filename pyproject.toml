@@ -32,6 +32,7 @@ dev = [
     "ruff>=0.6",
     "ty>=0.0.66",
 ]
+mps = ["jax-mps>=0.11.1"]
 
 [tool.uv]
 no-build-isolation-package = ["palladium"]
@@ -39,6 +40,7 @@ default-groups = ["build", "dev"]
 
 [tool.uv.sources]
 metal-runtime = { path = "../metal-runtime" }
+jax-mps = { path = "../jax-mps" }
 
 [tool.uv.extra-build-dependencies]
 palladium = ["jax", "metal-runtime"]
@@ -70,3 +72,10 @@ combine-as-imports = true
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401"]
+
+[tool.ty.src]
+exclude = [
+    "benchmarks/bench_sir_simulators.py",
+    "examples/sbi_sir.py",
+    "examples/sbi_sir_npe.py",
+]
