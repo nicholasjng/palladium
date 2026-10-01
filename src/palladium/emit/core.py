@@ -331,12 +331,17 @@ class Environment:
         Var -> defining eqn, for rules that need lookahead.
     """
 
-    def __init__(self, no_stream_refs: frozenset[Var] = frozenset()) -> None:
+    def __init__(
+        self, no_stream_refs: frozenset[Var] = frozenset(), *, fuse_loads: bool = False
+    ) -> None:
         self.bindings: dict[Var, CVal] = {}
         # Refs sharing a buffer with another ref (input_output_aliases):
         # never scan-ys streaming targets, since reads through the twin
         # var are invisible here.
         self.no_stream_refs = no_stream_refs
+        # Read input blocks in place instead of copying them to thread
+        # storage, where each element is read once.
+        self.fuse_loads = fuse_loads
         # Per jaxpr level, populated before each (sub-)jaxpr is walked;
         # Vars are unique objects per jaxpr, so levels never collide.
         self.consumers: dict[Var, list[JaxprEqn | None]] = {}

@@ -26,10 +26,18 @@ def _tanh_call(**kwargs):
     )
 
 
+def _reused_kernel(x_ref, o_ref):
+    t = jnp.tanh(x_ref[...])  # two consumers, so it stays a thread-local array
+    o_ref[...] = t * t + t
+
+
+def _reused_call(n):
+    return palladium.metal_call(_reused_kernel, out_shape=jax.ShapeDtypeStruct((n,), jnp.float32))
+
+
 def test_explain_reports_per_thread_stack():
     """The per-thread stack has no published ceiling, so explain reports the estimate before compiling."""
-    f = _tanh_call()
-    d = f.explain(jax.ShapeDtypeStruct((64,), jnp.float32))
+    d = _reused_call(64).explain(jax.ShapeDtypeStruct((64,), jnp.float32))
     # 64 f32 elements per live array, several arrays.
     assert d.thread_bytes >= 64 * 4
     assert d.threadgroup_bytes == 0
@@ -37,10 +45,8 @@ def test_explain_reports_per_thread_stack():
 
 
 def test_stack_estimate_scales_with_block_size():
-    small = _tanh_call().explain(jax.ShapeDtypeStruct((64,), jnp.float32))
-    big = palladium.metal_call(
-        _tanh_kernel, out_shape=jax.ShapeDtypeStruct((512,), jnp.float32)
-    ).explain(jax.ShapeDtypeStruct((512,), jnp.float32))
+    small = _reused_call(64).explain(jax.ShapeDtypeStruct((64,), jnp.float32))
+    big = _reused_call(512).explain(jax.ShapeDtypeStruct((512,), jnp.float32))
     assert big.thread_bytes == small.thread_bytes * 8
 
 

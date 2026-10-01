@@ -6,11 +6,7 @@ kernel void palladium_kernel(
     device float* arg1 [[buffer(1)]],
     uint3 _pid [[thread_position_in_grid]])
 {
-    float t0[512];
-    for (uint _i1 = 0; _i1 < 512; ++_i1) {
-        t0[_i1] = arg0[_i1];
-    }
-    for (uint _i2 = 0; _i2 < 512; ++_i2) {
-        arg1[_i2] = t0[_i2];
+    for (uint _i0 = 0; _i0 < 512; ++_i0) {
+        arg1[_i0] = arg0[_i0];
     }
 }

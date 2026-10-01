@@ -10,6 +10,7 @@ from jax.extend.core import Jaxpr, JaxprEqn
 from palladium.emit.addressing import ref_view
 from palladium.emit.core import Cursor, Environment, declare, emit_jaxpr, rule, shaped
 from palladium.emit.rules.control import _consumed_only_as_scan_xs
+from palladium.emit.rules.elementwise import _fuses_into_consumer
 from palladium.errors import EmitError
 
 
@@ -19,9 +20,10 @@ def _rule_get(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     dims squeeze, Slice dims are kept).
 
     An indexed load from a read-only ref binds the pointer view instead
-    of copying, since nothing writes through a `const device` ref.
-    Full-block loads copy, except a block consumed only as scan xs,
-    which binds the ref directly.
+    of copying, since nothing writes through a `const device` ref. A
+    full-block load binds the view only when each element is read once:
+    by a store, a fused elementwise consumer, or a scan taking it as xs.
+    A block reused inside a loop keeps the copy.
     """
     indexer_args = eqn.params["tree"].unflatten(eqn.invars[1:])
     src = env.val(eqn.invars[0])
@@ -35,16 +37,24 @@ def _rule_get(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         and src.space == "device"
         and src.shape
         and math.prod(src.shape) == math.prod(out_shape)
-        and (
-            bool(indexer_args)
-            or (bool(out_shape) and _consumed_only_as_scan_xs(env, eqn.outvars[0]))
-        )
+        and (bool(indexer_args) or (bool(out_shape) and _read_once(env, eqn.outvars[0], out_shape)))
     )
     if viewable:
         env.bind(eqn.outvars[0], dataclasses.replace(src, shape=out_shape))
         return
     dst = declare(env, cursor, eqn.outvars[0])
     cursor.copy(dst, src, dst.size)
+
+
+def _read_once(env: Environment, var, shape: tuple[int, ...]) -> bool:
+    if _consumed_only_as_scan_xs(env, var):
+        return True
+    if not env.fuse_loads:
+        return False
+    consumer = env.sole_consumer(var)
+    if consumer is not None and consumer.primitive.name == "swap" and consumer.invars[1] is var:
+        return True
+    return _fuses_into_consumer(env, var, shape, [])
 
 
 @rule("swap")

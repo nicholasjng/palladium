@@ -38,7 +38,7 @@ def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     Consts pass through unchanged; carries get fresh mutable loop
     variables bound on the outvars; scanned xs bind per-iteration
     strided views; stacked ys stream straight to a device ref
-    (`_ys_stream_target`) or fill thread-local stacked storage, bounded
+    (`store_target`) or fill thread-local stacked storage, bounded
     by the per-thread stack.
 
     Carries update simultaneously (see `_copy_back_carries`). ys slices
@@ -68,7 +68,7 @@ def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 
     ys_targets = []
     for outvar in eqn.outvars[num_carry:]:
-        target = _ys_stream_target(env, outvar)
+        target = store_target(env, outvar)
         if target is not None:
             env.bind(outvar, target)
         else:
@@ -189,11 +189,11 @@ def _consumed_only_as_scan_xs(env: Environment, var: Var) -> bool:
     return True
 
 
-def _ys_stream_target(env: Environment, outvar: Var) -> CVal | None:
-    """The device ref to stream a stacked ys into, or None for the
-    thread-local fallback.
+def store_target(env: Environment, outvar: Var) -> CVal | None:
+    """The device ref a value can be computed into directly, or None to
+    use thread-local storage.
 
-    Streaming writes the ref earlier than its swap; that is unobservable
+    Writing the ref earlier than its swap is unobservable
     only while the ref feeds nothing but that one full-block swap and
     shares its buffer with no other ref (`env.no_stream_refs`). The swap
     then degenerates to a self-copy, which `_rule_swap` skips.

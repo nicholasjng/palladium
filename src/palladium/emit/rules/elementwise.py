@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from jax.extend.core import JaxprEqn
 
 from palladium.emit.addressing import element_strides, flat_index
@@ -14,6 +16,7 @@ from palladium.emit.numeric import (
     typed_expression,
     unwrapped,
 )
+from palladium.emit.rules.control import store_target
 from palladium.errors import EmitError
 
 # MSL has no erf, erfinv, expm1, or log1p; these are float32 helpers emitted
@@ -203,7 +206,12 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         )
         return
 
-    dst = declare(env, cursor, eqn.outvars[0])
+    target = store_target(env, eqn.outvars[0])
+    if target is not None:
+        # Compute straight into the output ref; the swap then skips its copy.
+        dst = env.bind(eqn.outvars[0], dataclasses.replace(target, shape=out_shape or (1,)))
+    else:
+        dst = declare(env, cursor, eqn.outvars[0])
     rank = len(dst.shape)
     dst_strides = element_strides(dst.shape)
 

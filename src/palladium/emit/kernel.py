@@ -78,6 +78,21 @@ def emit_msl_stats(
         else:
             return source, EmitStats(thread_bytes=0, threadgroup_bytes=threadgroup_bytes)
 
+    source, stats = _assemble(spec, kernel_name, fuse_loads=False)
+    if stats.thread_bytes >= _REGISTER_BYTES:
+        source, stats = _assemble(spec, kernel_name, fuse_loads=True)
+    return source, stats
+
+
+# Per-thread storage above which copied input blocks spill out of registers.
+# Below it, copying a block first measured faster than reading it in place;
+# above it, reading in place won by up to 2.9x (M2, blocked elementwise).
+_REGISTER_BYTES = 512
+
+
+def _assemble(
+    spec: KernelSpec, kernel_name: str | None, *, fuse_loads: bool
+) -> tuple[str, EmitStats]:
     name = kernel_name or spec.name
     if len(spec.grid) > 3:
         raise EmitError(f"grid {spec.grid} has rank > 3; Metal grids are 3D")
@@ -94,7 +109,8 @@ def emit_msl_stats(
     env = Environment(
         no_stream_refs=frozenset(
             spec.jaxpr.invars[k] for i, j in spec.aliases for k in (i, n_in + j)
-        )
+        ),
+        fuse_loads=fuse_loads,
     )
     cursor = Cursor()
     ref_vals: list[CVal] = []
