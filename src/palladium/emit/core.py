@@ -12,7 +12,7 @@ import contextlib
 import dataclasses
 import itertools
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from typing import Literal as TLiteral
 
 import jax.numpy as jnp
@@ -460,7 +460,7 @@ class Cursor:
         return f"{prefix}{next(self._names)}"
 
     @contextlib.contextmanager
-    def block(self, header: str) -> Iterator[None]:
+    def block(self, header: str) -> Generator[None]:
         """Open a braced MSL block and indent statements emitted inside it.
 
         Parameters
@@ -485,7 +485,7 @@ class Cursor:
         self.emit("}")
 
     @contextlib.contextmanager
-    def loop(self, count: int | str, prefix: str = "_i", reverse: bool = False) -> Iterator[str]:
+    def loop(self, count: int | str, prefix: str = "_i", reverse: bool = False) -> Generator[str]:
         """Emit a counted loop and expose its index to nested emission.
 
         Parameters
@@ -521,7 +521,7 @@ class Cursor:
             yield idx
 
     @contextlib.contextmanager
-    def loop_nest(self, shape: tuple[int, ...], prefix: str = "_i") -> Iterator[list[str]]:
+    def loop_nest(self, shape: tuple[int, ...], prefix: str = "_i") -> Generator[list[str]]:
         """Emit nested loops over logical dimensions and expose their indices.
 
         Parameters
@@ -552,7 +552,7 @@ class Cursor:
         *,
         name: str | None = None,
         prefix: str = "_i",
-    ) -> Iterator[str]:
+    ) -> Generator[str]:
         """Emit a loop that assigns strided work to cooperative threads.
 
         Parameters
