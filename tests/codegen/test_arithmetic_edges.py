@@ -39,3 +39,23 @@ def test_sign_and_remainder(dtype):
     np.testing.assert_allclose(actual, expected, rtol=0, atol=0, equal_nan=True)
     if np.issubdtype(dtype, np.floating):
         np.testing.assert_array_equal(np.signbit(actual[0][2:4]), np.signbit(x[2:4]))
+
+
+@pytest.mark.parametrize(
+    "op, reference",
+    [
+        (jnp.tanh, np.tanh),
+        (jnp.sinh, np.sinh),
+        (jnp.arcsinh, np.arcsinh),
+        (jnp.arctanh, np.arctanh),
+    ],
+)
+def test_odd_functions_keep_relative_accuracy_near_zero(op, reference):
+    # Metal's own versions return 0 for 1e-8 and are 1-3% off at 2e-6.
+    x = np.array([1e-8, -2e-6, 1e-4, 5e-3, -0.02, 0.5], np.float32)
+
+    def kernel(x_ref, o_ref):
+        o_ref[...] = op(x_ref[...])
+
+    f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct(x.shape, jnp.float32))
+    np.testing.assert_allclose(f(x), reference(x.astype(np.float64)), rtol=5e-6)

@@ -8,7 +8,7 @@ from jax.extend.core import Literal, Var
 
 from palladium.emit.addressing import block_offset
 from palladium.emit.core import CTYPES, Cursor, CVal, Environment, msl_type
-from palladium.emit.numeric import ELEMENTWISE, format_scalar, typed_expression
+from palladium.emit.numeric import ELEMENTWISE, HELPERS, format_scalar, typed_expression
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
 
@@ -351,7 +351,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
                     for atom in eqn.invars
                 )
                 result_type = msl_type(eqn.outvars[0].aval.dtype)
-                expression = _elementwise_expression(eqn, result_type, operands)
+                expression = _elementwise_expression(eqn, result_type, operands, cursor)
                 result_name = cursor.fresh("tensorops_epilogue")
                 cursor.emit(f"{result_type} {result_name} = {expression};")
                 scalar_values[eqn.outvars[0]] = result_name
@@ -384,7 +384,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
                         for atom in eqn.invars
                     )
                     result_type = msl_type(eqn.outvars[0].aval.dtype)
-                    expression = _elementwise_expression(eqn, result_type, operands)
+                    expression = _elementwise_expression(eqn, result_type, operands, cursor)
                     result_name = cursor.fresh("tensorops_epilogue")
                     cursor.emit(f"{result_type} {result_name} = {expression};")
                     scalar_values[eqn.outvars[0]] = result_name
@@ -415,7 +415,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
         else:
             cursor.emit(f"{cooperative_result.expr}.store({output_tensor.expr});")
 
-    source = _kernel_source(kernel_name or spec.name, params, cursor.lines)
+    source = _kernel_source(kernel_name or spec.name, params, cursor)
     return source, cursor.threadgroup_bytes
 
 
@@ -453,8 +453,7 @@ def _epilogue_path(value, dot_value, producers) -> tuple[list, set[int]]:
     """Collect the supported elementwise producer chain feeding one store."""
     ordered = []
     used: set[int] = set()
-    allowed = set(ELEMENTWISE)
-    allowed.update(("max", "broadcast_in_dim"))
+    allowed = {*ELEMENTWISE, *HELPERS, "max", "broadcast_in_dim"}
 
     def visit(atom):
         if atom is dot_value or isinstance(atom, Literal):
@@ -504,7 +503,7 @@ def _scalar_value(atom, scalar_values, values, env, index: str, shape: tuple[int
     return value.at(index)
 
 
-def _elementwise_expression(eqn, ctype: str, operands: tuple[str, ...]) -> str:
+def _elementwise_expression(eqn, ctype: str, operands: tuple[str, ...], cursor) -> str:
     """Format one supported scalar equation for the current output element."""
     if eqn.primitive.name == "broadcast_in_dim":
         if len(operands) != 1 or tuple(eqn.params["broadcast_dimensions"]) not in ((1,), (1, 2)):
@@ -512,7 +511,7 @@ def _elementwise_expression(eqn, ctype: str, operands: tuple[str, ...]) -> str:
         return operands[0]
     if len(operands) != len(eqn.invars):
         raise EmitError(f"{eqn.primitive.name} epilogue has unsupported arity")
-    return format_scalar(eqn.primitive.name, ctype, operands)
+    return format_scalar(eqn.primitive.name, ctype, operands, cursor)
 
 
 def _is_tile_shape(shape: tuple[int, ...], rank: int, tm: int, tn: int) -> bool:

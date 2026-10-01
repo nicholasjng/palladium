@@ -13,7 +13,7 @@ from palladium.trace import BlockInfo, KernelSpec
 SIMDGROUPS = 4
 
 
-def _kernel_source(name: str, parameters: tuple[str, ...], body: list[str]) -> str:
+def _kernel_source(name: str, parameters: tuple[str, ...], cursor: Cursor) -> str:
     """Wrap emitted statements in the common Metal TensorOps kernel preamble."""
     parameter_text = ",\n    ".join(parameters)
     return "\n".join(
@@ -24,8 +24,9 @@ def _kernel_source(name: str, parameters: tuple[str, ...], body: list[str]) -> s
             "using namespace metal;",
             "using namespace mpp;",
             "",
+            *cursor.helpers.values(),
             f"kernel void {name}(\n    {parameter_text})\n{{",
-            *body,
+            *cursor.lines,
             "}",
             "",
         )

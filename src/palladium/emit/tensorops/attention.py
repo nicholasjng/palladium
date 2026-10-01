@@ -579,5 +579,5 @@ def _emit(plan: _AttentionPlan, spec: KernelSpec, kernel_name: str | None):
         "uint sg [[simdgroup_index_in_threadgroup]]",
         "uint3 threads_per_group [[threads_per_threadgroup]]",
     )
-    source = _kernel_source(name, params, cursor.lines)
+    source = _kernel_source(name, params, cursor)
     return source, cursor.threadgroup_bytes

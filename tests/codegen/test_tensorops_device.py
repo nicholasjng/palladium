@@ -52,6 +52,26 @@ def test_matmul(rng, m, n, k, tn, dtype, tol):
     )
 
 
+def test_matmul_with_a_tanh_epilogue(rng):
+    def kernel(a_ref, b_ref, out_ref):
+        out_ref[...] = jnp.tanh(jnp.matmul(a_ref[...], b_ref[...]))
+
+    call = palladium.metal_call(
+        kernel,
+        compiler_params=palladium.CompilerParams(dot_general="tensorops"),
+        grid=(2, 2),
+        in_specs=[
+            pl.BlockSpec((TM, 32), lambda i, j: (i, 0)),
+            pl.BlockSpec((32, 32), lambda i, j: (0, j)),
+        ],
+        out_specs=pl.BlockSpec((TM, 32), lambda i, j: (i, j)),
+        out_shape=jax.ShapeDtypeStruct((32, 64), jnp.float32),
+    )
+    a = rng.standard_normal((32, 32), dtype=np.float32) * 0.1
+    b = rng.standard_normal((32, 64), dtype=np.float32) * 0.1
+    np.testing.assert_allclose(call(a, b), np.tanh(a @ b), rtol=1e-4, atol=1e-5)
+
+
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("head_dim, tile_q, tile_k", [(16, 16, 16), (16, 16, 128), (32, 32, 32)])
 def test_attention(rng, head_dim, tile_q, tile_k, causal):
