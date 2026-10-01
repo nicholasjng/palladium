@@ -10,9 +10,19 @@ from __future__ import annotations
 from jax.extend.core import JaxprEqn
 
 from palladium.emit.addressing import element_strides, flat_index
-from palladium.emit.core import REGISTER_BYTES, Cursor, Environment, declare, rule
+from palladium.emit.core import (
+    REGISTER_BYTES,
+    Cursor,
+    CVal,
+    Environment,
+    declare,
+    msl_type,
+    rule,
+    shaped,
+)
 from palladium.emit.numeric import extremum, extremum_identity
 from palladium.emit.rules.control import store_or_declare
+from palladium.emit.rules.elementwise import reads_by_flat_index
 from palladium.errors import EmitError
 
 _CUMULATIVE = {
@@ -25,9 +35,22 @@ _CUMULATIVE = {
 
 @rule("iota")
 def _rule_iota(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """`lax.broadcasted_iota` / `jnp.arange`: the index along one dimension."""
-    dst = declare(env, cursor, eqn.outvars[0])
+    """`lax.broadcasted_iota` / `jnp.arange`: the index along one dimension.
+
+    Read only by flat index, it is a lazy expression of that index.
+    """
     dimension = int(eqn.params["dimension"])
+    aval = shaped(eqn.outvars[0].aval)
+    shape = tuple(int(d) for d in aval.shape)
+    if shape and reads_by_flat_index(env, eqn.outvars[0]):
+        stride = element_strides(shape)[dimension]
+        coordinate = "$i" if stride == 1 else f"($i / {stride})"
+        if dimension:
+            coordinate = f"({coordinate} % {shape[dimension]})"
+        ctype = msl_type(aval.dtype)
+        env.bind(eqn.outvars[0], CVal("", shape, ctype, lazy=f"(({ctype}){coordinate})"))
+        return
+    dst = declare(env, cursor, eqn.outvars[0])
     strides = element_strides(dst.shape)
     with cursor.loop_nest(dst.shape, "_o") as idx:
         flat = flat_index(list(zip(idx, strides, strict=True)))

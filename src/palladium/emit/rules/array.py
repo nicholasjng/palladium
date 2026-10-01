@@ -12,7 +12,7 @@ from jax.extend.core import JaxprEqn
 from palladium.emit.addressing import element_strides, flat_index
 from palladium.emit.core import Cursor, CVal, Environment, declare, rule, shaped
 from palladium.emit.numeric import unwrapped
-from palladium.emit.rules.elementwise import _rule_elementwise, lowers_elementwise
+from palladium.emit.rules.elementwise import _rule_elementwise, reads_by_flat_index
 from palladium.errors import EmitError
 
 
@@ -175,14 +175,8 @@ _CHEAP_SCALAR = re.compile(r"[A-Za-z_]\w*|-?[\d.]+(e[-+]?\d+)?f?|bfloat\(-?[\d.]
 
 def _scalar_reads_only(env: Environment, var, src: CVal) -> bool:
     """Whether a broadcast of `src` can stay a scalar: it is a variable or a
-    literal, and every consumer reads it elementwise by index."""
-    uses = env.consumer_eqns(var)
-    return (
-        _CHEAP_SCALAR.fullmatch(src.expr) is not None
-        and bool(uses)
-        and not env.escapes(var)
-        and all(lowers_elementwise(use) for use in uses)
-    )
+    literal, and every consumer reads it by flat index."""
+    return _CHEAP_SCALAR.fullmatch(src.expr) is not None and reads_by_flat_index(env, var)
 
 
 def _transpose_is_dot_rhs_only(env: Environment, eqn: JaxprEqn) -> bool:

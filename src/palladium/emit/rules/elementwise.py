@@ -33,6 +33,17 @@ def lowers_elementwise(eqn: JaxprEqn) -> bool:
     return RULES.get(eqn.primitive.name) is _rule_elementwise
 
 
+def reads_by_flat_index(env: Environment, var) -> bool:
+    """Whether every consumer reads `var` element by element through its
+    flat index, so it may be a lazy expression with no storage."""
+    uses = env.consumer_eqns(var)
+    return (
+        bool(uses)
+        and not env.escapes(var)
+        and all(lowers_elementwise(use) or use.primitive.name in _FLAT_READERS for use in uses)
+    )
+
+
 def _fuses_into_consumer(env: Environment, var, shape: tuple[int, ...], ops: list[CVal]) -> bool:
     """Whether `var` can stay an expression: it is consumed exactly once, by
     an elementwise equation of the same shape at this jaxpr level, and its

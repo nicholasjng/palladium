@@ -157,3 +157,14 @@ def test_where_at_the_end_computes_into_the_output():
     shape = jax.ShapeDtypeStruct((256,), jnp.float32)
     msl = palladium.debug_msl(kernel, shape, out_shape=shape)
     assert "[256]" not in msl
+
+
+def test_iota_mask_needs_no_index_array():
+    def kernel(x_ref, o_ref):
+        row = jax.lax.broadcasted_iota(jnp.int32, (8, 16), 0)
+        col = jax.lax.broadcasted_iota(jnp.int32, (8, 16), 1)
+        o_ref[...] = jnp.where(col <= row, x_ref[...], -1.0)
+
+    shape = jax.ShapeDtypeStruct((8, 16), jnp.float32)
+    msl = palladium.debug_msl(kernel, shape, out_shape=shape)
+    assert "int t" not in msl
