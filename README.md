@@ -46,11 +46,18 @@ uv sync
 uv run pytest -q
 ```
 
-To run on the `mps` platform, install and select the jax-mps plugin
-separately; this repository does not install it.
+To run on the `mps` platform, build jax-mps with the `palladium.dispatch` PJRT
+handler and install it into the same Python environment. A stock jax-mps wheel
+is not sufficient for this integration. See [Installation](INSTALLATION.md) for
+the source revisions, build commands, and a custom-call smoke test.
 
 ## Documentation
 
+- [Architecture and interview walkthrough](docs/architecture.md): building
+  blocks, JAX Pallas integration, both dispatch paths, and a presentation route.
+- [Emitter walkthrough](docs/emitter.md): jaxpr lowering, Ref addressing,
+  control flow, optimizations, and cooperative TensorOps.
+- [API guide](docs/api.md): public entry points, metadata, diagnostics, and errors.
 - [Getting started](docs/getting-started.md): the mps and CPU-FFI call paths,
   with the CPU interpreter as a correctness reference.
 - [Supported JAX functionality](docs/supported-jax.md): Pallas constructs,

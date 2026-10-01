@@ -53,12 +53,16 @@ raises where it does not apply; `dot_general="default"` forces the primitive
 path. The lowering covers a standalone, tiled rank-2 matmul or matching rank-3
 batches of matrices. The batched form uses arrays
 `[B, M, K] @ [B, K, N]`, one batch per Pallas grid coordinate, and one
-threadgroup per output tile. Batch sizes must match, M and N must tile evenly,
-and each tile must contain the full K dimension. Rank-2 inputs may be
-transposed. Fused epilogues support ReLU, a same-shape residual, or column bias;
-the rank-3 path supports ReLU and a same-shape residual. Batch broadcasting,
-edge tiles, split-K, and arbitrary `dot_general` batch dimensions are not
-recognized. This is a grid of 2D products, not a batched `dot_general`
+threadgroup per output tile. Batch sizes must match and each Pallas tile must
+contain the full K dimension. Output tile dimensions must be multiples of 16;
+partial M/N edge tiles are masked. The generated matmul processes K in internal
+chunks and handles its tail. Matching float32, float16, and bfloat16 buffers are
+supported, with float accumulation and narrowing stores for half/bfloat outputs.
+Rank-2 inputs may be transposed. Recognized scalar elementwise epilogue chains,
+such as ReLU or tanh, can be fused; same-shape residuals and rank-2 column bias
+are also supported. Batch broadcasting, split-K across Pallas programs, and
+arbitrary `dot_general` batch dimensions are not recognized. This is a grid of
+2D products, not a batched `dot_general`
 primitive. The attention form requires rank-4 `[batch, sequence, heads, D]`
 buffers and a static key-tile scan; query and key/value lengths may differ for
 noncausal attention. Causal attention requires matching lengths. Q/output use
@@ -79,7 +83,7 @@ operation-specific limits:
 |---|---|
 | float32 | All listed arithmetic, reductions, and dots |
 | float16 | Load/store, elementwise, reductions, and dots; f32 accumulation when requested |
-| bfloat16 | Load/store, elementwise, and reductions |
+| bfloat16 | Load/store, elementwise, reductions, and cooperative TensorOps matmul |
 | int32, uint32 | Load/store, arithmetic, bitwise operations, shifts, and reductions |
 | bool | Load/store, logic, and selection |
 
