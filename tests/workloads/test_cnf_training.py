@@ -30,11 +30,14 @@ make_training_step = functools.partial(make_training_step, call=CALL)
 
 
 def test_density_matches_change_of_variables():
-    """Independent check of the divergence integral and reverse-density sign.
+    """Compare CNF log density with an independent Jacobian log-determinant change-of-variables
+    calculation."""
 
-    The integrated continuous logdet approximates the discrete RK4 map logdet;
-    a sufficiently fine solve makes their discrepancy small.
-    """
+    # Independent check of the divergence integral and reverse-density sign.
+
+    # The integrated continuous logdet approximates the discrete RK4 map logdet; a
+    # sufficiently fine solve makes their discrepancy small.
+
     n, width = 8, 2
     weights = init_parameters(width)
     points = jnp.asarray(mixture_data(n))
@@ -56,6 +59,8 @@ def test_density_matches_change_of_variables():
 
 
 def test_cnf_fits_heldout_mixture_and_refines():
+    """Check held-out density improvement, CPU loss/gradient agreement, and stability under step
+    refinement."""
     n, width = 256, 4
     train = jnp.asarray(mixture_data(n, 17))
     heldout = jnp.asarray(mixture_data(n, 29))
@@ -84,6 +89,8 @@ def test_cnf_fits_heldout_mixture_and_refines():
 
 @pytest.mark.parametrize("steps,interval,width", [(1, 1, 2), (5, 2, 2), (5, 9, 4), (16, 4, 4)])
 def test_checkpointed_cnf_vjp(steps, interval, width):
+    """Compare checkpointed CNF values and input/parameter VJPs with an independent CPU scan across
+    intervals."""
     n = 8
     rng = np.random.default_rng(steps + width)
     states = jnp.asarray(rng.normal(size=(n, 3)).astype(np.float32))
@@ -114,6 +121,7 @@ def test_checkpointed_cnf_vjp(steps, interval, width):
 
 
 def test_translation_log_density():
+    """Compare a constant-translation CNF with its analytic shifted-Gaussian log density."""
     n, width = 8, 2
     params = jnp.zeros(parameter_count(width)).at[-2:].set(jnp.array([0.4, -0.7]))
     points = jnp.arange(n * 2, dtype=jnp.float32).reshape(n, 2) / 10

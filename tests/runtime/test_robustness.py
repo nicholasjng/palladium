@@ -13,6 +13,8 @@ import palladium
 
 
 def test_concurrent_first_calls_emit_once_per_shape(monkeypatch, rng):
+    """Check correct concurrent first-call results and exactly one emission for each of two shape
+    specializations."""
     import palladium.ffi as callable_module
 
     emits = []
@@ -51,6 +53,9 @@ def test_concurrent_first_calls_emit_once_per_shape(monkeypatch, rng):
 
 
 def test_concurrent_calls_on_one_compiled_kernel(rng):
+    """Check that concurrent reuse of one compiled kernel keeps each call's input and output
+    buffers distinct."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] + 1.0
 
@@ -80,26 +85,32 @@ def _roundtrip_and_op(dtype, op, expect, x):
 
 
 def test_dtype_float16(rng):
+    """Check half-precision upload, affine arithmetic, and result values against NumPy."""
     x = rng.standard_normal(16).astype(np.float16)
     _roundtrip_and_op(jnp.float16, lambda v: v * 2.0 + 1.0, lambda v: v * 2 + 1, x)
 
 
 def test_dtype_int32():
+    """Check signed integer upload, affine arithmetic, and result values against NumPy."""
     x = np.arange(-8, 8, dtype=np.int32)
     _roundtrip_and_op(jnp.int32, lambda v: v * 3 + 1, lambda v: v * 3 + 1, x)
 
 
 def test_dtype_uint32():
+    """Check unsigned integer upload and bitwise XOR results against NumPy."""
     x = np.arange(16, dtype=np.uint32)
     _roundtrip_and_op(jnp.uint32, lambda v: v ^ np.uint32(0xFF), lambda v: v ^ 0xFF, x)
 
 
 def test_dtype_bool():
+    """Check boolean upload and logical negation results against NumPy."""
     x = np.array([True, False] * 8)
     _roundtrip_and_op(jnp.bool_, jnp.logical_not, np.logical_not, x)
 
 
 def test_dtype_float16_reduction(rng):
+    """Compare a half-precision reduction and its one-element output with NumPy."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.sum(x_ref[...], keepdims=True)
 
@@ -110,6 +121,8 @@ def test_dtype_float16_reduction(rng):
 
 
 def test_dtype_int32_reduction():
+    """Compare an int32 reduction and its one-element output with NumPy exactly."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.sum(x_ref[...], keepdims=True)
 
@@ -119,6 +132,8 @@ def test_dtype_int32_reduction():
 
 
 def test_bfloat16_round_trips_through_the_handler():
+    """Check bfloat16 buffers through native FFI with an exactly representable increment."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] + jnp.bfloat16(1.0)
 

@@ -11,6 +11,9 @@ import palladium
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, np.int32, np.uint32])
 def test_sign_and_remainder(dtype):
+    """Check sign and remainder at NaNs, infinities, signed zeros, zero divisors, and integer
+    limits."""
+
     def kernel(x, y, sign, remainder):
         sign[...] = jax.lax.sign(x[...])
         remainder[...] = jax.lax.rem(x[...], y[...])
@@ -52,6 +55,7 @@ def test_sign_and_remainder(dtype):
 )
 def test_odd_functions_keep_relative_accuracy_near_zero(op, reference):
     # Metal's own versions return 0 for 1e-8 and are 1-3% off at 2e-6.
+    """Compare small-argument tanh, sinh, asinh, and atanh with float64 NumPy references."""
     x = np.array([1e-8, -2e-6, 1e-4, 5e-3, -0.02, 0.5], np.float32)
 
     def kernel(x_ref, o_ref):

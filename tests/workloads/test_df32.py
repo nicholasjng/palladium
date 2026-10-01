@@ -47,6 +47,7 @@ def _operands(rng, n=10_000):
     [("df_add", np.add), ("df_sub", np.subtract), ("df_mul", np.multiply), ("df_div", np.divide)],
 )
 def test_binary_ops_match_float64(rng, name, reference):
+    """Compare df32 binary results with float64 NumPy and check normalization of each high/low pair."""
     a, b = _operands(rng), _operands(rng)
     out = _run(BINARY, name, a, b)
     want = reference(a, b)
@@ -57,6 +58,7 @@ def test_binary_ops_match_float64(rng, name, reference):
 
 
 def test_sqrt_matches_float64_and_handles_zero_and_negatives(rng):
+    """Compare df32 square roots with float64, including zero and negative-input NaNs."""
     a = np.abs(_operands(rng))
     out = _run(UNARY, "df_sqrt", a)
     assert np.max(np.abs(out[:, 0] + out[:, 1] - np.sqrt(a)) / np.sqrt(a)) <= 2**-40
@@ -67,6 +69,7 @@ def test_sqrt_matches_float64_and_handles_zero_and_negatives(rng):
 
 
 def test_prelude_requires_safe_math():
+    """Verify that the df32 prelude rejects a math mode that could remove compensated error terms."""
     source = PRELUDE + "kernel void noop() {}"
     for mode in (mr.MathMode.FAST, mr.MathMode.RELAXED):
         with pytest.raises(mr.CompileError, match="SAFE"):

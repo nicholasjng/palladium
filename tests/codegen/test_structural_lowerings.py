@@ -29,6 +29,7 @@ def _reshape_kernel(perm, new_shape):
 
 @pytest.mark.parametrize("shape,perm,new_shape", RESHAPES)
 def test_permuted_reshape_emits(shape, perm, new_shape):
+    """Check that permuted reshapes emit an output store with no separate transpose temporary."""
     source = palladium.debug_msl(
         _reshape_kernel(perm, new_shape),
         jax.ShapeDtypeStruct(shape, jnp.float32),
@@ -41,6 +42,8 @@ def test_permuted_reshape_emits(shape, perm, new_shape):
 
 @pytest.mark.parametrize("shape,perm,new_shape", RESHAPES)
 def test_permuted_reshape_on_metal(metal_device, shape, perm, new_shape):
+    """Compare permuted reshape results with NumPy and the interpreter, including scalar and unit
+    axes."""
     call = palladium.metal_call(
         _reshape_kernel(perm, new_shape),
         out_shape=jax.ShapeDtypeStruct(new_shape, np.float32),
@@ -63,6 +66,7 @@ def _select_kernel(count):
 @pytest.mark.parametrize("count", [1, 2, 3, 8])
 @pytest.mark.parametrize("index_dtype", [np.int32, np.uint32])
 def test_multiway_select_emits_all_cases(count, index_dtype):
+    """Check that one to eight integer-indexed select cases all appear in the emitted source."""
     shapes = [jax.ShapeDtypeStruct((2, 4), np.float32)] * count
     source = palladium.debug_msl(
         _select_kernel(count),
@@ -79,6 +83,7 @@ def test_multiway_select_emits_all_cases(count, index_dtype):
 @pytest.mark.parametrize("count", [1, 2, 3, 8])
 @pytest.mark.parametrize("scalar_index", [False, True])
 def test_multiway_select_on_metal(metal_device, count, scalar_index):
+    """Compare multiway selection with the interpreter for scalar and per-element indices."""
     shape = (2, 4)
     cases = [np.arange(8, dtype=np.float32).reshape(shape) + i * 10 for i in range(count)]
     which = (
@@ -93,6 +98,9 @@ def test_multiway_select_on_metal(metal_device, count, scalar_index):
 
 
 def test_scalar_select_and_permuted_reshape_inside_scan(metal_device):
+    """Compare a loop composing scalar multiway selection and permuted reshape with the
+    interpreter."""
+
     def kernel(x, o):
         def body(i, carry):
             flat = jax.lax.reshape(carry, (6,), dimensions=(1, 0))
@@ -109,6 +117,8 @@ def test_scalar_select_and_permuted_reshape_inside_scan(metal_device):
 
 @pytest.mark.parametrize("dtype", [jnp.float16, jnp.bfloat16, jnp.int32, jnp.bool_])
 def test_select_case_dtypes(metal_device, dtype):
+    """Compare multiway selects with the interpreter for half, bfloat, integer, and boolean case
+    arrays."""
     which = np.asarray([0, 1, 2, 1], dtype=np.int32)
     cases = [
         np.asarray(values, dtype=dtype) for values in ([0, 1, 0, 1], [1, 0, 1, 0], [1, 1, 1, 1])
@@ -120,6 +130,7 @@ def test_select_case_dtypes(metal_device, dtype):
 @pytest.mark.parametrize("dtype", [np.int32, np.uint32])
 def test_select_out_of_range_uses_endpoints(metal_device, dtype):
     # This is palladium's policy; JAX leaves these indices implementation-defined.
+    """Check Palladium's endpoint policy for out-of-range signed and unsigned select indices."""
     limits = np.iinfo(dtype)
     which = np.asarray([limits.min, limits.max, 1], dtype=dtype)
     cases = [np.full((3,), i * 10, dtype=np.float32) for i in range(3)]

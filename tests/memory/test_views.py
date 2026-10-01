@@ -19,6 +19,8 @@ def copy_kernel(x, out):
     [((3,), (8,)), ((17,), (8,)), ((9, 13), (4, 8)), ((3, 5), (8, 8)), ((8, 12), (2, 3))],
 )
 def test_edge_and_strided_tiles(metal_device, shape, block):
+    """Compare doubled arrays with the interpreter across oversized, partial-edge, and strided
+    block layouts."""
     spec = pl.BlockSpec(block, lambda *ids: ids)
     call = palladium.metal_call(
         copy_kernel,
@@ -35,6 +37,8 @@ def test_edge_and_strided_tiles(metal_device, shape, block):
 
 @pytest.mark.parametrize("block", [(2, None, 3), (2, 7, None), (None, 3, 2)])
 def test_squeezed_axes(metal_device, block):
+    """Compare squeezed-axis blocks with the interpreter for several original axis positions and
+    edge tiles."""
     shape = (5, 7, 3)
     extents = tuple(1 if b is None else b for b in block)
     spec = pl.BlockSpec(block, lambda i, j, k: (i, j, k))
@@ -51,6 +55,9 @@ def test_squeezed_axes(metal_device, block):
 
 
 def test_column_read_write_snapshot(metal_device):
+    """Check that a saved column survives later output mutation and produces the expected column
+    swap."""
+
     def kernel(x, out):
         out[...] = x[...]
         saved = out[:, 1]
@@ -66,6 +73,8 @@ def test_column_read_write_snapshot(metal_device):
 
 
 def test_edge_indexed_writes_preserve_alias(metal_device):
+    """Check that indexed writes into aliased partial tiles update only the selected valid columns."""
+
     def kernel(x, out):
         value = x[:, 1]
         out[:, 1] = value + 10
@@ -87,6 +96,7 @@ def test_edge_indexed_writes_preserve_alias(metal_device):
 
 
 def test_edge_source_guards_memory_access():
+    """Check that partial-edge source guards input loads and output stores."""
     spec = pl.BlockSpec((8,), lambda i: (i,))
     source = palladium.debug_msl(
         copy_kernel,
@@ -102,6 +112,9 @@ def test_edge_source_guards_memory_access():
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, jnp.bfloat16, np.int32, np.uint32])
 def test_padding_matches_interpreter(metal_device, dtype):
+    """Compare out-of-array edge-lane padding with the interpreter across floating and integer
+    dtypes."""
+
     def kernel(x, out):
         out[0] = x[7]
 
@@ -120,6 +133,8 @@ def test_padding_matches_interpreter(metal_device, dtype):
 
 
 def test_strided_tile_read_and_write(metal_device):
+    """Compare positive-stride indexed tile updates with NumPy and the interpreter at array edges."""
+
     def kernel(x, out):
         out[...] = x[...]
         out[::2, 1::2] = x[::2, 1::2] + 10
@@ -141,6 +156,7 @@ def test_strided_tile_read_and_write(metal_device):
 
 
 def test_gridless_strided_block(metal_device):
+    """Compare a gridless column-block read with NumPy and the interpreter."""
     x = np.arange(20, dtype=np.float32).reshape(4, 5)
     call = palladium.metal_call(
         copy_kernel,

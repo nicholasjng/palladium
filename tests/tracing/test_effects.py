@@ -22,6 +22,8 @@ def _trace(kernel, in_shapes, out_shape):
 
 
 def test_debug_print_is_rejected_at_trace_time():
+    """Verify that a JAX debug-print effect inside a kernel is rejected during tracing."""
+
     def kernel(x_ref, o_ref):
         jax.debug.print("x0={}", x_ref[0])
         o_ref[...] = x_ref[...]
@@ -31,6 +33,8 @@ def test_debug_print_is_rejected_at_trace_time():
 
 
 def test_pallas_debug_print_is_rejected_at_trace_time():
+    """Verify that a Pallas debug-print effect inside a kernel is rejected during tracing."""
+
     def kernel(x_ref, o_ref):
         pl.debug_print("x0={}", x_ref[0])
         o_ref[...] = x_ref[...]
@@ -40,6 +44,8 @@ def test_pallas_debug_print_is_rejected_at_trace_time():
 
 
 def test_pure_state_effects_pass_the_gate():
+    """Check that ordinary Ref read/write effects pass the tracing effect gate."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2.0
 
@@ -48,7 +54,7 @@ def test_pure_state_effects_pass_the_gate():
 
 
 def test_effects_surface_through_control_flow():
-    """A read buried in a fori_loop body appears on the outer equation's effects without sub-jaxpr walking."""
+    """Check that reads nested in a loop appear in the enclosing equation's aggregate Ref effects."""
 
     def kernel(x_ref, o_ref):
         def body(i, acc):

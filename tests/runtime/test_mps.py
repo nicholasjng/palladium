@@ -21,6 +21,8 @@ def _add_kernel(x_ref, y_ref, o_ref):
 
 
 def test_descriptor_json_omits_a_default_threadgroup():
+    """Check deterministic descriptor JSON and omission of an automatically selected threadgroup
+    field."""
     descriptor = MpsDispatchDescriptor(
         version=2,
         header="#include <metal_stdlib>\nusing namespace metal;\n",
@@ -64,6 +66,8 @@ _DOT_SHAPES = (
 
 
 def test_descriptor_splits_an_independent_kernel_into_header_prologue_body():
+    """Check source splitting, MLX buffer/builtin bindings, and launch geometry for a primitive
+    kernel."""
     call = pl.pallas_call(_add_kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32))
     shape = jax.ShapeDtypeStruct((8,), jnp.float32)
     msl, descriptor = _descriptor_for(call, shape, shape)
@@ -85,8 +89,8 @@ def test_descriptor_splits_an_independent_kernel_into_header_prologue_body():
 
 
 def test_descriptor_binds_buffers_by_index_not_by_emitted_name():
-    """The attention lowering names its buffers query/key/value/output; the
-    handler only knows arg<N>_base."""
+    """Check descriptor bindings for named attention buffers using buffer indices rather than arg-
+    style names."""
     from flash_attention import attention_kernel, attention_specs
 
     grid, in_specs, out_specs = attention_specs(1, 128, 2, 16, 16)
@@ -112,6 +116,8 @@ def test_descriptor_binds_buffers_by_index_not_by_emitted_name():
 
 
 def test_descriptor_rejects_a_mismatched_cooperative_threadgroup():
+    """Verify that descriptor construction rejects an explicit group incompatible with cooperative
+    emission."""
     with pytest.raises(ValueError, match="cooperative kernel requires threadgroup"):
         _descriptor_for(_tiled_dot_call(), *_DOT_SHAPES, dot_general="tensorops", threadgroup=(64,))
 
@@ -127,7 +133,7 @@ def _mps_device():
 
 
 def test_plain_pallas_call_runs_through_palladium_on_mps_when_available():
-    """One Pallas dispatch can sit between ordinary MPS JAX operations."""
+    """Compare a Pallas dispatch surrounded by ordinary jitted MPS operations with NumPy."""
     device = _mps_device()
     call = pl.pallas_call(_add_kernel, out_shape=jax.ShapeDtypeStruct((16,), jnp.float32))
 
@@ -142,8 +148,7 @@ def test_plain_pallas_call_runs_through_palladium_on_mps_when_available():
 
 
 def test_cooperative_tensorops_matmul_runs_under_jit_on_mps_when_available():
-    """Descriptor v2 carries the MPP header, the threadgroup-position
-    prologue, and the scaled launch."""
+    """Compare a plain jitted cooperative Pallas matmul on MPS with NumPy."""
     device = _mps_device()
 
     def dot(a_ref, b_ref, o_ref):

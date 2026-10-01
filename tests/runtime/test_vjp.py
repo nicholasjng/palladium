@@ -37,6 +37,8 @@ def _interpreted(kernel, out_shape):
 
 
 def test_vjp_accepts_a_pallas_backward_kernel():
+    """Compare jitted reverse-mode gradients using an explicit Pallas backward kernel with analytic
+    gradients."""
     forward = _interpreted(_add_kernel, jax.ShapeDtypeStruct((8,), jnp.float32))
     backward = _interpreted(
         _add_vjp_kernel,
@@ -53,6 +55,8 @@ def test_vjp_accepts_a_pallas_backward_kernel():
 
 
 def test_vjp_saves_trailing_residual_outputs_for_the_backward_kernel():
+    """Check hidden residuals, backward gradients, and rejection of a residual count leaving no
+    public output."""
     forward = _interpreted(
         _add_with_residual_kernel,
         (jax.ShapeDtypeStruct((8,), jnp.float32), jax.ShapeDtypeStruct((8,), jnp.float32)),

@@ -30,6 +30,8 @@ def _run_and_compare(kernel, out_shape, *arrays, tol=1e-5):
 
 
 def test_stacked_ys_without_xs(rng):
+    """Compare a scan producing stacked outputs without scanned inputs with the interpreter."""
+
     def kernel(y0_ref, o_ref):
         def step(y, _):
             y = y * 1.5 + 1.0
@@ -43,7 +45,8 @@ def test_stacked_ys_without_xs(rng):
 
 
 def test_dense_output_scan_streams_to_the_ref(rng):
-    """Stacked ys stream straight to the output ref, with no thread-local trajectory array or final copy loop."""
+    """Check direct streaming of stacked scan outputs without a local trajectory array, plus oracle
+    agreement."""
 
     def kernel(y0_ref, ts_ref, o_ref):
         def step(y, t):
@@ -62,7 +65,8 @@ def test_dense_output_scan_streams_to_the_ref(rng):
 
 
 def test_dense_output_survives_the_stack_ceiling(rng):
-    """A trajectory too large for the per-thread stack lowers and runs through the streaming path."""
+    """Check that a large trajectory runs through output streaming without exceeding per-thread
+    storage."""
     n_save, dim = 4096, 8
 
     def kernel(y0_ref, o_ref):
@@ -83,6 +87,8 @@ def test_dense_output_survives_the_stack_ceiling(rng):
 
 
 def test_ys_with_other_consumers_falls_back_to_thread_local(rng):
+    """Check that scan outputs transformed before storing retain local storage and match the oracle."""
+
     def kernel(y0_ref, o_ref):
         def step(y, _):
             y = y * 1.1
@@ -98,6 +104,8 @@ def test_ys_with_other_consumers_falls_back_to_thread_local(rng):
 
 
 def test_multiple_stacked_ys(rng):
+    """Compare scans returning multiple stacked output arrays with the interpreter."""
+
     def kernel(ts_ref, sums_ref, prods_ref):
         def step(c, t):
             s, p = c
@@ -113,6 +121,8 @@ def test_multiple_stacked_ys(rng):
 
 
 def test_reverse_scan_with_xs_and_ys(rng):
+    """Compare reverse scanning of xs and correctly ordered stacked ys with the interpreter."""
+
     def kernel(ts_ref, o_ref):
         def step(acc, t):
             acc = acc * 0.5 + t
@@ -126,6 +136,8 @@ def test_reverse_scan_with_xs_and_ys(rng):
 
 
 def test_matrix_valued_xs_slices(rng):
+    """Compare scans consuming matrix-valued slices of stacked xs with the interpreter."""
+
     def kernel(ms_ref, v_ref, o_ref):
         def step(v, m):
             return jnp.dot(m, v), None
@@ -139,7 +151,8 @@ def test_matrix_valued_xs_slices(rng):
 
 
 def test_aliased_output_is_not_a_streaming_target(rng):
-    """An aliased output shares its buffer with the input ref, so the ys take the thread-local path and stay correct."""
+    """Check that aliased outputs disable scan streaming and preserve interpreter snapshot
+    semantics."""
 
     def kernel(x_ref, o_ref):
         def step(acc, x):
@@ -159,7 +172,7 @@ def test_aliased_output_is_not_a_streaming_target(rng):
 
 
 def test_grid_blocked_dense_output(rng):
-    """One trajectory per program instance streams its ys into that instance's output block."""
+    """Compare per-program trajectory streaming into blocked output slices with the interpreter."""
     import jax.experimental.pallas as pl
 
     n_traj, n_save = 8, 16
@@ -190,6 +203,8 @@ def test_grid_blocked_dense_output(rng):
 
 
 def test_full_block_xs_reads_the_ref_without_a_stack_copy(rng):
+    """Check that full-block scan xs use direct device reads without a local copy, plus oracle
+    agreement."""
     n_ts = 16384  # 64KB as f32: alone past the per-thread stack
 
     def kernel(ts_ref, o_ref):
@@ -209,6 +224,8 @@ def test_full_block_xs_reads_the_ref_without_a_stack_copy(rng):
 
 
 def test_scan_const_blocks_keep_their_thread_local_copy(rng):
+    """Check that invariant scan blocks retain local snapshots and match the interpreter."""
+
     def kernel(w_ref, ts_ref, o_ref):
         w = w_ref[...]  # const inside the body: copied
 
@@ -227,7 +244,7 @@ def test_scan_const_blocks_keep_their_thread_local_copy(rng):
 
 
 def test_block_used_as_both_xs_and_const_still_copies(rng):
-    """One value feeding the same scan as both xs and const disqualifies the alias."""
+    """Check that a block used as both xs and a scan constant retains its local snapshot."""
 
     def kernel(ts_ref, o_ref):
         ts = ts_ref[...]

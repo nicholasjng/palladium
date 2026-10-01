@@ -13,6 +13,8 @@ import palladium
 
 
 def test_program_id_lands_in_the_right_block():
+    """Check that each program writes its identifier into the block selected by its BlockSpec."""
+
     def kernel(o_ref):
         pid = pl.program_id(0)
         o_ref[...] = jnp.zeros((4,), jnp.float32) + pid
@@ -28,7 +30,7 @@ def test_program_id_lands_in_the_right_block():
 
 
 def test_row_blocks_2d(rng):
-    """Blocks are rows of a 2D array: (1, 128) of (64, 128), contiguous."""
+    """Compare contiguous row-block addressing in a two-dimensional array with NumPy."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] + 1.0
@@ -45,7 +47,7 @@ def test_row_blocks_2d(rng):
 
 
 def test_2d_grid_with_index_map_arithmetic(rng):
-    """A 2D grid mapped onto rows via `i * 16 + j` lowers the index map's arithmetic through the ELEMENTWISE table."""
+    """Compare a two-axis grid flattened by index-map arithmetic with the interpreter."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 3.0

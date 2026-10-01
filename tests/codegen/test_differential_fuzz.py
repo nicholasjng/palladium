@@ -162,6 +162,7 @@ def make_elementwise_kernel(tree, n_inputs):
 @settings(max_examples=MAX_EXAMPLES, deadline=None)
 @given(elementwise_cases())
 def test_fuzz_elementwise(case):
+    """Compare generated expression trees with the interpreter for gridless and blocked kernels."""
     n_inputs, tree, blocked, args = case
     kwargs: dict = {"out_shape": jax.ShapeDtypeStruct((N,), jnp.float32)}
     if blocked:
@@ -227,6 +228,7 @@ def make_loop_kernel(n_carry, n_consts, length, plans):
 @settings(max_examples=MAX_EXAMPLES, deadline=None)
 @given(loop_cases())
 def test_fuzz_loops(case):
+    """Compare generated loops, including carry permutations and constants, with the interpreter."""
     n_carry, n_consts, length, plans, args = case
     out_shape = tuple(jax.ShapeDtypeStruct((N,), jnp.float32) for _ in range(n_carry))
     f = palladium.metal_call(
@@ -322,6 +324,7 @@ def make_scan_kernel(
 @settings(max_examples=MAX_EXAMPLES, deadline=None)
 @given(scan_cases())
 def test_fuzz_scan_xs_ys(case):
+    """Compare generated forward/reverse scans with the interpreter across xs and ys storage paths."""
     (
         n_carry,
         n_consts,
@@ -385,7 +388,8 @@ def make_switch_kernel(branches, n_inputs):
 @settings(max_examples=MAX_EXAMPLES, deadline=None)
 @given(switch_cases())
 def test_fuzz_cond(case):
-    """lax.switch with per-instance branch selection and clamped index semantics matches the oracle."""
+    """Compare generated switches with the interpreter for per-program branches and clamped
+    indices."""
     n_inputs, branches, blocked, args = case
     kwargs: dict = {"out_shape": jax.ShapeDtypeStruct((N,), jnp.float32)}
     if blocked:
@@ -456,6 +460,8 @@ def make_while_kernel(n_carry, n_consts, plans):
 @settings(max_examples=MAX_EXAMPLES, deadline=None)
 @given(while_cases())
 def test_fuzz_while(case):
+    """Compare generated while loops with the interpreter for varying trip counts and tuple
+    carries."""
     n_carry, n_consts, plans, blocked, args = case
     block = 8
     out_shape = tuple(jax.ShapeDtypeStruct((N,), jnp.float32) for _ in range(n_carry))

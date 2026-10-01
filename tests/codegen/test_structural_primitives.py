@@ -17,6 +17,9 @@ def _check(kernel, args, out_shape, rtol=1e-5, atol=1e-6):
 
 
 def test_iota_and_arange(rng):
+    """Compare broadcast row/column iotas combined with floating arithmetic against the
+    interpreter."""
+
     def kernel(x_ref, o_ref):
         rows = jax.lax.broadcasted_iota(jnp.int32, (4, 8), 0)
         cols = jax.lax.broadcasted_iota(jnp.int32, (4, 8), 1)
@@ -29,6 +32,8 @@ def test_iota_and_arange(rng):
 @pytest.mark.parametrize("axis", [0, 1])
 @pytest.mark.parametrize("reverse", [False, True])
 def test_cumsum_along_either_axis(rng, axis, reverse):
+    """Compare forward and reverse cumulative sums along both matrix axes with the interpreter."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = jax.lax.cumsum(x_ref[...], axis=axis, reverse=reverse)
 
@@ -37,6 +42,9 @@ def test_cumsum_along_either_axis(rng, axis, reverse):
 
 
 def test_cumprod_cummax_cummin(rng):
+    """Compare composed cumulative products, maxima, and minima along different axes with the
+    interpreter."""
+
     def kernel(x_ref, o_ref):
         x = x_ref[...]
         o_ref[...] = jnp.cumprod(x, axis=1) + jax.lax.cummax(x, axis=1) - jax.lax.cummin(x, axis=0)
@@ -46,6 +54,8 @@ def test_cumprod_cummax_cummin(rng):
 
 
 def test_concatenate_along_both_dimensions(rng):
+    """Compare chained column and row concatenation with the interpreter."""
+
     def kernel(x_ref, y_ref, o_ref):
         x, y = x_ref[...], y_ref[...]
         top = jnp.concatenate([x, y], axis=1)  # (3, 8)
@@ -57,6 +67,8 @@ def test_concatenate_along_both_dimensions(rng):
 
 
 def test_dynamic_slice_clamps_like_jax(rng):
+    """Compare dynamic slices with the interpreter for ordinary and oversized start indices."""
+
     def kernel(x_ref, i_ref, o_ref):
         i = i_ref[0]
         o_ref[...] = jax.lax.dynamic_slice(x_ref[...], (i, i * 2), (2, 3))
@@ -71,8 +83,8 @@ def test_dynamic_slice_clamps_like_jax(rng):
 
 
 def test_systematic_resampling_building_blocks(rng):
-    """The particle-filter idiom: normalized weights, cumulative sum,
-    and a stratified threshold comparison."""
+    """Compare normalization, cumulative weights, broadcast thresholds, and integer counts with the
+    interpreter."""
 
     def kernel(w_ref, u_ref, o_ref):
         w = w_ref[...]

@@ -77,7 +77,13 @@ def _angular_momentum(qx, qy, px, py):
 
 
 def test_conserves_angular_momentum():
-    """L is exact for a central force under Verlet, so the budget is round-off over 20k float32 steps (eps*sqrt(steps) ~ 1e-5) plus FAST-math reassociation; 1e-4 is still four orders below any structural bug."""
+    """Check bounded angular-momentum drift after a long float32 Verlet integration of central-
+    force orbits."""
+
+    # L is exact for a central force under Verlet, so the budget is round-off over 20k
+    # float32 steps (eps*sqrt(steps) ~ 1e-5) plus FAST-math reassociation; 1e-4 is still
+    # four orders below any structural bug.
+
     n = 256
     f = make_solver(n)
     *args, e = _ensemble(n)
@@ -86,11 +92,14 @@ def test_conserves_angular_momentum():
 
 
 def test_energy_error_stays_inside_the_step_size_bound():
-    """The energy error is set by h, not by the horizon.
+    """Check that long-horizon Verlet energy error remains within the configured step-size-
+    dependent bound."""
 
-    At h=0.002 the modified-Hamiltonian bound for these orbits is ~1e-6;
-    5e-5 leaves room for the float32 round-off walk over 20k steps.
-    """
+    # The energy error is set by h, not by the horizon.
+
+    # At h=0.002 the modified-Hamiltonian bound for these orbits is ~1e-6; 5e-5 leaves room
+    # for the float32 round-off walk over 20k steps.
+
     n = 256
     f = make_solver(n)
     *args, _ = _ensemble(n)
@@ -100,7 +109,8 @@ def test_energy_error_stays_inside_the_step_size_bound():
 
 
 def test_energy_bound_tracks_step_size_not_horizon():
-    """Doubling the horizon at fixed h does not double the energy error; round-off contributes at most sqrt(2)."""
+    """Check that doubling the integration horizon keeps energy error below three times its initial
+    horizon's error."""
     n = 256
     *args, _ = _ensemble(n)
     start = _energy(*args)
@@ -111,7 +121,8 @@ def test_energy_bound_tracks_step_size_not_horizon():
 
 @pytest.mark.parametrize("steps", [1, 2, 64])
 def test_short_horizons_match_a_numpy_reference(steps):
-    """Agreement before round-off accumulates catches an off-by-one in the loop or a mis-sequenced kick."""
+    """Compare short Verlet integrations with a NumPy reference to catch loop-count and kick-order
+    errors."""
     n = 64
     *args, _ = _ensemble(n)
     q = np.stack(args[:2]).astype(np.float64)

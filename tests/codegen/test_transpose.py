@@ -12,6 +12,8 @@ import palladium
 
 
 def test_transpose_matches_numpy(rng):
+    """Compare a materialized matrix transpose with NumPy."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...].T
 
@@ -22,7 +24,7 @@ def test_transpose_matches_numpy(rng):
 
 
 def test_lhs_transposed_matmul_matches_numpy(rng):
-    """dL/dW = x.T @ dy, the backward-pass shape for a dense layer's weight gradient."""
+    """Compare a transposed-left matrix product with NumPy for a dense-layer weight-gradient shape."""
 
     def kernel(x_ref, dy_ref, o_ref):
         o_ref[...] = jnp.dot(x_ref[...].T, dy_ref[...])
@@ -35,7 +37,7 @@ def test_lhs_transposed_matmul_matches_numpy(rng):
 
 
 def test_rhs_transposed_matmul_matches_numpy(rng):
-    """dL/dx = dy @ W.T, the backward-pass shape for a dense layer's input gradient."""
+    """Compare a transposed-right matrix product with NumPy for a dense-layer input-gradient shape."""
 
     def kernel(dy_ref, w_ref, o_ref):
         o_ref[...] = jnp.dot(dy_ref[...], w_ref[...].T)

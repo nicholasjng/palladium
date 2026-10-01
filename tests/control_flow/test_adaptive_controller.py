@@ -160,6 +160,8 @@ def _inputs(rng, n: int, stiff_fraction: float = 0.0):
 
 
 def test_matches_interpret_oracle(rng):
+    """Compare adaptive Van der Pol states, final times, and accepted/rejected step counts with the
+    interpreter."""
     n = 256
     f = make_solver(n)
     args = _inputs(rng, n)
@@ -176,7 +178,8 @@ def test_matches_interpret_oracle(rng):
 
 
 def test_reaches_t1(rng):
-    """Every thread's clock lands on T1 within the MAX_STEPS budget, stiff members included."""
+    """Check that every adaptive trajectory, including stiff members, reaches T1 within the step
+    budget."""
     n = 256
     f = make_solver(n)
     got_t, *_ = f(*_inputs(rng, n, stiff_fraction=0.02))
@@ -184,7 +187,7 @@ def test_reaches_t1(rng):
 
 
 def test_matches_diffrax(rng):
-    """Final states agree with per-trajectory Diffrax Bosh3 at matched tolerances."""
+    """Compare adaptive Van der Pol final states with independent Diffrax Bosh3 solves."""
     diffrax = pytest.importorskip("diffrax")
     n = 64
     f = make_solver(n)

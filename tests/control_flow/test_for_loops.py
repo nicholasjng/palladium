@@ -8,7 +8,8 @@ import palladium
 
 
 def test_euler_logistic(rng):
-    """100 explicit Euler steps of dy/dt = r*y(1 - y) in-kernel, with r read before the loop so it becomes a scan const."""
+    """Compare 100 in-kernel Euler steps with the interpreter when the growth rate is a loop
+    constant."""
     dt, steps = 0.01, 100
 
     def kernel(y0_ref, r_ref, o_ref):
@@ -30,6 +31,8 @@ def test_euler_logistic(rng):
 
 
 def test_tuple_carry(rng):
+    """Compare a loop updating multiple carried values with the interpreter."""
+
     def kernel(x_ref, o1_ref, o2_ref):
         def step(_, carry):
             a, b = carry
@@ -54,6 +57,8 @@ def test_tuple_carry(rng):
 
 
 def test_nested_loops(rng):
+    """Compare nested in-kernel loops with the interpreter."""
+
     def kernel(y_ref, o_ref):
         def outer(_, y):
             def inner(_, z):
@@ -69,7 +74,8 @@ def test_nested_loops(rng):
 
 
 def test_carry_permutation(rng):
-    """A body that returns its carries reordered updates all carries simultaneously rather than clobbering through a sequential copy-back."""
+    """Check simultaneous carry permutation against the interpreter to catch sequential copy-back
+    corruption."""
 
     def kernel(x_ref, y_ref, xo_ref, yo_ref):
         def step(_, c):
@@ -96,11 +102,15 @@ def test_carry_permutation(rng):
 
 
 def test_carry_permutation_beside_computed_carry():
-    """A carry swap beside a computed third carry miscompiles on the Metal shader compiler when the loop body holds three or more thread-local array temporaries: the optimizer forwards a permuted carry's read across the write it must precede.
+    """Check a carry swap beside a computed carry against the interpreter, covering Metal optimizer
+    aliasing."""
 
-    Volatile reads/writes at the hazard endpoints, which `_copy_back_carries`
-    emits for permuted carries, avoid the miscompile.
-    """
+    # A carry swap beside a computed third carry miscompiles on the Metal shader compiler
+    # when the loop body holds three or more thread-local array temporaries: the optimizer
+    # forwards a permuted carry's read across the write it must precede.
+
+    # Volatile reads/writes at the hazard endpoints, which `_copy_back_carries` emits for
+    # permuted carries, avoid the miscompile.
 
     def kernel(a_ref, b_ref, c_ref, ao_ref, bo_ref, co_ref):
         def step(_, c):
@@ -127,7 +137,8 @@ def test_carry_permutation_beside_computed_carry():
 
 
 def test_carry_read_and_alias_conflict(rng):
-    """c0 is both a computation's input and one half of a swap with c2, the same Metal compiler hazard as test_carry_permutation_beside_computed_carry."""
+    """Compare a loop that both reads and swaps a carry with the interpreter to detect clobbered
+    reads."""
 
     def kernel(x0_ref, x1_ref, x2_ref, o0_ref, o1_ref, o2_ref):
         def step(_, carry):

@@ -36,7 +36,8 @@ def _reused_call(n):
 
 
 def test_explain_reports_per_thread_stack():
-    """The per-thread stack has no published ceiling, so explain reports the estimate before compiling."""
+    """Check that explain reports nonzero per-thread storage and includes it in the formatted
+    report."""
     d = _reused_call(64).explain(jax.ShapeDtypeStruct((64,), jnp.float32))
     # 64 f32 elements per live array, several arrays.
     assert d.thread_bytes >= 64 * 4
@@ -45,12 +46,15 @@ def test_explain_reports_per_thread_stack():
 
 
 def test_stack_estimate_scales_with_block_size():
+    """Check that declared thread-storage estimates increase with the kernel block size."""
     small = _reused_call(64).explain(jax.ShapeDtypeStruct((64,), jnp.float32))
     big = _reused_call(512).explain(jax.ShapeDtypeStruct((512,), jnp.float32))
     assert big.thread_bytes == small.thread_bytes * 8
 
 
 def test_threadgroup_over_device_thread_limit_is_rejected():
+    """Verify that an explicit group exceeding the device thread limit is rejected before
+    compilation."""
     limit = device_limits()["max_threads_per_threadgroup"]
     f = _tanh_call(compiler_params=palladium.CompilerParams(threadgroup=limit * 2))
     with pytest.raises(EmitError, match="max_threads_per_threadgroup"):
@@ -61,7 +65,8 @@ def test_threadgroup_over_device_thread_limit_is_rejected():
 
 
 def test_unsupported_primitive_names_the_primitive_as_a_field():
-    """The primitive name is a field a caller can branch on instead of matching message text."""
+    """Check that a missing primitive raises UnsupportedPrimitiveError with a machine-readable
+    primitive name."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.sort(x_ref[...])
@@ -89,8 +94,8 @@ def _key(n):
 
 
 def test_cache_is_bounded(rng, monkeypatch):
-    """Under JAX's trace caching a hit need not re-enter Python, so the
-    bound is on entries, not on recency."""
+    """Check that shape-specialization caching evicts the oldest entry when its configured capacity
+    is exceeded."""
     monkeypatch.setattr(palladium.ffi, "_CACHE_SIZE", 2)
     # out_shape is fixed while the input length is free, so every n is a new key.
     f = palladium.metal_call(_sum_kernel, out_shape=jax.ShapeDtypeStruct((1,), jnp.float32))

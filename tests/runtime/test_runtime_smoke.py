@@ -20,6 +20,8 @@ kernel void saxpy(
 
 
 def test_handwritten_saxpy(rng):
+    """Compile and dispatch handwritten Metal SAXPY to check the runtime independently of Pallas
+    emission."""
     n = 4096
     x = rng.standard_normal(n, dtype=np.float32)
     y = rng.standard_normal(n, dtype=np.float32)

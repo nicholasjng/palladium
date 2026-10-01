@@ -23,6 +23,7 @@ def _classic_call():
 
 
 def test_explain_reports_geometry():
+    """Check default grid, automatic threadgroup, kernel name, and source-size diagnostics."""
     diag = _classic_call().explain(_shaped(8, 8), _shaped(8, 8))
     assert diag.grid == (1, 1, 1)
     assert diag.threadgroup is None
@@ -31,6 +32,8 @@ def test_explain_reports_geometry():
 
 
 def test_explain_explicit_threadgroup():
+    """Check that an integer threadgroup option is padded to three dimensions in diagnostics."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2.0
 
@@ -43,6 +46,8 @@ def test_explain_explicit_threadgroup():
 
 
 def test_explain_ffi_matches_metal_call():
+    """Check that explaining an FFI matrix-product call reports the gridless Metal launch."""
+
     def kernel(q_ref, k_ref, o_ref):
         o_ref[...] = jnp.dot(q_ref[...], k_ref[...] * 2.0)
 
@@ -51,6 +56,7 @@ def test_explain_ffi_matches_metal_call():
 
 
 def test_explain_env_logs_once_per_compile(monkeypatch, capsys, rng):
+    """Check that PALLADIUM_EXPLAIN logs once for a specialization and stays silent on a cache hit."""
     monkeypatch.setenv("PALLADIUM_EXPLAIN", "1")
     call = _classic_call()
     x = rng.standard_normal((8, 8), dtype=np.float32)
@@ -61,6 +67,8 @@ def test_explain_env_logs_once_per_compile(monkeypatch, capsys, rng):
 
 
 def test_all_errors_are_palladium_errors():
+    """Check stage-specific exception inheritance, including ValueError, TypeError, and
+    NotImplementedError."""
     for exc in (TraceError, EmitError, UnsupportedPrimitiveError, DispatchError):
         assert issubclass(exc, palladium.PalladiumError)
     assert issubclass(TraceError, ValueError)
@@ -70,6 +78,7 @@ def test_all_errors_are_palladium_errors():
 
 
 def test_multiple_pallas_calls_rejected():
+    """Verify that tracing a wrapper containing two Pallas calls rejects the ambiguous kernel."""
     from jax.experimental import pallas as pl
 
     def kernel(x_ref, o_ref):

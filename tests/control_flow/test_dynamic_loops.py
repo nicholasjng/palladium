@@ -8,6 +8,9 @@ import palladium
 
 
 def test_bare_dynamic_fori_loop():
+    """Check dynamic loop bounds, empty/reversed ranges, and signed floor/modulo arithmetic against
+    Python."""
+
     def kernel(bounds, output):
         # Dynamic lower/upper bounds, an empty loop, and signed floor/modulo.
         lo, hi = bounds[0], bounds[1]

@@ -26,6 +26,9 @@ def _trace(kernel, grid, in_shape, out_shape, **kwargs):
 def test_full_block_write_ignoring_the_grid_axis_is_rejected():
     # Default out spec: whole array, constant index map. Every one of the
     # 4 instances writes all 8 elements: a guaranteed race.
+    """Verify that identical full-block writes from multiple programs are rejected as a parallel
+    race."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2.0
 
@@ -34,6 +37,8 @@ def test_full_block_write_ignoring_the_grid_axis_is_rejected():
 
 
 def test_write_indexed_by_program_id_passes():
+    """Check that direct program-id-indexed output writes pass parallel-write validation."""
+
     def kernel(x_ref, o_ref):
         i = pl.program_id(0)
         o_ref[i] = x_ref[i] * 2.0
@@ -43,6 +48,8 @@ def test_write_indexed_by_program_id_passes():
 
 
 def test_write_indexed_through_arithmetic_on_program_id_passes():
+    """Check that write-index dependence through program-id arithmetic passes validation."""
+
     def kernel(x_ref, o_ref):
         i = pl.program_id(0) * 2
         o_ref[i] = x_ref[i]
@@ -53,6 +60,8 @@ def test_write_indexed_through_arithmetic_on_program_id_passes():
 
 
 def test_blocked_output_index_map_passes():
+    """Check that a BlockSpec using the grid axis permits otherwise identical full-block writes."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2.0
 
@@ -68,6 +77,8 @@ def test_blocked_output_index_map_passes():
 
 
 def test_second_grid_axis_ignored_by_map_and_writes_is_rejected():
+    """Verify that ignoring one nonunit grid axis in both layout and writes is rejected."""
+
     def kernel(x_ref, o_ref):
         i = pl.program_id(0)
         o_ref[i] = x_ref[i] * 2.0  # never varies along axis 1
@@ -77,6 +88,8 @@ def test_second_grid_axis_ignored_by_map_and_writes_is_rejected():
 
 
 def test_write_in_control_flow_indexed_by_a_program_id_operand_passes():
+    """Check that a conditional write depending on an outer program-id operand passes validation."""
+
     def kernel(x_ref, o_ref):
         i = pl.program_id(0)
 
@@ -91,6 +104,8 @@ def test_write_in_control_flow_indexed_by_a_program_id_operand_passes():
 
 
 def test_write_in_a_loop_calling_program_id_passes():
+    """Check that a loop body's own program_id call establishes write dependence on the grid axis."""
+
     def kernel(x_ref, o_ref):
         def body(_, carry):
             i = pl.program_id(0)
@@ -104,6 +119,9 @@ def test_write_in_a_loop_calling_program_id_passes():
 
 
 def test_write_in_a_loop_ignoring_the_grid_axis_is_rejected():
+    """Verify that looping over output indices without using the program grid is rejected as a
+    write race."""
+
     def kernel(x_ref, o_ref):
         def body(k, carry):
             o_ref[k] = x_ref[k] + carry
@@ -116,6 +134,8 @@ def test_write_in_a_loop_ignoring_the_grid_axis_is_rejected():
 
 
 def test_unit_extent_axes_are_exempt():
+    """Check that a single-program axis permits full-block writes without program-id dependence."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2.0
 

@@ -23,6 +23,8 @@ def _run_and_compare(kernel, out_shape, *arrays, tol=1e-5):
 
 
 def test_batched_dot_general_rejected():
+    """Verify that primitive dot lowering rejects dot_general batch dimensions."""
+
     def kernel(a_ref, b_ref, o_ref):
         o_ref[...] = jnp.einsum("bij,bjk->bik", a_ref[...], b_ref[...])
 
@@ -31,6 +33,8 @@ def test_batched_dot_general_rejected():
 
 
 def test_rank1_matvec(rng):
+    """Compare a matrix-vector product with the Pallas interpreter."""
+
     def kernel(m_ref, v_ref, o_ref):
         o_ref[...] = jnp.dot(m_ref[...], v_ref[...])
 
@@ -40,6 +44,8 @@ def test_rank1_matvec(rng):
 
 
 def test_rank1_vecmat(rng):
+    """Compare a vector-matrix product with the Pallas interpreter."""
+
     def kernel(v_ref, m_ref, o_ref):
         o_ref[...] = jnp.dot(v_ref[...], m_ref[...])
 
@@ -49,6 +55,8 @@ def test_rank1_vecmat(rng):
 
 
 def test_rank1_vecvec(rng):
+    """Compare a vector inner product with the interpreter, including its scalar output."""
+
     def kernel(a_ref, b_ref, o_ref):
         o_ref[...] = jnp.dot(a_ref[...], b_ref[...])
 
@@ -62,6 +70,9 @@ def test_preferred_element_type_accumulates_in_f32():
     # is exact in f32 but rounds to 1 + 2^-9 in f16, so a kernel that
     # multiplies in half before accumulating is off by k * 2^-20 = 2^-16,
     # past the 2^-17 tolerance below. Catches a dropped promote cast.
+    """Verify that half inputs are promoted before multiplication when float32 accumulation is
+    requested."""
+
     def kernel(a_ref, b_ref, o_ref):
         o_ref[...] = jax.lax.dot_general(
             a_ref[...],
@@ -80,6 +91,8 @@ def test_preferred_element_type_accumulates_in_f32():
 
 
 def test_preferred_element_type_f16_to_f32(rng):
+    """Check the float32 result dtype and NumPy agreement for a promoted half-precision product."""
+
     def kernel(a_ref, b_ref, o_ref):
         o_ref[...] = jax.lax.dot_general(
             a_ref[...],
@@ -104,6 +117,7 @@ def _matmul_kernel(a_ref, b_ref, o_ref):
 
 
 def test_rectangular_matmul_matches_interpret(rng):
+    """Compare a rectangular matrix product with both the interpreter and NumPy."""
     a = rng.standard_normal((4, 6), dtype=np.float32)
     b = rng.standard_normal((6, 10), dtype=np.float32)
     f = palladium.metal_call(_matmul_kernel, out_shape=_shaped(4, 10))
@@ -114,7 +128,7 @@ def test_rectangular_matmul_matches_interpret(rng):
 
 
 def test_non_square_inner_dim_matches_numpy(rng):
-    """Inner dim 1, a degenerate but legal matmul (outer product shape)."""
+    """Check that a matrix product with contraction size one matches NumPy's outer-product result."""
     a = rng.standard_normal((5, 1), dtype=np.float32)
     b = rng.standard_normal((1, 3), dtype=np.float32)
     f = palladium.metal_call(_matmul_kernel, out_shape=_shaped(5, 3))
@@ -123,7 +137,7 @@ def test_non_square_inner_dim_matches_numpy(rng):
 
 
 def test_non_standard_contraction_is_rejected():
-    """Contracting lhs dim 0 (a transposed-lhs matmul) is rejected as a non-standard contraction."""
+    """Verify that contracting the lhs leading axis raises an unsupported-contraction error."""
 
     def kernel(a_ref, b_ref, o_ref):
         o_ref[...] = jax.lax.dot_general(a_ref[...], b_ref[...], (((0,), (0,)), ((), ())))

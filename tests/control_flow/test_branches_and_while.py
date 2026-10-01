@@ -28,6 +28,8 @@ def _per_row(kernel, n_rows, *arrays, n_in):
 
 
 def test_cond_two_branches_diverge_per_thread(rng):
+    """Compare per-program conditionals with the interpreter and verify that both branches run."""
+
     def kernel(x_ref, o_ref):
         x = x_ref[0, 0]
         o_ref[0, 0] = jax.lax.cond(x > 0.0, lambda v: v * 2.0, lambda v: v - 1.0, x)
@@ -39,6 +41,8 @@ def test_cond_two_branches_diverge_per_thread(rng):
 
 
 def test_switch_three_branches_and_index_clamping(rng):
+    """Check per-program three-way switches and low/high index clamping against the interpreter."""
+
     def kernel(x_ref, i_ref, o_ref):
         o_ref[0, 0] = jax.lax.switch(
             i_ref[0, 0],
@@ -66,6 +70,9 @@ def test_switch_three_branches_and_index_clamping(rng):
 
 
 def test_while_loop_trip_count_diverges_per_thread(rng):
+    """Compare while loops whose programs take different numbers of iterations with the
+    interpreter."""
+
     def kernel(x_ref, o_ref):
         def cond(carry):
             y, _ = carry
@@ -85,8 +92,7 @@ def test_while_loop_trip_count_diverges_per_thread(rng):
 
 
 def test_while_swapped_carries_need_the_snapshot(rng):
-    """Body rotates its carries; without the two-phase copy-back one
-    would clobber the other."""
+    """Check simultaneous carry rotation in a while loop to detect sequential copy-back corruption."""
 
     def kernel(a_ref, o_ref):
         def cond(carry):
@@ -107,6 +113,8 @@ def test_while_swapped_carries_need_the_snapshot(rng):
 
 
 def test_logical_and_xor_not(rng):
+    """Compare composed boolean AND, XOR, and NOT operations with the interpreter."""
+
     def kernel(x_ref, o_ref):
         x = x_ref[...]
         p = x > 0.0

@@ -61,13 +61,15 @@ def _source(kind):
 
 
 def test_fractional_bfloat_literal():
+    """Verify that a fractional bfloat literal receives an explicit bfloat constructor in emitted
+    MSL."""
     assert " + bfloat(0.5f);" in _source("bfloat_literal")
 
 
 @pytest.mark.parametrize("kind", ["scalar_to_array", "array_to_scalar"])
 def test_reshape_between_scalar_and_one_element_array_stays_in_registers(kind):
-    """Rank-0 values and one-element arrays are both plain scalar variables;
-    neither side of the reshape may index the other."""
+    """Verify that scalar/one-element reshapes never subscript scalar-backed storage or declare
+    length-one arrays."""
     source = _source(kind)
     scalars = re.findall(r"^    float (t\d+);$", source, re.MULTILINE)
     assert scalars
@@ -77,6 +79,7 @@ def test_reshape_between_scalar_and_one_element_array_stays_in_registers(kind):
 
 
 def test_swap_snapshots_before_store_and_later_mutation():
+    """Check that swap copies the old scratch value before mutation and returns that snapshot."""
     source = _source("swap")
     snapshot = re.search(r"(t\d+)\[_i\d+\] = scratch0\[_i\d+\];", source)
     assert snapshot is not None
@@ -92,6 +95,8 @@ def test_swap_snapshots_before_store_and_later_mutation():
     ["bfloat_literal", "scalar_to_array", "array_to_scalar", "zero_power", "swap"],
 )
 def test_regressions_against_interpret(kind):
+    """Compare literal, scalar-reshape, zero-power, and scratch-swap regressions with the
+    interpreter."""
     try:
         mr.device_name()
     except mr.DeviceError as exc:
@@ -111,6 +116,9 @@ def test_regressions_against_interpret(kind):
 def test_a_jitted_helper_fuses_on_every_call():
     # jit bodies are cached and shared by every call, Vars included, so the
     # second walk once saw the first walk's consumers and fused nothing.
+    """Check that reusing a cached JIT body preserves fusion without duplicating its intermediate
+    arrays."""
+
     @jax.jit
     def act(v):
         return jnp.tanh(v * 2.0 + 1.0) * 3.0 - v
@@ -127,6 +135,8 @@ def test_a_jitted_helper_fuses_on_every_call():
 
 
 def test_scalar_fill_of_where_is_not_materialized():
+    """Verify that a scalar where fallback emits no materialized broadcast loop."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.where(x_ref[...] > 0.0, x_ref[...], 0.0)
 
@@ -137,6 +147,9 @@ def test_scalar_fill_of_where_is_not_materialized():
 
 
 def test_sum_of_squares_needs_no_block_array():
+    """Verify that a large sum-of-squares kernel fuses its load and product without a block-sized
+    temporary."""
+
     def kernel(x_ref, o_ref):
         o_ref[0] = jnp.sum(x_ref[...] * x_ref[...])
 
@@ -151,6 +164,9 @@ def test_sum_of_squares_needs_no_block_array():
 def test_where_at_the_end_computes_into_the_output():
     # jnp.where's select sits in an inlined jit body; its result is still
     # stored straight to the output ref once the block is large.
+    """Verify that a large terminal where writes directly to the output without a block-sized
+    temporary."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.where(x_ref[...] > 0.0, x_ref[...], 0.0)
 
@@ -160,6 +176,8 @@ def test_where_at_the_end_computes_into_the_output():
 
 
 def test_iota_mask_needs_no_index_array():
+    """Verify that row/column iotas used by a mask remain expressions instead of integer arrays."""
+
     def kernel(x_ref, o_ref):
         row = jax.lax.broadcasted_iota(jnp.int32, (8, 16), 0)
         col = jax.lax.broadcasted_iota(jnp.int32, (8, 16), 1)

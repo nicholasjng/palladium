@@ -12,6 +12,7 @@ def _copy_kernel(x_ref, o_ref):
 
 
 def test_emitted_source_is_plausible_msl(rng):
+    """Check input/output buffer declarations and compile emitted copy-kernel source with Metal."""
     from jax.experimental import pallas as pl
 
     f = pl.pallas_call(_copy_kernel, out_shape=jax.ShapeDtypeStruct((64,), jnp.float32))
@@ -26,12 +27,14 @@ def test_emitted_source_is_plausible_msl(rng):
 
 
 def test_copy_roundtrip_1d(rng):
+    """Verify that loading and storing a one-dimensional block preserves every element exactly."""
     f = palladium.metal_call(_copy_kernel, out_shape=jax.ShapeDtypeStruct((256,), jnp.float32))
     x = rng.standard_normal(256, dtype=np.float32)
     np.testing.assert_array_equal(f(x), x)
 
 
 def test_copy_roundtrip_2d(rng):
+    """Verify that loading and storing a two-dimensional block preserves every element exactly."""
     f = palladium.metal_call(_copy_kernel, out_shape=jax.ShapeDtypeStruct((16, 32), jnp.float32))
     x = rng.standard_normal((16, 32), dtype=np.float32)
     np.testing.assert_array_equal(f(x), x)
@@ -43,6 +46,7 @@ def _sum_and_diff_kernel(x_ref, y_ref, sum_ref, diff_ref):
 
 
 def test_multi_output_kernel(rng):
+    """Check sum and difference outputs against NumPy and the interpreter in declared output order."""
     f = palladium.metal_call(
         _sum_and_diff_kernel,
         out_shape=(

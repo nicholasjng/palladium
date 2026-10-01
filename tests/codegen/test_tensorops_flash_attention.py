@@ -72,6 +72,8 @@ def _replace_scan_body(spec, transform, transform_outer=None):
 
 @pytest.mark.parametrize("causal", [False, True])
 def test_tensorops_attention_fuses_both_dots_into_one_threadgroup(causal):
+    """Check fused score/value TensorOps, online softmax, and causal masking within one cooperative
+    program."""
     spec = _spec(causal=causal)
     source, stats = palladium.emit.emit_msl_stats(spec, dot_general="tensorops")
 
@@ -112,6 +114,7 @@ def test_tensorops_attention_fuses_both_dots_into_one_threadgroup(causal):
 
 
 def test_tensorops_attention_supports_distinct_query_and_key_lengths():
+    """Check that noncausal cooperative attention accepts different query and key sequence lengths."""
     source = palladium.emit_msl(_cross_attention_spec(), dot_general="tensorops")
 
     assert "const uint q_base = (batch * 32 * 2 + head) * D;" in source
@@ -122,6 +125,8 @@ def test_tensorops_attention_supports_distinct_query_and_key_lengths():
 
 
 def test_tensorops_attention_matches_dataflow_after_independent_equations_reorder():
+    """Check that attention recognition follows data dependencies when independent equations are
+    reordered."""
     spec = _spec()
     source = palladium.emit_msl(spec, dot_general="tensorops")
 
@@ -138,6 +143,8 @@ def test_tensorops_attention_matches_dataflow_after_independent_equations_reorde
 
 
 def test_tensorops_attention_rejects_same_primitives_with_wrong_probability_wiring():
+    """Verify that rewiring probability operands is rejected even when primitive names are
+    unchanged."""
     spec = _spec()
 
     def swap_probability_operands(eqns):
@@ -157,6 +164,7 @@ def test_tensorops_attention_rejects_same_primitives_with_wrong_probability_wiri
 
 
 def test_tensorops_attention_matches_sam2_token_to_image_shape():
+    """Check cooperative emission for a short-query, long-key token-to-image attention layout."""
     spec = _cross_attention_spec(
         query_length=16,
         key_length=4096,
@@ -175,6 +183,7 @@ def test_tensorops_attention_matches_sam2_token_to_image_shape():
 
 
 def test_tensorops_attention_explain_scales_batch_axis_for_cooperative_groups():
+    """Check that attention diagnostics report the cooperative group and scaled batch grid axis."""
     diagnostics = explain_spec(_spec(), dot_general="tensorops")
 
     assert diagnostics.grid == (128, 2, 2)
@@ -184,6 +193,7 @@ def test_tensorops_attention_explain_scales_batch_axis_for_cooperative_groups():
 
 
 def test_tensorops_attention_emits_benchmark_tile_configuration():
+    """Check emission for the attention tile configuration used by the benchmark."""
     shape = (1, 128, 4, 64)
     call = attention_call(shape, tile_q=32, tile_k=64)
     args = (jax.ShapeDtypeStruct(shape, jnp.float32),) * 3
@@ -195,6 +205,8 @@ def test_tensorops_attention_emits_benchmark_tile_configuration():
 
 
 def test_tensorops_attention_emits_large_query_tile_with_bounded_shared_memory():
+    """Check that a large query tile emits with bounded shared storage and a register-held
+    accumulator."""
     shape = (1, 64, 1, 64)
     call = attention_call(shape, tile_q=64, tile_k=32)
     args = (jax.ShapeDtypeStruct(shape, jnp.float32),) * 3
@@ -209,6 +221,7 @@ def test_tensorops_attention_emits_large_query_tile_with_bounded_shared_memory()
 
 @pytest.mark.parametrize("head_dim", [16, 32, 48, 64])
 def test_tensorops_attention_supports_multiples_of_sixteen_head_dimensions(head_dim):
+    """Check cooperative attention emission for supported head dimensions divisible by sixteen."""
     source = palladium.emit_msl(_spec(head_dim=head_dim), dot_general="tensorops")
 
     assert f"constexpr int D = {head_dim};" in source
@@ -222,6 +235,7 @@ def test_tensorops_attention_supports_multiples_of_sixteen_head_dimensions(head_
 
 
 def test_tensorops_attention_rejects_unsupported_tile_shape():
+    """Verify that a query tile not divisible by sixteen is rejected by cooperative attention."""
     shape = (1, 32, 2, 64)
     call = attention_call(shape, tile_q=8, tile_k=16)
     args = (jax.ShapeDtypeStruct(shape, jnp.float32),) * 3
@@ -232,5 +246,6 @@ def test_tensorops_attention_rejects_unsupported_tile_shape():
 
 
 def test_tensorops_attention_rejects_unsupported_head_dimension():
+    """Verify that a head dimension not divisible by sixteen is rejected by cooperative attention."""
     with pytest.raises(EmitError, match="head dimensions must be multiples of 16"):
         palladium.emit_msl(_spec(head_dim=24), dot_general="tensorops")

@@ -27,6 +27,8 @@ def _tiles(extent: int, tile: int) -> int:
     ],
 )
 def test_matmul(rng, m, n, k, tn, dtype, tol):
+    """Compare cooperative matmul with JAX across K tails, output edge tiles, and
+    float32/half/bfloat buffers."""
 
     def kernel(a_ref, b_ref, out_ref):
         out_ref[...] = jnp.matmul(a_ref[...], b_ref[...])
@@ -53,6 +55,8 @@ def test_matmul(rng, m, n, k, tn, dtype, tol):
 
 
 def test_matmul_with_a_tanh_epilogue(rng):
+    """Compare a cooperative matmul with a fused tanh epilogue against NumPy."""
+
     def kernel(a_ref, b_ref, out_ref):
         out_ref[...] = jnp.tanh(jnp.matmul(a_ref[...], b_ref[...]))
 
@@ -75,6 +79,8 @@ def test_matmul_with_a_tanh_epilogue(rng):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("head_dim, tile_q, tile_k", [(16, 16, 16), (16, 16, 128), (32, 32, 32)])
 def test_attention(rng, head_dim, tile_q, tile_k, causal):
+    """Compare causal and noncausal cooperative attention with NumPy across small tiles and head
+    dimensions."""
     shape = (1, 256, 2, head_dim)
     grid, in_specs, out_specs = attention_specs(1, 256, 2, tile_q, head_dim)
     call = palladium.metal_call(

@@ -11,6 +11,8 @@ import palladium
 
 
 def test_sum_to_scalar_matches_numpy(rng):
+    """Compare a full matrix sum with NumPy, including its rank-zero result."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.sum(x_ref[...])
 
@@ -21,6 +23,8 @@ def test_sum_to_scalar_matches_numpy(rng):
 
 
 def test_sum_along_last_axis_matches_numpy(rng):
+    """Compare row sums with NumPy to check reduction over the trailing axis."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.sum(x_ref[...], axis=1)
 
@@ -31,6 +35,8 @@ def test_sum_along_last_axis_matches_numpy(rng):
 
 
 def test_sum_along_first_axis_matches_numpy(rng):
+    """Compare column sums with NumPy to check reduction over the leading axis."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.sum(x_ref[...], axis=0)
 
@@ -41,6 +47,8 @@ def test_sum_along_first_axis_matches_numpy(rng):
 
 
 def test_mean_matches_numpy(rng):
+    """Compare a full-array mean with NumPy, exercising sum followed by division."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.mean(x_ref[...])
 
@@ -51,6 +59,8 @@ def test_mean_matches_numpy(rng):
 
 
 def test_mse_loss_matches_numpy(rng):
+    """Compare a scalar mean-squared-error kernel with NumPy."""
+
     def kernel(pred_ref, target_ref, o_ref):
         diff = pred_ref[...] - target_ref[...]
         o_ref[...] = jnp.mean(diff**2)
@@ -64,6 +74,8 @@ def test_mse_loss_matches_numpy(rng):
 
 
 def test_max_to_scalar_matches_numpy(rng):
+    """Compare a full matrix maximum with NumPy, including its scalar result."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.max(x_ref[...])
 
@@ -74,6 +86,8 @@ def test_max_to_scalar_matches_numpy(rng):
 
 
 def test_max_along_last_axis_matches_numpy(rng):
+    """Compare per-row maxima with NumPy to check reduction over the trailing axis."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.max(x_ref[...], axis=1)
 
@@ -84,7 +98,8 @@ def test_max_along_last_axis_matches_numpy(rng):
 
 
 def test_softmax_stability_matches_numpy(rng):
-    """A max-subtracted softmax matches numpy on scores large enough to overflow a raw exp."""
+    """Compare max-subtracted softmax with NumPy on scores large enough to overflow an unshifted
+    exp."""
 
     def kernel(x_ref, o_ref):
         x = x_ref[...]

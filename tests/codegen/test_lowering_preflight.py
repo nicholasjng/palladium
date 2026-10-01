@@ -22,7 +22,7 @@ def _oracle_check(f, *args, rtol=1e-5, atol=1e-6):
 
 
 def test_comparison_to_float(rng):
-    """Stages gt plus a bool -> float convert_element_type."""
+    """Verify that comparison results convert from bool to float32 with NumPy-equivalent values."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = (x_ref[...] > 0.5).astype(F32)
@@ -34,7 +34,7 @@ def test_comparison_to_float(rng):
 
 
 def test_where_abs_the_hard_way(rng):
-    """Predicate-order canary: swapped select_n cases emit -|x|, not |x|."""
+    """Check select_n case ordering by implementing absolute value with asymmetric signed branches."""
 
     def kernel(x_ref, o_ref):
         x = x_ref[...]
@@ -48,7 +48,7 @@ def test_where_abs_the_hard_way(rng):
 
 
 def test_where_asymmetric_branches(rng):
-    """Branches with different math, so any case mixup changes values."""
+    """Compare a two-input where expression with the interpreter to detect reversed cases."""
 
     def kernel(x_ref, y_ref, o_ref):
         x, y = x_ref[...], y_ref[...]
@@ -64,7 +64,7 @@ def test_where_asymmetric_branches(rng):
 
 
 def test_select_n_accepts_integer_predicate(rng):
-    """Integer indices select among all cases, not only false/true."""
+    """Check that integer select_n indices reach each of three cases, matching the interpreter."""
 
     def kernel(i_ref, x_ref, o_ref):
         idx = i_ref[...]
@@ -78,7 +78,8 @@ def test_select_n_accepts_integer_predicate(rng):
 
 
 def test_inf_literal(rng):
-    """jnp.inf closed over in the kernel formats as INFINITY."""
+    """Check INFINITY source formatting and SAFE-math execution for a captured positive-infinity
+    literal."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.minimum(x_ref[...], jnp.inf)
@@ -99,7 +100,7 @@ def test_inf_literal(rng):
 
 
 def test_negative_inf_sentinel(rng):
-    """A running-max seeded with -inf: the standard sentinel pattern."""
+    """Compare a loop's running maximum, initialized to negative infinity, with the interpreter."""
 
     def kernel(x_ref, o_ref):
         def step(i, best):
@@ -117,7 +118,8 @@ def test_negative_inf_sentinel(rng):
 
 
 def test_nan_literal_propagates(rng):
-    """NAN formats, compiles, and both sides agree on where the NaNs are."""
+    """Check that a NaN literal preserves the interpreter's NaN locations and remaining finite
+    values."""
 
     def kernel(x_ref, o_ref):
         x = x_ref[...]
@@ -136,7 +138,8 @@ def test_nan_literal_propagates(rng):
 
 
 def test_conditional_accumulation_in_loop(rng):
-    """Per-element accept/reject inside a fori_loop composes comparisons, select_n, consts, and carries."""
+    """Compare per-element accept/reject accumulation with the interpreter and check its upper
+    bound."""
 
     def kernel(y0_ref, r_ref, o_ref):
         r = r_ref[...]

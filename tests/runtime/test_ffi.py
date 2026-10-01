@@ -30,6 +30,7 @@ def _add_kernel(x_ref, y_ref, o_ref):
 
 
 def test_eager_call_matches_interpret(rng):
+    """Compare an eager two-input FFI addition with the Pallas interpreter."""
     x = rng.standard_normal((8, 8), dtype=np.float32)
     y = rng.standard_normal((8, 8), dtype=np.float32)
     call = palladium.metal_call(_add_kernel, out_shape=jax.ShapeDtypeStruct((8, 8), jnp.float32))
@@ -39,7 +40,7 @@ def test_eager_call_matches_interpret(rng):
 
 
 def test_composes_inside_jax_jit_with_ordinary_jnp_ops(rng):
-    """A kernel result feeds jnp.sum under jax.jit with no tracer conflict."""
+    """Check that an FFI result feeds ordinary JAX operations correctly inside one jitted function."""
     x = rng.standard_normal((8, 8), dtype=np.float32)
     y = rng.standard_normal((8, 8), dtype=np.float32)
     call = palladium.metal_call(_add_kernel, out_shape=jax.ShapeDtypeStruct((8, 8), jnp.float32))
@@ -54,6 +55,8 @@ def test_composes_inside_jax_jit_with_ordinary_jnp_ops(rng):
 
 
 def test_repeated_calls_reuse_the_cached_kernel(rng):
+    """Check repeated FFI calls for correct results and reuse of the shape-specialization cache
+    entry."""
     call = palladium.metal_call(_add_kernel, out_shape=jax.ShapeDtypeStruct((4, 4), jnp.float32))
 
     @jax.jit
@@ -75,7 +78,7 @@ def test_repeated_calls_reuse_the_cached_kernel(rng):
 
 
 def test_multi_output_kernel(rng):
-    """Multiple outputs take a different path from the single-output case on both the Python and C++ sides."""
+    """Check sum/difference FFI outputs and a jitted computation consuming both against NumPy."""
 
     def kernel(x_ref, y_ref, sum_ref, diff_ref):
         sum_ref[...] = x_ref[...] + y_ref[...]
@@ -106,7 +109,7 @@ def test_multi_output_kernel(rng):
 
 
 def test_math_mode_safe_is_actually_requested(rng):
-    """`x + nan` only reliably produces NaN under SAFE, so a passing run shows math_mode reaches mr_compile_library."""
+    """Check NaN propagation to verify that SAFE math reaches native Metal compilation."""
 
     def kernel(x_ref, o_ref):
         x = x_ref[...]
@@ -125,7 +128,8 @@ def test_math_mode_safe_is_actually_requested(rng):
 
 
 def test_vmap_matches_per_element_calls_and_interpret(rng):
-    """jax.vmap handles the whole batch in one FFI call and matches per-element calls bit for bit."""
+    """Compare vmapped FFI results with individual calls bit for bit and with the interpreter
+    numerically."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.tanh(x_ref[...]) * 2.0
@@ -149,7 +153,7 @@ def test_vmap_matches_per_element_calls_and_interpret(rng):
 
 
 def test_vmap_broadcasts_unbatched_operands(rng):
-    """An unbatched operand rides along at stride 0 rather than being materialized per element."""
+    """Check that a shared unbatched operand broadcasts correctly across a vmapped FFI batch."""
 
     def kernel(x_ref, w_ref, o_ref):
         o_ref[...] = x_ref[...] * w_ref[...] + 1.0
@@ -167,6 +171,8 @@ def test_vmap_broadcasts_unbatched_operands(rng):
 
 
 def test_vmap_multi_output(rng):
+    """Check that vmapped FFI dispatch preserves every output's batch shape and numerical result."""
+
     def kernel(x_ref, s_ref, d_ref):
         s_ref[...] = x_ref[...] + x_ref[...]
         d_ref[...] = x_ref[...] * x_ref[...]
@@ -185,7 +191,7 @@ def test_vmap_multi_output(rng):
 
 
 def test_nested_vmap_batches_outer_levels_sequentially(rng):
-    """An enclosing vmap batches the ffi_call itself, one dispatch per outer element."""
+    """Check nested vmaps of an FFI scaling kernel against NumPy across both batch dimensions."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 3.0
@@ -196,7 +202,8 @@ def test_nested_vmap_batches_outer_levels_sequentially(rng):
 
 
 def test_custom_vjp_pairs_forward_and_backward_kernels(rng):
-    """Forward and fused backward kernels paired with jax.custom_vjp match jax.grad of the plain jnp expression."""
+    """Compare explicit forward/backward FFI kernels wrapped in custom_vjp with a plain JAX
+    gradient."""
     m, k, n = 8, 16, 8
 
     def fwd_kernel(x_ref, w_ref, y_ref):
@@ -241,6 +248,8 @@ def test_custom_vjp_pairs_forward_and_backward_kernels(rng):
 
 
 def test_multiple_outputs_come_back_as_a_tuple_like_pallas_call():
+    """Verify that a multiple-output FFI call returns a tuple rather than the FFI primitive's list."""
+
     def two(x_ref, a_ref, b_ref):
         a_ref[...] = x_ref[...] + 1.0
         b_ref[...] = x_ref[...] * 2.0

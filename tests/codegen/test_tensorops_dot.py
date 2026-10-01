@@ -193,6 +193,8 @@ def _blocked_batched_residual_dot():
 
 
 def test_tensorops_dot_uses_one_threadgroup_per_pallas_program():
+    """Check that tiled dot emission uses cooperative TensorOps and threadgroup-based program
+    indexing."""
     msl = palladium.emit_msl(_blocked_dot())
 
     assert "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>" in msl
@@ -205,6 +207,7 @@ def test_tensorops_dot_uses_one_threadgroup_per_pallas_program():
 
 
 def test_tensorops_dot_fuses_relu_epilogue_in_cooperative_tensor():
+    """Check that ReLU is applied to the cooperative result without a shared output intermediate."""
     msl, stats = palladium.emit.emit_msl_stats(_blocked_dot(_relu_dot), dot_general="tensorops")
 
     assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in msl
@@ -215,6 +218,8 @@ def test_tensorops_dot_fuses_relu_epilogue_in_cooperative_tensor():
 
 
 def test_tensorops_dot_supports_transposed_rhs_tiles():
+    """Check that cooperative matmul recognizes a transposed right operand and emits its transpose
+    flag."""
     msl = palladium.emit_msl(_blocked_dot_rhs_transposed(), dot_general="tensorops")
 
     assert "matmul2d_descriptor desc(16, 32, 16, false, true, false," in msl
@@ -224,6 +229,8 @@ def test_tensorops_dot_supports_transposed_rhs_tiles():
 
 
 def test_tensorops_dot_supports_transposed_lhs_tiles():
+    """Check that cooperative matmul recognizes a transposed left operand and emits its transpose
+    flag."""
     msl = palladium.emit_msl(_blocked_dot_lhs_transposed(), dot_general="tensorops")
 
     assert "matmul2d_descriptor desc(16, 32, 16, true, false, false," in msl
@@ -233,6 +240,7 @@ def test_tensorops_dot_supports_transposed_lhs_tiles():
 
 
 def test_tensorops_dot_fuses_matrix_residual_add():
+    """Check that a matrix residual is read and added inside the cooperative output epilogue."""
     msl, stats = palladium.emit.emit_msl_stats(_blocked_residual_dot(), dot_general="tensorops")
 
     assert "device float* arg2 [[buffer(2)]]" in msl
@@ -244,6 +252,7 @@ def test_tensorops_dot_fuses_matrix_residual_add():
 
 
 def test_tensorops_dot_fuses_column_bias():
+    """Check that a column bias is bound and added using the output column coordinate."""
     spec = _blocked_column_bias_dot()
     msl, stats = palladium.emit.emit_msl_stats(spec, dot_general="tensorops")
     eqns = spec.jaxpr.eqns
@@ -271,6 +280,7 @@ def test_tensorops_dot_fuses_column_bias():
 
 
 def test_tensorops_batched_dot_maps_batch_and_output_tiles_to_threadgroups():
+    """Check rank-3 matmul batch strides and output-tile coordinates in cooperative source."""
     msl = palladium.emit_msl(_blocked_batched_dot(), dot_general="tensorops")
     ordinary = palladium.emit_msl(_blocked_batched_dot(), dot_general="default")
 
@@ -284,6 +294,7 @@ def test_tensorops_batched_dot_maps_batch_and_output_tiles_to_threadgroups():
 
 
 def test_tensorops_batched_dot_fuses_max_epilogue():
+    """Check that a batched cooperative matmul applies its maximum/ReLU epilogue before storing."""
     msl, stats = palladium.emit.emit_msl_stats(_blocked_batched_relu_dot(), dot_general="tensorops")
 
     assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in msl
@@ -293,6 +304,7 @@ def test_tensorops_batched_dot_fuses_max_epilogue():
 
 
 def test_tensorops_batched_dot_fuses_matrix_residual_add():
+    """Check that a batched residual epilogue uses the matching batch slice and cooperative result."""
     msl, stats = palladium.emit.emit_msl_stats(
         _blocked_batched_residual_dot(), dot_general="tensorops"
     )
@@ -307,6 +319,8 @@ def test_tensorops_batched_dot_fuses_matrix_residual_add():
 
 
 def test_tensorops_batched_dot_explain_scales_batch_axis_for_groups():
+    """Check that batched matmul diagnostics scale the first grid axis by the cooperative group
+    width."""
     f = palladium.metal_call(
         _dot,
         grid=(2, 2, 2),
@@ -328,6 +342,7 @@ def test_tensorops_batched_dot_explain_scales_batch_axis_for_groups():
 
 
 def test_auto_selects_tensorops_for_tiled_dots_and_default_forces_the_primitive_path():
+    """Check that auto selects cooperative tiled dots while default selects primitive emission."""
     auto = palladium.emit_msl(_blocked_dot())
     assert auto == palladium.emit_msl(_blocked_dot(), dot_general="tensorops")
     ordinary = palladium.emit_msl(_blocked_dot(), dot_general="default")
@@ -336,9 +351,8 @@ def test_auto_selects_tensorops_for_tiled_dots_and_default_forces_the_primitive_
 
 
 def test_auto_falls_back_to_the_primitive_path_for_dots_tensorops_rejects():
-    """Two outputs are outside the cooperative matmul's contract; "auto"
-    keeps the kernel on the one-thread-per-program emitter, while
-    "tensorops" surfaces the rejection."""
+    """Check that auto falls back for a two-output dot kernel while explicit tensorops raises
+    EmitError."""
 
     def kernel(a_ref, b_ref, o_ref, p_ref):
         product = jnp.dot(a_ref[...], b_ref[...])
@@ -365,6 +379,7 @@ def test_auto_falls_back_to_the_primitive_path_for_dots_tensorops_rejects():
 
 
 def test_tensorops_explain_reports_group_scaled_dispatch():
+    """Check that explain reports cooperative execution with the required group and scaled grid."""
     f = palladium.metal_call(
         _dot,
         grid=(2, 2),
@@ -387,6 +402,7 @@ def test_tensorops_explain_reports_group_scaled_dispatch():
 
 
 def test_tensorops_dot_is_used_by_jittable_metal_runtime_calls():
+    """Check that FFI specialization selects cooperative source with four SIMD groups per program."""
     call = palladium.metal_call(
         _dot,
         grid=(2, 2),
@@ -410,6 +426,8 @@ def test_tensorops_dot_is_used_by_jittable_metal_runtime_calls():
 
 
 def test_tensorops_dot_rejects_unblocked_single_program_matmul():
+    """Verify that explicit cooperative lowering rejects an unblocked, single-program matrix
+    product."""
     call = pl.pallas_call(
         _dot,
         out_shape=jax.ShapeDtypeStruct((16, 32), jnp.float32),
@@ -425,6 +443,7 @@ def test_tensorops_dot_rejects_unblocked_single_program_matmul():
 
 
 def test_tensorops_matmul_lowering_emits_full_tiles():
+    """Check cooperative full-tile source, writable tensor buffer types, and zero shared storage."""
     spec = _blocked_dot()
     source, stats = palladium.emit.emit_msl_stats(spec, dot_general="tensorops")
 
@@ -437,6 +456,7 @@ def test_tensorops_matmul_lowering_emits_full_tiles():
 
 
 def test_tensorops_matmul_accumulates_k_in_tensorops_tiles_and_handles_tail():
+    """Check K chunking, tail extents, and multiply-accumulate initialization in cooperative source."""
     source = palladium.emit_msl(_blocked_dot(k=144), dot_general="tensorops")
 
     assert "matmul2d_descriptor desc(16, 32, 128, false, false, false," in source
@@ -448,6 +468,7 @@ def test_tensorops_matmul_accumulates_k_in_tensorops_tiles_and_handles_tail():
 
 
 def test_tensorops_matmul_masks_partial_output_tiles():
+    """Check that cooperative source guards matrix-edge loads and output stores."""
     source = palladium.emit_msl(_blocked_dot(_relu_dot, m=30, n=45, k=32), dot_general="tensorops")
 
     assert "min(16, 30 - (int)_pid.x * 16)" in source
@@ -464,6 +485,7 @@ def test_tensorops_matmul_masks_partial_output_tiles():
     ((jnp.float16, "half"), (jnp.bfloat16, "bfloat")),
 )
 def test_tensorops_matmul_accepts_half_precision_buffer_types(dtype, metal_type):
+    """Check half and bfloat buffer declarations, float accumulation, and narrowed output stores."""
     source = palladium.emit_msl(_blocked_dot(k=32, dtype=dtype), dot_general="tensorops")
 
     assert f"device {metal_type}* arg0 [[buffer(0)]]" in source
@@ -475,6 +497,7 @@ def test_tensorops_matmul_accepts_half_precision_buffer_types(dtype, metal_type)
 
 
 def test_tensorops_matmul_lowering_composes_chained_epilogues():
+    """Check that multiple scalar epilogue operations remain fused into the cooperative result."""
     chained, stats = palladium.emit.emit_msl_stats(
         _blocked_dot(_chained_dot), dot_general="tensorops"
     )

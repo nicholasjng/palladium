@@ -109,6 +109,8 @@ SNAPSHOTS = {
 
 @pytest.mark.parametrize("name", SNAPSHOTS)
 def test_emitted_msl_matches_golden(name):
+    """Compare deterministic emitted source with each committed MSL snapshot, or regenerate when
+    requested."""
     msl = palladium.emit_msl(SNAPSHOTS[name]())
     path = GOLDEN / f"{name}.metal"
     if os.environ.get("PALLADIUM_REGEN_GOLDEN"):

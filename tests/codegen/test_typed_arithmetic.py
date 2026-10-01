@@ -23,6 +23,8 @@ def call_for(op, *args, mode=mr.MathMode.SAFE):
 @pytest.mark.parametrize("dtype", [np.int32, np.uint32])
 @pytest.mark.parametrize("op", [jax.lax.min, jax.lax.max, jax.lax.div, jax.lax.rem])
 def test_integer_binary_edges(metal_device, dtype, op):
+    """Compare integer extrema, division, and remainder with the interpreter at zero divisors and
+    dtype limits."""
     limits = np.iinfo(dtype)
     x = np.array([limits.min, limits.max, 2**24 + 1, 2**24 + 3, 0, 1, 7], dtype)
     y = np.array([limits.max, 0, 2**24, 2**24 + 2, 0, 0, 3], dtype)
@@ -32,6 +34,7 @@ def test_integer_binary_edges(metal_device, dtype, op):
 
 @pytest.mark.parametrize("scalar", [False, True])
 def test_signed_overflow_division_abs(metal_device, scalar):
+    """Check int32 minimum-value absolute and division overflow for scalar and array storage."""
     x = np.array(-2147483648 if scalar else [-2147483648, -7, -1, 0, 1], np.int32)
     for op in (jnp.abs, lambda x: jax.lax.div(x, np.int32(-1))):
         call = call_for(op, x)
@@ -43,6 +46,8 @@ def test_signed_overflow_division_abs(metal_device, scalar):
     "op", [jax.lax.shift_right_logical, jax.lax.shift_right_arithmetic, jax.lax.shift_left]
 )
 def test_shift_boundaries_and_broadcast(metal_device, dtype, op):
+    """Compare broadcast shifts with the interpreter at negative, word-size, and oversized shift
+    counts."""
     x = np.array([0, 1, np.iinfo(dtype).max, np.iinfo(dtype).min], dtype)[:, None]
     counts = [0, 1, 30, 31, 32, 33, np.iinfo(dtype).max]
     if dtype == np.int32:
@@ -57,6 +62,8 @@ def test_shift_boundaries_and_broadcast(metal_device, dtype, op):
 @pytest.mark.parametrize("axis", [None, 0, 1, ()])
 @pytest.mark.parametrize("op", [jnp.min, jnp.max])
 def test_typed_reduction(metal_device, dtype, axis, op):
+    """Compare dtype-specific extrema reductions with the interpreter across axes, empty axes, and
+    special values."""
     if np.dtype(dtype).kind in "iu":
         limits = np.iinfo(dtype)
         x = np.array([[limits.min, limits.max, 2**24 + 1], [2**24 + 3, 0, 7]], dtype)
@@ -71,6 +78,8 @@ def test_typed_reduction(metal_device, dtype, axis, op):
 
 @pytest.mark.parametrize("op", [jnp.minimum, jnp.maximum])
 def test_float_extrema_nan_and_zero(metal_device, op):
+    """Check floating extrema for NaN propagation and signed-zero ties against the SAFE-math
+    interpreter."""
     x = np.array([np.nan, 1, -0.0, 0.0, -np.inf, np.inf], np.float32)
     y = np.array([1, np.nan, 0.0, -0.0, np.inf, -np.inf], np.float32)
     call = call_for(op, x, y)
@@ -83,6 +92,8 @@ def test_float_extrema_nan_and_zero(metal_device, op):
 @pytest.mark.parametrize("mode", [mr.MathMode.SAFE, mr.MathMode.FAST])
 @pytest.mark.parametrize("op", [jax.lax.one_minus_square, jnp.log2])
 def test_new_float_primitives(metal_device, dtype, mode, op):
+    """Compare log2 and one_minus_square with the interpreter across floating dtypes and math
+    modes."""
     eps = float(jnp.finfo(dtype).eps)
     values = [-1 - eps, -1, -1 + eps / 2, -eps / 4, 0, eps / 4, 1 - eps / 2, 1, 1 + eps, 2]
     if op is jnp.log2:
@@ -99,6 +110,7 @@ def test_new_float_primitives(metal_device, dtype, mode, op):
 
 @pytest.mark.parametrize("dtype", [np.int32, np.uint32])
 def test_integer_one_minus_square(metal_device, dtype):
+    """Compare integer one_minus_square with the interpreter at overflow-prone and boundary values."""
     x = np.array([np.iinfo(dtype).min, np.iinfo(dtype).max, 0, 1, 2, 65537], dtype)
     call = call_for(jax.lax.one_minus_square, x)
     np.testing.assert_array_equal(call(x), call.interpret(x))
@@ -106,6 +118,8 @@ def test_integer_one_minus_square(metal_device, dtype):
 
 def test_tanh_ad_in_control_flow(metal_device):
     # Differentiate twice, then stage through both scan and cond.
+    """Compare first/second tanh derivatives staged through a loop and conditional with the
+    interpreter."""
     derivative = jax.grad(lambda x: jnp.tanh(x))
     second = jax.grad(derivative)
 
@@ -119,6 +133,7 @@ def test_tanh_ad_in_control_flow(metal_device):
 
 @pytest.mark.parametrize("op", [jax.lax.min, jax.lax.max])
 def test_integer_scalar_literal(metal_device, op):
+    """Check integer min/max with scalar literals above float32's exact-integer range."""
     x = np.array([2**24 + 1, 2**24 + 3], np.int32)
     call = call_for(lambda x: op(x, np.int32(2**24)), x)
     np.testing.assert_array_equal(call(x), call.interpret(x))
@@ -126,6 +141,7 @@ def test_integer_scalar_literal(metal_device, op):
 
 @pytest.mark.parametrize("op", [jax.lax.one_minus_square, jnp.log2])
 def test_new_float_special_values(metal_device, op):
+    """Compare log2 and one_minus_square at infinities, NaNs, signed zeros, and domain boundaries."""
     x = np.array([-np.inf, -2, -1, -0.0, 0.0, 1, 2, np.inf, np.nan], np.float32)
     call = call_for(op, x)
     np.testing.assert_array_equal(call(x), call.interpret(x))
@@ -133,6 +149,8 @@ def test_new_float_special_values(metal_device, op):
 
 @pytest.mark.parametrize("dtype", [np.int32, np.uint32, np.float32])
 def test_minmax_pair(metal_device, dtype):
+    """Compare both outputs of jnp.minmax with the interpreter for integer and float input arrays."""
+
     def kernel(x, lo, hi):
         lo[...], hi[...] = jnp.minmax(x[...])
 
@@ -148,12 +166,15 @@ def test_minmax_pair(metal_device, dtype):
 
 @pytest.mark.parametrize("op", [jax.lax.min, jax.lax.max])
 def test_boolean_extrema(metal_device, op):
+    """Compare boolean min/max with the interpreter for every pair of truth values."""
     x, y = np.array([False, False, True, True]), np.array([False, True, False, True])
     call = call_for(op, x, y)
     np.testing.assert_array_equal(call(x, y), call.interpret(x, y))
 
 
 def test_new_primitives_trace_without_device():
+    """Check that log2 of one_minus_square emits precise::log2 without requiring GPU dispatch."""
+
     def kernel(x, out):
         out[...] = jnp.log2(jax.lax.one_minus_square(x[...]))
 
@@ -164,6 +185,8 @@ def test_new_primitives_trace_without_device():
 
 @pytest.mark.parametrize("dtype", [np.int32, np.uint32])
 def test_integer_extrema_do_not_lower_via_float(dtype):
+    """Check that integer min/max source uses neither floating extrema nor infinity identities."""
+
     def kernel(x, out):
         out[...] = jnp.max(jnp.minimum(x[...], dtype(7)))
 

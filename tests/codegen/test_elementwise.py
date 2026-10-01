@@ -19,6 +19,8 @@ def _check_against_oracle(kernel, args, rtol=1e-5, atol=1e-6, **shapes):
 
 
 def test_saxpy_with_literal(rng):
+    """Compare SAXPY with the interpreter when the scaling coefficient is an inline float literal."""
+
     def kernel(x_ref, y_ref, o_ref):
         o_ref[...] = 2.5 * x_ref[...] + y_ref[...]
 
@@ -28,6 +30,9 @@ def test_saxpy_with_literal(rng):
 
 
 def test_autodiff_cotangent_accumulation(rng):
+    """Compare in-kernel autodiff of a reused input with the interpreter, exercising add_any
+    lowering."""
+
     def kernel(x_ref, out_ref):
         out_ref[...] = jax.grad(lambda x: jnp.sum(x * x + jnp.sin(x)))(x_ref[...])
 
@@ -36,6 +41,8 @@ def test_autodiff_cotangent_accumulation(rng):
 
 
 def test_binary_zoo(rng):
+    """Compare composed min, max, subtraction, multiplication, and division with the interpreter."""
+
     def kernel(x_ref, y_ref, o_ref):
         x, y = x_ref[...], y_ref[...]
         o_ref[...] = jnp.maximum(x, y) * (x - y) / (jnp.minimum(x, y) - 4.0)
@@ -46,6 +53,8 @@ def test_binary_zoo(rng):
 
 
 def test_unary_zoo(rng):
+    """Compare a composition of exp, sin, cos, and tanh with the interpreter."""
+
     def kernel(x_ref, o_ref):
         x = x_ref[...]
         o_ref[...] = jnp.exp(-x * x) + jnp.sin(x) * jnp.cos(x) + jnp.tanh(x)
@@ -57,6 +66,8 @@ def test_unary_zoo(rng):
 
 
 def test_integer_pow_and_sqrt(rng):
+    """Compare integer powers and square root in a floating expression with the interpreter."""
+
     def kernel(x_ref, o_ref):
         x = x_ref[...]
         o_ref[...] = jnp.sqrt(x**2 + 1.0) - x**3
@@ -68,7 +79,7 @@ def test_integer_pow_and_sqrt(rng):
 
 
 def test_row_vector_broadcasts_against_matrix_matches_numpy(rng):
-    """A (32,) bias stages `broadcast_in_dim` to (1, 32) before the add, so the elementwise rule must broadcast per operand."""
+    """Check that a row bias broadcasts across all rows of a matrix-product result."""
 
     def kernel(x_ref, w_ref, b_ref, o_ref):
         o_ref[...] = jnp.dot(x_ref[...], w_ref[...]) + b_ref[...]
@@ -82,6 +93,8 @@ def test_row_vector_broadcasts_against_matrix_matches_numpy(rng):
 
 
 def test_column_vector_broadcasts_against_matrix_matches_numpy(rng):
+    """Check that a column vector broadcasts across all columns of a matrix."""
+
     def kernel(x_ref, col_ref, o_ref):
         o_ref[...] = x_ref[...] + col_ref[...]
 
@@ -93,7 +106,8 @@ def test_column_vector_broadcasts_against_matrix_matches_numpy(rng):
 
 
 def test_transcendental_zoo_matches_the_oracle(rng):
-    """Ops that map onto MSL builtins directly."""
+    """Compare composed MSL-backed transcendental, rounding, and finite-check operations with the
+    interpreter."""
 
     def kernel(x_ref, o_ref):
         x = x_ref[...]
@@ -123,6 +137,8 @@ def test_transcendental_zoo_matches_the_oracle(rng):
 
 
 def test_rounding_modes_match_the_oracle():
+    """Check nearest-even and away-from-zero rounding at positive and negative half-integer ties."""
+
     def kernel(x_ref, o_ref):
         x = x_ref[...]
         o_ref[...] = jnp.round(x) * 4.0 + jax.lax.round(x)
@@ -132,8 +148,8 @@ def test_rounding_modes_match_the_oracle():
 
 
 def test_helper_backed_ops_match_the_oracle(rng):
-    """erf, erf_inv, expm1, and log1p have no MSL builtin; they are
-    emitted once as helper functions above the kernel."""
+    """Check helper-backed numerical results and verify that the erf helper is emitted once before
+    the kernel."""
 
     def kernel(x_ref, o_ref):
         x = x_ref[...]
@@ -154,6 +170,8 @@ def test_helper_backed_ops_match_the_oracle(rng):
 
 
 def test_expm1_and_log1p_keep_precision_near_zero():
+    """Compare expm1 plus log1p near zero with a float64 reference under SAFE math."""
+
     def kernel(x_ref, o_ref):
         x = x_ref[...]
         o_ref[...] = jnp.expm1(x) + jnp.log1p(x)

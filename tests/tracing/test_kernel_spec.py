@@ -14,6 +14,8 @@ def _mad_kernel(x_ref, y_ref, o_ref):
 
 
 def test_gridless_spec(rng):
+    """Check gridless normalization, operand layouts/dtype, and the traced arithmetic primitive
+    sequence."""
     f = pl.pallas_call(_mad_kernel, out_shape=jax.ShapeDtypeStruct((8, 128), jnp.float32))
     x = rng.standard_normal((8, 128), dtype=np.float32)
     spec = trace(f, x, x)
@@ -27,6 +29,8 @@ def test_gridless_spec(rng):
 
 
 def test_gridded_spec_and_loop_staging(rng):
+    """Check blocked layout metadata, static-loop scan staging, and the staged BlockSpec index map."""
+
     def kernel(x_ref, o_ref):
         y = x_ref[...]
         y = jax.lax.fori_loop(0, 10, lambda i, c: c + 0.1 * c, y)
@@ -57,6 +61,7 @@ def test_gridded_spec_and_loop_staging(rng):
 
 
 def test_trace_rejects_multiple_pallas_calls(rng):
+    """Verify that tracing a wrapper with two Pallas calls reports the call count and rejects it."""
     f = pl.pallas_call(_mad_kernel, out_shape=jax.ShapeDtypeStruct((4,), jnp.float32))
 
     def two_calls(x, y):
@@ -68,7 +73,7 @@ def test_trace_rejects_multiple_pallas_calls(rng):
 
 
 def test_non_blocked_dims_rejected():
-    """pl.Element/Indirect/BoundedSlice dims duck-type as Blocked through block_size but mean different indexing semantics, so the tracer rejects them by name."""
+    """Verify that an Element block dimension is rejected despite exposing a block_size attribute."""
     from palladium.errors import TraceError
 
     def kernel(x_ref, o_ref):
@@ -86,6 +91,9 @@ def test_non_blocked_dims_rejected():
 
 
 def test_trace_looks_through_a_jit_wrapper(rng):
+    """Check that tracing a JIT-wrapped Pallas call preserves direct tracing's grid and operand
+    layouts."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2.0
 

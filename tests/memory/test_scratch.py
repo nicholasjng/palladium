@@ -17,7 +17,7 @@ def _f32(shape):
 
 
 def test_spec_captures_scratch():
-    """trace() lifts grid_mapping.scratch_avals into KernelSpec.scratch."""
+    """Check that tracing records scratch shape/dtype separately from input and output operands."""
 
     def kernel(x_ref, o_ref, s_ref):
         s_ref[...] = x_ref[...]
@@ -35,6 +35,8 @@ def test_spec_captures_scratch():
 
 
 def test_scratch_roundtrip(rng):
+    """Compare a write/read scratch-buffer computation with the interpreter."""
+
     def kernel(x_ref, o_ref, s_ref):
         s_ref[...] = x_ref[...] * 2.0
         o_ref[...] = s_ref[...] + 1.0
@@ -49,7 +51,7 @@ def test_scratch_roundtrip(rng):
 
 
 def test_scalar_scratch(rng):
-    """Shape-() scratch stays indexable, matching the operand path's axis-1 scalar refs."""
+    """Compare scalar scratch reads followed by broadcast with the interpreter."""
 
     def kernel(x_ref, o_ref, s_ref):
         s_ref[...] = x_ref[0] + x_ref[1]
@@ -65,7 +67,8 @@ def test_scalar_scratch(rng):
 
 
 def test_multiple_scratch_buffers_mixed_dtypes(rng):
-    """Scratch entries bind in jaxpr order, each with its own ctype."""
+    """Compare mixed float/int scratch buffers with the interpreter to check operand order and type
+    binding."""
 
     def kernel(x_ref, o_ref, sf_ref, si_ref):
         sf_ref[...] = x_ref[...] * 3.0
@@ -82,7 +85,7 @@ def test_multiple_scratch_buffers_mixed_dtypes(rng):
 
 
 def test_scratch_is_private_per_program_instance(rng):
-    """Each grid point gets its own scratch; a shared allocation would show up as another row's value."""
+    """Check that each program's scratch retains its own row and program-id contribution."""
 
     def kernel(x_ref, o_ref, s_ref):
         i = pl.program_id(0)
@@ -103,7 +106,7 @@ def test_scratch_is_private_per_program_instance(rng):
 
 
 def test_scratch_accumulator_across_loop(rng):
-    """A fori_loop body accumulates into a scratch Ref instead of threading the value through the carry."""
+    """Compare accumulation into a scratch Ref across loop iterations with a NumPy column sum."""
 
     def kernel(x_ref, o_ref, s_ref):
         s_ref[...] = jnp.zeros((4,), jnp.float32)

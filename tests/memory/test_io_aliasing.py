@@ -18,6 +18,8 @@ def _double_kernel(x_ref, o_ref):
 
 
 def test_aliased_call_matches_interpret(rng):
+    """Compare an aliased output with the interpreter and verify that the caller's NumPy input
+    stays unchanged."""
     f = palladium.metal_call(
         _double_kernel,
         out_shape=jax.ShapeDtypeStruct((64,), F32),
@@ -32,7 +34,7 @@ def test_aliased_call_matches_interpret(rng):
 
 
 def test_aliased_kernel_grid_and_second_input(rng):
-    """Alias one of two inputs, under a blocked grid."""
+    """Compare a blocked two-input kernel with the interpreter when one input aliases the output."""
 
     def kernel(x_ref, w_ref, o_ref):
         o_ref[...] = x_ref[...] * w_ref[...]
@@ -54,6 +56,7 @@ def test_aliased_kernel_grid_and_second_input(rng):
 
 
 def test_ffi_aliased_call_matches_interpret_under_jit(rng):
+    """Compare a jitted FFI call with an input/output alias against the interpreter."""
     f = palladium.metal_call(
         _double_kernel,
         out_shape=jax.ShapeDtypeStruct((64,), F32),
@@ -65,6 +68,7 @@ def test_ffi_aliased_call_matches_interpret_under_jit(rng):
 
 
 def test_ffi_aliased_vmap(rng):
+    """Check that vmapped aliased FFI calls double each batch element correctly."""
     f = palladium.metal_call(
         _double_kernel,
         out_shape=jax.ShapeDtypeStruct((16,), F32),
@@ -76,8 +80,7 @@ def test_ffi_aliased_vmap(rng):
 
 
 def test_read_after_aliased_write_is_rejected(rng):
-    """The interpret oracle keeps pre-call input values visible for the
-    whole kernel; one shared buffer cannot, so this must be rejected."""
+    """Verify that reading an input after an aliased output write raises TraceError."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2.0
@@ -93,6 +96,8 @@ def test_read_after_aliased_write_is_rejected(rng):
 
 
 def test_mismatched_alias_pair_is_rejected(rng):
+    """Verify that aliasing differently sized input and output arrays is rejected."""
+
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[0:8] + x_ref[8:16]
 

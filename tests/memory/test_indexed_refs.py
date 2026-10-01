@@ -13,7 +13,7 @@ import palladium
 
 
 def test_dynamic_scalar_index(rng):
-    """`x_ref[i, :]`: program_id selects a row, `:` keeps the trailing dim."""
+    """Check that program-id-indexed row reads reconstruct the original NumPy input array."""
 
     def kernel(x_ref, o_ref):
         i = pl.program_id(0)
@@ -31,7 +31,7 @@ def test_dynamic_scalar_index(rng):
 
 
 def test_static_literal_index(rng):
-    """`x_ref[1, :]`: a compile-time-constant row index."""
+    """Compare the difference of two statically indexed rows with NumPy."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[1, :] - x_ref[0, :]
@@ -46,7 +46,8 @@ def test_static_literal_index(rng):
 
 
 def test_fully_scalar_indexed_get_and_swap(rng):
-    """Both dims scalar on load and store, with neighbour reads guarded by `jnp.where`; both branches trace, so the index must stay in range."""
+    """Compare scalar-indexed loads and stores, including in-range neighbor reads, with the
+    interpreter."""
 
     def kernel(x_ref, o_ref):
         i, j = pl.program_id(0), pl.program_id(1)
@@ -72,7 +73,7 @@ def test_fully_scalar_indexed_get_and_swap(rng):
 
 
 def test_periodic_wraparound_index(rng):
-    """Periodic neighbour reads stage `eq` and `ne` comparisons for the index arithmetic."""
+    """Compare periodic neighbor reads with NumPy rolls to check wraparound index arithmetic."""
 
     def kernel(x_ref, o_ref):
         i, j = pl.program_id(0), pl.program_id(1)
@@ -95,8 +96,7 @@ def test_periodic_wraparound_index(rng):
 
 
 def test_dynamic_partial_leading_slice(rng):
-    """`x_ref[pl.dslice(i, 2), :]`: a dynamic-start, statically-sized
-    partial slice on the leading dim, `:` kept full on the trailing one."""
+    """Compare dynamic-start, fixed-size leading-axis slices with the interpreter."""
 
     def kernel(x_ref, o_ref):
         i = pl.program_id(0)
@@ -116,7 +116,7 @@ def test_dynamic_partial_leading_slice(rng):
 
 
 def test_noncontiguous_kept_dims():
-    """A partial Slice on a trailing dim, non-contiguous in memory, addresses storage correctly."""
+    """Check that a partial trailing-axis slice addresses noncontiguous source storage correctly."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[:, :, 0:1]

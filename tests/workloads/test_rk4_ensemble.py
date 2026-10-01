@@ -39,6 +39,7 @@ def _ensemble(rng, n):
 
 
 def test_matches_interpret_oracle(rng):
+    """Compare a blocked Lotka-Volterra RK4 ensemble's final states with the Pallas interpreter."""
     n = 512
     f = make_solver(n)
     args = _ensemble(rng, n)
@@ -51,6 +52,7 @@ def test_matches_interpret_oracle(rng):
 
 
 def test_matches_diffrax(rng):
+    """Compare RK4 ensemble final states with independent adaptive Diffrax Tsit5 solves."""
     diffrax = pytest.importorskip("diffrax")
     n = 64
     f = make_solver(n)

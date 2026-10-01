@@ -47,6 +47,8 @@ def _backend_config(text: str) -> dict:
 
 
 def test_plain_pallas_call_lowers_to_the_dispatch_custom_call_on_mps():
+    """Check that MPS lowering emits palladium.dispatch with a version-2 source descriptor and
+    default grid."""
     call = pl.pallas_call(_add, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32))
     x = jnp.ones(8, jnp.float32)
     text = _lower_for(("mps",), lambda a, b: call(a, b) * 2.0, x, x)
@@ -59,6 +61,9 @@ def test_plain_pallas_call_lowers_to_the_dispatch_custom_call_on_mps():
 
 
 def test_compiler_params_select_tensorops_and_scale_the_launch():
+    """Check that MPS compiler options select TensorOps and encode its required group and scaled
+    grid."""
+
     def dot(a_ref, b_ref, o_ref):
         o_ref[...] = jnp.dot(a_ref[...], b_ref[...])
 
@@ -83,6 +88,8 @@ def test_compiler_params_select_tensorops_and_scale_the_launch():
 
 
 def test_other_platforms_keep_jax_own_lowering():
+    """Check that CPU calls keep JAX's interpret-mode requirement and interpreted calls bypass
+    Palladium."""
     call = pl.pallas_call(_add, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32))
     x = jnp.ones(8, jnp.float32)
     with pytest.raises(ValueError, match="interpret mode"):
@@ -95,6 +102,7 @@ def test_other_platforms_keep_jax_own_lowering():
 
 
 def test_mps_lowering_rejects_non_fast_math_and_aliases():
+    """Check rejection of non-FAST MPS math, MPS aliases, and an unknown dot policy."""
     call = pl.pallas_call(
         _add,
         out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),

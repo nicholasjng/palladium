@@ -19,7 +19,7 @@ F32 = jnp.float32
 
 
 def test_random_bits_matches_jax_exactly(rng):
-    """Raw `random_bits` output, bit-for-bit, not only the float conversion."""
+    """Check raw Threefry uint32 random bits against JAX bit for bit."""
 
     def kernel(k_ref, o_ref):
         key = jax.random.wrap_key_data(k_ref[...], impl="threefry2x32")
@@ -34,7 +34,7 @@ def test_random_bits_matches_jax_exactly(rng):
 
 
 def test_uniform_matches_jax_exactly():
-    """The full uniform() pipeline: random_bits, shift, or, bitcast, sub/mul/add."""
+    """Check the complete random-uniform conversion pipeline against JAX bit for bit."""
 
     def kernel(k_ref, o_ref):
         key = jax.random.wrap_key_data(k_ref[...], impl="threefry2x32")
@@ -49,6 +49,8 @@ def test_uniform_matches_jax_exactly():
 
 
 def test_fold_in_matches_jax_exactly():
+    """Compare folded Threefry key data with JAX for a fixed key and integer datum."""
+
     def kernel(k_ref, d_ref, ko_ref):
         key = jax.random.wrap_key_data(k_ref[...], impl="threefry2x32")
         folded = jax.random.fold_in(key, d_ref[0])
@@ -67,7 +69,8 @@ def test_fold_in_matches_jax_exactly():
 
 
 def test_per_thread_independent_streams():
-    """Folding program_id into the key gives each lane a distinct stream rather than a copy of lane 0's."""
+    """Check program-id-folded random streams against JAX and verify that all program streams
+    differ."""
 
     def kernel(k_ref, o_ref):
         base = jax.random.wrap_key_data(k_ref[...], impl="threefry2x32")
