@@ -20,20 +20,16 @@ kernel void palladium_kernel(
         for (uint _i6 = 0; _i6 < 64; ++_i6) {
             t5[_i6] = t2[_i6] + t0[_i6];
         }
-        bool t7[64];
+        float t7[64];
         for (uint _i8 = 0; _i8 < 64; ++_i8) {
-            t7[_i8] = t5[_i8] <= 1.0f;
+            t7[_i8] = (t5[_i8] <= 1.0f) ? t5[_i8] : t2[_i8];
         }
-        float t9[64];
-        for (uint _i10 = 0; _i10 < 64; ++_i10) {
-            t9[_i10] = t7[_i10] ? t5[_i10] : t2[_i10];
-        }
-        for (uint _i11 = 0; _i11 < 64; ++_i11) {
-            float _cb12 = t9[_i11];
-            t2[_i11] = _cb12;
+        for (uint _i9 = 0; _i9 < 64; ++_i9) {
+            float _cb10 = t7[_i9];
+            t2[_i9] = _cb10;
         }
     }
-    for (uint _i13 = 0; _i13 < 64; ++_i13) {
-        arg2[_i13] = t2[_i13];
+    for (uint _i11 = 0; _i11 < 64; ++_i11) {
+        arg2[_i11] = t2[_i11];
     }
 }

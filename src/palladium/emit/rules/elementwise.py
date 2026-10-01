@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 
+import numpy as np
 from jax.extend.core import JaxprEqn
 
 from palladium.emit.addressing import element_strides, flat_index
@@ -27,10 +28,27 @@ def _fuses_into_consumer(env: Environment, var, shape: tuple[int, ...], ops: lis
     an elementwise equation of the same shape at this jaxpr level, and its
     own operands are addressable by the same flat index."""
     consumer = env.sole_consumer(var)
-    if consumer is None:
+    # An inlined jit (jnp.where wraps its select in one) shares the C scope,
+    # so follow `var` to its single use inside the body.
+    while consumer is not None and consumer.primitive.name in ("jit", "pjit"):
+        if consumer.invars.count(var) != 1:
+            return False
+        body = consumer.params["jaxpr"].jaxpr
+        var = body.invars[consumer.invars.index(var)]
+        uses = [eqn for eqn in body.eqns if var in eqn.invars]
+        if var in body.outvars or len(uses) != 1:
+            return False
+        consumer = uses[0]
+    if consumer is None or consumer.invars.count(var) != 1:
         return False
     name = consumer.primitive.name
-    if RULES.get(name) is not _rule_elementwise:
+    # A two-case select on a bool predicate lowers through this rule too.
+    boolean_select = (
+        name == "select_n"
+        and len(consumer.invars) == 3
+        and shaped(consumer.invars[0].aval).dtype == np.bool_
+    )
+    if RULES.get(name) is not _rule_elementwise and not boolean_select:
         return False
     consumer_shape = tuple(int(d) for d in shaped(consumer.outvars[0].aval).shape)
     if consumer_shape != shape or not shape:
