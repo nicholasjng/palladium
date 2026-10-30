@@ -23,11 +23,6 @@ def _emit_threefry2x32(cursor: Cursor, k1: str, k2: str, x1: str, x2: str) -> tu
     cursor.emit(f"uint {x0} = {x1} + {ks[0]};")
     cursor.emit(f"uint {x1n} = {x2} + {ks[1]};")
 
-    def apply_round(rot: int) -> None:
-        cursor.emit(f"{x0} = {x0} + {x1n};")
-        cursor.emit(f"{x1n} = ({x1n} << {rot}u) | ({x1n} >> {32 - rot}u);")
-        cursor.emit(f"{x1n} = {x0} ^ {x1n};")
-
     # 5 groups of 4 rounds, alternating rotation sets; a, b index into ks
     # for the post-group key-schedule addition, n is that round's counter.
     schedule = (
@@ -38,8 +33,10 @@ def _emit_threefry2x32(cursor: Cursor, k1: str, k2: str, x1: str, x2: str) -> tu
         (_THREEFRY_ROT0, 2, 0, 5),
     )
     for rots, a, b, n in schedule:
-        for r in rots:
-            apply_round(r)
+        for rot in rots:
+            cursor.emit(f"{x0} = {x0} + {x1n};")
+            cursor.emit(f"{x1n} = ({x1n} << {rot}u) | ({x1n} >> {32 - rot}u);")
+            cursor.emit(f"{x1n} = {x0} ^ {x1n};")
         cursor.emit(f"{x0} = {x0} + {ks[a]};")
         cursor.emit(f"{x1n} = {x1n} + {ks[b]} + {n}u;")
 

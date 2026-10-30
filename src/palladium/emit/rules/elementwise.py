@@ -240,13 +240,10 @@ def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
             ]
         )
 
-    def assign(idx_vars: list[str]) -> str:
+    with cursor.loop_nest(dst.shape) as idx_vars:
         dst_idx = flat_index(list(zip(idx_vars, dst_strides)))
         inputs = {name: op.at(op_index(op, idx_vars)) for name, op in zip(PRIMITIVE_INVARS, ops)}
-        return f"{dst.at(dst_idx)} = {unwrapped(template.format(**inputs))};"
-
-    with cursor.loop_nest(dst.shape) as idx_vars:
-        cursor.emit(assign(idx_vars))
+        cursor.emit(f"{dst.at(dst_idx)} = {unwrapped(template.format(**inputs))};")
 
 
 # select_n has its own rule in array.py, which falls back to this one.

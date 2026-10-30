@@ -130,10 +130,10 @@ class KernelSpec:
 
 
 def _block_dim(dim: Any) -> int | None:
-    # Squeezed dims vanish from the visible block. pl.Element, pl.Indirect,
-    # and pl.BoundedSlice also carry `block_size` but index differently, so
-    # accepting them would silently lower wrong offsets.
-    """Normalize blocked/squeezed extents, rejecting dimension kinds with different indexing semantics."""
+    """Normalize a block extent; None for a squeezed dimension, which vanishes
+    from the visible block. pl.Element, pl.Indirect and pl.BoundedSlice also
+    carry `block_size` but index differently, so they are rejected rather than
+    lowered with wrong offsets."""
     if isinstance(dim, (int, np.integer)):
         return int(dim)
     if isinstance(dim, pl.Squeezed):
@@ -278,14 +278,6 @@ def _calls_program_id(jaxpr: Jaxpr, axis: int) -> bool:
     ) or any(_calls_program_id(child, axis) for child in subjaxprs(jaxpr))
 
 
-def _scratch_infos(scratch_avals: Any) -> list[ScratchInfo]:
-    """Preserve scratch operand order while normalizing static shapes and NumPy dtypes."""
-    return [
-        ScratchInfo(shape=tuple(int(d) for d in aval.shape), dtype=np.dtype(aval.dtype))
-        for aval in scratch_avals
-    ]
-
-
 def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
     """Extract one Pallas kernel specification using only input shapes and dtypes.
 
@@ -396,7 +388,10 @@ def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
         grid=grid,
         inputs=inputs,
         outputs=outputs,
-        scratch=tuple(_scratch_infos(scratch_bufs)),
+        scratch=tuple(
+            ScratchInfo(shape=tuple(int(d) for d in aval.shape), dtype=np.dtype(aval.dtype))
+            for aval in scratch_bufs
+        ),
         aliases=aliases,
     )
 

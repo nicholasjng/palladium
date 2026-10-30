@@ -24,6 +24,7 @@ from jax._src.pallas.pallas_call import pallas_call_p
 from metal_runtime import MathMode
 
 from palladium.emit import emit_msl
+from palladium.emit.core import shaped
 from palladium.launch import CompilerParams, check_threadgroup, launch_geometry
 from palladium.trace import KernelSpec, spec_from_params
 
@@ -125,11 +126,6 @@ def kernel_prologue(params: list[str]) -> str:
 def _layout(rank: int) -> tuple[int, ...]:
     """JAX/XLA layout for a C-contiguous array (minor-to-major)."""
     return tuple(range(rank - 1, -1, -1))
-
-
-def _aval_to_ir_type(aval):
-    """Construct a ranked tensor type without ``aval_to_ir_type``'s unstable API."""
-    return ir.RankedTensorType.get(aval.shape, mlir.dtype_to_ir_type(aval.dtype))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -237,43 +233,6 @@ class MpsDispatchDescriptor:
         return json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
-def lower_dispatch(ctx, *args, descriptor: MpsDispatchDescriptor):
-    """Emit the StableHLO custom call consumed by the jax-mps dispatch handler.
-
-    Parameters
-    ----------
-    ctx : LoweringRuleContext
-        JAX lowering context supplying input and output abstract values.
-    *args : ir.Value
-        Lowered input operands in kernel order.
-    descriptor : MpsDispatchDescriptor
-        Static source and launch payload for ``palladium.dispatch``.
-
-    Returns
-    -------
-    sequence of ir.Value
-        Custom-call results with row-major operand and result layouts.
-
-    Notes
-    -----
-    This constructs IR only. Runtime execution requires a jax-mps build implementing the
-    descriptor ABI; it does not use or register the CPU FFI target.
-    """
-    result_types = [_aval_to_ir_type(aval) for aval in ctx.avals_out]
-    operand_layouts = [_layout(len(aval.shape)) for aval in ctx.avals_in]
-    result_layouts = [_layout(len(aval.shape)) for aval in ctx.avals_out]
-    op = mlir.custom_call(
-        _CUSTOM_CALL_TARGET,
-        result_types=result_types,
-        operands=args,
-        backend_config=descriptor.to_json(),
-        api_version=2,
-        operand_layouts=operand_layouts,
-        result_layouts=result_layouts,
-    )
-    return op.results
-
-
 _FAST_ORDINAL = 2
 
 
@@ -303,7 +262,20 @@ def _palladium_lowering(ctx: mlir.LoweringRuleContext, *in_nodes, interpret: Any
     descriptor = MpsDispatchDescriptor.from_spec(
         spec, msl, threadgroup=options.threadgroup_dims, math_mode=_FAST_ORDINAL
     )
-    return lower_dispatch(ctx, *in_nodes, descriptor=descriptor)
+    # The jax-mps palladium.dispatch handler reads the descriptor. Result types
+    # are built directly: mlir.aval_to_ir_type's signature is not stable.
+    return mlir.custom_call(
+        _CUSTOM_CALL_TARGET,
+        result_types=[
+            ir.RankedTensorType.get(aval.shape, mlir.dtype_to_ir_type(aval.dtype))
+            for aval in map(shaped, ctx.avals_out)
+        ],
+        operands=in_nodes,
+        backend_config=descriptor.to_json(),
+        api_version=2,
+        operand_layouts=[_layout(len(aval.shape)) for aval in map(shaped, ctx.avals_in)],
+        result_layouts=[_layout(len(aval.shape)) for aval in map(shaped, ctx.avals_out)],
+    ).results
 
 
 def _install() -> None:

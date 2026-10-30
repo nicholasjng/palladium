@@ -15,6 +15,9 @@ from palladium.emit.numeric import unwrapped
 from palladium.emit.rules.elementwise import _rule_elementwise, reads_by_flat_index
 from palladium.errors import EmitError
 
+# A variable name or a numeric literal.
+_CHEAP_SCALAR = re.compile(r"[A-Za-z_]\w*|-?[\d.]+(e[-+]?\d+)?f?|bfloat\(-?[\d.]+(e[-+]?\d+)?f\)")
+
 
 @rule("reshape")
 def _rule_reshape(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
@@ -149,8 +152,12 @@ def _rule_broadcast_in_dim(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> N
     if src.shape and src.size == math.prod(out_shape):
         env.bind(eqn.outvars[0], dataclasses.replace(src, shape=out_shape))
         return
-    if not src.shape and _scalar_reads_only(env, eqn.outvars[0], src):
-        # Every element reads the same scalar: a lazy value whose
+    if (
+        not src.shape
+        and _CHEAP_SCALAR.fullmatch(src.expr)
+        and reads_by_flat_index(env, eqn.outvars[0])
+    ):
+        # Every consumer reads the same cheap scalar: a lazy value whose
         # expression ignores the index.
         env.bind(eqn.outvars[0], CVal("", out_shape, src.ctype, lazy=src.expr))
         return
@@ -168,15 +175,6 @@ def _rule_broadcast_in_dim(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> N
         )
         dst_idx = flat_index(list(zip(idx_vars, dst_strides)))
         cursor.emit(f"{dst.at(dst_idx)} = {src.at(src_idx)};")
-
-
-_CHEAP_SCALAR = re.compile(r"[A-Za-z_]\w*|-?[\d.]+(e[-+]?\d+)?f?|bfloat\(-?[\d.]+(e[-+]?\d+)?f\)")
-
-
-def _scalar_reads_only(env: Environment, var, src: CVal) -> bool:
-    """Whether a broadcast of `src` can stay a scalar: it is a variable or a
-    literal, and every consumer reads it by flat index."""
-    return _CHEAP_SCALAR.fullmatch(src.expr) is not None and reads_by_flat_index(env, var)
 
 
 def _transpose_is_dot_rhs_only(env: Environment, eqn: JaxprEqn) -> bool:

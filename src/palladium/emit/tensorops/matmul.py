@@ -578,8 +578,11 @@ def _epilogue_expression(
     """
     scalar_values = {dot_value: product}
     for eqn in elementwise_eqns:
-        if not _is_tile_shape(_shape(eqn.outvars[0]), rank, tm, tn) and not (
-            eqn.primitive.name == "broadcast_in_dim" and _shape(eqn.outvars[0]) == (1, tn)
+        shape = _shape(eqn.outvars[0])
+        if (
+            shape != (tm, tn)
+            and not (rank == 3 and shape == (1, tm, tn))
+            and not (eqn.primitive.name == "broadcast_in_dim" and shape == (1, tn))
         ):
             raise EmitError(
                 "tensorops matmul epilogue operations must preserve the output tile shape"
@@ -598,18 +601,6 @@ def _epilogue_expression(
         raise EmitError("tensorops matmul store value was not lowered") from error
 
 
-def _full_get(eqn, ref: Var):
-    """Require a full-block read of the expected Ref, raising EmitError for other read forms."""
-    if (
-        eqn is None
-        or eqn.primitive.name != "get"
-        or len(eqn.invars) != 1
-        or eqn.invars[0] is not ref
-    ):
-        raise EmitError("tensorops dot operands must be full-block reads of the first two refs")
-    return eqn
-
-
 def _matrix_get(atom, producers, ref: Var):
     """Resolve a matrix operand read, retaining a lazy 2D transpose."""
     eqn = producers.get(atom) if isinstance(atom, Var) else None
@@ -626,7 +617,14 @@ def _matrix_get(atom, producers, ref: Var):
             raise EmitError("TensorOps matmul supports only matrix transposes")
         atom = eqn.invars[0]
         eqn = producers.get(atom) if isinstance(atom, Var) else None
-    return _full_get(eqn, ref), transpose, squeezed
+    if (
+        eqn is None
+        or eqn.primitive.name != "get"
+        or len(eqn.invars) != 1
+        or eqn.invars[0] is not ref
+    ):
+        raise EmitError("tensorops dot operands must be full-block reads of the first two refs")
+    return eqn, transpose, squeezed
 
 
 def _epilogue_path(value, dot_value, producers) -> tuple[list, set[int]]:
@@ -692,8 +690,3 @@ def _elementwise_expression(eqn, ctype: str, operands: tuple[str, ...], cursor) 
     if len(operands) != len(eqn.invars):
         raise EmitError(f"{eqn.primitive.name} epilogue has unsupported arity")
     return format_scalar(eqn.primitive.name, ctype, operands, cursor)
-
-
-def _is_tile_shape(shape: tuple[int, ...], rank: int, tm: int, tn: int) -> bool:
-    """Accept a matrix tile or its leading-singleton batch form for rank-three operands."""
-    return shape == (tm, tn) or (rank == 3 and shape == (1, tm, tn))

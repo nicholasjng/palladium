@@ -144,11 +144,6 @@ def explain_spec(
     )
 
 
-def _explain_enabled() -> bool:
-    """Treat any PALLADIUM_EXPLAIN value except empty or "0" as enabled."""
-    return os.environ.get("PALLADIUM_EXPLAIN", "") not in ("", "0")
-
-
 def log_compile(
     spec: KernelSpec,
     threadgroup: tuple[int, ...] | None = None,
@@ -175,7 +170,7 @@ def log_compile(
     This function emits source again when enabled; it does not deduplicate logs. The caller
     invokes it on cache misses to obtain one line per specialization.
     """
-    if _explain_enabled():
+    if os.environ.get("PALLADIUM_EXPLAIN", "") not in ("", "0"):
         print(
             explain_spec(spec, threadgroup, dot_general=dot_general, program=program),
             file=sys.stderr,
