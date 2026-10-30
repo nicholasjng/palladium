@@ -93,4 +93,4 @@ def debug_msl(kernel: Callable, *example_args, **pallas_kwargs) -> str:
 
     params = pallas_kwargs.get("compiler_params") or CompilerParams()
     spec = trace(pl.pallas_call(kernel, **pallas_kwargs), *example_args)
-    return emit_msl(spec, dot_general=params.dot_general)
+    return emit_msl(spec, dot_general=params.dot_general, program=params.program)

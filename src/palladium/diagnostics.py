@@ -92,6 +92,7 @@ def explain_spec(
     threadgroup: tuple[int, ...] | None = None,
     *,
     dot_general: str = "auto",
+    program: str = "thread",
 ) -> KernelDiagnostics:
     """Emit a traced kernel and report its geometry and declared storage.
 
@@ -128,7 +129,7 @@ def explain_spec(
     An unavailable Metal device leaves the shared-memory limit unknown. Resource counts
     describe declarations rather than compiler-measured stack or register use.
     """
-    msl, stats = emit_msl_stats(spec, dot_general=dot_general)
+    msl, stats = emit_msl_stats(spec, dot_general=dot_general, program=program)
     grid, group = launch_geometry(spec, msl, threadgroup)
     check_threadgroup(spec, group)
     return KernelDiagnostics(
@@ -152,6 +153,7 @@ def log_compile(
     spec: KernelSpec,
     threadgroup: tuple[int, ...] | None = None,
     dot_general: str = "auto",
+    program: str = "thread",
 ) -> None:
     """Print kernel diagnostics when the explain environment flag is enabled.
 
@@ -174,4 +176,7 @@ def log_compile(
     invokes it on cache misses to obtain one line per specialization.
     """
     if _explain_enabled():
-        print(explain_spec(spec, threadgroup, dot_general=dot_general), file=sys.stderr)
+        print(
+            explain_spec(spec, threadgroup, dot_general=dot_general, program=program),
+            file=sys.stderr,
+        )

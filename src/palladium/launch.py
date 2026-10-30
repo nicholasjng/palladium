@@ -10,8 +10,12 @@ from jax._src.pallas import core as pallas_core
 from metal_runtime import MathMode
 
 from palladium.device import device_limits, simdgroup_width
-from palladium.emit.kernel import DOT_GENERAL_POLICIES
-from palladium.emit.tensorops import cooperative_launch, emits_cooperative
+from palladium.emit.kernel import DOT_GENERAL_POLICIES, PROGRAM_SCOPES
+from palladium.emit.tensorops import (
+    cooperative_launch,
+    declared_threadgroup_width,
+    emits_cooperative,
+)
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
 
@@ -36,6 +40,11 @@ class CompilerParams(pallas_core.CompilerParams):
         "simdgroup" also requires it, and emits float32 tiled matmuls with
         `simdgroup_matrix` instead of Metal 4 `matmul2d` where the tile shape allows;
         that measured about 20% faster on an M2.
+    program : {"thread", "threadgroup"}, optional
+        "thread" (default) runs each Pallas program as one Metal thread, or
+        one threadgroup when a dot lowers cooperatively. "threadgroup" runs
+        each program as one threadgroup of rows (`emit/threadgroup.py`);
+        kernels it cannot lower raise EmitError.
     threadgroup : int, tuple of int, or None, optional
         One to three positive dimensions, or None for runtime selection. Cooperative
         kernels fix their own size and reject mismatches.
@@ -60,12 +69,15 @@ class CompilerParams(pallas_core.CompilerParams):
 
     BACKEND: str = "palladium"
     dot_general: str = "auto"
+    program: str = "thread"
     threadgroup: int | tuple[int, ...] | None = None
     math_mode: MathMode = MathMode.FAST
 
     def __post_init__(self) -> None:
         if self.dot_general not in DOT_GENERAL_POLICIES:
             raise ValueError("dot_general must be 'auto', 'default', 'tensorops', or 'simdgroup'")
+        if self.program not in PROGRAM_SCOPES:
+            raise ValueError("program must be 'thread' or 'threadgroup'")
         normalize_threadgroup(self.threadgroup)
 
     @property
@@ -192,7 +204,9 @@ def launch_geometry(
     grid = _pad3(spec.grid)
     group = None if threadgroup is None else _pad3(threadgroup)
     if emits_cooperative(msl_source):
-        required, grid = cooperative_launch(spec.grid, simdgroup_width())
+        required, grid = cooperative_launch(
+            spec.grid, simdgroup_width(), declared_threadgroup_width(msl_source)
+        )
         if group is not None and group != required:
             raise ValueError(f"cooperative kernel requires threadgroup={required}, got {group}")
         group = required

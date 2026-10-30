@@ -25,9 +25,11 @@ from palladium.emit.core import (
     msl_type,
 )
 from palladium.emit.tensorops import compile_kernel, uses_tensorops
+from palladium.emit.threadgroup import lower_row_program
 from palladium.trace import KernelSpec
 
 DOT_GENERAL_POLICIES = ("auto", "default", "tensorops", "simdgroup")
+PROGRAM_SCOPES = ("thread", "threadgroup")
 
 
 def emit_msl_stats(
@@ -35,6 +37,7 @@ def emit_msl_stats(
     kernel_name: str | None = None,
     *,
     dot_general: str = "auto",
+    program: str = "thread",
 ) -> tuple[str, EmitStats]:
     """Generate a complete Metal kernel and estimate its declared storage.
 
@@ -49,6 +52,11 @@ def emit_msl_stats(
         Use cooperative TensorOps when recognized, force primitive emission, require
         TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
         respectively. The default is "auto".
+    program : {"thread", "threadgroup"}, optional
+        "thread" (default) runs each Pallas program as one Metal thread, or
+        one threadgroup when a dot lowers cooperatively. "threadgroup" runs
+        each program as one threadgroup of rows (`emit/threadgroup.py`);
+        kernels it cannot lower raise EmitError.
 
     Returns
     -------
@@ -78,6 +86,11 @@ def emit_msl_stats(
     """
     if dot_general not in DOT_GENERAL_POLICIES:
         raise ValueError("dot_general must be 'auto', 'default', 'tensorops', or 'simdgroup'")
+    if program not in PROGRAM_SCOPES:
+        raise ValueError("program must be 'thread' or 'threadgroup'")
+    if program == "threadgroup":
+        source, threadgroup_bytes = lower_row_program(spec, kernel_name)
+        return source, EmitStats(thread_bytes=0, threadgroup_bytes=threadgroup_bytes)
     if dot_general != "default" and uses_tensorops(spec, dot_general):
         try:
             source, threadgroup_bytes = compile_kernel(
@@ -230,6 +243,7 @@ def emit_msl(
     kernel_name: str | None = None,
     *,
     dot_general: str = "auto",
+    program: str = "thread",
 ) -> str:
     """Generate a complete Metal kernel from a traced Pallas specification.
 
@@ -244,6 +258,11 @@ def emit_msl(
         Use cooperative TensorOps when recognized, force primitive emission, require
         TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
         respectively. The default is "auto".
+    program : {"thread", "threadgroup"}, optional
+        "thread" (default) runs each Pallas program as one Metal thread, or
+        one threadgroup when a dot lowers cooperatively. "threadgroup" runs
+        each program as one threadgroup of rows (`emit/threadgroup.py`);
+        kernels it cannot lower raise EmitError.
 
     Returns
     -------
@@ -271,4 +290,4 @@ def emit_msl(
     --------
     emit_msl_stats : Return source together with declared storage estimates.
     """
-    return emit_msl_stats(spec, kernel_name, dot_general=dot_general)[0]
+    return emit_msl_stats(spec, kernel_name, dot_general=dot_general, program=program)[0]

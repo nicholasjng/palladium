@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var, subjaxprs
 
@@ -218,10 +219,31 @@ def emits_cooperative(msl_source: str) -> bool:
     return "threadgroup_position_in_grid" in msl_source
 
 
+_WIDTH_MARKER = re.compile(r"// palladium: threadgroup width (\d+)")
+
+
+def declared_threadgroup_width(msl_source: str) -> int | None:
+    """Read the group width a cooperative kernel declares, if any.
+
+    Parameters
+    ----------
+    msl_source : str
+        Emitted source; a kernel that needs a width other than four SIMD groups
+        contains the line ``// palladium: threadgroup width N``.
+
+    Returns
+    -------
+    int or None
+        The declared thread count, or None for the four-SIMD-group default.
+    """
+    match = _WIDTH_MARKER.search(msl_source)
+    return int(match.group(1)) if match else None
+
+
 def cooperative_launch(
-    grid: tuple[int, ...], simd_width: int
+    grid: tuple[int, ...], simd_width: int, width: int | None = None
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    """Compute a four-SIMD-group launch for each Pallas program.
+    """Compute a cooperative launch of one threadgroup per Pallas program.
 
     Parameters
     ----------
@@ -229,11 +251,13 @@ def cooperative_launch(
         Pallas program grid with at most three dimensions.
     simd_width : int
         Positive thread count per SIMD group.
+    width : int or None, optional
+        Threads per group as the kernel declares it; None means four SIMD groups.
 
     Returns
     -------
     threadgroup : tuple of int
-        Group dimensions (4 * simd_width, 1, 1).
+        Group dimensions (width, 1, 1), by default (4 * simd_width, 1, 1).
     grid : tuple of int
         Thread grid padded to three axes and scaled by the group dimensions.
 
@@ -242,7 +266,7 @@ def cooperative_launch(
     The caller validates grid rank and device limits. This low-level helper truncates axes
     beyond three, so it must only receive an already validated Metal grid.
     """
-    threadgroup = (simd_width * SIMDGROUPS, 1, 1)
+    threadgroup = (width or simd_width * SIMDGROUPS, 1, 1)
     padded = (tuple(int(g) for g in grid) + (1, 1, 1))[:3]
     scaled = tuple(g * t for g, t in zip(padded, threadgroup, strict=True))
     return threadgroup, (scaled[0], scaled[1], scaled[2])

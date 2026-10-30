@@ -126,6 +126,7 @@ validating compiler behavior or resource limits.
 |---|---|---|---|
 | Primitive emitter | One Metal thread | Small independent simulations, elementwise work, serial loops and reductions | Per-thread blocks, scratch, and intermediate storage |
 | Cooperative TensorOps | One threadgroup of four SIMD groups | Recognized tiled matmul and online-softmax attention | Shared memory, register-held cooperative results, synchronization |
+| Row program (`program="threadgroup"`) | One threadgroup over a block of rows: a SIMD group per row up to 256 columns, the whole group (up to 1024 threads) for wider rows | Row softmax, layer and RMS norm, logsumexp, scans, stencils along rows, per-row and per-tile statistics | Per-thread registers holding each row's elements; reductions across SIMD groups through threadgroup memory |
 
 `CompilerParams(dot_general="auto")` attempts cooperative recognition for
 kernels containing dots on a 2D or 3D grid and falls back when recognition

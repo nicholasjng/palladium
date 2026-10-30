@@ -47,6 +47,27 @@ read snapshots are preserved across later writes.
 - **Effects:** Ref reads and writes. Debug printing and arbitrary JAX
   effects are unsupported.
 
+`CompilerParams(program="threadgroup")` runs each program as one threadgroup
+over a block of rows instead of one thread. The kernel stays plain Pallas on
+a 1D grid: refs are `(rows, columns)` blocks spanning all columns, `(rows,)`
+per-row vectors, `(columns,)` vectors such as weights, or per-tile outputs:
+`(1, columns)` blocks of a `(programs, columns)` array and `(1,)` blocks of a
+`(programs,)` array. Full-block reads and stores, elementwise operations,
+broadcasts, reshapes by unit dimensions, sum, max or min over the columns,
+and `cumsum`, `cumprod`, `cummax` or `cummin` along the columns (forward or
+reverse, for rows of at most 16 elements per thread) are supported. Slices,
+pads and concatenations along the columns, as in `jnp.roll`, `jnp.pad` and
+`jnp.diff`, read shifted columns; scan results cannot be shifted. Sum, max
+or min over the rows of a tile (or over the whole tile) accumulate across
+the rows and must go to per-tile outputs; tiles must divide the rows, and
+values that vary by row cannot be combined with these results. Nested `jit`
+and `custom_jvp_call` (as in `jax.nn.softmax`) are inlined. Broadcasts or
+shifts across rows, indexed reads and other primitives raise EmitError.
+Each block is read into registers once per row, so a row softmax, layer norm
+or cumsum reads and writes its data once. On an M2 they ran at 91 GB/s, about
+98% of the copy bandwidth and within 2% of MLX's fused kernels and
+`mx.cumsum` (`benchmarks/bench_row_programs.py`).
+
 On both paths, tiled matmuls on a 2D or 3D grid lower through Metal 4
 TensorOps by default (`CompilerParams(dot_general="auto")`); other dots keep
 the one-thread-per-program emitter. `dot_general="tensorops"` requires the cooperative lowering and

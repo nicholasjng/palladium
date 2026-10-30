@@ -153,6 +153,41 @@ def _template(cursor: Cursor, eqn: JaxprEqn, opname: str, ops: list[CVal], ctype
     return template
 
 
+def scalar_expression(cursor: Cursor, eqn: JaxprEqn, operands: list[CVal]) -> str:
+    """Format one element of an elementwise equation from scalar operands.
+
+    Parameters
+    ----------
+    cursor : Cursor
+        Receives helper functions the expression calls.
+    eqn : JaxprEqn
+        An equation for which `lowers_elementwise` holds.
+    operands : list of CVal
+        One scalar per invar; `expr` is the operand's expression and `ctype` its
+        type.
+
+    Returns
+    -------
+    str
+        MSL expression of the output element.
+
+    Raises
+    ------
+    EmitError
+        The template does not consume exactly the given operands.
+    """
+    out_ctype = msl_type(shaped(eqn.outvars[0].aval).dtype)
+    opname = eqn.primitive.name
+    if opname == "integer_pow" and eqn.params["y"] == 0:
+        return f"{out_ctype}(1)"
+    template = _template(cursor, eqn, opname, operands, out_ctype)
+    if template_fields(template) != set(PRIMITIVE_INVARS[: len(operands)]):
+        raise EmitError(f"{opname} does not take {len(operands)} operands")
+    return enclosed(
+        template.format(**{name: op.expr for name, op in zip(PRIMITIVE_INVARS, operands)})
+    )
+
+
 def _rule_elementwise(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     """One rule for every pure elementwise primitive.
 

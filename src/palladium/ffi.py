@@ -185,8 +185,17 @@ class FfiCallable:
                     check_dtypes(tuple(args))
                     spec = trace(self._staged, *self._shapes(args))
                     check_threadgroup(spec, self._params.threadgroup_dims)
-                    log_compile(spec, self._params.threadgroup_dims, self._params.dot_general)
-                    msl = emit_msl(spec, dot_general=self._params.dot_general)
+                    log_compile(
+                        spec,
+                        self._params.threadgroup_dims,
+                        self._params.dot_general,
+                        self._params.program,
+                    )
+                    msl = emit_msl(
+                        spec,
+                        dot_general=self._params.dot_general,
+                        program=self._params.program,
+                    )
                     entry = (spec, msl, hashlib.sha256(msl.encode()).hexdigest())
                     self._cache[key] = entry
                     if len(self._cache) > _CACHE_SIZE:
@@ -231,6 +240,7 @@ class FfiCallable:
             trace(self._staged, *self._shapes(args)),
             self._params.threadgroup_dims,
             dot_general=self._params.dot_general,
+            program=self._params.program,
         )
 
     def __call__(self, *args):
