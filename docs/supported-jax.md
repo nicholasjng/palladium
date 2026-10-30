@@ -35,8 +35,9 @@ read snapshots are preserved across later writes.
   (start indices clamped as JAX defines).
 - **Cumulative:** `cumsum`, `cumprod`, `cummax`, `cummin` along one axis,
   forward or reverse.
-- **Reductions:** sum, min, and max over supported axis subsets, including
-  `jnp.minmax`.
+- **Reductions:** sum, min, and max over supported axis subsets, and
+  `lax.reduce` with any combiner over several operands, such as `jnp.minmax`
+  or a value-and-index argmax.
 - **Dot:** standard rank-2 matrix multiplication and rank-1 matvec, vecmat, or
   vecvec. Batched dots and other contraction axes are rejected.
 - **Control flow:** `fori_loop`, `scan` (including reverse scans and stacked

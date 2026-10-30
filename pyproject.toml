@@ -11,7 +11,7 @@ license = "Apache-2.0"
 authors = [{ name = "Nicholas Junge", email = "nicho.junge@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = [
-    "jax>=0.11,<0.12",
+    "jax>=0.11",
     "metal-runtime",
 ]
 
@@ -33,10 +33,14 @@ dev = [
     "ty>=0.0.66",
 ]
 mps = ["jax-mps>=0.11.1"]
+# jax-mps requires jax<0.12. Without the mps group, take the newest jax;
+# sync the plugin with `uv sync --group mps --no-group latest-jax`.
+latest-jax = ["jax>=0.12", "jaxlib>=0.12"]
 
 [tool.uv]
 no-build-isolation-package = ["palladium"]
-default-groups = ["build", "dev"]
+default-groups = ["build", "dev", "latest-jax"]
+conflicts = [[{ group = "mps" }, { group = "latest-jax" }]]
 
 [tool.uv.sources]
 metal-runtime = { path = "../metal-runtime" }

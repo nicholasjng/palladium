@@ -8,9 +8,17 @@ from collections.abc import Callable
 from jax.extend.core import JaxprEqn
 
 from palladium.emit.addressing import element_strides, flat_index
-from palladium.emit.core import REGISTER_BYTES, Cursor, CVal, Environment, declare, rule
+from palladium.emit.core import (
+    REGISTER_BYTES,
+    Cursor,
+    CVal,
+    Environment,
+    declare,
+    emit_jaxpr,
+    rule,
+)
 from palladium.emit.numeric import extremum, extremum_identity
-from palladium.emit.rules.control import store_or_declare
+from palladium.emit.rules.control import copy_back_carries, store_or_declare
 from palladium.errors import EmitError
 
 
@@ -210,3 +218,54 @@ def _rule_reduce_extremum(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> No
         extremum_identity(op, ctype),
         lambda acc, x: extremum(op, ctype, acc, x),
     )
+
+
+@rule("reduce")
+def _rule_reduce(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """`lax.reduce` with any combiner, such as `jnp.minmax` or an argmax pair.
+
+    The loops follow `_emit_reduce`, with one scalar accumulator per operand.
+    The combiner jaxpr takes the accumulators then the current elements and
+    is inlined once per element; its results update every accumulator at
+    once, as loop carries do.
+    """
+    combiner = eqn.params["jaxpr"]
+    if combiner.constvars:
+        raise EmitError("reduce with a combiner that captures arrays is unsupported")
+    count = len(eqn.outvars)
+    operands = [env.val(v) for v in eqn.invars[:count]]
+    inits = [env.val(v) for v in eqn.invars[count:]]
+    axes = set(eqn.params["dimensions"])
+    shape = operands[0].shape
+    rank = len(shape)
+    kept_dims = [d for d in range(rank) if d not in axes]
+    reduced_dims = [d for d in range(rank) if d in axes]
+
+    dsts = [
+        store_or_declare(env, cursor, outvar, min_bytes=REGISTER_BYTES) for outvar in eqn.outvars
+    ]
+    src_strides = element_strides(shape)
+    dst_strides = element_strides(dsts[0].shape)
+
+    with cursor.loop_nest(tuple(shape[d] for d in kept_dims), "_d") as kept:
+        accs = []
+        for dst, init in zip(dsts, inits, strict=True):
+            acc = cursor.fresh("_acc")
+            cursor.emit(f"{dst.ctype} {acc} = {init.at('0')};")
+            accs.append(CVal(acc, (), dst.ctype))
+        with cursor.loop_nest(tuple(shape[d] for d in reduced_dims), "_d") as reduced:
+            index = dict(zip(kept_dims, kept)) | dict(zip(reduced_dims, reduced))
+            src_idx = flat_index([(index[d], src_strides[d]) for d in range(rank)])
+            elements = []
+            for src in operands:
+                value = src.at(src_idx)
+                if src.lazy is not None:
+                    # A fused input is an expression: evaluate it once.
+                    value = cursor.fresh("_x")
+                    cursor.emit(f"{src.ctype} {value} = {src.at(src_idx)};")
+                elements.append(CVal(value, (), src.ctype))
+            outs = emit_jaxpr(env, cursor, combiner, accs + elements)
+            copy_back_carries(cursor, outs, accs)
+        dst_idx = flat_index(list(zip(kept, dst_strides)))
+        for dst, acc in zip(dsts, accs, strict=True):
+            cursor.emit(f"{dst.at(dst_idx)} = {acc.expr};")

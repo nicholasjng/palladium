@@ -43,7 +43,7 @@ def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     (`store_target`) or fill thread-local stacked storage, bounded
     by the per-thread stack.
 
-    Carries update simultaneously (see `_copy_back_carries`). ys slices
+    Carries update simultaneously (see `copy_back_carries`). ys slices
     are stored before copy-back, while the body outputs still hold this
     iteration's values.
     """
@@ -92,7 +92,7 @@ def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         outs = emit_jaxpr(env, cursor, body, const_vals + carries + x_slices)
         for target, y in zip(ys_targets, outs[num_carry:], strict=True):
             cursor.copy(target.slot(idx, (y.size,)), y, y.size)
-        _copy_back_carries(cursor, outs[:num_carry], carries)
+        copy_back_carries(cursor, outs[:num_carry], carries)
 
 
 def _adoptable(env: Environment, var, value: CVal) -> bool:
@@ -328,7 +328,7 @@ def store_target(env: Environment, outvar: Var) -> CVal | None:
     return ref
 
 
-def _copy_back_carries(cursor: Cursor, outs: list[CVal], carries: list[CVal]) -> None:
+def copy_back_carries(cursor: Cursor, outs: list[CVal], carries: list[CVal]) -> None:
     """Write loop-body outputs back into their carry storage.
 
     All carries update simultaneously, so every source element is read
@@ -420,7 +420,7 @@ def _rule_while(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         with cursor.block(f"if (!{pred.at('0')})"):
             cursor.emit("break;")
         outs = emit_jaxpr(env, cursor, body_jaxpr.jaxpr, body_consts + carries)
-        _copy_back_carries(cursor, outs, carries)
+        copy_back_carries(cursor, outs, carries)
 
 
 @rule("cond")

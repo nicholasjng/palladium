@@ -109,7 +109,7 @@ def test_carry_permutation_beside_computed_carry():
     # when the loop body holds three or more thread-local array temporaries: the optimizer
     # forwards a permuted carry's read across the write it must precede.
 
-    # Volatile reads/writes at the hazard endpoints, which `_copy_back_carries` emits for
+    # Volatile reads/writes at the hazard endpoints, which `copy_back_carries` emits for
     # permuted carries, avoid the miscompile.
 
     def kernel(a_ref, b_ref, c_ref, ao_ref, bo_ref, co_ref):
