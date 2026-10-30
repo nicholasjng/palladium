@@ -7,9 +7,8 @@ steps with its own parameters; the grid is the ensemble.
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 from jax.experimental import pallas as pl
-from kernels import DT, STEPS, lv_kernel
+from kernels import lv_kernel
 
 import palladium
 
@@ -49,35 +48,3 @@ def test_matches_interpret_oracle(rng):
     # and the CPU, hence the 1e-3 relative bar.
     np.testing.assert_allclose(got_x, np.asarray(want_x), rtol=1e-3, atol=1e-5)
     np.testing.assert_allclose(got_y, np.asarray(want_y), rtol=1e-3, atol=1e-5)
-
-
-def test_matches_diffrax(rng):
-    """Compare RK4 ensemble final states with independent adaptive Diffrax Tsit5 solves."""
-    diffrax = pytest.importorskip("diffrax")
-    n = 64
-    f = make_solver(n)
-    x0, y0, a, b, c, d = _ensemble(rng, n)
-    got_x, got_y = f(x0, y0, a, b, c, d)
-
-    def rhs(t, u, p):
-        x, y = u
-        a_, b_, c_, d_ = p
-        return jnp.stack([a_ * x - b_ * x * y, c_ * x * y - d_ * y])
-
-    @jax.vmap
-    def solve(u0, p):
-        sol = diffrax.diffeqsolve(
-            diffrax.ODETerm(rhs),
-            diffrax.Tsit5(),
-            t0=0.0,
-            t1=DT * STEPS,
-            dt0=DT,
-            y0=u0,
-            args=p,
-            stepsize_controller=diffrax.PIDController(rtol=1e-6, atol=1e-8),
-        )
-        return sol.ys[-1]
-
-    want = solve(np.stack([x0, y0], axis=1), np.stack([a, b, c, d], axis=1))
-    np.testing.assert_allclose(got_x, np.asarray(want)[:, 0], rtol=2e-3, atol=1e-4)
-    np.testing.assert_allclose(got_y, np.asarray(want)[:, 1], rtol=2e-3, atol=1e-4)

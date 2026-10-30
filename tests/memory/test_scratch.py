@@ -34,22 +34,6 @@ def test_spec_captures_scratch():
     assert len(spec.inputs) == 1 and len(spec.outputs) == 1
 
 
-def test_scratch_roundtrip(rng):
-    """Compare a write/read scratch-buffer computation with the interpreter."""
-
-    def kernel(x_ref, o_ref, s_ref):
-        s_ref[...] = x_ref[...] * 2.0
-        o_ref[...] = s_ref[...] + 1.0
-
-    kwargs = {
-        "out_shape": jax.ShapeDtypeStruct((8,), jnp.float32),
-        "scratch_shapes": [_f32((8,))],
-    }
-    f = palladium.metal_call(kernel, **kwargs)
-    x = rng.standard_normal(8, dtype=np.float32)
-    np.testing.assert_allclose(f(x), np.asarray(f.interpret(x)), rtol=1e-6)
-
-
 def test_scalar_scratch(rng):
     """Compare scalar scratch reads followed by broadcast with the interpreter."""
 

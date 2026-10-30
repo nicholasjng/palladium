@@ -35,20 +35,13 @@ def _reused_call(n):
     return palladium.metal_call(_reused_kernel, out_shape=jax.ShapeDtypeStruct((n,), jnp.float32))
 
 
-def test_explain_reports_per_thread_stack():
-    """Check that explain reports nonzero per-thread storage and includes it in the formatted
-    report."""
-    d = _reused_call(64).explain(jax.ShapeDtypeStruct((64,), jnp.float32))
-    # 64 f32 elements per live array, several arrays.
-    assert d.thread_bytes >= 64 * 4
-    assert d.threadgroup_bytes == 0
-    assert "stack~" in str(d)
-
-
-def test_stack_estimate_scales_with_block_size():
-    """Check that declared thread-storage estimates increase with the kernel block size."""
+def test_explain_reports_per_thread_storage():
+    """Check that explain reports declared per-thread storage, scaling with the block size."""
     small = _reused_call(64).explain(jax.ShapeDtypeStruct((64,), jnp.float32))
     big = _reused_call(512).explain(jax.ShapeDtypeStruct((512,), jnp.float32))
+    # 64 f32 elements per live array, several arrays.
+    assert small.thread_bytes >= 64 * 4
+    assert small.threadgroup_bytes == 0
     assert big.thread_bytes == small.thread_bytes * 8
 
 

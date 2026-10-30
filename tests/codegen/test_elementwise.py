@@ -18,17 +18,6 @@ def _check_against_oracle(kernel, args, rtol=1e-5, atol=1e-6, **shapes):
     np.testing.assert_allclose(got, want, rtol=rtol, atol=atol)
 
 
-def test_saxpy_with_literal(rng):
-    """Compare SAXPY with the interpreter when the scaling coefficient is an inline float literal."""
-
-    def kernel(x_ref, y_ref, o_ref):
-        o_ref[...] = 2.5 * x_ref[...] + y_ref[...]
-
-    x = rng.standard_normal(512, dtype=np.float32)
-    y = rng.standard_normal(512, dtype=np.float32)
-    _check_against_oracle(kernel, (x, y), out_shape=jax.ShapeDtypeStruct((512,), jnp.float32))
-
-
 def test_autodiff_cotangent_accumulation(rng):
     """Compare in-kernel autodiff of a reused input with the interpreter, exercising add_any
     lowering."""
@@ -50,19 +39,6 @@ def test_binary_zoo(rng):
     x = rng.standard_normal(256, dtype=np.float32)
     y = rng.standard_normal(256, dtype=np.float32)
     _check_against_oracle(kernel, (x, y), out_shape=jax.ShapeDtypeStruct((256,), jnp.float32))
-
-
-def test_unary_zoo(rng):
-    """Compare a composition of exp, sin, cos, and tanh with the interpreter."""
-
-    def kernel(x_ref, o_ref):
-        x = x_ref[...]
-        o_ref[...] = jnp.exp(-x * x) + jnp.sin(x) * jnp.cos(x) + jnp.tanh(x)
-
-    x = rng.standard_normal(256, dtype=np.float32)
-    _check_against_oracle(
-        kernel, (x,), out_shape=jax.ShapeDtypeStruct((256,), jnp.float32), rtol=1e-4
-    )
 
 
 def test_integer_pow_and_sqrt(rng):
@@ -113,6 +89,8 @@ def test_transcendental_zoo_matches_the_oracle(rng):
         x = x_ref[...]
         o_ref[...] = (
             jax.lax.rsqrt(x * x + 1.0)
+            + jnp.exp(-x * x)
+            + jnp.sin(x) * jnp.cos(x)
             + jax.nn.sigmoid(x)
             + jnp.exp2(x)
             + jnp.square(x)

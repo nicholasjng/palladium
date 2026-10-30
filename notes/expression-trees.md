@@ -53,8 +53,8 @@ its precedence. tree_util only exposes leaves and structure.
 1. Add `expr.py`: nodes, pytree registration, and the printer. Wrap
    existing strings as Atoms with `enclosed()` so everything still emits.
 2. Turn the operator entries of `ELEMENTWISE` into `Infix` / `Prefix`,
-   and the call entries into `Call`. Regenerate the golden snapshots and
-   run the fuzz tests.
+   and the call entries into `Call`. Run the full suite and the fuzz
+   tests.
 3. Rewrite `typed_expression` and the `_template` special cases (NaN-aware
    extrema, integer div and rem, shifts, `sign`, `one_minus_square`) as
    builder functions. Builders that repeat an operand bind it once.

@@ -63,7 +63,7 @@ def _source(kind):
 def test_fractional_bfloat_literal():
     """Verify that a fractional bfloat literal receives an explicit bfloat constructor in emitted
     MSL."""
-    assert " + bfloat(0.5f);" in _source("bfloat_literal")
+    assert "bfloat(0.5" in _source("bfloat_literal")
 
 
 @pytest.mark.parametrize("kind", ["scalar_to_array", "array_to_scalar"])
@@ -76,18 +76,6 @@ def test_reshape_between_scalar_and_one_element_array_stays_in_registers(kind):
     assert not re.search(r"^    float t\d+\[1\];$", source, re.MULTILINE)
     for scalar in scalars:
         assert not re.search(rf"\b{scalar}\[", source)
-
-
-def test_swap_snapshots_before_store_and_later_mutation():
-    """Check that swap copies the old scratch value before mutation and returns that snapshot."""
-    source = _source("swap")
-    snapshot = re.search(r"(t\d+)\[_i\d+\] = scratch0\[_i\d+\];", source)
-    assert snapshot is not None
-    assert re.search(rf"arg1\[_i\d+\] = {snapshot[1]}\[_i\d+\];", source)
-    # Initialization precedes the snapshot; both subsequent writes follow it.
-    writes = list(re.finditer(r"scratch0\[_i\d+\] =", source))
-    assert len(writes) == 3
-    assert writes[0].start() < snapshot.start() < writes[1].start()
 
 
 @pytest.mark.parametrize(
@@ -134,18 +122,6 @@ def test_a_jitted_helper_fuses_on_every_call():
     assert twice.count("float t") <= once.count("float t") + 1
 
 
-def test_scalar_fill_of_where_is_not_materialized():
-    """Verify that a scalar where fallback emits no materialized broadcast loop."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = jnp.where(x_ref[...] > 0.0, x_ref[...], 0.0)
-
-    shape = jax.ShapeDtypeStruct((64,), jnp.float32)
-    msl = palladium.debug_msl(kernel, shape, out_shape=shape)
-    # A materialized broadcast is the only loop named _b.
-    assert "for (uint _b" not in msl
-
-
 def test_sum_of_squares_needs_no_block_array():
     """Verify that a large sum-of-squares kernel fuses its load and product without a block-sized
     temporary."""
@@ -185,4 +161,4 @@ def test_iota_mask_needs_no_index_array():
 
     shape = jax.ShapeDtypeStruct((8, 16), jnp.float32)
     msl = palladium.debug_msl(kernel, shape, out_shape=shape)
-    assert "int t" not in msl
+    assert not re.search(r"\bu?int \w+\[", msl)

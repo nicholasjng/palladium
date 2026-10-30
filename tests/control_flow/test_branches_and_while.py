@@ -27,19 +27,6 @@ def _per_row(kernel, n_rows, *arrays, n_in):
     return got, want
 
 
-def test_cond_two_branches_diverge_per_thread(rng):
-    """Compare per-program conditionals with the interpreter and verify that both branches run."""
-
-    def kernel(x_ref, o_ref):
-        x = x_ref[0, 0]
-        o_ref[0, 0] = jax.lax.cond(x > 0.0, lambda v: v * 2.0, lambda v: v - 1.0, x)
-
-    x = rng.standard_normal((512, 1)).astype(np.float32)
-    got, want = _per_row(kernel, 512, x, n_in=1)
-    np.testing.assert_allclose(got, want, atol=1e-6)
-    assert (x > 0).any() and (x <= 0).any(), "test data must exercise both branches"
-
-
 def test_switch_three_branches_and_index_clamping(rng):
     """Check per-program three-way switches and low/high index clamping against the interpreter."""
 

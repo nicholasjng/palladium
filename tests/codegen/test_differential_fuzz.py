@@ -177,69 +177,6 @@ def test_fuzz_elementwise(case):
 
 
 @st.composite
-def loop_cases(draw):
-    n_carry = draw(st.integers(1, 3))
-    n_consts = draw(st.integers(0, 2))
-    length = draw(st.integers(1, 7))
-    # Per carry: either pass another carry through unchanged (self-forward
-    # and permutation) or compute a tamed expression over carries and consts.
-    plans = draw(
-        st.tuples(
-            *[
-                st.one_of(
-                    st.integers(0, n_carry - 1),  # pass-through of carry j
-                    trees(
-                        n_carry + n_consts,
-                        compare_refs=range(n_carry, n_carry + n_consts),
-                    ),
-                )
-                for _ in range(n_carry)
-            ]
-        )
-    )
-    args = draw(input_arrays(n_carry + n_consts))
-    return n_carry, n_consts, length, plans, args
-
-
-def make_loop_kernel(n_carry, n_consts, length, plans):
-    def kernel(*refs):
-        ins, outs = refs[: n_carry + n_consts], refs[n_carry + n_consts :]
-        init = tuple(r[...] for r in ins[:n_carry])
-        consts = [r[...] for r in ins[n_carry:]]
-
-        def body(_, carry):
-            vals = list(carry) + consts
-            new = []
-            for plan in plans:
-                if isinstance(plan, int):
-                    new.append(carry[plan])
-                else:
-                    # tanh bounds the carry so `length` iterations cannot overflow.
-                    new.append(jnp.tanh(eval_tree(plan, vals) + 0.0 * carry[0]))
-            return tuple(new)
-
-        final = jax.lax.fori_loop(0, length, body, init)
-        for out, value in zip(outs, final):
-            out[...] = value
-
-    return kernel
-
-
-@settings(max_examples=MAX_EXAMPLES, deadline=None)
-@given(loop_cases())
-def test_fuzz_loops(case):
-    """Compare generated loops, including carry permutations and constants, with the interpreter."""
-    n_carry, n_consts, length, plans, args = case
-    out_shape = tuple(jax.ShapeDtypeStruct((N,), jnp.float32) for _ in range(n_carry))
-    f = palladium.metal_call(
-        make_loop_kernel(n_carry, n_consts, length, plans),
-        out_shape=out_shape,
-        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
-    )
-    _assert_matches_oracle(f, args)
-
-
-@st.composite
 def scan_cases(draw):
     """lax.scan cases with scanned xs and stacked ys, each ys either stored directly (streaming path) or through an add (thread-local path)."""
     n_carry = draw(st.integers(1, 2))

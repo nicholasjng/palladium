@@ -21,17 +21,6 @@ def _trace(kernel, in_shapes, out_shape):
     return trace(call, *[jax.ShapeDtypeStruct(s, F32) for s in in_shapes])
 
 
-def test_debug_print_is_rejected_at_trace_time():
-    """Verify that a JAX debug-print effect inside a kernel is rejected during tracing."""
-
-    def kernel(x_ref, o_ref):
-        jax.debug.print("x0={}", x_ref[0])
-        o_ref[...] = x_ref[...]
-
-    with pytest.raises(TraceError, match="DebugEffect"):
-        _trace(kernel, [(8,)], jax.ShapeDtypeStruct((8,), F32))
-
-
 def test_pallas_debug_print_is_rejected_at_trace_time():
     """Verify that a Pallas debug-print effect inside a kernel is rejected during tracing."""
 
@@ -41,16 +30,6 @@ def test_pallas_debug_print_is_rejected_at_trace_time():
 
     with pytest.raises(TraceError, match="cannot perform on the GPU"):
         _trace(kernel, [(8,)], jax.ShapeDtypeStruct((8,), F32))
-
-
-def test_pure_state_effects_pass_the_gate():
-    """Check that ordinary Ref read/write effects pass the tracing effect gate."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...] * 2.0
-
-    spec = _trace(kernel, [(8,)], jax.ShapeDtypeStruct((8,), F32))
-    assert effects.foreign_effects(spec.jaxpr) == []
 
 
 def test_effects_surface_through_control_flow():

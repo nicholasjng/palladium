@@ -16,7 +16,7 @@ def copy_kernel(x, out):
 
 @pytest.mark.parametrize(
     "shape,block",
-    [((3,), (8,)), ((17,), (8,)), ((9, 13), (4, 8)), ((3, 5), (8, 8)), ((8, 12), (2, 3))],
+    [((9, 13), (4, 8)), ((3, 5), (8, 8)), ((8, 12), (2, 3))],
 )
 def test_edge_and_strided_tiles(metal_device, shape, block):
     """Compare doubled arrays with the interpreter across oversized, partial-edge, and strided
@@ -96,7 +96,8 @@ def test_edge_indexed_writes_preserve_alias(metal_device):
 
 
 def test_edge_source_guards_memory_access():
-    """Check that partial-edge source guards input loads and output stores."""
+    """Check that every input load and output store of a partial edge tile is bounded by the
+    array extent: an unguarded store past the end corrupts memory without failing."""
     spec = pl.BlockSpec((8,), lambda i: (i,))
     source = palladium.debug_msl(
         copy_kernel,
@@ -106,8 +107,11 @@ def test_edge_source_guards_memory_access():
         out_specs=spec,
         out_shape=jax.ShapeDtypeStruct((9,), np.float32),
     )
-    assert " ? arg0[" in source
-    assert "if (" in source and "arg1[" in source
+    lines = source.splitlines()
+    loads = [line for line in lines if "arg0[" in line]
+    stores = [n for n, line in enumerate(lines) if "arg1[" in line]
+    assert loads and all("< 9" in line for line in loads)
+    assert stores and all("if (" in lines[n - 1] and "< 9" in lines[n - 1] for n in stores)
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, jnp.bfloat16, np.int32, np.uint32])

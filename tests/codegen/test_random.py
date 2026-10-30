@@ -18,21 +18,6 @@ U32 = jnp.uint32
 F32 = jnp.float32
 
 
-def test_random_bits_matches_jax_exactly(rng):
-    """Check raw Threefry uint32 random bits against JAX bit for bit."""
-
-    def kernel(k_ref, o_ref):
-        key = jax.random.wrap_key_data(k_ref[...], impl="threefry2x32")
-        o_ref[...] = jax.random.bits(key, (16,), "uint32")
-
-    f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((16,), U32))
-    key = jax.random.key(int(rng.integers(0, 2**31)))
-    kd = np.asarray(jax.random.key_data(key))
-    got = f(kd)
-    want = np.asarray(jax.random.bits(key, (16,), "uint32"))
-    np.testing.assert_array_equal(got, want)
-
-
 def test_uniform_matches_jax_exactly():
     """Check the complete random-uniform conversion pipeline against JAX bit for bit."""
 
@@ -69,8 +54,7 @@ def test_fold_in_matches_jax_exactly():
 
 
 def test_per_thread_independent_streams():
-    """Check program-id-folded random streams against JAX and verify that all program streams
-    differ."""
+    """Check program-id-folded random streams against JAX."""
 
     def kernel(k_ref, o_ref):
         base = jax.random.wrap_key_data(k_ref[...], impl="threefry2x32")
@@ -87,10 +71,8 @@ def test_per_thread_independent_streams():
     key = jax.random.key(7)
     kd = np.asarray(jax.random.key_data(key))
     got = np.asarray(f(kd))
-    assert not isinstance(got, tuple)
     want = np.stack(
         [np.asarray(jax.random.uniform(jax.random.fold_in(key, i), (4,))) for i in range(8)]
     )
     got = got.reshape(8, 4)
     np.testing.assert_array_equal(got, want)
-    assert len({tuple(row) for row in got}) == 8

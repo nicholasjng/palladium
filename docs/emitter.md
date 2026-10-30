@@ -188,7 +188,7 @@ shows the switch to threadgroup indexing and MPP operations.
 
 When adding a primitive rule, document its shape/dtype limits, preserve Ref
 snapshots and address spaces, and compare behavior against the interpreter
-or an independent reference. Source assertions and golden snapshots explain
+or an independent reference. Source assertions explain
 which optimization or layout was selected; device execution establishes that
 the source compiles and computes correctly. Declared storage statistics help
 explain resource failures but are not compiler-measured stack or register use.

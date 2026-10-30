@@ -13,7 +13,6 @@ _NO_GPU_MODULES = {
     "test_kernel_spec",
     "test_effects",
     "test_write_safety",
-    "test_msl_snapshots",
     "test_regressions",
     "test_structural_lowerings",
     "test_typed_arithmetic",

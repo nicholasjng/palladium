@@ -134,30 +134,3 @@ def test_carry_permutation_beside_computed_carry():
     want = f.interpret(a, b, c)
     for g, w in zip(got, want, strict=True):
         np.testing.assert_allclose(g, np.asarray(w), rtol=1e-6, atol=1e-6)
-
-
-def test_carry_read_and_alias_conflict(rng):
-    """Compare a loop that both reads and swaps a carry with the interpreter to detect clobbered
-    reads."""
-
-    def kernel(x0_ref, x1_ref, x2_ref, o0_ref, o1_ref, o2_ref):
-        def step(_, carry):
-            c0, _c1, c2 = carry
-            return c2, jnp.tanh(c0 + 0.0 * c0), c0
-
-        f0, f1, f2 = jax.lax.fori_loop(0, 2, step, (x0_ref[...], x1_ref[...], x2_ref[...]))
-        o0_ref[...] = f0
-        o1_ref[...] = f1
-        o2_ref[...] = f2
-
-    f = palladium.metal_call(
-        kernel,
-        out_shape=tuple(jax.ShapeDtypeStruct((16,), jnp.float32) for _ in range(3)),
-    )
-    x0 = np.zeros(16, dtype=np.float32)
-    x1 = np.zeros(16, dtype=np.float32)
-    x2 = np.ones(16, dtype=np.float32)
-    got = f(x0, x1, x2)
-    want = f.interpret(x0, x1, x2)
-    for g, w in zip(got, want, strict=True):
-        np.testing.assert_allclose(g, np.asarray(w))

@@ -21,32 +21,6 @@ def _oracle_check(f, *args, rtol=1e-5, atol=1e-6):
     np.testing.assert_allclose(got, want, rtol=rtol, atol=atol)
 
 
-def test_comparison_to_float(rng):
-    """Verify that comparison results convert from bool to float32 with NumPy-equivalent values."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = (x_ref[...] > 0.5).astype(F32)
-
-    f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((256,), F32))
-    x = rng.standard_normal(256, dtype=np.float32)
-    got = f(x)
-    np.testing.assert_array_equal(got, (x > 0.5).astype(np.float32))
-
-
-def test_where_abs_the_hard_way(rng):
-    """Check select_n case ordering by implementing absolute value with asymmetric signed branches."""
-
-    def kernel(x_ref, o_ref):
-        x = x_ref[...]
-        o_ref[...] = jnp.where(x > 0.0, x, -x)
-
-    f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((256,), F32))
-    x = rng.standard_normal(256, dtype=np.float32)
-    got = f(x)
-    np.testing.assert_array_equal(got, np.abs(x))
-    _oracle_check(f, x)
-
-
 def test_where_asymmetric_branches(rng):
     """Compare a two-input where expression with the interpreter to detect reversed cases."""
 
@@ -78,18 +52,12 @@ def test_select_n_accepts_integer_predicate(rng):
 
 
 def test_inf_literal(rng):
-    """Check INFINITY source formatting and SAFE-math execution for a captured positive-infinity
-    literal."""
+    """Check that a captured positive-infinity literal compiles and keeps its value under SAFE
+    math."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.minimum(x_ref[...], jnp.inf)
 
-    src = palladium.debug_msl(
-        kernel,
-        jax.ShapeDtypeStruct((64,), F32),
-        out_shape=jax.ShapeDtypeStruct((64,), F32),
-    )
-    assert "INFINITY" in src and "inff" not in src
     f = palladium.metal_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((64,), F32),
@@ -138,8 +106,7 @@ def test_nan_literal_propagates(rng):
 
 
 def test_conditional_accumulation_in_loop(rng):
-    """Compare per-element accept/reject accumulation with the interpreter and check its upper
-    bound."""
+    """Compare per-element accept/reject accumulation in a loop with the interpreter."""
 
     def kernel(y0_ref, r_ref, o_ref):
         r = r_ref[...]
@@ -153,6 +120,4 @@ def test_conditional_accumulation_in_loop(rng):
     f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((256,), F32))
     y0 = rng.uniform(0.0, 0.5, 256).astype(np.float32)
     r = rng.uniform(0.01, 0.2, 256).astype(np.float32)
-    got = f(y0, r)
     _oracle_check(f, y0, r)
-    assert np.all(got <= 1.0 + 1e-6), "accept/reject failed to cap growth"

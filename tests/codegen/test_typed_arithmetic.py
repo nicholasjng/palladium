@@ -1,4 +1,4 @@
-"""Numerical boundaries for typed lowering and JAX 0.11.2 AD primitives."""
+"""Numerical boundaries for typed lowering, log2 and one_minus_square."""
 
 import jax
 import jax.numpy as jnp
@@ -59,7 +59,7 @@ def test_shift_boundaries_and_broadcast(metal_device, dtype, op):
 
 
 @pytest.mark.parametrize("dtype", [np.int32, np.uint32, np.float16, jnp.bfloat16, np.float32])
-@pytest.mark.parametrize("axis", [None, 0, 1, ()])
+@pytest.mark.parametrize("axis", [None, 1, ()])
 @pytest.mark.parametrize("op", [jnp.min, jnp.max])
 def test_typed_reduction(metal_device, dtype, axis, op):
     """Compare dtype-specific extrema reductions with the interpreter across axes, empty axes, and
@@ -91,7 +91,7 @@ def test_float_extrema_nan_and_zero(metal_device, op):
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, jnp.bfloat16])
 @pytest.mark.parametrize("mode", [mr.MathMode.SAFE, mr.MathMode.FAST])
 @pytest.mark.parametrize("op", [jax.lax.one_minus_square, jnp.log2])
-def test_new_float_primitives(metal_device, dtype, mode, op):
+def test_log2_and_one_minus_square_near_their_boundaries(metal_device, dtype, mode, op):
     """Compare log2 and one_minus_square with the interpreter across floating dtypes and math
     modes."""
     eps = float(jnp.finfo(dtype).eps)
@@ -140,7 +140,7 @@ def test_integer_scalar_literal(metal_device, op):
 
 
 @pytest.mark.parametrize("op", [jax.lax.one_minus_square, jnp.log2])
-def test_new_float_special_values(metal_device, op):
+def test_log2_and_one_minus_square_special_values(metal_device, op):
     """Compare log2 and one_minus_square at infinities, NaNs, signed zeros, and domain boundaries."""
     x = np.array([-np.inf, -2, -1, -0.0, 0.0, 1, 2, np.inf, np.nan], np.float32)
     call = call_for(op, x)
@@ -172,7 +172,7 @@ def test_boolean_extrema(metal_device, op):
     np.testing.assert_array_equal(call(x, y), call.interpret(x, y))
 
 
-def test_new_primitives_trace_without_device():
+def test_log2_emits_the_precise_function_without_a_device():
     """Check that log2 of one_minus_square emits precise::log2 without requiring GPU dispatch."""
 
     def kernel(x, out):

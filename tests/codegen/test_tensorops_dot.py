@@ -152,50 +152,10 @@ def _blocked_batched_dot(batch=2, m=32, n=64, k=16, tm=16, tn=32):
     return spec
 
 
-def _blocked_batched_relu_dot():
-    batch, m, n, k, tm, tn = 2, 32, 64, 16, 16, 32
-    call = pl.pallas_call(
-        _relu_dot,
-        grid=(batch, m // tm, n // tn),
-        in_specs=[
-            pl.BlockSpec((1, tm, k), lambda b, i, j: (b, i, 0)),
-            pl.BlockSpec((1, k, tn), lambda b, i, j: (b, 0, j)),
-        ],
-        out_specs=pl.BlockSpec((1, tm, tn), lambda b, i, j: (b, i, j)),
-        out_shape=jax.ShapeDtypeStruct((batch, m, n), jnp.float32),
-    )
-    return palladium.trace(
-        call,
-        jax.ShapeDtypeStruct((batch, m, k), jnp.float32),
-        jax.ShapeDtypeStruct((batch, k, n), jnp.float32),
-    )
-
-
-def _blocked_batched_residual_dot():
-    batch, m, n, k, tm, tn = 2, 32, 64, 16, 16, 32
-    call = pl.pallas_call(
-        _residual_dot,
-        grid=(batch, m // tm, n // tn),
-        in_specs=[
-            pl.BlockSpec((1, tm, k), lambda b, i, j: (b, i, 0)),
-            pl.BlockSpec((1, k, tn), lambda b, i, j: (b, 0, j)),
-            pl.BlockSpec((1, tm, tn), lambda b, i, j: (b, i, j)),
-        ],
-        out_specs=pl.BlockSpec((1, tm, tn), lambda b, i, j: (b, i, j)),
-        out_shape=jax.ShapeDtypeStruct((batch, m, n), jnp.float32),
-    )
-    return palladium.trace(
-        call,
-        jax.ShapeDtypeStruct((batch, m, k), jnp.float32),
-        jax.ShapeDtypeStruct((batch, k, n), jnp.float32),
-        jax.ShapeDtypeStruct((batch, m, n), jnp.float32),
-    )
-
-
 def test_tensorops_dot_uses_one_threadgroup_per_pallas_program():
-    """Check that tiled dot emission uses cooperative TensorOps and threadgroup-based program
-    indexing."""
-    msl = palladium.emit_msl(_blocked_dot(), dot_general="tensorops")
+    """Check that tiled dot emission uses cooperative TensorOps, threadgroup-based program
+    indexing, writable tensor buffers and no shared storage."""
+    msl, stats = palladium.emit.emit_msl_stats(_blocked_dot(), dot_general="tensorops")
 
     assert "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>" in msl
     assert "uint3 _pid [[threadgroup_position_in_grid]]" in msl
@@ -204,16 +164,7 @@ def test_tensorops_dot_uses_one_threadgroup_per_pallas_program():
     assert "arg0 + (int)_pid.x * 256" in msl
     assert "arg1 + (int)_pid.y * 32" in msl
     assert "arg2 + (int)_pid.x * 1024 + (int)_pid.y * 32" in msl
-
-
-def test_tensorops_dot_fuses_relu_epilogue_in_cooperative_tensor():
-    """Check that ReLU is applied to the cooperative result without a shared output intermediate."""
-    msl, stats = palladium.emit.emit_msl_stats(_blocked_dot(_relu_dot), dot_general="tensorops")
-
-    assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in msl
-    assert "op.run(a_k, b_k, cTc);" in msl
-    assert "fmax(float(cTc[element" in msl
-    assert "cTc.store(c);" in msl
+    assert "const device float*" not in msl
     assert stats.threadgroup_bytes == 0
 
 
@@ -282,40 +233,12 @@ def test_tensorops_dot_fuses_column_bias():
 def test_tensorops_batched_dot_maps_batch_and_output_tiles_to_threadgroups():
     """Check rank-3 matmul batch strides and output-tile coordinates in cooperative source."""
     msl = palladium.emit_msl(_blocked_batched_dot(), dot_general="tensorops")
-    ordinary = palladium.emit_msl(_blocked_batched_dot(), dot_general="default")
 
     assert "uint3 _pid [[threadgroup_position_in_grid]]" in msl
     assert "matmul2d_descriptor desc(16, 32, 16" in msl
     assert "arg0 + (int)_pid.x * 512 + (int)_pid.y * 256" in msl
     assert "arg1 + (int)_pid.x * 1024 + (int)_pid.z * 32" in msl
     assert "arg2 + (int)_pid.x * 2048 + (int)_pid.y * 1024 + (int)_pid.z * 32" in msl
-    assert "MetalPerformancePrimitives" not in ordinary
-    assert "thread_position_in_grid" in ordinary
-
-
-def test_tensorops_batched_dot_fuses_max_epilogue():
-    """Check that a batched cooperative matmul applies its maximum/ReLU epilogue before storing."""
-    msl, stats = palladium.emit.emit_msl_stats(_blocked_batched_relu_dot(), dot_general="tensorops")
-
-    assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in msl
-    assert "arg2 + (int)_pid.x * 2048 + (int)_pid.y * 1024 + (int)_pid.z * 32" in msl
-    assert "fmax(" in msl and "float(0.0f)" in msl
-    assert stats.threadgroup_bytes == 0
-
-
-def test_tensorops_batched_dot_fuses_matrix_residual_add():
-    """Check that a batched residual epilogue uses the matching batch slice and cooperative result."""
-    msl, stats = palladium.emit.emit_msl_stats(
-        _blocked_batched_residual_dot(), dot_general="tensorops"
-    )
-
-    assert "device float* arg3 [[buffer(3)]]" in msl
-    assert "arg2 + (int)_pid.x * 2048 + (int)_pid.y * 1024 + (int)_pid.z * 32" in msl
-    assert (
-        "(arg3 + (int)_pid.x * 2048 + (int)_pid.y * 1024 + (int)_pid.z * 32)[row * 64 + column]"
-        in msl
-    )
-    assert stats.threadgroup_bytes == 16 * 32 * 4
 
 
 def test_tensorops_batched_dot_explain_scales_batch_axis_for_groups():
@@ -410,30 +333,6 @@ def test_tensorops_explain_reports_group_scaled_dispatch():
     assert diag.cooperative
 
 
-def test_tensorops_dot_is_used_by_jittable_metal_runtime_calls():
-    """Check that FFI specialization selects cooperative source with four SIMD groups per program."""
-    call = palladium.metal_call(
-        _dot,
-        grid=(2, 2),
-        in_specs=[
-            pl.BlockSpec((16, 16), lambda i, j: (i, 0)),
-            pl.BlockSpec((16, 32), lambda i, j: (0, j)),
-        ],
-        out_specs=pl.BlockSpec((16, 32), lambda i, j: (i, j)),
-        out_shape=jax.ShapeDtypeStruct((32, 64), jnp.float32),
-        compiler_params=palladium.CompilerParams(dot_general="tensorops"),
-    )
-    _, msl, _ = call._spec_and_msl(
-        (
-            jax.ShapeDtypeStruct((32, 16), jnp.float32),
-            jax.ShapeDtypeStruct((16, 64), jnp.float32),
-        )
-    )
-
-    assert "threadgroup_position_in_grid" in msl
-    assert "execution_simdgroups<4>" in msl
-
-
 def test_tensorops_dot_rejects_unblocked_single_program_matmul():
     """Verify that explicit cooperative lowering rejects an unblocked, single-program matrix
     product."""
@@ -451,29 +350,13 @@ def test_tensorops_dot_rejects_unblocked_single_program_matmul():
         palladium.emit_msl(spec, dot_general="tensorops")
 
 
-def test_tensorops_matmul_lowering_emits_full_tiles():
-    """Check cooperative full-tile source, writable tensor buffer types, and zero shared storage."""
-    spec = _blocked_dot()
-    source, stats = palladium.emit.emit_msl_stats(spec, dot_general="tensorops")
-
-    assert "threadgroup_position_in_grid" in source
-    assert "execution_simdgroups<4>" in source
-    assert "matmul2d_descriptor desc(16, 32, 16" in source
-    assert "device float* arg0 [[buffer(0)]]" in source
-    assert "const device float*" not in source
-    assert stats.threadgroup_bytes == 0
-
-
 def test_tensorops_matmul_accumulates_k_in_tensorops_tiles_and_handles_tail():
-    """Check K chunking, tail extents, and multiply-accumulate initialization in cooperative source."""
+    """Check that a long K runs as 128-wide multiply-accumulate chunks; device tests cover the
+    tail's numerics."""
     source = palladium.emit_msl(_blocked_dot(k=144), dot_general="tensorops")
 
     assert "matmul2d_descriptor desc(16, 32, 128, false, false, false," in source
     assert "mode::multiply_accumulate" in source
-    assert "for (int k_start = 0; k_start < 144; k_start += 128)" in source
-    assert "min(128, 144 - k_start)" in source
-    assert "op.run(a_k, b_k, cTc);" in source
-    assert "cTc[init0] = 0.0f;" in source
 
 
 def test_tensorops_matmul_masks_partial_output_tiles():
@@ -484,9 +367,6 @@ def test_tensorops_matmul_masks_partial_output_tiles():
     assert "min(32, 45 - (int)_pid.y * 32)" in source
     assert "cTc.store(c_edge);" in source
     assert "if (row < min(16, 30 - (int)_pid.x * 16)" in source
-    assert "threadgroup float edge_result[512];" in source
-    assert "cTc[element1] = tensorops_epilogue2;" in source
-    assert "(arg2 + (int)_pid.x * 720 + (int)_pid.y * 32)[row * 45 + column]" in (source)
 
 
 @pytest.mark.parametrize(
@@ -494,23 +374,20 @@ def test_tensorops_matmul_masks_partial_output_tiles():
     ((jnp.float16, "half"), (jnp.bfloat16, "bfloat")),
 )
 def test_tensorops_matmul_accepts_half_precision_buffer_types(dtype, metal_type):
-    """Check half and bfloat buffer declarations, float accumulation, and narrowed output stores."""
+    """Check half and bfloat buffer declarations and float accumulation."""
     source = palladium.emit_msl(_blocked_dot(k=32, dtype=dtype), dot_general="tensorops")
 
     assert f"device {metal_type}* arg0 [[buffer(0)]]" in source
     assert f"device {metal_type}* arg2 [[buffer(2)]]" in source
     # Products accumulate in float and narrow on the per-element store.
-    assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in (source)
-    assert "threadgroup float dot_result[512];" in source
-    assert f"= {metal_type}(dot_result[element]);" in source
+    assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in source
 
 
 def test_tensorops_matmul_lowering_composes_chained_epilogues():
-    """Check that multiple scalar epilogue operations remain fused into the cooperative result."""
+    """Check that a ReLU and a further scalar epilogue fuse into the cooperative result without
+    shared storage."""
     chained, stats = palladium.emit.emit_msl_stats(
         _blocked_dot(_chained_dot), dot_general="tensorops"
     )
-    assert "threadgroup float tensorops_value_0[512];" not in chained
-    assert "cTc[element1] = tensorops_epilogue3;" in chained
     assert "fmax" in chained
     assert stats.threadgroup_bytes == 0

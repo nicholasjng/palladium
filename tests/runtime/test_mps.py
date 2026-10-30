@@ -75,12 +75,14 @@ def test_descriptor_splits_an_independent_kernel_into_header_prologue_body():
     assert descriptor.header.startswith("#include <metal_stdlib>")
     assert "kernel void" not in descriptor.header
     assert "kernel void" not in descriptor.body
-    assert descriptor.prologue.splitlines() == [
+    # jax-mps passes buffers as argN_base; the prologue binds them to the kernel's names.
+    prologue = descriptor.prologue.splitlines()
+    for binding in (
         "const device float* arg0 = (const device float*)arg0_base;",
         "const device float* arg1 = (const device float*)arg1_base;",
         "device float* arg2 = (device float*)arg2_base;",
-        "uint3 _pid = uint3(thread_position_in_grid);",
-    ]
+    ):
+        assert binding in prologue
     assert descriptor.grid == (1, 1, 1)
     assert descriptor.threadgroup is None
     # Nothing is lost: the pieces reassemble the emitted source.

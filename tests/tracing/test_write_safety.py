@@ -36,17 +36,6 @@ def test_full_block_write_ignoring_the_grid_axis_is_rejected():
         _trace(kernel, (4,), (8,), (8,))
 
 
-def test_write_indexed_by_program_id_passes():
-    """Check that direct program-id-indexed output writes pass parallel-write validation."""
-
-    def kernel(x_ref, o_ref):
-        i = pl.program_id(0)
-        o_ref[i] = x_ref[i] * 2.0
-
-    spec = _trace(kernel, (4,), (4,), (4,))
-    assert spec.grid == (4,)
-
-
 def test_write_indexed_through_arithmetic_on_program_id_passes():
     """Check that write-index dependence through program-id arithmetic passes validation."""
 

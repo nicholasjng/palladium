@@ -152,7 +152,7 @@ The tests provide several kinds of evidence:
 | Tests | Evidence |
 |---|---|
 | `tracing/` | Metadata normalization, effect rejection, aliasing and write-safety contracts |
-| `codegen/` | Source structure, deterministic golden MSL, numeric boundaries, cooperative recognition, and device comparisons |
+| `codegen/` | Source structure, numeric boundaries, cooperative recognition, and device comparisons |
 | `memory/`, `control_flow/` | Ref snapshots, edge guards, strided layouts, scratch, carry updates, and scan streaming |
 | `runtime/` | FFI/JIT/vmap composition, MPS descriptors and lowering, dtype transport, and cache concurrency |
 | `workloads/` | Independent numerical references, conservation properties, and explicit gradient checks |

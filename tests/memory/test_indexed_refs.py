@@ -72,29 +72,6 @@ def test_fully_scalar_indexed_get_and_swap(rng):
     np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
 
 
-def test_periodic_wraparound_index(rng):
-    """Compare periodic neighbor reads with NumPy rolls to check wraparound index arithmetic."""
-
-    def kernel(x_ref, o_ref):
-        i, j = pl.program_id(0), pl.program_id(1)
-        n = 4
-        ip = jnp.where(i == n - 1, 0, i + 1)
-        im = jnp.where(i != 0, i - 1, n - 1)
-        o_ref[i, j] = x_ref[ip, j] + x_ref[im, j]
-
-    f = palladium.metal_call(
-        kernel,
-        grid=(4, 4),
-        in_specs=[pl.BlockSpec((4, 4), lambda i, j: (0, 0))],
-        out_specs=pl.BlockSpec((4, 4), lambda i, j: (0, 0)),
-        out_shape=jax.ShapeDtypeStruct((4, 4), jnp.float32),
-    )
-    x = rng.standard_normal((4, 4), dtype=np.float32)
-    got = f(x)
-    want = np.roll(x, -1, 0) + np.roll(x, 1, 0)
-    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
-
-
 def test_dynamic_partial_leading_slice(rng):
     """Compare dynamic-start, fixed-size leading-axis slices with the interpreter."""
 

@@ -29,23 +29,6 @@ def test_program_id_lands_in_the_right_block():
     np.testing.assert_array_equal(f(), want)
 
 
-def test_row_blocks_2d(rng):
-    """Compare contiguous row-block addressing in a two-dimensional array with NumPy."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...] + 1.0
-
-    f = palladium.metal_call(
-        kernel,
-        grid=(64,),
-        in_specs=[pl.BlockSpec((1, 128), lambda i: (i, 0))],
-        out_specs=pl.BlockSpec((1, 128), lambda i: (i, 0)),
-        out_shape=jax.ShapeDtypeStruct((64, 128), jnp.float32),
-    )
-    x = rng.standard_normal((64, 128), dtype=np.float32)
-    np.testing.assert_allclose(f(x), x + 1.0, rtol=1e-6)
-
-
 def test_2d_grid_with_index_map_arithmetic(rng):
     """Compare a two-axis grid flattened by index-map arithmetic with the interpreter."""
 

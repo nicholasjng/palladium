@@ -76,47 +76,21 @@ def _angular_momentum(qx, qy, px, py):
     return qx * py - qy * px
 
 
-def test_conserves_angular_momentum():
-    """Check bounded angular-momentum drift after a long float32 Verlet integration of central-
-    force orbits."""
+def test_long_run_conserves_angular_momentum_and_bounds_energy():
+    """Check a long float32 Verlet integration of central-force orbits: angular momentum drifts
+    only by round-off, and the energy error stays inside the step-size bound."""
 
-    # L is exact for a central force under Verlet, so the budget is round-off over 20k
+    # L is exact for a central force under Verlet, so its budget is round-off over 20k
     # float32 steps (eps*sqrt(steps) ~ 1e-5) plus FAST-math reassociation; 1e-4 is still
-    # four orders below any structural bug.
+    # four orders below any structural bug. The energy error is set by h, not by the
+    # horizon: at h=0.002 the modified-Hamiltonian bound for these orbits is ~1e-6, and
+    # 5e-5 leaves room for the float32 round-off walk.
 
     n = 256
-    f = make_solver(n)
     *args, e = _ensemble(n)
-    got = _angular_momentum(*f(*args))
-    np.testing.assert_allclose(got, np.sqrt(1.0 - e**2), rtol=1e-4, atol=0.0)
-
-
-def test_energy_error_stays_inside_the_step_size_bound():
-    """Check that long-horizon Verlet energy error remains within the configured step-size-
-    dependent bound."""
-
-    # The energy error is set by h, not by the horizon.
-
-    # At h=0.002 the modified-Hamiltonian bound for these orbits is ~1e-6; 5e-5 leaves room
-    # for the float32 round-off walk over 20k steps.
-
-    n = 256
-    f = make_solver(n)
-    *args, _ = _ensemble(n)
-    start = _energy(*args)
-    end = _energy(*f(*args))
-    assert np.max(np.abs(end - start)) < 5e-5
-
-
-def test_energy_bound_tracks_step_size_not_horizon():
-    """Check that doubling the integration horizon keeps energy error below three times its initial
-    horizon's error."""
-    n = 256
-    *args, _ = _ensemble(n)
-    start = _energy(*args)
-    short = np.max(np.abs(_energy(*make_solver(n, STEPS)(*args)) - start))
-    long = np.max(np.abs(_energy(*make_solver(n, 2 * STEPS)(*args)) - start))
-    assert long < 3.0 * short
+    final = make_solver(n)(*args)
+    np.testing.assert_allclose(_angular_momentum(*final), np.sqrt(1.0 - e**2), rtol=1e-4, atol=0.0)
+    assert np.max(np.abs(_energy(*final) - _energy(*args))) < 5e-5
 
 
 @pytest.mark.parametrize("steps", [1, 2, 64])

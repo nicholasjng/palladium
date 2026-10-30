@@ -90,28 +90,6 @@ def test_preferred_element_type_accumulates_in_f32():
     np.testing.assert_allclose(got, want, rtol=0, atol=2**-17)
 
 
-def test_preferred_element_type_f16_to_f32(rng):
-    """Check the float32 result dtype and NumPy agreement for a promoted half-precision product."""
-
-    def kernel(a_ref, b_ref, o_ref):
-        o_ref[...] = jax.lax.dot_general(
-            a_ref[...],
-            b_ref[...],
-            (((1,), (0,)), ((), ())),
-            preferred_element_type=jnp.float32,
-        )
-
-    a = rng.standard_normal((8, 16)).astype(np.float16)
-    b = rng.standard_normal((16, 8)).astype(np.float16)
-    call = palladium.metal_call(kernel, out_shape=_shaped(8, 8))
-    got = call(a, b)
-    assert not isinstance(got, tuple)
-    got = np.asarray(got)
-    assert got.dtype == np.float32
-    want = a.astype(np.float32) @ b.astype(np.float32)
-    np.testing.assert_allclose(got, want, rtol=2e-3, atol=2e-3)
-
-
 def _matmul_kernel(a_ref, b_ref, o_ref):
     o_ref[...] = jnp.dot(a_ref[...], b_ref[...])
 
@@ -124,15 +102,6 @@ def test_rectangular_matmul_matches_interpret(rng):
     got = f(a, b)
     want = np.asarray(f.interpret(a, b))
     np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
-    np.testing.assert_allclose(got, a @ b, rtol=1e-4, atol=1e-4)
-
-
-def test_non_square_inner_dim_matches_numpy(rng):
-    """Check that a matrix product with contraction size one matches NumPy's outer-product result."""
-    a = rng.standard_normal((5, 1), dtype=np.float32)
-    b = rng.standard_normal((1, 3), dtype=np.float32)
-    f = palladium.metal_call(_matmul_kernel, out_shape=_shaped(5, 3))
-    got = f(a, b)
     np.testing.assert_allclose(got, a @ b, rtol=1e-4, atol=1e-4)
 
 

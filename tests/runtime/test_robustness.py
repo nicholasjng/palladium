@@ -1,4 +1,4 @@
-"""Robustness: thread safety and the dtype coverage matrix."""
+"""Robustness: thread safety, and sums in narrow and integer dtypes."""
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 import palladium
 
@@ -71,74 +72,13 @@ def test_concurrent_calls_on_one_compiled_kernel(rng):
 # --- dtype coverage ----------------------------------------------------------
 
 
-def _roundtrip_and_op(dtype, op, expect, x):
-    def kernel(x_ref, o_ref):
-        o_ref[...] = op(x_ref[...])
-
-    call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct(x.shape, dtype))
-    got = np.asarray(call(x))
-    want = np.asarray(expect(x))
-    if np.issubdtype(want.dtype, np.floating):
-        np.testing.assert_allclose(got, want, rtol=1e-3, atol=1e-3)
-    else:
-        np.testing.assert_array_equal(got, want)
-
-
-def test_dtype_float16(rng):
-    """Check half-precision upload, affine arithmetic, and result values against NumPy."""
-    x = rng.standard_normal(16).astype(np.float16)
-    _roundtrip_and_op(jnp.float16, lambda v: v * 2.0 + 1.0, lambda v: v * 2 + 1, x)
-
-
-def test_dtype_int32():
-    """Check signed integer upload, affine arithmetic, and result values against NumPy."""
-    x = np.arange(-8, 8, dtype=np.int32)
-    _roundtrip_and_op(jnp.int32, lambda v: v * 3 + 1, lambda v: v * 3 + 1, x)
-
-
-def test_dtype_uint32():
-    """Check unsigned integer upload and bitwise XOR results against NumPy."""
-    x = np.arange(16, dtype=np.uint32)
-    _roundtrip_and_op(jnp.uint32, lambda v: v ^ np.uint32(0xFF), lambda v: v ^ 0xFF, x)
-
-
-def test_dtype_bool():
-    """Check boolean upload and logical negation results against NumPy."""
-    x = np.array([True, False] * 8)
-    _roundtrip_and_op(jnp.bool_, jnp.logical_not, np.logical_not, x)
-
-
-def test_dtype_float16_reduction(rng):
-    """Compare a half-precision reduction and its one-element output with NumPy."""
+@pytest.mark.parametrize("dtype", [np.float16, np.int32])
+def test_sum_accumulates_in_its_own_dtype(dtype):
+    """Compare sums of half-precision and int32 blocks with NumPy exactly."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.sum(x_ref[...], keepdims=True)
 
-    x = rng.standard_normal(16).astype(np.float16)
-    call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((1,), jnp.float16))
-    got = np.asarray(call(x))
-    np.testing.assert_allclose(got, np.sum(x, keepdims=True), rtol=1e-2, atol=1e-2)
-
-
-def test_dtype_int32_reduction():
-    """Compare an int32 reduction and its one-element output with NumPy exactly."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = jnp.sum(x_ref[...], keepdims=True)
-
-    x = np.arange(16, dtype=np.int32)
-    call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((1,), jnp.int32))
-    np.testing.assert_array_equal(np.asarray(call(x)), [x.sum()])
-
-
-def test_bfloat16_round_trips_through_the_handler():
-    """Check bfloat16 buffers through native FFI with an exactly representable increment."""
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...] + jnp.bfloat16(1.0)
-
-    call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.bfloat16))
-    x = jnp.arange(8, dtype=jnp.bfloat16)
-    np.testing.assert_array_equal(
-        np.asarray(call(x)).astype(np.float32), np.arange(1, 9, dtype=np.float32)
-    )
+    x = (np.arange(16) - 11).astype(dtype)
+    call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((1,), dtype))
+    np.testing.assert_array_equal(np.asarray(call(x)), np.sum(x, keepdims=True))

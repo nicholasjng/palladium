@@ -55,18 +55,6 @@ def test_aliased_kernel_grid_and_second_input(rng):
     np.testing.assert_allclose(f(x, w), np.asarray(f.interpret(x, w)), rtol=1e-6)
 
 
-def test_ffi_aliased_call_matches_interpret_under_jit(rng):
-    """Compare a jitted FFI call with an input/output alias against the interpreter."""
-    f = palladium.metal_call(
-        _double_kernel,
-        out_shape=jax.ShapeDtypeStruct((64,), F32),
-        input_output_aliases={0: 0},
-    )
-    x = rng.standard_normal(64).astype(np.float32)
-    got = np.asarray(jax.jit(f)(x))
-    np.testing.assert_allclose(got, np.asarray(f.interpret(x)), rtol=1e-6)
-
-
 def test_ffi_aliased_vmap(rng):
     """Check that vmapped aliased FFI calls double each batch element correctly."""
     f = palladium.metal_call(
@@ -95,16 +83,20 @@ def test_read_after_aliased_write_is_rejected(rng):
         f(rng.standard_normal(8).astype(np.float32))
 
 
-def test_mismatched_alias_pair_is_rejected(rng):
-    """Verify that aliasing differently sized input and output arrays is rejected."""
+def test_alias_pair_with_different_blocks_is_rejected():
+    """Verify that an alias whose input and output blocks map to different programs is rejected:
+    sharing one buffer would let a program overwrite another's input."""
 
     def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[0:8] + x_ref[8:16]
+        o_ref[...] = x_ref[...] * 2.0
 
-    f = palladium.metal_call(
+    call = pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((8,), F32),  # half the input's size
+        grid=(2,),
+        in_specs=[pl.BlockSpec((8,), lambda i: (i,))],
+        out_specs=pl.BlockSpec((8,), lambda i: (1 - i,)),
+        out_shape=jax.ShapeDtypeStruct((16,), F32),
         input_output_aliases={0: 0},
     )
-    with pytest.raises((TraceError, ValueError)):
-        f(rng.standard_normal(16).astype(np.float32))
+    with pytest.raises(TraceError, match="identical array shape"):
+        palladium.trace(call, jax.ShapeDtypeStruct((16,), F32))

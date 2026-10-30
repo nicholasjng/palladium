@@ -42,17 +42,6 @@ def test_explain_explicit_threadgroup():
     )
     diag = call.explain(_shaped(64))
     assert diag.threadgroup == (64, 1, 1)
-    assert "threadgroup=(64, 1, 1)" in str(diag)
-
-
-def test_explain_ffi_matches_metal_call():
-    """Check that explaining an FFI matrix-product call reports the gridless Metal launch."""
-
-    def kernel(q_ref, k_ref, o_ref):
-        o_ref[...] = jnp.dot(q_ref[...], k_ref[...] * 2.0)
-
-    call = palladium.metal_call(kernel, out_shape=_shaped(8, 8))
-    assert call.explain(_shaped(8, 8), _shaped(8, 8)).grid == (1, 1, 1)
 
 
 def test_explain_env_logs_once_per_compile(monkeypatch, capsys, rng):

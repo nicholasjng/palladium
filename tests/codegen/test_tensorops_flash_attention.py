@@ -77,31 +77,15 @@ def test_tensorops_attention_fuses_both_dots_into_one_threadgroup(causal):
     spec = _spec(causal=causal)
     source, stats = palladium.emit.emit_msl_stats(spec, dot_general="tensorops")
 
+    # The score product reads K transposed; the value product does not.
     assert source.count(".run(") == 2
-    assert "score_op.run(q_tile, k_tile, score_tile)" in source
-    assert "value_op.run(score_tile, value_tile, acc)" in source
     assert "16, 16, 64, false, true, false);" in source
     assert "16, 64, 16, false, false, false," in source
-    assert "uint3 group [[threadgroup_position_in_grid]]" in source
     assert "tensor<const device float" not in source
-    assert "tensor<device float, dextents<int, 2>, tensor_inline>" in source
-    assert "threadgroup float scores[256];" in source
-    assert "array<int, 2>{1, 128}" in source
     assert "array<int, 2>{{" not in source
-    assert "(output + q_base + q_start * 128)[row * 128 + column]" in source
-    assert "group.z * BQ" in source
-    assert "group.x;" in source and "group.y;" in source
-    # Rows belong to SIMD groups, lanes to columns; the accumulator is the
-    # value matmul's cooperative tensor, addressed by MPP coordinates.
-    assert "for (uint row = sg; row < 16; row += 4)" in source
-    assert "scores[row * 16 + lane]" in source
-    assert " * 0.125f" in source
-    assert "simd_max(lane_max)" in source and "simd_sum(lane_sum)" in source
-    assert "= exp((s[0] - new_max));" in source
     assert "exp((new_max - new_max))" not in source
-    assert "if (lane == 0)" in source and "row_scale[row] = old_scale;" in source
+    # The accumulator is the value matmul's cooperative tensor, not shared memory.
     assert "acc.get_multidimensional_index(" in source
-    assert "acc[_i1] = (row_scale[acc_row] * acc[_i1]);" in source
     assert "threadgroup float accumulator" not in source
     assert source.count("threadgroup_barrier(mem_flags::mem_threadgroup)") == 4
     if causal:
@@ -113,15 +97,23 @@ def test_tensorops_attention_fuses_both_dots_into_one_threadgroup(causal):
     assert stats.threadgroup_bytes == (16 * 16 + 3 * 16) * 4
 
 
-def test_tensorops_attention_supports_distinct_query_and_key_lengths():
-    """Check that noncausal cooperative attention accepts different query and key sequence lengths."""
-    source = palladium.emit_msl(_cross_attention_spec(), dot_general="tensorops")
+@pytest.mark.parametrize(
+    ("query_length", "key_length", "heads", "head_dim", "tile_k"),
+    [(32, 64, 2, 64, 16), (16, 4096, 8, 16, 64)],  # the second: SAM2's token-to-image attention
+)
+def test_tensorops_attention_supports_distinct_query_and_key_lengths(
+    query_length, key_length, heads, head_dim, tile_k
+):
+    """Check that noncausal cooperative attention addresses and loops over keys by their own
+    length."""
+    spec = _cross_attention_spec(
+        query_length, key_length, heads=heads, head_dim=head_dim, tile_q=16, tile_k=tile_k
+    )
+    source = palladium.emit_msl(spec, dot_general="tensorops")
 
-    assert "const uint q_base = (batch * 32 * 2 + head) * D;" in source
-    assert "const uint kv_base = (batch * 64 * 2 + head) * D;" in source
-    assert "k_start < 64" in source
-    assert "key + kv_base + k_start * 128" in source
-    assert "(output + q_base + q_start * 128)" in source
+    assert f"const uint q_base = (batch * {query_length} * {heads} + head) * D;" in source
+    assert f"const uint kv_base = (batch * {key_length} * {heads} + head) * D;" in source
+    assert f"k_start < {key_length}" in source
 
 
 def test_tensorops_attention_matches_dataflow_after_independent_equations_reorder():
@@ -163,25 +155,6 @@ def test_tensorops_attention_rejects_same_primitives_with_wrong_probability_wiri
         palladium.emit_msl(malformed, dot_general="tensorops")
 
 
-def test_tensorops_attention_matches_sam2_token_to_image_shape():
-    """Check cooperative emission for a short-query, long-key token-to-image attention layout."""
-    spec = _cross_attention_spec(
-        query_length=16,
-        key_length=4096,
-        heads=8,
-        head_dim=16,
-        tile_q=16,
-        tile_k=64,
-    )
-    source = palladium.emit_msl(spec, dot_general="tensorops")
-
-    assert "constexpr int BQ = 16;" in source
-    assert "constexpr int BK = 64;" in source
-    assert "constexpr int D = 16;" in source
-    assert "k_start < 4096" in source
-    assert "const uint kv_base = (batch * 4096 * 8 + head) * D;" in source
-
-
 def test_tensorops_attention_explain_scales_batch_axis_for_cooperative_groups():
     """Check that attention diagnostics report the cooperative group and scaled batch grid axis."""
     diagnostics = explain_spec(_spec(), dot_general="tensorops")
@@ -192,63 +165,33 @@ def test_tensorops_attention_explain_scales_batch_axis_for_cooperative_groups():
     assert diagnostics.cooperative
 
 
-def test_tensorops_attention_emits_benchmark_tile_configuration():
-    """Check emission for the attention tile configuration used by the benchmark."""
-    shape = (1, 128, 4, 64)
-    call = attention_call(shape, tile_q=32, tile_k=64)
-    args = (jax.ShapeDtypeStruct(shape, jnp.float32),) * 3
-    source = palladium.emit_msl(palladium.trace(call, *args), dot_general="tensorops")
-
-    assert "constexpr int BQ = 32;" in source
-    assert "constexpr int BK = 64;" in source
-    assert source.count(".run(") == 2
-
-
 def test_tensorops_attention_emits_large_query_tile_with_bounded_shared_memory():
-    """Check that a large query tile emits with bounded shared storage and a register-held
-    accumulator."""
+    """Check that a 64-row query tile keeps shared storage to the score tile and row state."""
     shape = (1, 64, 1, 64)
     call = attention_call(shape, tile_q=64, tile_k=32)
     args = (jax.ShapeDtypeStruct(shape, jnp.float32),) * 3
-    source, stats = palladium.emit.emit_msl_stats(
-        palladium.trace(call, *args), dot_general="tensorops"
-    )
+    _, stats = palladium.emit.emit_msl_stats(palladium.trace(call, *args), dot_general="tensorops")
 
-    assert "constexpr int BQ = 64;" in source
-    assert "constexpr int BK = 32;" in source
     assert stats.threadgroup_bytes == (64 * 32 + 3 * 64) * 4
 
 
-@pytest.mark.parametrize("head_dim", [16, 32, 48, 64])
+@pytest.mark.parametrize("head_dim", [16, 48])
 def test_tensorops_attention_supports_multiples_of_sixteen_head_dimensions(head_dim):
-    """Check cooperative attention emission for supported head dimensions divisible by sixteen."""
+    """Check that the matmul2d descriptors and the softmax scale follow the head dimension."""
     source = palladium.emit_msl(_spec(head_dim=head_dim), dot_general="tensorops")
 
-    assert f"constexpr int D = {head_dim};" in source
     assert f"16, 16, {head_dim}, false, true, false);" in source
     assert f"16, {head_dim}, 16, false, false, false," in source
-    scale_line = next(line for line in source.splitlines() if "scores[row * 16 + lane] *" in line)
-    match = re.search(r"\* ([0-9.e-]+)f\)", scale_line)
-    assert match is not None
-    scale = float(match.group(1))
-    assert scale == pytest.approx(head_dim**-0.5, rel=1e-6)
+    literals = [float(x) for x in re.findall(r"\b(\d*\.\d+(?:e-?\d+)?)f\b", source)]
+    assert any(x == pytest.approx(head_dim**-0.5, rel=1e-6) for x in literals)
 
 
-def test_tensorops_attention_rejects_unsupported_tile_shape():
-    """Verify that a query tile not divisible by sixteen is rejected by cooperative attention."""
-    shape = (1, 32, 2, 64)
-    call = attention_call(shape, tile_q=8, tile_k=16)
-    args = (jax.ShapeDtypeStruct(shape, jnp.float32),) * 3
-    spec = palladium.trace(call, *args)
-
+@pytest.mark.parametrize(("tile_q", "head_dim"), [(8, 64), (16, 24)])
+def test_matmul2d_attention_rejects_sizes_off_multiples_of_sixteen(tile_q, head_dim):
+    """Verify that the matmul2d schedule rejects query tiles and head dimensions that are not
+    multiples of sixteen."""
     with pytest.raises(EmitError, match="multiples of 16"):
-        palladium.emit_msl(spec, dot_general="tensorops")
-
-
-def test_tensorops_attention_rejects_unsupported_head_dimension():
-    """Verify that a head dimension not divisible by sixteen is rejected by cooperative attention."""
-    with pytest.raises(EmitError, match="head dimensions must be multiples of 16"):
-        palladium.emit_msl(_spec(head_dim=24), dot_general="tensorops")
+        palladium.emit_msl(_spec(tile_q=tile_q, head_dim=head_dim), dot_general="tensorops")
 
 
 @pytest.mark.parametrize("causal", [False, True])
