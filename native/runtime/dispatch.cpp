@@ -18,9 +18,6 @@ constexpr size_t kMaxInlineScalarBytes = 4096;
 // Threadgroup memory allocations are sized in 16-byte units.
 constexpr size_t kThreadgroupMemoryAlignment = 16;
 
-// MTLDispatchThreadgroupsIndirectArguments: three uint32 threadgroup counts.
-constexpr size_t kIndirectArgumentsSize = 3 * sizeof(uint32_t);
-
 std::string to_string(Dim3 d) {
     return "(" + std::to_string(d.x) + ", " + std::to_string(d.y) + ", " + std::to_string(d.z) +
            ")";
@@ -42,7 +39,7 @@ void validate(const Launch& launch, bool non_uniform, size_t max_threadgroup_mem
 
     const Dim3 grid = launch.grid;
     const Dim3 tg = launch.threadgroup;
-    if (!launch.indirect_grid && (grid.x == 0 || grid.y == 0 || grid.z == 0)) {
+    if (grid.x == 0 || grid.y == 0 || grid.z == 0) {
         throw std::invalid_argument("dispatch: grid " + to_string(grid) +
                                     " must be non-zero in every dimension");
     }
@@ -109,7 +106,7 @@ void validate(const Launch& launch, bool non_uniform, size_t max_threadgroup_mem
             throw std::invalid_argument("dispatch: inline scalar of " +
                                         std::to_string(scalar.size) + " bytes exceeds Metal's " +
                                         std::to_string(kMaxInlineScalarBytes) +
-                                        "-byte setBytes limit; pass it as a Buffer instead");
+                                        "-byte setBytes limit; pass it as a buffer instead");
         }
     }
     // Reflection reports `constant T&` and `constant T*` alike, so a scalar
@@ -135,17 +132,7 @@ void validate(const Launch& launch, bool non_uniform, size_t max_threadgroup_mem
         }
     }
 
-    if (launch.indirect_grid) {
-        size_t size = launch.indirect_grid->size();
-        if (launch.indirect_offset % 4 != 0 || launch.indirect_offset > size ||
-            kIndirectArgumentsSize > size - launch.indirect_offset) {
-            throw std::invalid_argument(
-                "dispatch: indirect grid arguments need " + std::to_string(kIndirectArgumentsSize) +
-                " bytes at a 4-byte-aligned offset, but offset " +
-                std::to_string(launch.indirect_offset) + " into a buffer of " +
-                std::to_string(size) + " bytes doesn't provide that");
-        }
-    } else if (!non_uniform && (grid.x % tg.x || grid.y % tg.y || grid.z % tg.z)) {
+    if (!non_uniform && (grid.x % tg.x || grid.y % tg.y || grid.z % tg.z)) {
         throw std::invalid_argument(
             "dispatch: this GPU does not support non-uniform threadgroups, so grid " +
             to_string(grid) + " must divide evenly by threadgroup " + to_string(tg));
@@ -209,7 +196,7 @@ Dim3 ComputePipeline::default_threadgroup(Dim3 grid) const {
     return tg;
 }
 
-CommandBatch::CommandBatch(MetalRuntime& rt, bool concurrent)
+CommandBatch::CommandBatch(MetalRuntime& rt)
     : non_uniform_(rt.supports_non_uniform_threadgroups()),
       max_threadgroup_memory_(rt.max_threadgroup_memory_length()) {
     AutoreleaseScope scope;
@@ -220,9 +207,7 @@ CommandBatch::CommandBatch(MetalRuntime& rt, bool concurrent)
     if (!command_buffer_) {
         throw DispatchError("could not create a Metal command buffer");
     }
-    encoder_ = NS::RetainPtr(
-        concurrent ? command_buffer_->computeCommandEncoder(MTL::DispatchTypeConcurrent)
-                   : command_buffer_->computeCommandEncoder());
+    encoder_ = NS::RetainPtr(command_buffer_->computeCommandEncoder());
     if (!encoder_) {
         throw DispatchError("could not create a Metal compute command encoder");
     }
@@ -235,10 +220,7 @@ CommandBatch::~CommandBatch() {
 
 void CommandBatch::add(const Launch& launch) {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    if (committed_ || discarded_) {
-        throw DispatchError(std::string("cannot add to a batch that has already been ") +
-                            (committed_ ? "committed" : "discarded"));
-    }
+    if (committed_) throw DispatchError("cannot add to a batch that has already been committed");
     validate(launch, non_uniform_, max_threadgroup_memory_);
 
     encoder_->setComputePipelineState(launch.pipeline->handle());
@@ -257,24 +239,12 @@ void CommandBatch::add(const Launch& launch) {
     const Dim3 grid = launch.grid;
     const Dim3 tg = launch.threadgroup;
     MTL::Size mtl_tg = MTL::Size::Make(tg.x, tg.y, tg.z);
-    if (launch.indirect_grid) {
-        encoder_->dispatchThreadgroups(launch.indirect_grid->handle(), launch.indirect_offset,
-                                       mtl_tg);
-    } else if (non_uniform_) {
+    if (non_uniform_) {
         encoder_->dispatchThreads(MTL::Size::Make(grid.x, grid.y, grid.z), mtl_tg);
     } else {
         encoder_->dispatchThreadgroups(MTL::Size::Make(grid.x / tg.x, grid.y / tg.y, grid.z / tg.z),
                                        mtl_tg);
     }
-}
-
-void CommandBatch::barrier() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    if (committed_ || discarded_) {
-        throw DispatchError(std::string("cannot add a barrier to a batch that has already been ") +
-                            (committed_ ? "committed" : "discarded"));
-    }
-    encoder_->memoryBarrier(MTL::BarrierScopeBuffers);
 }
 
 void CommandBatch::commit() {
@@ -283,7 +253,6 @@ void CommandBatch::commit() {
 }
 
 void CommandBatch::commit_locked() {
-    if (discarded_) throw DispatchError("this batch was discarded without being committed");
     if (committed_) return;
     committed_ = true;
 
@@ -311,18 +280,6 @@ void CommandBatch::wait() {
     if (command_buffer_->status() == MTL::CommandBufferStatusError) {
         throw DispatchError("kernel execution failed: " + describe(command_buffer_->error()));
     }
-}
-
-void CommandBatch::discard() {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-    if (committed_ || discarded_) return;
-    discarded_ = true;
-
-    // The queue counts uncommitted command buffers against its limit too.
-    AutoreleaseScope scope;
-    encoder_->endEncoding();
-    encoder_.reset();
-    command_buffer_.reset();
 }
 
 void dispatch(MetalRuntime& rt, const Launch& launch) {

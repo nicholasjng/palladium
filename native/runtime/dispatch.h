@@ -6,8 +6,6 @@
 #include <vector>
 
 #include "buffer.h"
-#include "export.h"
-#include "library.h"
 #include "ns_ptr.h"
 
 namespace MTL {
@@ -33,7 +31,7 @@ struct BindingInfo {
     size_t data_size = 0;  // bytes per element of a buffer binding; 0 if unknown
 };
 
-class MR_API ComputePipeline {
+class ComputePipeline {
    public:
     // `label` is the function name, used in error messages.
     ComputePipeline(MTL::Device* device, MTL::Function* function, const std::string& label);
@@ -69,8 +67,7 @@ class MR_API ComputePipeline {
 };
 
 // One kernel launch. Buffers bind at indices 0..n-1, scalars (setBytes) at
-// the indices after. With indirect_grid set, grid is ignored and the GPU reads
-// three uint32 threadgroup counts from that buffer at indirect_offset.
+// the indices after.
 struct Launch {
     struct BufferBinding {
         Buffer* buffer;
@@ -87,15 +84,12 @@ struct Launch {
     std::vector<size_t> threadgroup_memory;
     Dim3 grid;
     Dim3 threadgroup;
-    Buffer* indirect_grid = nullptr;
-    size_t indirect_offset = 0;
 };
 
-// Several launches in one command buffer. A concurrent encoder lets them
-// overlap, ordered only across barrier(). Methods are synchronized.
-class MR_API CommandBatch {
+// Several launches in one command buffer, run in order. Methods are synchronized.
+class CommandBatch {
    public:
-    explicit CommandBatch(MetalRuntime& rt, bool concurrent = false);
+    explicit CommandBatch(MetalRuntime& rt);
     ~CommandBatch();
     CommandBatch(CommandBatch&&) = delete;
     CommandBatch(const CommandBatch&) = delete;
@@ -104,19 +98,12 @@ class MR_API CommandBatch {
     // Validates, then encodes. Throws before touching the encoder if invalid.
     void add(const Launch& launch);
 
-    // Orders buffer writes across it; only needed on a concurrent encoder.
-    void barrier();
-
     // Submits without blocking.
     void commit();
 
     // Commits if needed, then blocks until done. Throws DispatchError on a
     // faulted command buffer. Every caller blocks, however many times.
     void wait();
-
-    // Drops an uncommitted command buffer now, freeing its queue slot; later
-    // add/commit/wait throw. A no-op once committed.
-    void discard();
 
     // Device-side execution seconds for the whole batch; set by wait().
     std::optional<double> gpu_time() const {
@@ -132,10 +119,9 @@ class MR_API CommandBatch {
     NS::SharedPtr<MTL::ComputeCommandEncoder> encoder_;
     mutable std::mutex state_mutex_;
     bool committed_ = false;
-    bool discarded_ = false;
     bool non_uniform_ = false;
     size_t max_threadgroup_memory_ = 0;
     std::optional<double> gpu_time_;
 };
 
-MR_API void dispatch(MetalRuntime& rt, const Launch& launch);
+void dispatch(MetalRuntime& rt, const Launch& launch);

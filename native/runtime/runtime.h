@@ -1,12 +1,7 @@
 #pragma once
 #include <cstddef>
-#include <memory>
-#include <mutex>
 #include <string>
 
-#include "export.h"
-#include "library.h"
-#include "lru.h"
 #include "ns_ptr.h"
 
 namespace MTL {
@@ -14,9 +9,8 @@ class Device;
 class CommandQueue;
 }  // namespace MTL
 
-inline constexpr size_t kDefaultLibraryCacheLimit = 256;
-
-class MR_API MetalRuntime {
+// The process's Metal device and command queue.
+class MetalRuntime {
    public:
     MetalRuntime();
     ~MetalRuntime();
@@ -44,32 +38,12 @@ class MR_API MetalRuntime {
     // Kernels choose between matrix instructions by it.
     int apple_gpu_family() const { return apple_gpu_family_; }
 
-    // Cached by source text and compile options.
-    std::shared_ptr<Library> library_for(const std::string& msl_source,
-                                         const CompileOptions& options = {});
-
-    // 0 disables eviction.
-    void set_library_cache_limit(size_t limit);
-    size_t library_cache_size() const;
-    void clear_library_cache();
-
-    // GPU trace capture of every queue on this device.
-    void start_capture(const std::string& path);
-    void stop_capture();
-    bool is_capturing() const;
-
    private:
     NS::SharedPtr<MTL::Device> device_;
     NS::SharedPtr<MTL::CommandQueue> queue_;
     bool non_uniform_threadgroups_ = false;
     int apple_gpu_family_ = 0;
     size_t max_threadgroup_memory_ = 0;
-
-    mutable std::mutex mutex_;
-    LruCache<Library> libraries_{kDefaultLibraryCacheLimit};
-
-    mutable std::mutex capture_mutex_;
-    bool capture_started_ = false;
 };
 
-MR_API MetalRuntime& runtime();
+MetalRuntime& runtime();

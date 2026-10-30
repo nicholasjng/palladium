@@ -1,6 +1,5 @@
 #include "runtime.h"
 
-#include <stdexcept>
 #include <string>
 
 #include "errors.h"
@@ -44,80 +43,6 @@ size_t MetalRuntime::max_threads_per_threadgroup() const {
 }
 
 size_t MetalRuntime::max_buffer_length() const { return (size_t)(device_->maxBufferLength()); }
-
-std::shared_ptr<Library> MetalRuntime::library_for(const std::string& msl_source,
-                                                   const CompileOptions& options) {
-    std::string serialized = options.cache_key();
-    const std::string key = std::to_string(serialized.size()) + ":" + serialized + msl_source;
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (auto hit = libraries_.find(key)) return hit;
-    }
-    // Compiled outside the lock.
-    auto library = std::make_shared<Library>(device_.get(), msl_source, options);
-    std::lock_guard<std::mutex> lock(mutex_);
-    return libraries_.insert(key, std::move(library));
-}
-
-void MetalRuntime::set_library_cache_limit(size_t limit) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    libraries_.set_limit(limit);
-}
-
-size_t MetalRuntime::library_cache_size() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return libraries_.size();
-}
-
-void MetalRuntime::clear_library_cache() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    libraries_.clear();
-}
-
-void MetalRuntime::start_capture(const std::string& path) {
-    if (path.empty()) throw std::invalid_argument("start_capture: output path must not be empty");
-
-    std::lock_guard<std::mutex> lock(capture_mutex_);
-    AutoreleaseScope scope;
-    MTL::CaptureManager* manager = MTL::CaptureManager::sharedCaptureManager();
-    if (manager->isCapturing()) {
-        throw CaptureError("a Metal capture is already in progress");
-    }
-    if (!manager->supportsDestination(MTL::CaptureDestinationGPUTraceDocument)) {
-        throw CaptureError("this system does not support GPU trace document captures");
-    }
-
-    MTL::CaptureDescriptor* descriptor = MTL::CaptureDescriptor::alloc()->init()->autorelease();
-    // A device capture includes queues owned by other bindings in the process.
-    descriptor->setCaptureObject(device_.get());
-    descriptor->setDestination(MTL::CaptureDestinationGPUTraceDocument);
-    NS::String* output_path = to_ns_string(path, "capture path");
-    descriptor->setOutputURL(NS::URL::fileURLWithPath(output_path));
-
-    NS::Error* error = nullptr;
-    if (!manager->startCapture(descriptor, &error)) {
-        throw CaptureError("failed to start Metal capture at " + path + ": " + describe(error));
-    }
-    capture_started_ = true;
-}
-
-void MetalRuntime::stop_capture() {
-    std::lock_guard<std::mutex> lock(capture_mutex_);
-    if (!capture_started_) throw CaptureError("no capture started by metal_runtime is active");
-    MTL::CaptureManager* manager = MTL::CaptureManager::sharedCaptureManager();
-    if (!manager->isCapturing()) {
-        capture_started_ = false;
-        throw CaptureError("the Metal capture was stopped outside metal_runtime");
-    }
-    manager->stopCapture();
-    capture_started_ = false;
-}
-
-bool MetalRuntime::is_capturing() const {
-    std::lock_guard<std::mutex> lock(capture_mutex_);
-    return MTL::CaptureManager::sharedCaptureManager()->isCapturing();
-}
 
 MetalRuntime& runtime() {
     static MetalRuntime rt;

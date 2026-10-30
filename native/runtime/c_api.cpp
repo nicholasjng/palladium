@@ -205,22 +205,22 @@ MRStatus mr_compile_library(const char* msl_source, size_t msl_source_len, MRMat
     return mr_guard(out_err_msg, [&] {
         if (!out_library) throw std::invalid_argument("mr_compile_library: out_library is null");
         if (!msl_source) throw std::invalid_argument("mr_compile_library: msl_source is null");
-        CompileOptions options;
+        MathMode mode;
         switch (math_mode) {
             case MR_MATH_MODE_SAFE:
-                options.math_mode = MathMode::Safe;
+                mode = MathMode::Safe;
                 break;
             case MR_MATH_MODE_RELAXED:
-                options.math_mode = MathMode::Relaxed;
+                mode = MathMode::Relaxed;
                 break;
             case MR_MATH_MODE_FAST:
-                options.math_mode = MathMode::Fast;
+                mode = MathMode::Fast;
                 break;
             default:
                 throw std::invalid_argument("mr_compile_library: unknown math_mode");
         }
         auto* lib = new MRLibrary{
-            Library(runtime().device(), std::string(msl_source, msl_source_len), options)};
+            Library(runtime().device(), std::string(msl_source, msl_source_len), mode)};
         *out_library = lib;
     });
 }
@@ -234,7 +234,7 @@ MRStatus mr_get_pipeline(MRLibrary* library, const char* function_name, MRPipeli
         if (!out_pipeline) throw std::invalid_argument("mr_get_pipeline: out_pipeline is null");
         if (!library) throw std::invalid_argument("mr_get_pipeline: library is null");
         if (!function_name) throw std::invalid_argument("mr_get_pipeline: function_name is null");
-        auto* pipeline = new MRPipeline{library->library.pipeline_for(function_name)};
+        auto* pipeline = new MRPipeline{library->library.pipeline(function_name)};
         *out_pipeline = pipeline;
     });
 }

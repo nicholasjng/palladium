@@ -1,5 +1,5 @@
-// C entry point into metal-runtime for callers without Python or the GIL,
-// such as an XLA FFI handler. Opaque handles and POD structs only.
+// C entry point into the runtime for callers without Python or the GIL,
+// such as the XLA FFI handler. Opaque handles and POD structs only.
 //
 // Compile once (mr_compile_library + mr_get_pipeline), hold the handles for
 // the process lifetime, release at teardown.

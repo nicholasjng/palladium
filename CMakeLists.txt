@@ -61,7 +61,6 @@ add_library(palladium_runtime STATIC
   native/runtime/runtime.cpp
   native/runtime/metal.cpp
   native/runtime/buffer.cpp
-  native/runtime/dtype.cpp
   native/runtime/library.cpp
   native/runtime/dispatch.cpp
   native/runtime/c_api.cpp)

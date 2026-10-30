@@ -1,7 +1,6 @@
 #pragma once
 #include <cstddef>
 
-#include "export.h"
 #include "ns_ptr.h"
 
 namespace MTL {
@@ -10,7 +9,7 @@ class Buffer;
 }  // namespace MTL
 
 // Shared storage: host and GPU read and write the same bytes.
-class MR_API Buffer {
+class Buffer {
    public:
     Buffer(MTL::Device* device, size_t size_bytes);
 
