@@ -264,12 +264,12 @@ def test_tensorops_batched_dot_explain_scales_batch_axis_for_groups():
     assert diag.threadgroup == (128, 1, 1)
 
 
-@pytest.mark.parametrize(("family", "policy"), [(8, "simdgroup"), (9, "tensorops")])
+@pytest.mark.parametrize(("family", "policy"), [(9, "simdgroup"), (10, "tensorops")])
 def test_auto_selects_tensorops_for_tiled_dots_and_default_forces_the_primitive_path(
     monkeypatch, family, policy
 ):
-    """Check that auto selects cooperative tiled dots, with `simdgroup_matrix` on M1
-    and M2 GPUs, while default selects primitive emission."""
+    """Check that auto selects cooperative tiled dots, with `simdgroup_matrix` up to
+    Apple family 9 (M4), while default selects primitive emission."""
     import palladium.emit.kernel
 
     monkeypatch.setattr(

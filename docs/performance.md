@@ -78,7 +78,7 @@ direct dispatch, f32, `[1, 4096, 4, 64]`, medians of resident-buffer runs:
 | 16×128, full | n/a | 9.3 ms |
 | 32×128, causal | n/a | 6.0 ms |
 
-With `dot_general="simdgroup"` (the `"auto"` default on M1 and M2), query
+With `dot_general="simdgroup"` (the `"auto"` default on M1 to M4), query
 tiles of 32 or more rows use a schedule with both products on
 `simdgroup_matrix` and the scores, probabilities and output in each SIMD
 group's registers, two barriers per key step. At `[1, 4096, 32, 64]` on the M2

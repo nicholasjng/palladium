@@ -70,7 +70,7 @@ or cumsum reads and writes its data once. On an M2 they ran at 91 GB/s, about
 
 On both paths, tiled matmuls on a 2D or 3D grid lower through Metal 4
 TensorOps by default (`CompilerParams(dot_general="auto")`), taking the
-`simdgroup_matrix` form below on M1 and M2 GPUs; other dots keep the
+`simdgroup_matrix` form below on M1 to M4 GPUs; other dots keep the
 one-thread-per-program emitter. `dot_general="tensorops"` requires the cooperative lowering and
 raises where it does not apply; `dot_general="default"` forces the primitive
 path. `dot_general="simdgroup"` also requires the cooperative lowering, and
@@ -97,7 +97,7 @@ buffers and a static key-tile scan; query and key/value lengths may differ for
 noncausal attention. Causal attention requires matching lengths. Q/output use
 query tiles, while K/V are full-sequence blocks. One Metal threadgroup computes
 each query tile and runs the score and value matmuls with Metal TensorOps.
-Under `dot_general="simdgroup"`, and under `"auto"` on M1 and M2 GPUs, query
+Under `dot_general="simdgroup"`, and under `"auto"` on M1 to M4 GPUs, query
 tiles that are a multiple of 32 rows instead use `simdgroup_matrix` for both
 products and keep the softmax in registers, if the K and V tiles fit in
 threadgroup memory together; other tiles keep TensorOps. At 4096 tokens and 32

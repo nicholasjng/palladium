@@ -109,11 +109,15 @@ edge tiles, K not a multiple of 16 and tiles above 8192 elements keep
 | 4096³, 32x32 | 0.68 | 2.09 |
 | 2048³, 64x32 | 2.35 | 2.64 |
 
-`"auto"` now picks `"simdgroup"` on Apple GPU families 7 and 8 (M1, M2), read
-from `palladium.device.device_limits()["apple_gpu_family"]`: 4096³ float32 end
-to end through `metal_call` ran at 2.42 TFLOPS against 1.89. Measured on the
-M2 only; confirm on an M1, and measure an M3 or M4 before widening it. GPUs
-with matrix accelerators (family 10) keep `matmul2d`.
+`"auto"` now picks `"simdgroup"` on Apple GPU families 7 to 9 (M1 to M4),
+read from `palladium.device.device_limits()["apple_gpu_family"]`: 4096³
+float32 end to end through `metal_call` ran at 2.42 TFLOPS against 1.89 on
+the M2. On an M4 Pro (2026-10-30, GPU time) `simdgroup` led `matmul2d` at
+every tile shape, 6.66 TFLOPS at 64x64 against 5.82 for `matmul2d`'s best
+tiling (128x64) and 6.00 for MLX through jax-mps; the simdgroup_matrix peak
+there is 7.36 (f32) and 7.95 (f16), and float16 `matmul2d` matches MLX at
+7.52. Confirm on an M1; the M3 shares family 9 and is unmeasured. GPUs with
+matrix accelerators (family 10) keep `matmul2d`.
 
 ## Steps
 

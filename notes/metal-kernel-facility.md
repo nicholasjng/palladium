@@ -93,17 +93,21 @@ remaining costs were outside the kernels. Those come first:
   wraps silently copied (XNU splits mappings into 128 MB entries).
   The runtime now caches validated wraps and walks all entries; a row
   softmax over 128 MB went from 6.4 to 3.4 ms end to end.
-- **N2, `"auto"` uses `simdgroup_matrix` on Apple families 7 and 8 (done).**
-  4096³ float32 end to end: 2.42 TFLOPS against 1.89 for `matmul2d`. To do:
-  confirm on an M1:
+- **N2, `"auto"` uses `simdgroup_matrix` on Apple families 7 to 9 (done).**
+  4096³ float32 end to end on an M2: 2.42 TFLOPS against 1.89 for
+  `matmul2d`. On an M4 Pro (family 9, GPU time): 6.66 TFLOPS against 5.82
+  for `matmul2d` at its best tiling and 2.74 at the same 64x64 tiles, and
+  6.00 for MLX through jax-mps. The M3 shares family 9 and is unmeasured.
+  To do: confirm on an M1:
   `uv run mew run --random-interleaving -k "float32-n4096|attention"
   benchmarks/bench_roofline.py` should show `simdgroup` ahead of `tensorops`
-  in every pair. Measure an M3 or M4 before widening the families.
+  in every pair.
 - **N3, attention in the recognizer (done).** At 4096 tokens and 32 heads of
   64, float32: 2.10 TFLOPS (1.93 causal) with `simdgroup_matrix` for both
   products and the softmax in registers, against 1.48 for `matmul2d` and
-  MLX's 1.99. Taken by `"auto"` on families 7 and 8 for query tiles of 32 or
-  more rows. This met the old F5 target without F2–F4.
+  MLX's 1.99. Taken by `"auto"` on families 7 to 9 for query tiles of 32 or
+  more rows; on an M4 Pro the margin over `matmul2d` is small (5.67 against
+  5.45 TFLOPS, 4.98 against 4.93 causal). This met the old F5 target without F2–F4.
 
 The explicit model is gated on a kernel that needs it:
 

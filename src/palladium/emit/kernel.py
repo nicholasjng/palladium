@@ -53,7 +53,7 @@ def emit_msl_stats(
         Use cooperative TensorOps when recognized, force primitive emission, require
         TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
         respectively. The default is "auto", which also prefers `simdgroup_matrix`
-        on M1 and M2 GPUs (Apple families 7 and 8), where it is faster than
+        on M1 to M4 GPUs (Apple families 7 to 9), where it is faster than
         `matmul2d`.
     program : {"thread", "threadgroup"}, optional
         "thread" (default) runs each Pallas program as one Metal thread, or
@@ -95,9 +95,10 @@ def emit_msl_stats(
         source, threadgroup_bytes = lower_row_program(spec, kernel_name)
         return source, EmitStats(thread_bytes=0, threadgroup_bytes=threadgroup_bytes)
     if dot_general != "default" and uses_tensorops(spec, dot_general):
-        # Measured on an M2; later families keep matmul2d until measured there.
+        # Measured on an M2 and an M4 Pro. Family 10 GPUs have matrix
+        # accelerators, which matmul2d can use, so they keep it.
         prefer_simdgroup = dot_general == "simdgroup" or (
-            dot_general == "auto" and device_limits().get("apple_gpu_family") in (7, 8)
+            dot_general == "auto" and device_limits().get("apple_gpu_family") in (7, 8, 9)
         )
         try:
             source, threadgroup_bytes = compile_kernel(
@@ -265,7 +266,7 @@ def emit_msl(
         Use cooperative TensorOps when recognized, force primitive emission, require
         TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
         respectively. The default is "auto", which also prefers `simdgroup_matrix`
-        on M1 and M2 GPUs (Apple families 7 and 8), where it is faster than
+        on M1 to M4 GPUs (Apple families 7 to 9), where it is faster than
         `matmul2d`.
     program : {"thread", "threadgroup"}, optional
         "thread" (default) runs each Pallas program as one Metal thread, or
