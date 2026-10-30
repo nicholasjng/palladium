@@ -107,9 +107,14 @@ near the integrator's step-size error bound. Run
   Pallas grid.
 - Keep each instance's blocks and intermediates small: they occupy per-thread
   storage and can exceed Metal's stack limit.
-- `metal_call` adds CPU-FFI setup and buffer wrapping. The measured
-  end-to-end passthrough overhead was 0.19 ms for 16 KB buffers and 0.25 ms
-  for 1 MB; the common path wraps eligible XLA memory without copying.
+- `metal_call` adds CPU-FFI setup and buffer wrapping. It wraps XLA memory
+  without copying, but each new wrap costs the GPU about 15 µs per MB of
+  page-table setup on first use, so metal-runtime caches wraps of 1 MB or
+  more while the memory behind them is unchanged. On an M2, a kernel reading
+  and writing 128 MB took 0.6 ms more end to end than on the GPU, against
+  3.5 ms before the cache, and 0.2 ms for 1 MB. Cached wraps keep freed
+  pages alive until the next call notices; `MR_WRAP_CACHE_BYTES` sets the
+  budget (a quarter of the GPU working set by default, 0 disables it).
 - Prefer static `fori_loop` or `scan`. A data-dependent `while_loop` is
   correct, but instances may finish at different times.
 
