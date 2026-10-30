@@ -115,6 +115,20 @@ first-step compile time, peak memory, and agreement with a CPU or XLA
 reference: a faster step that compiles for a minute or drifts numerically is
 not a win.
 
+M1 so far (2026-11-01): the plugin skeleton, `native/pjrt/plugin.cpp`
+against the PJRT C API 0.116 that jaxlib 0.12 pins. One `metal` device with
+one `device` memory, buffers in shared MTLBuffers (host data is copied in,
+strided arrays included), copies to the host and other devices, memory
+stats, and the device's `apple_gpu_family` as a device attribute. All work
+is synchronous and every event is born ready; `PJRT_Client_Compile` returns
+UNIMPLEMENTED. `palladium._pjrt` registers it through the `jax_plugins`
+entry point, but only when JAX_PLATFORMS names `metal`, until it can run
+programs. Lessons: the 0.12 header defines `PJRT_Error` and `PJRT_Memory`
+as function tables the caller may use directly, and jaxlib calls some
+slots without a null check (`PJRT_Client_TopologyDescription`,
+`PJRT_Error_ForEachPayload`, `PJRT_TopologyDescription_Fingerprint` for
+compilation cache keys). Next: `Compile` taking StableHLO through MLIR.
+
 Work that costs time without proving anything: a JAX port of SAM2's image
 encoder and mask decoder (SAM2 is PyTorch) for M5, and a small JAX LoRA
 training stack for M4.

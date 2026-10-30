@@ -14,6 +14,9 @@ dependencies = [
     "jax>=0.11",
 ]
 
+[project.entry-points.jax_plugins]
+metal = "palladium._pjrt"
+
 [tool.scikit-build]
 minimum-version = "build-system.requires"
 build-dir = "build/{wheel_tag}"
