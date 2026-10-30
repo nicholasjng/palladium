@@ -119,4 +119,4 @@ def test_mps_lowering_rejects_non_fast_math_and_aliases():
     with pytest.raises(ValueError, match="input_output_aliases"):
         _lower_for(("mps",), aliased, x, x)
     with pytest.raises(ValueError, match="dot_general"):
-        palladium.CompilerParams(dot_general="simdgroup")
+        palladium.CompilerParams(dot_general="warpgroup")

@@ -27,7 +27,7 @@ from palladium.emit.core import (
 from palladium.emit.tensorops import compile_kernel, uses_tensorops
 from palladium.trace import KernelSpec
 
-DOT_GENERAL_POLICIES = ("auto", "default", "tensorops")
+DOT_GENERAL_POLICIES = ("auto", "default", "tensorops", "simdgroup")
 
 
 def emit_msl_stats(
@@ -45,9 +45,10 @@ def emit_msl_stats(
     kernel_name : str or None, optional
         MSL function name override; None uses ``spec.name``. The name must be a valid
         MSL identifier.
-    dot_general : {"auto", "default", "tensorops"}, optional
-        Use cooperative TensorOps when recognized, force primitive emission, or require
-        TensorOps, respectively. The default is "auto".
+    dot_general : {"auto", "default", "tensorops", "simdgroup"}, optional
+        Use cooperative TensorOps when recognized, force primitive emission, require
+        TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
+        respectively. The default is "auto".
 
     Returns
     -------
@@ -76,10 +77,12 @@ def emit_msl_stats(
     bytes; register use inside MPP operations is not included.
     """
     if dot_general not in DOT_GENERAL_POLICIES:
-        raise ValueError("dot_general must be 'auto', 'default', or 'tensorops'")
+        raise ValueError("dot_general must be 'auto', 'default', 'tensorops', or 'simdgroup'")
     if dot_general != "default" and uses_tensorops(spec, dot_general):
         try:
-            source, threadgroup_bytes = compile_kernel(spec, kernel_name)
+            source, threadgroup_bytes = compile_kernel(
+                spec, kernel_name, prefer_simdgroup=dot_general == "simdgroup"
+            )
         except EmitError:
             # "auto" only takes dots the cooperative lowering recognizes;
             # anything else keeps the one-thread-per-program emitter.
@@ -237,9 +240,10 @@ def emit_msl(
     kernel_name : str or None, optional
         MSL function name override; None uses ``spec.name``. The name must be a valid
         MSL identifier.
-    dot_general : {"auto", "default", "tensorops"}, optional
-        Use cooperative TensorOps when recognized, force primitive emission, or require
-        TensorOps, respectively. The default is "auto".
+    dot_general : {"auto", "default", "tensorops", "simdgroup"}, optional
+        Use cooperative TensorOps when recognized, force primitive emission, require
+        TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
+        respectively. The default is "auto".
 
     Returns
     -------

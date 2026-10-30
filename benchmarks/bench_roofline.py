@@ -9,7 +9,8 @@ add ``JAX_PLATFORMS=mps,cpu`` with jax-mps installed for the vendor rows.
   operands. Every product reads another accumulator, so the compiler cannot
   hoist it out of the loop.
 - ``bench_pallas_matmul``: a plain tiled ``jnp.dot`` Pallas kernel through the
-  TensorOps lowering, checked against NumPy before timing.
+  TensorOps lowering (``matmul2d``), and for float32 also through
+  ``dot_general="simdgroup"``, checked against NumPy before timing.
 - ``bench_vendor_matmul``: ``jnp.dot`` on the mps platform, which jax-mps
   runs on MLX's kernels. Wall time per call, so it includes dispatch.
 
@@ -35,12 +36,16 @@ DTYPES = ("float32", "float16")
 SIZES = (2048, 4096)
 TILES = ((32, 32), (64, 32), (64, 64), (128, 64))
 MATMUL_CASES = [
-    {"size": size, "dtype": dtype, "tile_m": tm, "tile_n": tn}
+    {"size": size, "dtype": dtype, "tile_m": tm, "tile_n": tn, "policy": policy}
     for size in SIZES
     for dtype in DTYPES
     for tm, tn in TILES
+    # The simdgroup kernel covers float32 only; float16 keeps matmul2d.
+    for policy in (("tensorops", "simdgroup") if dtype == "float32" else ("tensorops",))
 ]
-MATMUL_IDS = [f"{c['dtype']}-n{c['size']}-tm{c['tile_m']}-tn{c['tile_n']}" for c in MATMUL_CASES]
+MATMUL_IDS = [
+    f"{c['policy']}-{c['dtype']}-n{c['size']}-tm{c['tile_m']}-tn{c['tile_n']}" for c in MATMUL_CASES
+]
 VENDOR_CASES = [{"size": size, "dtype": dtype} for size in SIZES for dtype in DTYPES]
 VENDOR_IDS = [f"{c['dtype']}-n{c['size']}" for c in VENDOR_CASES]
 
@@ -142,7 +147,9 @@ def _matmul_kernel(x_ref, y_ref, o_ref):
 
 
 @mew.parametrize(MATMUL_CASES, ids=MATMUL_IDS, tags="roofline", use_manual_time=True, unit="ms")
-def bench_pallas_matmul(state: mew.State, size: int, dtype: str, tile_m: int, tile_n: int) -> None:
+def bench_pallas_matmul(
+    state: mew.State, size: int, dtype: str, tile_m: int, tile_n: int, policy: str
+) -> None:
     import palladium
 
     rng = np.random.default_rng(0)
@@ -160,7 +167,7 @@ def bench_pallas_matmul(state: mew.State, size: int, dtype: str, tile_m: int, ti
         ),
         out_specs=pl.BlockSpec((tile_m, tile_n), lambda i, j: (i, j)),
         out_shape=shape,
-        compiler_params=palladium.CompilerParams(dot_general="tensorops"),
+        compiler_params=palladium.CompilerParams(dot_general=policy),
     )
     kernel = mr.Kernel(source, "palladium_kernel")
     output = mr.Buffer.empty([size, size], dtype=dtype)

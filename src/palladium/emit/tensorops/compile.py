@@ -9,7 +9,9 @@ from .attention import lower_attention
 from .matmul import lower_matmul
 
 
-def compile_kernel(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str, int]:
+def compile_kernel(
+    spec: KernelSpec, kernel_name: str | None = None, *, prefer_simdgroup: bool = False
+) -> tuple[str, int]:
     """Choose a cooperative lowering and emit Metal TensorOps source.
 
     Parameters
@@ -19,6 +21,9 @@ def compile_kernel(spec: KernelSpec, kernel_name: str | None = None) -> tuple[st
     kernel_name : str or None, optional
         MSL function name override; None uses ``spec.name``. The name must be a valid
         MSL identifier.
+    prefer_simdgroup : bool, optional
+        Lower supported float32 matmuls with `simdgroup_matrix` instead of
+        `matmul2d`; attention is unaffected.
 
     Returns
     -------
@@ -39,5 +44,6 @@ def compile_kernel(spec: KernelSpec, kernel_name: str | None = None) -> tuple[st
     attempted. Recognition errors propagate here; the outer auto policy is responsible for
     fallback.
     """
-    lower = lower_attention if _contains(spec.jaxpr, "scan") else lower_matmul
-    return lower(spec, kernel_name)
+    if _contains(spec.jaxpr, "scan"):
+        return lower_attention(spec, kernel_name)
+    return lower_matmul(spec, kernel_name, prefer_simdgroup=prefer_simdgroup)

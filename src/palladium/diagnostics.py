@@ -102,9 +102,10 @@ def explain_spec(
     threadgroup : tuple of int or None, optional
         One to three positive dimensions, or None for runtime selection. Cooperative
         kernels require their fixed group size.
-    dot_general : {"auto", "default", "tensorops"}, optional
-        Use cooperative TensorOps when recognized, force primitive emission, or require
-        TensorOps, respectively. The default is "auto".
+    dot_general : {"auto", "default", "tensorops", "simdgroup"}, optional
+        Use cooperative TensorOps when recognized, force primitive emission, require
+        TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
+        respectively. The default is "auto".
 
     Returns
     -------
@@ -161,9 +162,10 @@ def log_compile(
     threadgroup : tuple of int or None, optional
         One to three positive dimensions, or None for runtime selection. Cooperative
         kernels require their fixed group size.
-    dot_general : {"auto", "default", "tensorops"}, optional
-        Use cooperative TensorOps when recognized, force primitive emission, or require
-        TensorOps, respectively. The default is "auto".
+    dot_general : {"auto", "default", "tensorops", "simdgroup"}, optional
+        Use cooperative TensorOps when recognized, force primitive emission, require
+        TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
+        respectively. The default is "auto".
 
     Notes
     -----

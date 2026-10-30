@@ -12,6 +12,7 @@ from palladium.emit.numeric import ELEMENTWISE, HELPERS, format_scalar, typed_ex
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
 
+from . import simdgroup
 from ._shared import (
     _index_map_is,
     _kernel_source,
@@ -23,7 +24,9 @@ from ._shared import (
 _K_TILE = 128
 
 
-def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str, int]:
+def lower_matmul(
+    spec: KernelSpec, kernel_name: str | None = None, *, prefer_simdgroup: bool = False
+) -> tuple[str, int]:
     """Recognize a tiled matrix product and emit its cooperative TensorOps kernel.
 
     Parameters
@@ -33,6 +36,10 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
     kernel_name : str or None, optional
         MSL function name override; None uses ``spec.name``. The name must be a valid
         MSL identifier.
+    prefer_simdgroup : bool, optional
+        Emit the `simdgroup_matrix` kernel of `simdgroup.py` instead of `matmul2d`
+        for float32 products it supports: untransposed operands, evenly tiled M
+        and N, and K a multiple of 16. Other products keep `matmul2d`.
 
     Returns
     -------
@@ -187,6 +194,28 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
     if not set(map(id, all_gets)).issubset(used) or len(used) != len(spec.jaxpr.eqns):
         raise EmitError("tensorops matmul jaxpr has operations outside the dot epilogue path")
 
+    if (
+        prefer_simdgroup
+        and CTYPES.get(matmul_dtype) == "float"
+        and not (transpose_lhs or transpose_rhs)
+        and m % tm == 0
+        and n % tn == 0
+        and simdgroup.supports(tm, tn, k)
+    ):
+        return _lower_simdgroup(
+            spec,
+            kernel_name,
+            all_gets=all_gets,
+            dot_value=dot.outvars[0],
+            store_value=store_value,
+            elementwise_eqns=elementwise_eqns,
+            rank=rank,
+            k=k,
+            n=n,
+            tm=tm,
+            tn=tn,
+        )
+
     cursor = Cursor()
     params = tuple(
         f"device {msl_type(info.dtype)}* arg{index} [[buffer({index})]]"
@@ -219,55 +248,7 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
             "const uint THREADS = threads_per_group.x * threads_per_group.y * threads_per_group.z;"
         )
 
-    env = Environment()
-    infos = (*spec.inputs, output_info)
-    ref_values: dict[Var, CVal] = {}
-    offsets = tuple(block_offset(env, cursor, spec, info) for info in infos)
-    for index, (ref, info, offset) in enumerate(
-        zip(spec.jaxpr.invars, infos, offsets, strict=True)
-    ):
-        pointer = f"arg{index}" if offset == "0" else f"(arg{index} + {offset})"
-        ref_values[ref] = CVal(
-            pointer,
-            info.block_shape,
-            msl_type(info.dtype),
-            space="device",
-            readonly=index < len(spec.inputs),
-        )
-
-    values: dict[Var, CVal] = {}
-    for eqn in all_gets:
-        if len(eqn.invars) != 1 or eqn.invars[0] not in ref_values:
-            raise EmitError("tensorops matmul reads must be full-block ref gets")
-        if tuple(eqn.params["tree"].flatten_up_to(())):
-            raise EmitError("tensorops matmul does not support indexed ref gets yet")
-        ref_value = ref_values[eqn.invars[0]]
-        if _shape(eqn.outvars[0]) != ref_value.shape:
-            raise EmitError("tensorops matmul get shape does not match its input block")
-        ref_index = spec.jaxpr.invars.index(eqn.invars[0])
-        if ref_index >= len(spec.inputs):
-            raise EmitError("tensorops matmul cannot read from its output ref")
-        expected_side = (tm, tn) if rank == 2 else (1, tm, tn)
-        side_map = (0, 1) if rank == 2 else (0, 1, 2)
-        column_bias = (
-            rank == 2 and ref_value.shape == (tn,) and _index_map_is(spec.inputs[ref_index], (1,))
-        )
-        if ref_index >= 2 and (
-            not column_bias
-            and (
-                ref_value.shape != expected_side
-                or not _index_map_is(spec.inputs[ref_index], side_map)
-            )
-        ):
-            raise EmitError("tensorops matmul epilogue reads must match the output tile layout")
-        if ref_index >= 2 and not column_bias:
-            full_row_stride = spec.inputs[ref_index].array_shape[-1]
-            ref_value = dataclasses.replace(
-                ref_value,
-                shape=(tm, tn),
-                index_map=f"(($i / {tn}) * {full_row_stride} + ($i % {tn}))",
-            )
-        values[eqn.outvars[0]] = ref_value
+    env, offsets, ref_values, values = _bind_operands(spec, cursor, all_gets, rank, tm, tn)
 
     output_storage = (
         cursor.allocate(acc_ctype, (tm, tn), name="dot_result", space="threadgroup")
@@ -394,30 +375,19 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
             cursor.emit(f"const uint column = {index} % {tn};")
             with cursor.block(f"if (row < {valid_m} && column < {valid_n})"):
                 product = output_storage.at(index)
-                scalar_values = {
-                    dot.outvars[0]: f"{output_ctype}({product})" if narrowing else product
-                }
-                for eqn in elementwise_eqns:
-                    if not _is_tile_shape(_shape(eqn.outvars[0]), rank, tm, tn) and not (
-                        eqn.primitive.name == "broadcast_in_dim"
-                        and _shape(eqn.outvars[0]) == (1, tn)
-                    ):
-                        raise EmitError(
-                            "tensorops matmul epilogue operations must preserve the output tile shape"
-                        )
-                    operands = tuple(
-                        _scalar_value(atom, scalar_values, values, env, index, (tm, tn))
-                        for atom in eqn.invars
-                    )
-                    result_type = msl_type(eqn.outvars[0].aval.dtype)
-                    expression = _elementwise_expression(eqn, result_type, operands, cursor)
-                    result_name = cursor.fresh("tensorops_epilogue")
-                    cursor.emit(f"{result_type} {result_name} = {expression};")
-                    scalar_values[eqn.outvars[0]] = result_name
-                try:
-                    expression = scalar_values[store_value]
-                except KeyError as error:
-                    raise EmitError("tensorops matmul store value was not lowered") from error
+                expression = _epilogue_expression(
+                    cursor,
+                    env,
+                    values,
+                    elementwise_eqns,
+                    dot.outvars[0],
+                    store_value,
+                    f"{output_ctype}({product})" if narrowing else product,
+                    index,
+                    rank,
+                    tm,
+                    tn,
+                )
                 cursor.emit(f"{output_ref.expr}[row * {n} + column] = {expression};")
     else:
         if has_edge_tiles:
@@ -443,6 +413,189 @@ def lower_matmul(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str,
 
     source = _kernel_source(kernel_name or spec.name, params, cursor)
     return source, cursor.threadgroup_bytes
+
+
+def _bind_operands(
+    spec: KernelSpec, cursor: Cursor, all_gets: list, rank: int, tm: int, tn: int
+) -> tuple[Environment, tuple[str, ...], dict[Var, CVal], dict[Var, CVal]]:
+    """Emit block offsets and lower the refs and full-block reads of a matmul.
+
+    Returns
+    -------
+    env : Environment
+        Environment that resolves literals.
+    offsets : tuple of str
+        Element offset of each operand's block, inputs then output.
+    ref_values : dict
+        Device pointer value of each ref, at its block.
+    values : dict
+        Value of each `get` result. Epilogue reads beyond the two dot operands
+        become `(tm, tn)` tile views; a `(tn,)` read with a column block map
+        stays a column bias.
+    """
+    env = Environment()
+    infos = (*spec.inputs, spec.outputs[0])
+    ref_values: dict[Var, CVal] = {}
+    offsets = tuple(block_offset(env, cursor, spec, info) for info in infos)
+    for index, (ref, info, offset) in enumerate(
+        zip(spec.jaxpr.invars, infos, offsets, strict=True)
+    ):
+        pointer = f"arg{index}" if offset == "0" else f"(arg{index} + {offset})"
+        ref_values[ref] = CVal(
+            pointer,
+            info.block_shape,
+            msl_type(info.dtype),
+            space="device",
+            readonly=index < len(spec.inputs),
+        )
+
+    values: dict[Var, CVal] = {}
+    for eqn in all_gets:
+        if len(eqn.invars) != 1 or eqn.invars[0] not in ref_values:
+            raise EmitError("tensorops matmul reads must be full-block ref gets")
+        if tuple(eqn.params["tree"].flatten_up_to(())):
+            raise EmitError("tensorops matmul does not support indexed ref gets yet")
+        ref_value = ref_values[eqn.invars[0]]
+        if _shape(eqn.outvars[0]) != ref_value.shape:
+            raise EmitError("tensorops matmul get shape does not match its input block")
+        ref_index = spec.jaxpr.invars.index(eqn.invars[0])
+        if ref_index >= len(spec.inputs):
+            raise EmitError("tensorops matmul cannot read from its output ref")
+        expected_side = (tm, tn) if rank == 2 else (1, tm, tn)
+        side_map = (0, 1) if rank == 2 else (0, 1, 2)
+        column_bias = (
+            rank == 2 and ref_value.shape == (tn,) and _index_map_is(spec.inputs[ref_index], (1,))
+        )
+        if ref_index >= 2 and (
+            not column_bias
+            and (
+                ref_value.shape != expected_side
+                or not _index_map_is(spec.inputs[ref_index], side_map)
+            )
+        ):
+            raise EmitError("tensorops matmul epilogue reads must match the output tile layout")
+        if ref_index >= 2 and not column_bias:
+            full_row_stride = spec.inputs[ref_index].array_shape[-1]
+            ref_value = dataclasses.replace(
+                ref_value,
+                shape=(tm, tn),
+                index_map=f"(($i / {tn}) * {full_row_stride} + ($i % {tn}))",
+            )
+        values[eqn.outvars[0]] = ref_value
+    return env, offsets, ref_values, values
+
+
+def _lower_simdgroup(
+    spec: KernelSpec,
+    kernel_name: str | None,
+    *,
+    all_gets: list,
+    dot_value: Var,
+    store_value,
+    elementwise_eqns: list,
+    rank: int,
+    k: int,
+    n: int,
+    tm: int,
+    tn: int,
+) -> tuple[str, int]:
+    """Emit a recognized float32 matmul with the `simdgroup_matrix` kernel.
+
+    The caller has checked `simdgroup.supports(tm, tn, k)`, untransposed float32
+    operands and even M and N tiling. Each lane applies the epilogue to the
+    elements it holds and stores them directly.
+    """
+    cursor = Cursor()
+    params = (
+        tuple(
+            f"device {msl_type(info.dtype)}* arg{index} [[buffer({index})]]"
+            for index, info in enumerate((*spec.inputs, spec.outputs[0]))
+        )
+        + ("uint3 _pid [[threadgroup_position_in_grid]]",)
+        + simdgroup.PARAMETERS
+    )
+    env, offsets, _, values = _bind_operands(spec, cursor, all_gets, rank, tm, tn)
+    a_offset, b_offset, c_offset = offsets[0], offsets[1], offsets[-1]
+    simdgroup.emit_main_loop(
+        cursor,
+        a=f"(arg0 + {a_offset})",
+        b=f"(arg1 + {b_offset})",
+        k=k,
+        n=n,
+        tm=tm,
+        tn=tn,
+    )
+    output = f"(arg{len(spec.inputs)} + {c_offset})"
+    with simdgroup.accumulator_elements(cursor, tm, tn) as (value, row, column):
+        # Parenthesized: column-bias reads append `% tn` to it.
+        index = f"({row} * {tn} + {column})"
+        expression = _epilogue_expression(
+            cursor,
+            env,
+            values,
+            elementwise_eqns,
+            dot_value,
+            store_value,
+            value,
+            index,
+            rank,
+            tm,
+            tn,
+        )
+        cursor.emit(f"{output}[{row} * {n} + {column}] = {expression};")
+    source = _kernel_source(kernel_name or spec.name, params, cursor)
+    return source, cursor.threadgroup_bytes
+
+
+def _epilogue_expression(
+    cursor: Cursor,
+    env: Environment,
+    values: dict,
+    elementwise_eqns: list,
+    dot_value: Var,
+    store_value,
+    product: str,
+    index: str,
+    rank: int,
+    tm: int,
+    tn: int,
+) -> str:
+    """Emit the epilogue for one output element and return the value to store.
+
+    Parameters
+    ----------
+    product : str
+        The element of the dot result.
+    index : str
+        The element's flat position in the `tm x tn` tile, for reads of other
+        tiles and column biases.
+
+    Raises
+    ------
+    EmitError
+        An epilogue operation changes the tile shape, or the store value was not
+        produced.
+    """
+    scalar_values = {dot_value: product}
+    for eqn in elementwise_eqns:
+        if not _is_tile_shape(_shape(eqn.outvars[0]), rank, tm, tn) and not (
+            eqn.primitive.name == "broadcast_in_dim" and _shape(eqn.outvars[0]) == (1, tn)
+        ):
+            raise EmitError(
+                "tensorops matmul epilogue operations must preserve the output tile shape"
+            )
+        operands = tuple(
+            _scalar_value(atom, scalar_values, values, env, index, (tm, tn)) for atom in eqn.invars
+        )
+        result_type = msl_type(eqn.outvars[0].aval.dtype)
+        expression = _elementwise_expression(eqn, result_type, operands, cursor)
+        result_name = cursor.fresh("tensorops_epilogue")
+        cursor.emit(f"{result_type} {result_name} = {expression};")
+        scalar_values[eqn.outvars[0]] = result_name
+    try:
+        return scalar_values[store_value]
+    except KeyError as error:
+        raise EmitError("tensorops matmul store value was not lowered") from error
 
 
 def _full_get(eqn, ref: Var):

@@ -51,7 +51,13 @@ On both paths, tiled matmuls on a 2D or 3D grid lower through Metal 4
 TensorOps by default (`CompilerParams(dot_general="auto")`); other dots keep
 the one-thread-per-program emitter. `dot_general="tensorops"` requires the cooperative lowering and
 raises where it does not apply; `dot_general="default"` forces the primitive
-path. The lowering covers a standalone, tiled rank-2 matmul or matching rank-3
+path. `dot_general="simdgroup"` also requires the cooperative lowering, and
+emits float32 matmuls with `simdgroup_matrix` instead of Metal 4 `matmul2d`
+when the operands are not transposed, M and N divide evenly into tiles, K is
+a multiple of 16, the tile has 16, 32, 64 or 128 rows and a multiple of 16
+columns, and at most 8192 elements. Everything else keeps `matmul2d`. On an
+M2 this ran float32 4096³ at 2.54 TFLOPS against 1.97 for `matmul2d` with
+the same 64x64 tiles; see `notes/apple-gpu-kernel-recipe.md`. The lowering covers a standalone, tiled rank-2 matmul or matching rank-3
 batches of matrices. The batched form uses arrays
 `[B, M, K] @ [B, K, N]`, one batch per Pallas grid coordinate, and one
 threadgroup per output tile. Batch sizes must match and each Pallas tile must

@@ -1,4 +1,4 @@
-# A Pallas matmul and attention recipe near the Apple GPU roofline (planned)
+# A Pallas matmul and attention recipe near the Apple GPU roofline (step 2 done)
 
 Goal: hand-written Pallas kernels that reach a large share of the GPU's
 throughput, told as a roofline story like the scaling book and the Mosaic GPU
@@ -50,13 +50,77 @@ effective tile per device-memory read: stage operands in threadgroup memory,
 share them across SIMD groups, and order programs so neighbours reuse cache
 lines.
 
+## Step 2 results (2026-10-29, M2, float32 4096³, GPU time)
+
+| Variant | TFLOPS |
+|---|---:|
+| palladium `matmul2d`, 128x64 tile, 4 SIMD groups (baseline) | 2.12 |
+| `matmul2d` 128x128, 4 / 8 / 12 SIMD groups | 0.77 / 1.47 / 1.53 |
+| `matmul2d` 128x128, 16 SIMD groups | does not launch: register use caps the threadgroup at 384 threads |
+| `matmul2d` 128x128, 8 SIMD groups, K step 16 / 32 / 64 / 128 | 1.35 / 1.47 / 1.33 / 1.47 |
+| element-wise threadgroup staging in front of `matmul2d` | 0.49–0.67 |
+| grouped program order (groups of 4, 8, 16 row tiles), 64x64 and 128x64 | 1.90–2.12 |
+| hand-written `simdgroup_matrix` GEMM, 64x64x16, 2x2 SIMD groups | 0.05 |
+| same, with `#pragma clang loop unroll(full)` on the fragment loops | 2.00 |
+| same, threadgroup rows padded by 4 elements | 1.97 |
+| same, float16 | 2.65 |
+| **MLX-style inner loop** (below), 64x64x16, 2x2 SIMD groups | **2.54** |
+| MLX-style, 64x64x32 / 128x64x16 | 2.34–2.37 / 2.46–2.47 |
+| MLX-style, float16 inputs, float32 accumulation | 2.97–3.09 |
+| MLX (same tile configuration on this device class, no swizzle) | 2.72 |
+
+The hand-written variant scripts behind these rows were removed on
+2026-10-30. The winning kernel is `emit/tensorops/simdgroup.py`, and
+`benchmarks/bench_roofline.py` measures it against `matmul2d`.
+
+What this changes:
+
+- The traffic model below fits the small tiles, but its premise is not the
+  whole story: if re-reading operands from device memory were the limit,
+  grouped program order should have helped, and it did not.
+- Large tiles do not work with `matmul2d` on M1/M2-class GPUs: the
+  accumulator spills, and more SIMD groups recover only part of it.
+- Staging is not a win by itself, and a hand-written kernel matches
+  `matmul2d` (2.0) only once its fragment loops are fully unrolled.
+  Without that, the accumulators go to stack memory (40x slower).
+- MLX reaches 2.72 with the same tile configuration, so the remaining gap is
+  in the inner loop. MLX does not use `simdgroup_load`: each thread reads its
+  own fragment elements from threadgroup memory (`BaseMMAFrag::load` in
+  `steel/gemm/mma.h`), and accumulators stay thread-local vectors that are
+  reinterpreted as `simdgroup_matrix` only for the multiply.
+
+Porting that inner loop (with MLX's interleaved SIMD-group layout,
+serpentine product order and contiguous per-thread tile copies) reaches
+2.54 TFLOPS, past the 2.5 target and 93% of MLX. The rest of the gap is
+unexplored: MLX's vectorized tile loader, its epilogue, or compiler flags.
+
+The TensorOps lowering now emits this kernel for float32 tiled matmuls
+under `CompilerParams(dot_general="simdgroup")`
+(`src/palladium/emit/tensorops/simdgroup.py`); float16, transposed operands,
+edge tiles, K not a multiple of 16 and tiles above 8192 elements keep
+`matmul2d`. A plain Pallas `jnp.dot` through palladium, M2, 3 repetitions
+(`bench_roofline.py`):
+
+| float32, tile | `matmul2d` | `simdgroup` |
+|---|---:|---:|
+| 4096³, 64x64 | 1.97 | **2.54** |
+| 4096³, 128x64 | 2.00 | 2.47 |
+| 4096³, 32x32 | 0.68 | 2.09 |
+| 2048³, 64x32 | 2.35 | 2.64 |
+
+`"auto"` still picks `matmul2d`. Make `"simdgroup"` the float32 default once
+it is measured on an M1 and an M3 or later; GPUs with matrix accelerators
+should keep `matmul2d`, which needs a device capability query.
+
 ## Steps
 
 1. **Roofline benchmark** (done): `benchmarks/bench_roofline.py`.
 2. **Threadgroup staging.** A threadgroup memory space for Pallas scratch,
    barriers, and several SIMD groups per program cooperating on one larger
-   tile (`notes/threadgroup-programs.md`). Done when float32 4096³ reaches
-   2.5 TFLOPS with a 128x128 effective tile.
+   tile (`notes/threadgroup-programs.md`). Measured (see Step 2 results):
+   larger tiles and staging alone do not reach the target; a hand-written
+   kernel with MLX's inner loop does. Done: palladium emits it for a plain
+   Pallas `jnp.dot` under `dot_general="simdgroup"`, 2.54 TFLOPS at 4096³.
 3. **Double-buffered K loop.** Metal has no public counterpart of TMA or
    `cp.async`, so overlap comes from two staging buffers and barriers, not
    from asynchronous copies. This is the main difference from the Mosaic GPU
@@ -64,7 +128,9 @@ lines.
    trace and float32 gains over step 2.
 4. **Program-order swizzle and tile search.** Group programs so neighbouring
    threadgroups share operand tiles in cache, then sweep tile shapes (attention
-   already showed 2x from tile shape alone). Done at the targets above.
+   already showed 2x from tile shape alone). Grouped order showed no effect
+   at 4096³ (Step 2 results); MLX also uses none on this device class. Done
+   at the targets above.
 5. **Attention.** Head sizes padded to multiples of 16 (SAM2's 56 is not
    supported today), larger key tiles, probabilities times V in float16, and
    a look at `exp` throughput. Done at ≥ 2.0 TFLOPS float32.

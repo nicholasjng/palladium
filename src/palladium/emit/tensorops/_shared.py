@@ -255,15 +255,16 @@ def uses_tensorops(spec: KernelSpec, dot_general: str) -> bool:
     ----------
     spec : KernelSpec
         Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
-    dot_general : {"auto", "default", "tensorops"}, optional
-        Use cooperative TensorOps when recognized, force primitive emission, or require
-        TensorOps, respectively. The default is "auto".
+    dot_general : {"auto", "default", "tensorops", "simdgroup"}, optional
+        Use cooperative TensorOps when recognized, force primitive emission, require
+        TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
+        respectively. The default is "auto".
 
     Returns
     -------
     bool
-        True for a kernel containing a dot when policy is "tensorops", or "auto" on a 2D
-        or 3D grid.
+        True for a kernel containing a dot when policy is "tensorops" or "simdgroup",
+        or "auto" on a 2D or 3D grid.
 
     Notes
     -----
@@ -273,4 +274,6 @@ def uses_tensorops(spec: KernelSpec, dot_general: str) -> bool:
     """
     if not _contains(spec.jaxpr, "dot_general"):
         return False
-    return dot_general == "tensorops" or (dot_general == "auto" and len(spec.grid) in (2, 3))
+    return dot_general in ("tensorops", "simdgroup") or (
+        dot_general == "auto" and len(spec.grid) in (2, 3)
+    )

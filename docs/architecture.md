@@ -130,7 +130,10 @@ validating compiler behavior or resource limits.
 `CompilerParams(dot_general="auto")` attempts cooperative recognition for
 kernels containing dots on a 2D or 3D grid and falls back when recognition
 fails. `"default"` forces primitive emission; `"tensorops"` propagates a
-recognition failure for a kernel containing dots. A kernel without dots still
+recognition failure for a kernel containing dots. `"simdgroup"` behaves like
+`"tensorops"`, but lowers supported float32 matmuls with `simdgroup_matrix`
+fragments staged through threadgroup memory instead of `matmul2d`
+(`emit/tensorops/simdgroup.py`). A kernel without dots still
 uses primitive emission. Launch geometry follows the actual emitted source
 after fallback.
 
