@@ -1,4 +1,4 @@
-# A Mosaic-style kernel facility for Apple GPUs (planned, not built)
+# A Mosaic-style kernel facility for Apple GPUs (F0–F1 built, rest gated)
 
 Goal: write Apple GPU kernels in Pallas with explicit control of the memory
 hierarchy and the matrix instructions, as `jax.experimental.pallas.mosaic_gpu`
@@ -69,41 +69,63 @@ epilogue is plain `jnp` on the fragment array.
 
 ## Milestones
 
-Estimates are guesses for one person.
+Estimates are guesses for one person. Status as of 2026-10-30, measured on an
+M2 unless noted.
 
 - **F0, baseline (done).** Roofline benchmark; float32 GEMM at 2.54 TFLOPS
   through `dot_general="simdgroup"`.
-- **F1, threadgroup scope (3–4 weeks).** A `pallas_call` option running each
-  program as one threadgroup, a `THREADGROUP` scratch space, barriers, SIMD
-  group and lane indices (`notes/threadgroup-programs.md`). Cooperative
-  elementwise ops and row reductions (`plmtl.sum` and `max` with SIMD-group
-  collectives). Done when a row softmax and a layer norm written this way
-  match MLX's fused kernels within 20%.
-  Status 2026-10-29: done as row programs (`program="threadgroup"`): column
-  reductions and scans, reductions over the rows of a tile to per-tile
-  outputs, and shifts along the columns (roll, pad, diff). Softmax, layer
-  norm and cumsum run within 2% of MLX at 91 GB/s. Moved out: user-declared
-  `THREADGROUP` scratch, explicit barriers and lane indices go to the
-  explicit model with F2/F4; 2D stencils with halos across rows likewise;
-  histograms need atomic scatter, which core Pallas lacks.
+- **F1, threadgroup scope (done).** Built as row programs
+  (`program="threadgroup"`, `notes/threadgroup-programs.md`): plain Pallas
+  kernels whose block ops lower cooperatively, with column reductions and
+  scans, reductions over the rows of a tile, and shifts along the columns.
+  Softmax, layer norm and cumsum run within 2% of MLX at 91 GB/s. The
+  explicit primitives first planned here (user-declared `THREADGROUP`
+  scratch, barriers, lane indices) moved to F2/F4; 2D stencils with halos
+  across rows go with them; histograms need atomic scatter, which core Pallas
+  lacks.
+
+What F0–F1 showed: the speed so far came from the emitter (recognized
+matmuls, row programs), not from user-written schedules, and the largest
+remaining costs were outside the kernels. Those come first:
+
+- **N1, per-call overhead (done).** `metal_call` lost 3–4 ms per 268 MB call
+  to the GPU's page-table setup for each new no-copy wrap, and over 128 MB
+  wraps silently copied (XNU splits mappings into 128 MB entries).
+  metal-runtime now caches validated wraps and walks all entries; a row
+  softmax over 128 MB went from 6.4 to 3.4 ms end to end.
+- **N2, `"auto"` uses `simdgroup_matrix` on Apple families 7 and 8 (done).**
+  4096³ float32 end to end: 2.42 TFLOPS against 1.89 for `matmul2d`. To do:
+  confirm on an M1, and measure an M3 or M4 before widening it.
+- **N3, attention in the recognizer.** At 4096 tokens and 32 heads of 64,
+  float32: 1.42 TFLOPS at 64×64 tiles, against MLX's 1.99. Next is
+  `simdgroup_matrix` for both matmuls on families 7 and 8, as for GEMM.
+  Done at ≥ 2.0 TFLOPS; this replaces the old F5 target, which needed F2–F4
+  first.
+
+The explicit model is gated on a kernel that needs it:
+
 - **F2, fragments (2–3 weeks).** A fragment-layout array type, `plmtl.mma`,
-  `plmtl.copy`, and elementwise epilogues on fragments. Done when the
-  hand-written Pallas matmul above reaches 2.5 TFLOPS float32 at 4096³, the
-  same as the emitted one.
-- **F3, pipelining (1–2 weeks).** `plmtl.emit_pipeline`: a double-buffered K
-  loop over two threadgroup buffers. Done when it is measured against F2;
-  keep it only if it gains.
-- **F4, `pl.kernel` on Metal (1–2 weeks).** A `plmtl.Mesh` implementing
-  `jax._src.pallas.core.Mesh`, and `mpmd_map` lowerings for `mps` (and `cpu`
-  for `metal_call`). Done when the example above runs on both paths.
-- **F5, attention (2–3 weeks).** Flash attention written with F1–F3; head
-  sizes not multiples of 16 padded. Done at ≥ 2.0 TFLOPS float32 (MLX parity
-  at 4096 tokens, 64-wide heads).
-- **F6, tensor operations (open).** `plmtl.tensor_matmul` over MPP and a
-  device capability query in metal-runtime, to choose it on GPUs with matrix
-  accelerators. Needs such a machine.
+  `plmtl.copy`, and elementwise epilogues on fragments. Its done condition
+  (the hand-written matmul above at the emitted kernel's 2.5 TFLOPS) gains
+  no speed by itself; it pays off only for kernels the recognizers cannot
+  match, such as dequantizing matmuls or attention variants. Start when such
+  a kernel has a user.
+- **F3, pipelining: dropped.** Metal has no asynchronous copies, and
+  threadgroup staging and program-order swizzles did not help the GEMM
+  (`notes/apple-gpu-kernel-recipe.md`). Revisit only if a GPU trace shows
+  loads and compute not overlapping.
+- **F4, `pl.kernel` on Metal (1–2 weeks), with F2.** A `plmtl.Mesh`
+  implementing `jax._src.pallas.core.Mesh`, and `mpmd_map` lowerings for
+  `mps` (and `cpu` for `metal_call`). Blocked on the mps side until jax-mps
+  supports jax 0.12 and takes the `mps.metal_kernel` custom call.
+- **F5, attention written with F2–F4.** Only if N3 cannot reach its target
+  inside the recognizer.
+- **F6, tensor operations (open).** `plmtl.tensor_matmul` over MPP, chosen on
+  GPUs with matrix accelerators (Apple family 10). metal-runtime reports the
+  family as `device_info()["apple_gpu_family"]`. Needs such a machine.
 - **F7, docs.** A tutorial in the style of the Mosaic GPU matmul guide:
-  roofline, each step, its number.
+  roofline, each step, its number. Can start with row programs and the
+  `simdgroup` GEMM.
 
 Cross-cutting, from F1 on:
 
@@ -124,5 +146,5 @@ Cross-cutting, from F1 on:
 - Apple's compiler is opaque: unrolling, spills and scheduling are decided
   there. The roofline benchmark and GPU traces are the feedback loop.
 - No public asynchronous copies: pipelining may gain little (F3 decides).
-- Hardware: only M1/M2-class GPUs measured; GPUs with matrix accelerators
-  change the ceilings, and F6 is untested.
+- Hardware: only an M2 measured; GPUs with matrix accelerators change the
+  ceilings, and F6 is untested.
