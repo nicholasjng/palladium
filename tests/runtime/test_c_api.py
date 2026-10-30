@@ -82,6 +82,8 @@ def test_device_info_reports_device_limits(lib):
     assert info.max_threads_per_threadgroup >= 256
     assert info.max_threadgroup_memory_length >= 16 * 1024
     assert info.has_unified_memory
+    assert info.apple_gpu_family >= 7  # Apple silicon
+    assert info.name.startswith(b"Apple")
 
     assert lib.mr_device_info(None, ctypes.byref(err)) == rt.ERROR_INVALID_ARGUMENT
     assert err.value is not None

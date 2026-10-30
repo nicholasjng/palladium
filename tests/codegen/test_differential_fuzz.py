@@ -20,7 +20,6 @@ import os
 
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import numpy as np
 import pytest
 from hypothesis import given, settings, strategies as st
@@ -171,7 +170,7 @@ def test_fuzz_elementwise(case):
     f = palladium.metal_call(
         make_elementwise_kernel(tree, n_inputs),
         **kwargs,
-        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
+        compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE),
     )
     _assert_matches_oracle(f, args)
 
@@ -289,7 +288,7 @@ def test_fuzz_scan_xs_ys(case):
             ys_plans,
         ),
         out_shape=out_shape,
-        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
+        compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE),
     )
     _assert_matches_oracle(f, args)
 
@@ -335,7 +334,7 @@ def test_fuzz_cond(case):
     f = palladium.metal_call(
         make_switch_kernel(branches, n_inputs),
         **kwargs,
-        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
+        compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE),
     )
     _assert_matches_oracle(f, args)
 
@@ -413,6 +412,6 @@ def test_fuzz_while(case):
     f = palladium.metal_call(
         make_while_kernel(n_carry, n_consts, plans),
         **kwargs,
-        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
+        compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE),
     )
     _assert_matches_oracle(f, args)

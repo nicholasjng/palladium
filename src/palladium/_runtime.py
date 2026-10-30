@@ -58,6 +58,8 @@ class DeviceInfo(ctypes.Structure):
         ("recommended_max_working_set_size", ctypes.c_size_t),
         ("has_unified_memory", ctypes.c_int),
         ("supports_non_uniform_threadgroups", ctypes.c_int),
+        ("apple_gpu_family", ctypes.c_int),
+        ("name", ctypes.c_char * 128),
     ]
 
 

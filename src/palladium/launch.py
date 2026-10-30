@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import math
 import operator
 
 from jax._src.pallas import core as pallas_core
-from metal_runtime import MathMode
 
 from palladium.device import device_limits
 from palladium.emit.kernel import DOT_GENERAL_POLICIES, PROGRAM_SCOPES
@@ -17,10 +17,22 @@ from palladium.trace import KernelSpec
 
 __all__ = [
     "CompilerParams",
+    "MathMode",
     "check_threadgroup",
     "launch_geometry",
     "normalize_threadgroup",
 ]
+
+
+class MathMode(enum.StrEnum):
+    """How much freedom the Metal compiler has to rewrite floating-point arithmetic."""
+
+    #: IEEE semantics; compensated arithmetic needs it.
+    SAFE = "safe"
+    #: Reassociates like FAST, but keeps infinities and NaNs well-defined.
+    RELAXED = "relaxed"
+    #: Metal's default: permits reassociation and flushes denormals.
+    FAST = "fast"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,7 +56,7 @@ class CompilerParams(pallas_core.CompilerParams):
     threadgroup : int, tuple of int, or None, optional
         One to three positive dimensions, or None for runtime selection. Cooperative
         kernels fix their own size and reject mismatches.
-    math_mode : metal_runtime.MathMode, optional
+    math_mode : MathMode, optional
         FAST by default; RELAXED and SAFE are available through CPU FFI. The mps path
         accepts FAST only.
     BACKEND : str

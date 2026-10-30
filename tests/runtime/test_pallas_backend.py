@@ -10,10 +10,10 @@ import jax
 import jax.numpy as jnp
 import pytest
 from jax.experimental import pallas as pl
-from metal_runtime import MathMode
 
 import palladium
 import palladium.device
+from palladium import MathMode
 
 
 def _add(x_ref, y_ref, o_ref):

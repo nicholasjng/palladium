@@ -155,12 +155,11 @@ def test_expm1_and_log1p_keep_precision_near_zero():
         o_ref[...] = jnp.expm1(x) + jnp.log1p(x)
 
     x = np.array([1e-8, -1e-8, 1e-5, -1e-5, 1e-3], dtype=np.float32)
-    import metal_runtime as mr
 
     call = palladium.metal_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((5,), jnp.float32),
-        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
+        compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE),
     )
     want = np.expm1(x.astype(np.float64)) + np.log1p(x.astype(np.float64))
     np.testing.assert_allclose(call(x), want.astype(np.float32), rtol=1e-6)

@@ -249,7 +249,9 @@ MRStatus mr_device_info(MRDeviceInfo* out_info, char** out_err_msg) {
             rt.max_threads_per_threadgroup(), rt.max_threadgroup_memory_length(),
             rt.max_buffer_length(),           rt.recommended_max_working_set_size(),
             rt.has_unified_memory(),          rt.supports_non_uniform_threadgroups(),
+            rt.apple_gpu_family(),            {},
         };
+        std::strncpy(out_info->name, rt.device_name().c_str(), sizeof(out_info->name) - 1);
     });
 }
 

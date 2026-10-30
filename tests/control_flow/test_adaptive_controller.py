@@ -7,7 +7,6 @@ fixed-trip fori_loop.
 
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import numpy as np
 from jax.experimental import pallas as pl
 
@@ -131,7 +130,7 @@ def vdp_adaptive_kernel(x0_ref, v0_ref, mu_ref, to_ref, xo_ref, vo_ref, steps_re
     rejected_ref[...] = rejected
 
 
-def make_solver(n: int, math_mode: mr.MathMode = mr.MathMode.RELAXED):
+def make_solver(n: int, math_mode: palladium.MathMode = palladium.MathMode.RELAXED):
     spec_1 = pl.BlockSpec((1,), lambda i: (i,))
     return palladium.metal_call(
         vdp_adaptive_kernel,

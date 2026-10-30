@@ -4,9 +4,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from metal_runtime import MathMode
 
 import palladium
+from palladium import MathMode
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, np.int32, np.uint32])

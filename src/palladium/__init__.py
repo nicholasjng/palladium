@@ -22,7 +22,7 @@ from palladium.errors import (
     UnsupportedPrimitiveError,
 )
 from palladium.ffi import metal_call
-from palladium.launch import CompilerParams
+from palladium.launch import CompilerParams, MathMode
 from palladium.trace import BlockInfo, KernelSpec, ScratchInfo, trace
 from palladium.vjp import with_vjp
 
@@ -33,6 +33,7 @@ __all__ = [
     "EmitError",
     "KernelDiagnostics",
     "KernelSpec",
+    "MathMode",
     "PalladiumError",
     "ScratchInfo",
     "TraceError",

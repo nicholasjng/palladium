@@ -21,11 +21,10 @@ from jax._src import effects as jax_effects
 from jax._src.interpreters import mlir
 from jax._src.lib.mlir import ir
 from jax._src.pallas.pallas_call import pallas_call_p
-from metal_runtime import MathMode
 
 from palladium.emit import emit_msl
 from palladium.emit.core import shaped
-from palladium.launch import CompilerParams, check_threadgroup, launch_geometry
+from palladium.launch import CompilerParams, MathMode, check_threadgroup, launch_geometry
 from palladium.trace import KernelSpec, spec_from_params
 
 __all__ = ["MpsDispatchDescriptor"]

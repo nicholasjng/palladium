@@ -63,6 +63,8 @@ typedef struct MRDeviceInfo {
     size_t recommended_max_working_set_size;
     int has_unified_memory;
     int supports_non_uniform_threadgroups;  // else the grid must divide by the threadgroup
+    int apple_gpu_family;  // highest N with MTLGPUFamilyAppleN: 7 for M1 to 10 for M5, or 0
+    char name[128];        // NUL-terminated, truncated if longer
 } MRDeviceInfo;
 
 MR_EXPORT MRStatus mr_device_info(MRDeviceInfo* out_info, char** out_err_msg);

@@ -7,7 +7,6 @@ skips when the native handler is not built.
 
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import numpy as np
 import pytest
 
@@ -105,7 +104,7 @@ def test_math_mode_safe_is_actually_requested(rng):
     f = palladium.metal_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((64,), jnp.float32),
-        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
+        compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE),
     )
     x = rng.standard_normal(64, dtype=np.float32)
     got = f(x)

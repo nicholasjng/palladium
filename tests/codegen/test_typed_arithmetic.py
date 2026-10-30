@@ -2,14 +2,13 @@
 
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import numpy as np
 import pytest
 
 import palladium
 
 
-def call_for(op, *args, mode=mr.MathMode.SAFE):
+def call_for(op, *args, mode=palladium.MathMode.SAFE):
     def kernel(*refs):
         *inputs, out = refs
         out[...] = op(*(ref[...] for ref in inputs))
@@ -89,7 +88,7 @@ def test_float_extrema_nan_and_zero(metal_device, op):
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, jnp.bfloat16])
-@pytest.mark.parametrize("mode", [mr.MathMode.SAFE, mr.MathMode.FAST])
+@pytest.mark.parametrize("mode", [palladium.MathMode.SAFE, palladium.MathMode.FAST])
 @pytest.mark.parametrize("op", [jax.lax.one_minus_square, jnp.log2])
 def test_log2_and_one_minus_square_near_their_boundaries(metal_device, dtype, mode, op):
     """Compare log2 and one_minus_square with the interpreter across floating dtypes and math
@@ -159,7 +158,7 @@ def test_minmax_pair(metal_device, dtype):
     call = palladium.metal_call(
         kernel,
         out_shape=(scalar, scalar),
-        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
+        compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE),
     )
     np.testing.assert_array_equal(call(x), call.interpret(x))
 

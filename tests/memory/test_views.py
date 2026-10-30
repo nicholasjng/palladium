@@ -2,7 +2,6 @@
 
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import numpy as np
 import pytest
 from jax.experimental import pallas as pl
@@ -128,7 +127,7 @@ def test_padding_matches_interpreter(metal_device, dtype):
         in_specs=[pl.BlockSpec((8,), lambda i: (i,))],
         out_specs=pl.BlockSpec((1,), lambda i: (i,)),
         out_shape=jax.ShapeDtypeStruct((2,), dtype),
-        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE),
+        compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE),
     )
     x = np.arange(9, dtype=np.float32).astype(dtype)
     np.testing.assert_array_equal(

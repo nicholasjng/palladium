@@ -4,7 +4,6 @@ import re
 
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import numpy as np
 import pytest
 from jax.experimental import pallas as pl
@@ -82,16 +81,14 @@ def test_reshape_between_scalar_and_one_element_array_stays_in_registers(kind):
     "kind",
     ["bfloat_literal", "scalar_to_array", "array_to_scalar", "zero_power", "swap"],
 )
-def test_regressions_against_interpret(kind):
+def test_regressions_against_interpret(metal_device, kind):
     """Compare literal, scalar-reshape, zero-power, and scratch-swap regressions with the
     interpreter."""
-    try:
-        mr.device_info()["name"]
-    except mr.DeviceError as exc:
-        pytest.skip(str(exc))
     kernel, arg, kwargs = _case(kind)
     call = palladium.metal_call(
-        kernel, **kwargs, compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.SAFE)
+        kernel,
+        **kwargs,
+        compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE),
     )
     x = np.arange(np.prod(arg.shape), dtype=np.float32).reshape(arg.shape)
     x = x.astype(arg.dtype)

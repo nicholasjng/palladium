@@ -24,12 +24,10 @@ _NO_GPU_MODULES = {
 
 
 def pytest_collection_modifyitems(config, items):
-    import metal_runtime as mr
+    from palladium.device import device_limits
 
-    try:
-        mr.device_info()["name"]
-    except mr.DeviceError as e:  # pragma: no cover - CI without a GPU
-        skip = pytest.mark.skip(reason=f"no Metal device: {e}")
+    if not device_limits():  # pragma: no cover - CI without a GPU
+        skip = pytest.mark.skip(reason="no Metal device")
         for item in items:
             if item.path.stem not in _NO_GPU_MODULES:
                 item.add_marker(skip)
@@ -43,9 +41,7 @@ def rng():
 @pytest.fixture
 def metal_device():
     """Skip the test when no Metal device is present."""
-    import metal_runtime as mr
+    from palladium.device import device_limits
 
-    try:
-        mr.device_info()["name"]
-    except mr.DeviceError as exc:
-        pytest.skip(str(exc))
+    if not device_limits():
+        pytest.skip("no Metal device")
