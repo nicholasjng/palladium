@@ -111,20 +111,27 @@ remaining costs were outside the kernels. Those come first:
 
 The explicit model is gated on a kernel that needs it:
 
-- **F2, fragments (2–3 weeks).** A fragment-layout array type, `plmtl.mma`,
-  `plmtl.copy`, and elementwise epilogues on fragments. Its done condition
-  (the hand-written matmul above at the emitted kernel's 2.5 TFLOPS) gains
-  no speed by itself; it pays off only for kernels the recognizers cannot
-  match, such as dequantizing matmuls or attention variants. Start when such
-  a kernel has a user.
+- **F2, fragments (first slice done 2026-10-30).** Built with the API
+  inferred rather than explicit: kernels stay plain Pallas inside
+  `plmtl.kernel` (`pl.kernel` on a `plmtl.Mesh`), stage tiles in
+  `plmtl.THREADGROUP` scratch with ordinary ref writes, and `jnp.dot` of two
+  threadgroup tiles lowers to SIMD-group fragments (`acc + dot` in place);
+  elementwise epilogues run per fragment element, and the emitter places the
+  barriers (`emit/mesh.py`). The hand-written matmul above runs at the
+  emitted kernel's speed: 2.69 against 2.71 TFLOPS at 4096³ and 64x64 tiles
+  on an M2 (`bench_plmtl_matmul`). Next: what M3 of
+  `notes/metal-compute-stack.md` needs (attention backward, implicit-GEMM
+  convolution, bf16 tiles), adding explicit primitives only where a kernel
+  needs them.
 - **F3, pipelining: dropped.** Metal has no asynchronous copies, and
   threadgroup staging and program-order swizzles did not help the GEMM
   (`notes/apple-gpu-kernel-recipe.md`). Revisit only if a GPU trace shows
   loads and compute not overlapping.
-- **F4, `pl.kernel` on Metal (1–2 weeks), with F2.** A `plmtl.Mesh`
-  implementing `jax._src.pallas.core.Mesh`, and `mpmd_map` lowerings for
-  `mps` (and `cpu` for `metal_call`). Blocked on the mps side until jax-mps
-  supports jax 0.12 and takes the `mps.metal_kernel` custom call.
+- **F4, `pl.kernel` on Metal (CPU path done).** `plmtl.Mesh` implements the
+  Pallas mesh protocol, and palladium traces `mpmd_map` the way JAX's CPU
+  fallback maps a mesh onto a grid; `plmtl.kernel` dispatches it through the
+  CPU FFI. The mps lowering is blocked until jax-mps supports jax 0.12, or
+  until our own plugin (`notes/metal-compute-stack.md`).
 - **F5, attention written with F2–F4: not needed for speed.** N3 met its
   target inside the recognizer; an explicit version would only serve
   attention variants the recognizer cannot match.

@@ -25,6 +25,7 @@ from palladium.emit.core import (
     emit_jaxpr,
     msl_type,
 )
+from palladium.emit.mesh import lower_mesh_program
 from palladium.emit.tensorops import compile_kernel, uses_tensorops
 from palladium.emit.threadgroup import lower_row_program
 from palladium.trace import KernelSpec
@@ -91,6 +92,9 @@ def emit_msl_stats(
         raise ValueError("dot_general must be 'auto', 'default', 'tensorops', or 'simdgroup'")
     if program not in PROGRAM_SCOPES:
         raise ValueError("program must be 'thread' or 'threadgroup'")
+    if spec.simdgroups is not None:
+        source, threadgroup_bytes = lower_mesh_program(spec, kernel_name)
+        return source, EmitStats(thread_bytes=0, threadgroup_bytes=threadgroup_bytes)
     if program == "threadgroup":
         source, threadgroup_bytes = lower_row_program(spec, kernel_name)
         return source, EmitStats(thread_bytes=0, threadgroup_bytes=threadgroup_bytes)

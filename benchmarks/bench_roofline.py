@@ -11,6 +11,8 @@ add ``JAX_PLATFORMS=mps,cpu`` with jax-mps installed for the vendor rows.
 - ``bench_pallas_matmul``: a plain tiled ``jnp.dot`` Pallas kernel through the
   TensorOps lowering (``matmul2d``), and for float32 also through
   ``dot_general="simdgroup"``, checked against NumPy before timing.
+- ``bench_plmtl_matmul``: the same float32 matmul written by hand in Pallas
+  on a ``plmtl.Mesh``, staging tiles in threadgroup memory over the K loop.
 - ``bench_vendor_matmul``: ``jnp.dot`` on the mps platform, which jax-mps
   runs on MLX's kernels. Wall time per call, so it includes dispatch.
 - ``bench_pallas_attention``: the example flash attention at 4096 tokens and
@@ -54,6 +56,14 @@ MATMUL_CASES = [
 ]
 MATMUL_IDS = [
     f"{c['policy']}-{c['dtype']}-n{c['size']}-tm{c['tile_m']}-tn{c['tile_n']}" for c in MATMUL_CASES
+]
+PLMTL_CASES = [
+    {"size": size, "tile_m": tm, "tile_n": tn, "tile_k": tk}
+    for size in SIZES
+    for tm, tn, tk in ((64, 64, 16), (128, 64, 16))
+]
+PLMTL_IDS = [
+    f"float32-n{c['size']}-tm{c['tile_m']}-tn{c['tile_n']}-tk{c['tile_k']}" for c in PLMTL_CASES
 ]
 VENDOR_CASES = [{"size": size, "dtype": dtype} for size in SIZES for dtype in DTYPES]
 VENDOR_IDS = [f"{c['dtype']}-n{c['size']}" for c in VENDOR_CASES]
@@ -192,6 +202,55 @@ def bench_pallas_matmul(
         output[:64, :64].astype(np.float32) / np.abs(corner).max(),
         corner / np.abs(corner).max(),
         atol=tolerance,
+    )
+    _run_timed(
+        state,
+        lambda: _runtime.run(kernel, buffers, grid, threadgroup),
+        work=2 * size**3,
+        counter="tflops",
+        scale=1e12,
+    )
+
+
+@mew.parametrize(PLMTL_CASES, ids=PLMTL_IDS, tags="roofline", use_manual_time=True, unit="ms")
+def bench_plmtl_matmul(state: mew.State, size: int, tile_m: int, tile_n: int, tile_k: int) -> None:
+    import palladium
+    from palladium import plmtl
+
+    def body(a_ref, b_ref, o_ref, a_tile, b_tile):
+        i, j = pl.program_id(0), pl.program_id(1)
+
+        def step(kb, acc):
+            a_tile[...] = a_ref[pl.ds(i * tile_m, tile_m), pl.ds(kb * tile_k, tile_k)]
+            b_tile[...] = b_ref[pl.ds(kb * tile_k, tile_k), pl.ds(j * tile_n, tile_n)]
+            return acc + jnp.dot(a_tile[...], b_tile[...])
+
+        acc = jax.lax.fori_loop(0, size // tile_k, step, jnp.zeros((tile_m, tile_n), jnp.float32))
+        o_ref[pl.ds(i * tile_m, tile_m), pl.ds(j * tile_n, tile_n)] = acc
+
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal((size, size)).astype(np.float32)
+    y = rng.standard_normal((size, size)).astype(np.float32)
+    shape = jax.ShapeDtypeStruct((size, size), jnp.float32)
+    call = pl.kernel(
+        body,
+        out_type=shape,
+        mesh=plmtl.Mesh((size // tile_m, size // tile_n)),
+        scratch_types=[
+            plmtl.THREADGROUP((tile_m, tile_k), jnp.float32),
+            plmtl.THREADGROUP((tile_k, tile_n), jnp.float32),
+        ],
+    )
+    source = palladium.emit_msl(palladium.trace(call, shape, shape))
+    kernel = _runtime.Kernel(source, "palladium_kernel")
+    output = np.empty((size, size), np.float32)
+    buffers = [x, y, output]
+    threadgroup = declared_threadgroup_width(source)
+    grid = ((size // tile_m) * threadgroup, size // tile_n, 1)
+    _runtime.run(kernel, buffers, grid, threadgroup)
+    corner = x[:64] @ y[:, :64]
+    np.testing.assert_allclose(
+        output[:64, :64] / np.abs(corner).max(), corner / np.abs(corner).max(), atol=1e-5
     )
     _run_timed(
         state,

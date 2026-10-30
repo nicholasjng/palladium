@@ -88,11 +88,13 @@ class FfiCallable:
 
     Parameters
     ----------
-    kernel : callable
-        Pallas kernel operating on input, output, and optional scratch Refs.
-    pallas_kwargs : dict of str to object
-        Keywords for ``pl.pallas_call``, excluding ``interpret``. Prefer ``metal_call``
-        as the constructor.
+    staged : callable
+        The Pallas call to trace: a ``pl.pallas_call`` or ``pl.kernel`` callable.
+    interpret : callable
+        The same call with ``interpret=True``.
+    params : CompilerParams or None
+        Palladium compiler options; None uses the defaults. Prefer ``metal_call``
+        or ``plmtl.kernel`` as the constructor.
 
     Attributes
     ----------
@@ -112,10 +114,7 @@ class FfiCallable:
     automatic JVP or transpose rule; pair it with a backward callable through ``with_vjp``.
     """
 
-    def __init__(self, kernel: Callable, pallas_kwargs: dict[str, Any]):
-        import jax.experimental.pallas as pl
-
-        params = pallas_kwargs.get("compiler_params")
+    def __init__(self, staged: Callable, interpret: Callable, params: CompilerParams | None):
         if params is None:
             params = CompilerParams()
         elif not isinstance(params, CompilerParams):
@@ -123,8 +122,8 @@ class FfiCallable:
                 f"metal_call takes palladium.CompilerParams, not {type(params).__name__}"
             )
         self._params = params
-        self._staged = pl.pallas_call(kernel, **pallas_kwargs)
-        self.interpret = pl.pallas_call(kernel, **pallas_kwargs, interpret=True)
+        self._staged = staged
+        self.interpret = interpret
         # Bounded LRU of (spec, msl, digest) per input shape signature.
         self._cache: OrderedDict[tuple, tuple[KernelSpec, str, str]] = OrderedDict()
         # Serialize cache misses: concurrent first calls compile once.
@@ -368,4 +367,10 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> FfiCallable:
     FfiCallable.explain : Inspect launch geometry and storage before dispatch.
     with_vjp : Attach an explicit reverse-mode derivative.
     """
-    return FfiCallable(kernel, pallas_kwargs)
+    import jax.experimental.pallas as pl
+
+    return FfiCallable(
+        pl.pallas_call(kernel, **pallas_kwargs),
+        pl.pallas_call(kernel, **pallas_kwargs, interpret=True),
+        pallas_kwargs.get("compiler_params"),
+    )

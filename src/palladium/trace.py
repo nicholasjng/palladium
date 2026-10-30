@@ -1,7 +1,6 @@
 """Extract the kernel jaxpr from Pallas: trace the wrapped `pl.pallas_call`
-with `jax.make_jaxpr` and repackage the `pallas_call` equation into a
-KernelSpec. Pinned to JAX 0.11: `grid_mapping`/`block_mapping` fields are
-version-sensitive.
+or `pl.kernel` with `jax.make_jaxpr` and repackage its equation into a
+KernelSpec. `grid_mapping`/`block_mapping` fields are version-sensitive.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ from typing import Any
 import jax
 import jax.experimental.pallas as pl
 import numpy as np
+from jax._src.pallas import core as pallas_core
 from jax.extend.core import (
     ClosedJaxpr,
     Jaxpr,
@@ -45,6 +45,9 @@ class ScratchInfo:
         Logical buffer dimensions; () denotes scalar scratch.
     dtype : numpy.dtype
         Element dtype, which must be supported by the selected emitter.
+    space : str, optional
+        "thread" (default) for storage private to each program, or "threadgroup" for
+        `plmtl.THREADGROUP` tiles shared by a mesh program's threads.
 
     Notes
     -----
@@ -54,6 +57,7 @@ class ScratchInfo:
 
     shape: tuple[int, ...]
     dtype: np.dtype
+    space: str = "thread"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,6 +116,9 @@ class KernelSpec:
     aliases : tuple of tuple of int, optional
         Validated (input index, output index) pairs sharing a buffer. Defaults to no
         aliases.
+    simdgroups : int or None, optional
+        SIMD groups per threadgroup for a `pl.kernel` over a `plmtl.Mesh`, whose programs
+        are threadgroups over whole arrays; None for a `pallas_call`.
 
     Notes
     -----
@@ -127,6 +134,7 @@ class KernelSpec:
     outputs: tuple[BlockInfo, ...]
     scratch: tuple[ScratchInfo, ...]
     aliases: tuple[tuple[int, int], ...] = ()
+    simdgroups: int | None = None
 
 
 def _block_dim(dim: Any) -> int | None:
@@ -319,7 +327,56 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
             f"found {len(eqns)} pallas_call equations; palladium handles one "
             "kernel at a time, trace them separately"
         )
-    return spec_from_params(eqns[0].params)
+    (eqn,) = eqns
+    if eqn.primitive.name == "mpmd_map":
+        return _mesh_spec(eqn)
+    return spec_from_params(eqn.params)
+
+
+def _mesh_spec(eqn: JaxprEqn) -> KernelSpec:
+    """A `pl.kernel` on a `plmtl.Mesh`, mapped onto a grid of whole-array programs the
+    way JAX's own fallback lowering maps a mesh onto `pallas_call`."""
+    from palladium.plmtl import Mesh
+
+    params = eqn.params
+    if len(params["meshes"]) != 1 or not isinstance(params["meshes"][0], Mesh):
+        raise TraceError("palladium runs pl.kernel on one palladium.plmtl.Mesh")
+    (mesh,) = params["meshes"]
+    (jaxpr,) = params["jaxprs"]
+    if mesh.simdgroups != 4:
+        raise TraceError("plmtl meshes support 4 SIMD groups per threadgroup so far")
+    if not 1 <= len(mesh.grid) <= 3:
+        raise TraceError("plmtl meshes have one to three grid axes")
+    out_avals = params["out_avals"]
+    n_in, n_out = len(eqn.invars), len(out_avals)
+    refs = [v.aval.inner_aval for v in jaxpr.invars[: n_in + n_out]]
+    scratch = [v.aval for v in jaxpr.invars[n_in + n_out :]]
+    any_space = pallas_core.MemorySpace.ANY
+    grid_spec = pallas_core.GridSpec(
+        grid=tuple(mesh.grid),
+        in_specs=tuple(pl.BlockSpec(memory_space=any_space) for _ in range(n_in)),
+        out_specs=tuple(pl.BlockSpec(memory_space=any_space) for _ in range(n_out)),
+        scratch_shapes=tuple(pallas_core.MemoryRef(a.inner_aval, a.memory_space) for a in scratch),
+    )
+    _, grid_mapping = pallas_core.get_grid_mapping(
+        grid_spec,
+        refs[:n_in],
+        jax.tree_util.tree_structure(tuple(range(n_in))),
+        [f"arg{i}" for i in range(n_in)],
+        refs[n_in:],
+        jax.tree_util.tree_structure(tuple(range(n_out))),
+        [f"out{i}" for i in range(n_out)],
+        debug=False,
+    )
+    spec = spec_from_params(
+        {
+            "jaxpr": jaxpr,
+            "grid_mapping": grid_mapping,
+            "name": params.get("name"),
+            "input_output_aliases": tuple(params["input_output_aliases"].items()),
+        }
+    )
+    return dataclasses.replace(spec, simdgroups=mesh.simdgroups)
 
 
 def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
@@ -389,7 +446,13 @@ def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
         inputs=inputs,
         outputs=outputs,
         scratch=tuple(
-            ScratchInfo(shape=tuple(int(d) for d in aval.shape), dtype=np.dtype(aval.dtype))
+            ScratchInfo(
+                shape=tuple(int(d) for d in aval.shape),
+                dtype=np.dtype(aval.dtype),
+                space="threadgroup"
+                if str(getattr(aval, "memory_space", None)) == "threadgroup"
+                else "thread",
+            )
             for aval in scratch_bufs
         ),
         aliases=aliases,
@@ -397,10 +460,11 @@ def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
 
 
 def _pallas_call_eqns(jaxpr: Jaxpr) -> list[JaxprEqn]:
-    """pallas_call equations in `jaxpr`, looking through jit wrappers."""
+    """pallas_call and mpmd_map (`pl.kernel`) equations in `jaxpr`, looking through
+    jit wrappers."""
     found = []
     for eqn in jaxpr.eqns:
-        if eqn.primitive.name == "pallas_call":
+        if eqn.primitive.name in ("pallas_call", "mpmd_map"):
             found.append(eqn)
         elif eqn.primitive.name == "jit":
             found.extend(_pallas_call_eqns(eqn.params["jaxpr"].jaxpr))

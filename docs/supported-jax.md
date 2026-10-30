@@ -1,14 +1,15 @@
 # Supported JAX functionality
 
 Palladium traces one Pallas kernel and lowers it to MSL. It requires
-`jax>=0.11,<0.12`; JAX 0.11.2 is tested. Cases outside the subset below
+`jax>=0.11`; JAX 0.12.0.1 is tested, and 0.11.2 with jax-mps, which pins
+`jax<0.12`. Cases outside the subset below
 raise an error during tracing, lowering, or compilation.
 
 ## Pallas kernels
 
 | Feature | Supported behavior |
 |---|---|
-| Kernel entry | One `pallas_call` per traced callable; multiple calls and `PrefetchScalarGridSpec` are rejected |
+| Kernel entry | One `pallas_call`, or one `pl.kernel` on a `plmtl.Mesh`, per traced callable; multiple calls and `PrefetchScalarGridSpec` are rejected |
 | Grid | Rank 1–3, or gridless for one program instance |
 | Blocks | Contiguous or strided `BlockSpec` tiles, squeezed axes, partial edge tiles; `pl.Element`, `pl.Indirect`, and `pl.BoundedSlice` are unsupported |
 | Ref indexing | Full refs, scalar indices, `pl.dslice`, positive static slice strides |
@@ -67,6 +68,23 @@ Each block is read into registers once per row, so a row softmax, layer norm
 or cumsum reads and writes its data once. On an M2 they ran at 91 GB/s, about
 98% of the copy bandwidth and within 2% of MLX's fused kernels and
 `mx.cumsum` (`benchmarks/bench_row_programs.py`).
+
+`plmtl.kernel` runs a `pl.kernel` on a `plmtl.Mesh`: each program is one
+threadgroup of four SIMD groups over whole device arrays, with
+`plmtl.THREADGROUP` scratch tiles. The body is plain Pallas. Copies between
+refs (`tile[...] = x_ref[pl.ds(...), pl.ds(...)]`) are spread over the
+threadgroup's threads; `jnp.dot` of two float32 threadgroup tiles runs on
+SIMD-group matrix fragments, with output tiles a multiple of 16 in each
+dimension and K a multiple of 8, and `acc + jnp.dot(...)` accumulates in
+place; elementwise operations on a dot's result, including comparisons, run
+per fragment element, and it can be stored to a device slice. Scalars,
+`fori_loop` with scalar and fragment carries, and broadcasts of scalars are
+supported; palladium places the barriers between threadgroup writes and
+reads. Use `pl.program_id` for the mesh coordinates, since the Pallas
+interpreter does not bind mesh axis names. A hand-written float32 matmul in
+this form ran at the speed of the emitted `simdgroup` kernel on an M2 (2.69
+TFLOPS at 4096³). Dots of device reads, other tile shapes, aliases and other
+primitives raise `EmitError`.
 
 On both paths, tiled matmuls on a 2D or 3D grid lower through Metal 4
 TensorOps by default (`CompilerParams(dot_general="auto")`), taking the
@@ -135,6 +153,7 @@ for numeric comparisons and measurement caveats.
 |---|---|---|---|
 | `pl.pallas_call` on `mps` | Yes: palladium is the registered Pallas backend for the platform (`palladium.CompilerParams` for options) | JAX's own `pallas_call` batching | `palladium.with_vjp` |
 | `metal_call` | Yes, through CPU FFI to Metal | One FFI call per batch; nested levels run one element at a time | `palladium.with_vjp` or `jax.custom_vjp` |
+| `plmtl.kernel` | As `metal_call` | As `metal_call` | As `metal_call` |
 
 The mps lowering supports FAST math only. On other platforms a `pallas_call`
 keeps JAX's own behavior: `interpret=True` runs the Pallas interpreter.
