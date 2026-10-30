@@ -47,7 +47,7 @@ metal-runtime = { path = "../metal-runtime" }
 jax-mps = { path = "../jax-mps" }
 
 [tool.uv.extra-build-dependencies]
-palladium = ["jax", "metal-runtime"]
+palladium = ["jax"]
 
 [tool.ty.environment]
 # Tests and benchmarks import the shared workloads from examples/.

@@ -2,8 +2,8 @@
 // "palladium_dispatch" on the "cpu" platform. MSL source, entry point, and
 // grid travel as FFI Attrs baked into the HLO; buffers arrive as
 // RemainingArgs/RemainingRets, so one handler covers any input/output
-// count. Uses only metal-runtime's C API (c_api.h). XLA:CPU runs FFI
-// handlers on its own thread pool, so KernelCache is mutex-guarded.
+// count. Uses only the runtime's C API (native/runtime/c_api.h). XLA:CPU
+// runs FFI handlers on its own thread pool, so KernelCache is mutex-guarded.
 
 #include <cstdlib>
 #include <list>

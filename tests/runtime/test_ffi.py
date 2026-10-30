@@ -12,10 +12,10 @@ import numpy as np
 import pytest
 
 import palladium
-from palladium.ffi import _library_path
+from palladium._runtime import library_path
 
 try:
-    _library_path()
+    library_path()
     _ffi_available = True
 except FileNotFoundError:
     _ffi_available = False

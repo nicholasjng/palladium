@@ -1,27 +1,23 @@
 """`metal_call`: a Pallas kernel dispatched to Metal from the CPU platform.
 
-The kernel is registered as a jax.ffi target backed by metal-runtime's C
-API (`native/ffi/`), so it composes with jax.jit and jax.vmap and needs no
-PJRT plugin. `PALLADIUM_FFI_LIBRARY` overrides the handler path for an
-out-of-tree build.
+The kernel is registered as a jax.ffi target backed by the runtime's C API
+(`native/ffi/`, `native/runtime/`), so it composes with jax.jit and jax.vmap
+and needs no PJRT plugin.
 """
 
 from __future__ import annotations
 
-import ctypes
 import hashlib
-import importlib.resources
 import math
-import os
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 import jax
 import numpy as np
 
+from palladium import _runtime
 from palladium.diagnostics import KernelDiagnostics, explain_spec, log_compile
 from palladium.emit import emit_msl
 from palladium.emit.core import CTYPES
@@ -33,31 +29,6 @@ __all__ = ["FfiCallable", "metal_call"]
 
 
 _TARGET_NAME = "palladium_dispatch"
-_LIBRARY_NAME = "libpalladium_ffi.dylib"
-
-# MRMathMode ordinals from metal-runtime's c_api.h; metal_runtime.MathMode
-# is a StrEnum.
-_MATH_MODE_ORDINALS = {"safe": 0, "relaxed": 1, "fast": 2}
-
-
-def _library_path() -> Path:
-    """Resolve the native FFI library or its environment override; reject a missing packaged build."""
-    override = os.environ.get("PALLADIUM_FFI_LIBRARY")
-    if override:
-        return Path(override)
-    # An editable install spans two roots (source tree and CMake build
-    # dir); joinpath resolves to whichever root has the file.
-    candidate = importlib.resources.files("palladium").joinpath(_LIBRARY_NAME)
-    if not candidate.is_file():
-        raise FileNotFoundError(
-            f"palladium's jax.ffi handler ({_LIBRARY_NAME}) isn't built or "
-            "installed. `uv sync`/`pip install` builds it automatically via "
-            "CMakeLists.txt; if this is a from-source checkout, re-run that. "
-            "Otherwise set PALLADIUM_FFI_LIBRARY to point at an existing build."
-        )
-    return Path(str(candidate))
-
-
 _REGISTER_LOCK = threading.Lock()
 _registered = False
 
@@ -70,8 +41,7 @@ def _register() -> None:
     with _REGISTER_LOCK:
         if _registered:
             return
-        handle = ctypes.CDLL(str(_library_path()))
-        capsule = jax.ffi.pycapsule(handle.palladium_dispatch)
+        capsule = jax.ffi.pycapsule(_runtime.library().palladium_dispatch)
         jax.ffi.register_ffi_target(_TARGET_NAME, capsule, platform="cpu")
         _registered = True
 
@@ -354,7 +324,7 @@ class FfiCallable:
             threadgroup_x=int(threadgroup[0]),
             threadgroup_y=int(threadgroup[1]),
             threadgroup_z=int(threadgroup[2]),
-            math_mode=_MATH_MODE_ORDINALS[self._params.math_mode],
+            math_mode=_runtime.MATH_MODES[self._params.math_mode],
             batch_size=1 if axis_size is None else int(axis_size),
             elem_strides=np.asarray(in_strides + out_strides, dtype=np.int64),
         )
