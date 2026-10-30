@@ -195,7 +195,7 @@ def _blocked_batched_residual_dot():
 def test_tensorops_dot_uses_one_threadgroup_per_pallas_program():
     """Check that tiled dot emission uses cooperative TensorOps and threadgroup-based program
     indexing."""
-    msl = palladium.emit_msl(_blocked_dot())
+    msl = palladium.emit_msl(_blocked_dot(), dot_general="tensorops")
 
     assert "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>" in msl
     assert "uint3 _pid [[threadgroup_position_in_grid]]" in msl
@@ -341,10 +341,19 @@ def test_tensorops_batched_dot_explain_scales_batch_axis_for_groups():
     assert diag.threadgroup == (128, 1, 1)
 
 
-def test_auto_selects_tensorops_for_tiled_dots_and_default_forces_the_primitive_path():
-    """Check that auto selects cooperative tiled dots while default selects primitive emission."""
+@pytest.mark.parametrize(("family", "policy"), [(8, "simdgroup"), (9, "tensorops")])
+def test_auto_selects_tensorops_for_tiled_dots_and_default_forces_the_primitive_path(
+    monkeypatch, family, policy
+):
+    """Check that auto selects cooperative tiled dots, with `simdgroup_matrix` on M1
+    and M2 GPUs, while default selects primitive emission."""
+    import palladium.emit.kernel
+
+    monkeypatch.setattr(
+        palladium.emit.kernel, "device_limits", lambda: {"apple_gpu_family": family}
+    )
     auto = palladium.emit_msl(_blocked_dot())
-    assert auto == palladium.emit_msl(_blocked_dot(), dot_general="tensorops")
+    assert auto == palladium.emit_msl(_blocked_dot(), dot_general=policy)
     ordinary = palladium.emit_msl(_blocked_dot(), dot_general="default")
     assert "MetalPerformancePrimitives" not in ordinary
     assert "thread_position_in_grid" in ordinary

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 
+from palladium.device import device_limits
 from palladium.emit import rules as _rules  # noqa: F401 - registers the rules
 from palladium.emit.addressing import (
     BlockLayout,
@@ -51,7 +52,9 @@ def emit_msl_stats(
     dot_general : {"auto", "default", "tensorops", "simdgroup"}, optional
         Use cooperative TensorOps when recognized, force primitive emission, require
         TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
-        respectively. The default is "auto".
+        respectively. The default is "auto", which also prefers `simdgroup_matrix`
+        on M1 and M2 GPUs (Apple families 7 and 8), where it is faster than
+        `matmul2d`.
     program : {"thread", "threadgroup"}, optional
         "thread" (default) runs each Pallas program as one Metal thread, or
         one threadgroup when a dot lowers cooperatively. "threadgroup" runs
@@ -92,9 +95,13 @@ def emit_msl_stats(
         source, threadgroup_bytes = lower_row_program(spec, kernel_name)
         return source, EmitStats(thread_bytes=0, threadgroup_bytes=threadgroup_bytes)
     if dot_general != "default" and uses_tensorops(spec, dot_general):
+        # Measured on an M2; later families keep matmul2d until measured there.
+        prefer_simdgroup = dot_general == "simdgroup" or (
+            dot_general == "auto" and device_limits().get("apple_gpu_family") in (7, 8)
+        )
         try:
             source, threadgroup_bytes = compile_kernel(
-                spec, kernel_name, prefer_simdgroup=dot_general == "simdgroup"
+                spec, kernel_name, prefer_simdgroup=prefer_simdgroup
             )
         except EmitError:
             # "auto" only takes dots the cooperative lowering recognizes;
@@ -257,7 +264,9 @@ def emit_msl(
     dot_general : {"auto", "default", "tensorops", "simdgroup"}, optional
         Use cooperative TensorOps when recognized, force primitive emission, require
         TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
-        respectively. The default is "auto".
+        respectively. The default is "auto", which also prefers `simdgroup_matrix`
+        on M1 and M2 GPUs (Apple families 7 and 8), where it is faster than
+        `matmul2d`.
     program : {"thread", "threadgroup"}, optional
         "thread" (default) runs each Pallas program as one Metal thread, or
         one threadgroup when a dot lowers cooperatively. "threadgroup" runs

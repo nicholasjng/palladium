@@ -69,8 +69,9 @@ or cumsum reads and writes its data once. On an M2 they ran at 91 GB/s, about
 `mx.cumsum` (`benchmarks/bench_row_programs.py`).
 
 On both paths, tiled matmuls on a 2D or 3D grid lower through Metal 4
-TensorOps by default (`CompilerParams(dot_general="auto")`); other dots keep
-the one-thread-per-program emitter. `dot_general="tensorops"` requires the cooperative lowering and
+TensorOps by default (`CompilerParams(dot_general="auto")`), taking the
+`simdgroup_matrix` form below on M1 and M2 GPUs; other dots keep the
+one-thread-per-program emitter. `dot_general="tensorops"` requires the cooperative lowering and
 raises where it does not apply; `dot_general="default"` forces the primitive
 path. `dot_general="simdgroup"` also requires the cooperative lowering, and
 emits float32 matmuls with `simdgroup_matrix` instead of Metal 4 `matmul2d`
