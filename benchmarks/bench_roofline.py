@@ -30,7 +30,7 @@ import mew
 import numpy as np
 from jax.experimental import pallas as pl
 
-from palladium.emit.tensorops import SIMDGROUPS
+from palladium.emit.tensorops import declared_threadgroup_width
 
 DTYPES = ("float32", "float16")
 SIZES = (2048, 4096)
@@ -172,7 +172,7 @@ def bench_pallas_matmul(
     kernel = mr.Kernel(source, "palladium_kernel")
     output = mr.Buffer.empty([size, size], dtype=dtype)
     buffers = [mr.Buffer(x), mr.Buffer(y), output]
-    threadgroup = SIMDGROUPS * kernel.thread_execution_width
+    threadgroup = declared_threadgroup_width(source)
     grid = ((size // tile_m) * threadgroup, size // tile_n, 1)
     _gpu_time(kernel, grid, threadgroup, buffers)
     corner = x[:64].astype(np.float32) @ y[:, :64].astype(np.float32)

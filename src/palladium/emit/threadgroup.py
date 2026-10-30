@@ -124,7 +124,7 @@ def lower_row_program(spec: KernelSpec, kernel_name: str | None = None) -> tuple
     Returns
     -------
     source : str
-        Complete MSL using one threadgroup per Pallas program. It declares its
+        Complete MSL using one threadgroup per Pallas program, declaring its
         group width with a ``// palladium: threadgroup width N`` line.
     threadgroup_bytes : int
         Declared shared storage per group.
@@ -171,7 +171,6 @@ def lower_row_program(spec: KernelSpec, kernel_name: str | None = None) -> tuple
         "uint _lane [[thread_index_in_simdgroup]]",
         "uint _tid [[thread_index_in_threadgroup]]",
     )
-    cursor.emit(f"// palladium: threadgroup width {layout.width}")
     if layout.whole_group:  # SIMD-group partials of reductions and scans, as bits
         size = _SIMD_WIDTH * (min(layout.slots, _MAX_CACHED) + 1)
         cursor.allocate("uint", (size,), name="_partials", space="threadgroup")
@@ -221,7 +220,7 @@ def lower_row_program(spec: KernelSpec, kernel_name: str | None = None) -> tuple
     with cursor.block(header):
         body.walk(spec.jaxpr.eqns, {})
     body.finish()
-    source = _kernel_source(kernel_name or spec.name, params, cursor)
+    source = _kernel_source(kernel_name or spec.name, params, cursor, layout.width)
     return source, cursor.threadgroup_bytes
 
 

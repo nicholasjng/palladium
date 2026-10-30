@@ -12,7 +12,7 @@ import sys
 
 from palladium.device import device_limits
 from palladium.emit import emit_msl_stats
-from palladium.emit.tensorops import emits_cooperative
+from palladium.emit.tensorops import declared_threadgroup_width
 from palladium.launch import check_threadgroup, launch_geometry
 from palladium.trace import KernelSpec
 
@@ -140,7 +140,7 @@ def explain_spec(
         thread_bytes=stats.thread_bytes,
         threadgroup_bytes=stats.threadgroup_bytes,
         threadgroup_limit=device_limits().get("max_threadgroup_memory_length"),
-        cooperative=emits_cooperative(msl),
+        cooperative=declared_threadgroup_width(msl) is not None,
     )
 
 

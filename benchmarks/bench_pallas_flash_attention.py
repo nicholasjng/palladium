@@ -21,7 +21,7 @@ import metal_runtime as mr
 import mew
 import numpy as np
 
-from palladium.emit.tensorops import SIMDGROUPS
+from palladium.emit.tensorops import declared_threadgroup_width
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
 from flash_attention import attention_kernel, attention_specs, reference_attention
@@ -137,7 +137,7 @@ def bench_pallas_flash_attention(
     compile_ms = (time.perf_counter() - start) * 1000
     output = mr.Buffer.empty(list(q.shape), dtype="float32")
     buffers = [mr.Buffer(q), mr.Buffer(k), mr.Buffer(v), output]
-    threadgroup = SIMDGROUPS * kernel.thread_execution_width
+    threadgroup = declared_threadgroup_width(source)
     metal_grid = (BATCH * threadgroup, HEADS, sequence_length // tile_q)
 
     def execute() -> None:

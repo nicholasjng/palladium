@@ -9,13 +9,9 @@ import operator
 from jax._src.pallas import core as pallas_core
 from metal_runtime import MathMode
 
-from palladium.device import device_limits, simdgroup_width
+from palladium.device import device_limits
 from palladium.emit.kernel import DOT_GENERAL_POLICIES, PROGRAM_SCOPES
-from palladium.emit.tensorops import (
-    cooperative_launch,
-    declared_threadgroup_width,
-    emits_cooperative,
-)
+from palladium.emit.tensorops import declared_threadgroup_width
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
 
@@ -175,8 +171,7 @@ def launch_geometry(
     spec : KernelSpec
         Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
     msl_source : str
-        Emitted source whose threadgroup-position builtin identifies cooperative
-        execution.
+        Emitted source; a declared threadgroup width marks cooperative execution.
     threadgroup : tuple of int or None, optional
         One to three positive dimensions, or None for runtime selection. Cooperative
         kernels require their fixed group size.
@@ -184,8 +179,8 @@ def launch_geometry(
     Returns
     -------
     grid : tuple of int
-        Three-dimensional thread grid, padded with ones. Cooperative emission scales x
-        by the group width.
+        Three-dimensional thread grid, padded with ones. Cooperative kernels scale x
+        by their declared group width.
     threadgroup : tuple of int or None
         Three-dimensional group size; None lets the runtime choose for primitive
         kernels.
@@ -197,17 +192,16 @@ def launch_geometry(
 
     Notes
     -----
-    Cooperative kernels use four SIMD groups per program. Geometry follows the emitted
-    source after any TensorOps fallback; callers must supply a grid of at most three
-    dimensions.
+    Geometry follows the emitted source after any TensorOps fallback; callers must
+    supply a grid of at most three dimensions.
     """
     grid = _pad3(spec.grid)
     group = None if threadgroup is None else _pad3(threadgroup)
-    if emits_cooperative(msl_source):
-        required, grid = cooperative_launch(
-            spec.grid, simdgroup_width(), declared_threadgroup_width(msl_source)
-        )
+    width = declared_threadgroup_width(msl_source)
+    if width is not None:
+        required = (width, 1, 1)
         if group is not None and group != required:
             raise ValueError(f"cooperative kernel requires threadgroup={required}, got {group}")
         group = required
+        grid = (grid[0] * width, grid[1], grid[2])
     return grid, group

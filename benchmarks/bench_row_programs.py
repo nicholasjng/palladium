@@ -20,7 +20,7 @@ import mew
 import numpy as np
 from jax.experimental import pallas as pl
 
-from palladium.emit.tensorops import SIMDGROUPS, declared_threadgroup_width
+from palladium.emit.tensorops import declared_threadgroup_width
 
 SHAPES = ((8192, 4096), (32768, 1024), (131072, 256))
 TILE = 8
@@ -82,7 +82,7 @@ def bench_row_program(state: mew.State, kernel: str, rows: int, columns: int) ->
     compiled = mr.Kernel(source, "palladium_kernel")
     output = mr.Buffer.empty([rows, columns])
     buffers = [*(mr.Buffer(a) for a in args), output]
-    threads = declared_threadgroup_width(source) or SIMDGROUPS * compiled.thread_execution_width
+    threads = declared_threadgroup_width(source)
     grid = ((rows // TILE) * threads, 1, 1)
 
     def run() -> float:
