@@ -30,8 +30,9 @@ requirements.
 
 ## Check out the sources side by side
 
-Palladium resolves `metal-runtime` from a sibling directory. These commands
-create a fresh checkout layout:
+The pinned Palladium revision resolves `metal-runtime` from a sibling
+directory; revisions from 2026-10-30 on build their Metal runtime in-tree and
+need no metal-runtime checkout. These commands create a fresh checkout layout:
 
 ```sh
 mkdir -p ~/Workspaces/palladium-demo
@@ -173,5 +174,5 @@ JAX, which is why `cpu` remains in `JAX_PLATFORMS`.
   restrictive sandbox may allow device discovery but block actual execution.
 
 For eager `palladium.metal_call` or the CPU-FFI `metal_call_jit` path, the
-modified jax-mps plugin is unnecessary. Those paths use `metal-runtime`
-directly; see [Getting started](docs/getting-started.md).
+modified jax-mps plugin is unnecessary. Those paths dispatch through
+Palladium's own Metal runtime; see [Getting started](docs/getting-started.md).

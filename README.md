@@ -37,9 +37,9 @@ forward call with a backward one through `palladium.with_vjp`.
 
 ## Install
 
-Palladium requires macOS on Apple silicon, Python 3.12+, CMake, Ninja,
-and a sibling [metal-runtime](https://github.com/nicholasjng/metal-runtime)
-checkout. Check the repositories out side by side and run:
+Palladium requires macOS on Apple silicon, Python 3.12+, CMake and Ninja.
+The build compiles its Metal runtime (`native/runtime`) and fetches Apple's
+metal-cpp headers. Run:
 
 ```sh
 uv sync

@@ -15,11 +15,11 @@ import statistics
 
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import mew
 import numpy as np
 from jax.experimental import pallas as pl
 
+from palladium import _runtime
 from palladium.emit.tensorops import declared_threadgroup_width
 
 SHAPES = ((8192, 4096), (32768, 1024), (131072, 256))
@@ -79,24 +79,19 @@ def bench_row_program(state: mew.State, kernel: str, rows: int, columns: int) ->
         out_shape=jax.ShapeDtypeStruct((rows, columns), jnp.float32),
         compiler_params=palladium.CompilerParams(program="threadgroup"),
     )
-    compiled = mr.Kernel(source, "palladium_kernel")
-    output = mr.Buffer.empty([rows, columns])
-    buffers = [*(mr.Buffer(a) for a in args), output]
+    compiled = _runtime.Kernel(source, "palladium_kernel")
+    output = np.empty((rows, columns), np.float32)
+    buffers = [*args, output]
     threads = declared_threadgroup_width(source)
     grid = ((rows // TILE) * threads, 1, 1)
 
     def run() -> float:
-        batch = mr.Batch()
-        batch.add(compiled, grid=grid, threadgroup=threads, buffers=buffers)
-        batch.wait()
-        if batch.gpu_time is None:
-            raise RuntimeError("gpu_time unavailable after wait()")
-        return batch.gpu_time
+        return _runtime.run(compiled, buffers, grid, threads)
 
     run()
     # A cumsum adds up to 4096 unit-scale terms in another order than NumPy.
     atol = 1e-2 if kernel == "cumsum" else 1e-5
-    np.testing.assert_allclose(output.to_numpy(), _reference(kernel, x, w, b), rtol=1e-4, atol=atol)
+    np.testing.assert_allclose(output, _reference(kernel, x, w, b), rtol=1e-4, atol=atol)
     times = []
     for _ in state:
         seconds = run()

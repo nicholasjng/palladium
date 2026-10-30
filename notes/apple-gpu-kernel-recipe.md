@@ -110,7 +110,7 @@ edge tiles, K not a multiple of 16 and tiles above 8192 elements keep
 | 2048³, 64x32 | 2.35 | 2.64 |
 
 `"auto"` now picks `"simdgroup"` on Apple GPU families 7 and 8 (M1, M2), read
-from metal-runtime's `device_info()["apple_gpu_family"]`: 4096³ float32 end
+from `palladium.device.device_limits()["apple_gpu_family"]`: 4096³ float32 end
 to end through `metal_call` ran at 2.42 TFLOPS against 1.89. Measured on the
 M2 only; confirm on an M1, and measure an M3 or M4 before widening it. GPUs
 with matrix accelerators (family 10) keep `matmul2d`.

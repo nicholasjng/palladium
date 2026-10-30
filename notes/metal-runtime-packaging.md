@@ -1,49 +1,26 @@
-# Packaging metal-runtime inside palladium (scratch)
+# Packaging the Metal runtime inside palladium (done 2026-10-30)
 
-## What palladium uses today
+palladium used one part of metal-runtime, its C API, which the jax.ffi
+handler linked as a shared library found through the Python package. That
+made distribution need two packages of matching versions, and changes on
+both sides of the API two commits in two repositories.
 
-- Native: the FFI bridge links `libmetal_runtime.dylib` and calls only its C
-  API (`mr_compile_library`, `mr_get_pipeline`, `mr_wrap_buffer`, the
-  `mr_batch_*` dispatch). CMake finds the header and library through the
-  Python package (`metal_runtime.c_api`); the installed bridge finds the
-  dylib through an rpath into that package.
-- Python: `MathMode` (launch.py, mps.py, ffi.py) and `device_info()`
-  (device.py: SIMD width, threadgroup limits).
-- The mps path uses none of it; jax-mps executes through MLX.
-- Oracles do not use `mr.Buffer`: `metal_call` checks against
-  `.interpret` (the Pallas interpreter) and NumPy. `mr.Buffer`/`mr.Kernel`
-  appear only in the runtime smoke test, one load/store test, df32 (example
-  and tests), the symplectic example, and the attention benchmark.
+What was done:
 
-## Why
+- The runtime core and C API live in `native/runtime` (from metal-runtime
+  82f39a0 plus its wrap cache and GPU family query), built by palladium's
+  CMake as the static `palladium::runtime` target and linked into
+  `libpalladium_ffi`, which exports the `mr_*` functions. CMake fetches
+  metal-cpp itself.
+- Pruned to what the C API uses: no library cache, GPU capture,
+  preprocessor defines, function constants, indirect dispatch, concurrent
+  encoders or batch discarding.
+- `palladium.MathMode` replaces metal-runtime's enum. Device queries read
+  the C API's `MRDeviceInfo` (now with the device name and Apple GPU
+  family) through ctypes in `palladium._runtime`, which also has a small
+  `Kernel`/`run` helper with GPU timing (`mr_batch_gpu_time`) for the
+  benchmarks, hand-written-MSL baselines and the df32 example.
+- metal-runtime is no longer a dependency; it stays a separate playground.
 
-Distribution. A user needs two packages with matching versions: the bridge
-requires the batch C API. Neither repo has CI or wheels; the path dependency
-is fine for development, not for anyone else installing palladium.
-
-## Steps
-
-1. Build metal-runtime's C library in palladium's CMake from a pinned commit
-   (submodule or FetchContent), statically linked into `libpalladium_ffi`.
-   metal-runtime only builds a shared library today; it needs a static
-   target.
-2. Own `MathMode` (a three-value StrEnum with the same values).
-3. Device queries: the C API has none. Add one to metal-runtime (SIMD width,
-   max threads per threadgroup, max threadgroup memory), or export one from
-   the bridge against metal-cpp and call it through ctypes.
-4. Keep `metal-runtime` as a dev dependency for df32, the smoke test, and the
-   attention benchmark (or move the benchmark to `metal_call`; its recorded
-   numbers use direct dispatch).
-
-## Costs
-
-- palladium owns the pin and its rebuilds.
-- A process that also imports `metal_runtime` loads two runtime copies with
-  separate pipeline caches; macOS keeps the symbols apart, but the state is
-  duplicated.
-
-## When
-
-When publishing a wheel. Cheapest preparation: the C API device-info
-function in metal-runtime, the only non-enum thing palladium's library code
-takes from the Python package.
+No process loads two runtimes any more, so pipeline state and the wrap
+cache's budget are not duplicated.

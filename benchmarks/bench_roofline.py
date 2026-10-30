@@ -31,11 +31,11 @@ import time
 
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import mew
 import numpy as np
 from jax.experimental import pallas as pl
 
+from palladium import _runtime
 from palladium.emit.tensorops import declared_threadgroup_width
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
@@ -74,15 +74,6 @@ _SIMD_GROUPS_PER_THREADGROUP = 4
 _THREADGROUPS = 4096
 
 
-def _gpu_time(kernel: mr.Kernel, grid, threadgroup, buffers) -> float:
-    batch = mr.Batch()
-    batch.add(kernel, grid=grid, threadgroup=threadgroup, buffers=buffers)
-    batch.wait()
-    if batch.gpu_time is None:
-        raise RuntimeError("gpu_time unavailable after wait()")
-    return batch.gpu_time
-
-
 def _run_timed(state: mew.State, run, work: float, counter: str, scale: float) -> None:
     run()
     times = []
@@ -95,7 +86,7 @@ def _run_timed(state: mew.State, run, work: float, counter: str, scale: float) -
 
 @mew.benchmark(tags="roofline", use_manual_time=True, unit="ms")
 def bench_copy_bandwidth(state: mew.State) -> None:
-    kernel = mr.Kernel(
+    kernel = _runtime.Kernel(
         """
 #include <metal_stdlib>
 using namespace metal;
@@ -106,10 +97,10 @@ kernel void copy4(device const float4* a [[buffer(0)]], device float4* b [[buffe
     )
     nbytes = 256 << 20
     count = nbytes // 16
-    buffers = [mr.Buffer(np.ones(count * 4, np.float32)), mr.Buffer.zeros([count * 4])]
+    buffers = [np.ones(count * 4, np.float32), np.zeros(count * 4, np.float32)]
     _run_timed(
         state,
-        lambda: _gpu_time(kernel, count, 256, buffers),
+        lambda: _runtime.run(kernel, buffers, count, 256),
         work=2 * nbytes,
         counter="gbps",
         scale=1e9,
@@ -146,16 +137,16 @@ kernel void peak(device const {ctype}* x [[buffer(0)]], device {ctype}* out [[bu
     simdgroup_store(c2, o + 128, 8);
     simdgroup_store(c3, o + 192, 8);
 }}"""
-    kernel = mr.Kernel(source, "peak")
+    kernel = _runtime.Kernel(source, "peak")
     threadgroup = _SIMD_GROUPS_PER_THREADGROUP * kernel.thread_execution_width
     simd_groups = _THREADGROUPS * _SIMD_GROUPS_PER_THREADGROUP
     buffers = [
-        mr.Buffer(np.full(128, 0.01, dtype)),
-        mr.Buffer.zeros([simd_groups * 256], dtype=dtype),
+        np.full(128, 0.01, dtype),
+        np.zeros(simd_groups * 256, dtype),
     ]
     _run_timed(
         state,
-        lambda: _gpu_time(kernel, _THREADGROUPS * threadgroup, threadgroup, buffers),
+        lambda: _runtime.run(kernel, buffers, _THREADGROUPS * threadgroup, threadgroup),
         work=simd_groups * _ITERATIONS * 4 * 2 * 8**3,
         counter="tflops",
         scale=1e12,
@@ -189,22 +180,22 @@ def bench_pallas_matmul(
         out_shape=shape,
         compiler_params=palladium.CompilerParams(dot_general=policy),
     )
-    kernel = mr.Kernel(source, "palladium_kernel")
-    output = mr.Buffer.empty([size, size], dtype=dtype)
-    buffers = [mr.Buffer(x), mr.Buffer(y), output]
+    kernel = _runtime.Kernel(source, "palladium_kernel")
+    output = np.empty((size, size), dtype)
+    buffers = [x, y, output]
     threadgroup = declared_threadgroup_width(source)
     grid = ((size // tile_m) * threadgroup, size // tile_n, 1)
-    _gpu_time(kernel, grid, threadgroup, buffers)
+    _runtime.run(kernel, buffers, grid, threadgroup)
     corner = x[:64].astype(np.float32) @ y[:, :64].astype(np.float32)
     tolerance = 1e-5 if dtype == "float32" else 1e-3
     np.testing.assert_allclose(
-        output.to_numpy()[:64, :64].astype(np.float32) / np.abs(corner).max(),
+        output[:64, :64].astype(np.float32) / np.abs(corner).max(),
         corner / np.abs(corner).max(),
         atol=tolerance,
     )
     _run_timed(
         state,
-        lambda: _gpu_time(kernel, grid, threadgroup, buffers),
+        lambda: _runtime.run(kernel, buffers, grid, threadgroup),
         work=2 * size**3,
         counter="tflops",
         scale=1e12,
@@ -255,22 +246,22 @@ def bench_pallas_attention(
         out_shape=shape,
         compiler_params=palladium.CompilerParams(dot_general=policy),
     )
-    kernel = mr.Kernel(source, "palladium_kernel")
-    output = mr.Buffer.empty(list(ATTENTION_SHAPE))
-    buffers = [mr.Buffer(q), mr.Buffer(k), mr.Buffer(v), output]
+    kernel = _runtime.Kernel(source, "palladium_kernel")
+    output = np.empty(ATTENTION_SHAPE, np.float32)
+    buffers = [q, k, v, output]
     threadgroup = declared_threadgroup_width(source)
     launch = (batch * threadgroup, heads, tokens // tile_q)
-    _gpu_time(kernel, launch, threadgroup, buffers)
+    _runtime.run(kernel, buffers, launch, threadgroup)
     head = (slice(None), slice(None), slice(0, 1))
     np.testing.assert_allclose(
-        output.to_numpy()[head],
+        output[head],
         reference_attention(q[head], k[head], v[head], causal=causal),
         rtol=3e-4,
         atol=3e-4,
     )
     _run_timed(
         state,
-        lambda: _gpu_time(kernel, launch, threadgroup, buffers),
+        lambda: _runtime.run(kernel, buffers, launch, threadgroup),
         work=4 * heads * tokens**2 * dim / (2 if causal else 1),
         counter="tflops",
         scale=1e12,

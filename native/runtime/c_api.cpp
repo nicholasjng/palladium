@@ -445,3 +445,13 @@ MRStatus mr_batch_commit(MRBatch* batch, char** out_err_msg) {
         batch->batch.commit();
     });
 }
+
+MRStatus mr_batch_gpu_time(const MRBatch* batch, double* out_seconds, char** out_err_msg) {
+    return mr_guard(out_err_msg, [&] {
+        if (!batch) throw std::invalid_argument("mr_batch_gpu_time: batch is null");
+        if (!out_seconds) throw std::invalid_argument("mr_batch_gpu_time: out_seconds is null");
+        std::optional<double> seconds = batch->batch.gpu_time();
+        if (!seconds) throw std::invalid_argument("mr_batch_gpu_time: the batch was not waited on");
+        *out_seconds = *seconds;
+    });
+}

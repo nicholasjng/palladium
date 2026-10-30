@@ -9,14 +9,12 @@ integrator. A df32 buffer is a float32 array of shape (..., 2) holding
 
 from pathlib import Path
 
-import metal_runtime as mr
+from palladium import _runtime
 
 PRELUDE = Path(__file__).with_name("df32.metal").read_text(encoding="utf-8")
 
-FRAGMENT = mr.Fragment("df32", PRELUDE)
 
-
-def kernel(source: str, function_name: str, **kwargs) -> mr.Kernel:
+def kernel(source: str, function_name: str, math_mode: str = "safe") -> _runtime.Kernel:
     """Compile handwritten MSL with the compensated float32-pair arithmetic prelude.
 
     Parameters
@@ -25,17 +23,18 @@ def kernel(source: str, function_name: str, **kwargs) -> mr.Kernel:
         MSL kernel source referencing df32 arithmetic.
     function_name : str
         Kernel entry point.
-    **kwargs : dict
-        Keywords forwarded to metal_runtime.Kernel; math_mode defaults to SAFE.
+    math_mode : str, optional
+        "safe" by default; the prelude rejects anything else.
 
     Returns
     -------
-    metal_runtime.Kernel
-        Compiled kernel with the df32 fragment assembled before the supplied source.
+    palladium._runtime.Kernel
+        Compiled kernel with the prelude before the supplied source; `#line`
+        markers keep compile errors pointing at the right part.
 
     Raises
     ------
-    metal_runtime.CompileError
+    palladium._runtime.MetalError
         The source fails compilation, including when a non-SAFE math mode violates the
         prelude requirement.
 
@@ -45,6 +44,5 @@ def kernel(source: str, function_name: str, **kwargs) -> mr.Kernel:
     compiles handwritten Metal; Pallas does not expose a df32 dtype. SAFE is required
     because reassociation removes compensation terms.
     """
-    kwargs.setdefault("math_mode", mr.MathMode.SAFE)
-    assembled = mr.assemble(FRAGMENT, mr.Fragment(function_name, source))
-    return mr.Kernel(assembled, function_name, **kwargs)
+    assembled = f'#line 1 "df32.metal"\n{PRELUDE}\n#line 1 "{function_name}"\n{source}\n'
+    return _runtime.Kernel(assembled, function_name, math_mode)

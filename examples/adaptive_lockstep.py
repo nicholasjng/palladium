@@ -16,7 +16,6 @@ import time
 import diffrax
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import numpy as np
 from jax.experimental import pallas as pl
 
@@ -223,7 +222,7 @@ def palladium_solver(n, pcoeff=PCOEFF, icoeff=ICOEFF):
         in_specs=[spec_1] * 3,
         out_specs=(spec_1,) * 6,
         out_shape=tuple(jax.ShapeDtypeStruct((n,), jnp.float32) for _ in range(6)),
-        compiler_params=palladium.CompilerParams(math_mode=mr.MathMode.RELAXED),
+        compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.RELAXED),
     )
 
 

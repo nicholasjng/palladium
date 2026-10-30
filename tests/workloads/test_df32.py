@@ -1,9 +1,10 @@
 """The df32 MSL library from examples/df32.py against float64 on the device."""
 
-import metal_runtime as mr
 import numpy as np
 import pytest
 from df32 import PRELUDE, kernel
+
+from palladium import MathMode, _runtime
 
 BINARY = """
 kernel void k(device const df32* a [[buffer(0)]], device const df32* b [[buffer(1)]],
@@ -26,13 +27,9 @@ def _pairs(x: np.ndarray) -> np.ndarray:
 
 def _run(template: str, name: str, *operands: np.ndarray) -> np.ndarray:
     pairs = [_pairs(x) for x in operands]
-    out = mr.Buffer.zeros(pairs[0].shape, "float32")
-    mr.run(
-        kernel(template.format(name=name), "k"),
-        grid=len(operands[0]),
-        buffers=[*map(mr.Buffer, pairs), out],
-    )
-    return out.to_numpy().astype(np.float64)
+    out = np.zeros(pairs[0].shape, np.float32)
+    _runtime.run(kernel(template.format(name=name), "k"), [*pairs, out], len(operands[0]))
+    return out.astype(np.float64)
 
 
 def _operands(rng, n=10_000):
@@ -71,7 +68,7 @@ def test_sqrt_matches_float64_and_handles_zero_and_negatives(rng):
 def test_prelude_requires_safe_math():
     """Verify that the df32 prelude rejects a math mode that could remove compensated error terms."""
     source = PRELUDE + "kernel void noop() {}"
-    for mode in (mr.MathMode.FAST, mr.MathMode.RELAXED):
-        with pytest.raises(mr.CompileError, match="SAFE"):
-            mr.Kernel(source, "noop", math_mode=mode)
-    assert kernel("kernel void noop() {}", "noop").math_mode == mr.MathMode.SAFE
+    for mode in (MathMode.FAST, MathMode.RELAXED):
+        with pytest.raises(_runtime.MetalError, match="SAFE"):
+            _runtime.Kernel(source, "noop", math_mode=mode)
+    assert kernel("kernel void noop() {}", "noop").math_mode == MathMode.SAFE

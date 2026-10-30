@@ -5,14 +5,13 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "palladium"
 version = "0.1.0"
-description = "Pallas kernels on Apple GPU: trace Pallas, emit MSL, dispatch via metal-runtime."
+description = "Pallas kernels on Apple GPU: trace Pallas, emit MSL, dispatch on Metal."
 readme = "README.md"
 license = "Apache-2.0"
 authors = [{ name = "Nicholas Junge", email = "nicho.junge@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = [
     "jax>=0.11",
-    "metal-runtime",
 ]
 
 [tool.scikit-build]
@@ -43,7 +42,6 @@ default-groups = ["build", "dev", "latest-jax"]
 conflicts = [[{ group = "mps" }, { group = "latest-jax" }]]
 
 [tool.uv.sources]
-metal-runtime = { path = "../metal-runtime" }
 jax-mps = { path = "../jax-mps" }
 
 [tool.uv.extra-build-dependencies]

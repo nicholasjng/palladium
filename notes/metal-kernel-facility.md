@@ -91,11 +91,11 @@ remaining costs were outside the kernels. Those come first:
 - **N1, per-call overhead (done).** `metal_call` lost 3–4 ms per 268 MB call
   to the GPU's page-table setup for each new no-copy wrap, and over 128 MB
   wraps silently copied (XNU splits mappings into 128 MB entries).
-  metal-runtime now caches validated wraps and walks all entries; a row
+  The runtime now caches validated wraps and walks all entries; a row
   softmax over 128 MB went from 6.4 to 3.4 ms end to end.
 - **N2, `"auto"` uses `simdgroup_matrix` on Apple families 7 and 8 (done).**
   4096³ float32 end to end: 2.42 TFLOPS against 1.89 for `matmul2d`. To do:
-  confirm on an M1 (with the metal-runtime that reports `apple_gpu_family`):
+  confirm on an M1:
   `uv run mew run --random-interleaving -k "float32-n4096|attention"
   benchmarks/bench_roofline.py` should show `simdgroup` ahead of `tensorops`
   in every pair. Measure an M3 or M4 before widening the families.
@@ -125,8 +125,9 @@ The explicit model is gated on a kernel that needs it:
   target inside the recognizer; an explicit version would only serve
   attention variants the recognizer cannot match.
 - **F6, tensor operations (open).** `plmtl.tensor_matmul` over MPP, chosen on
-  GPUs with matrix accelerators (Apple family 10). metal-runtime reports the
-  family as `device_info()["apple_gpu_family"]`. Needs such a machine.
+  GPUs with matrix accelerators (Apple family 10), which
+  `palladium.device.device_limits()["apple_gpu_family"]` reports. Needs such
+  a machine.
 - **F7, docs.** A tutorial in the style of the Mosaic GPU matmul guide:
   roofline, each step, its number. Can start with row programs and the
   `simdgroup` GEMM.

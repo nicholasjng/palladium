@@ -28,12 +28,12 @@ import time
 
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import numpy as np
 from df32 import kernel as df32_kernel
 from jax.experimental import pallas as pl
 
 import palladium
+from palladium import _runtime
 
 H = 0.002  # ~3140 steps per orbit; the truncation floor is O(H^2)
 N = 1024  # ensemble members, one Metal thread each
@@ -369,7 +369,7 @@ def palladium_run(math_mode, state0, on_mark):
 
     Parameters
     ----------
-    math_mode : metal_runtime.MathMode
+    math_mode : palladium.MathMode
         Compilation math mode for the float32 kernel.
     state0 : tuple of numpy.ndarray
         Four initial float32 component arrays (qx, qy, px, py), each of length N.
@@ -434,20 +434,20 @@ def df32_run(state0, on_mark):
     # three variants start from bit-identical states.
     zero = np.zeros(N, dtype=np.float32)
     limbs = [limb for v in state0 for limb in (v, zero)]
-    bufs = [mr.Buffer(np.ascontiguousarray(v)) for v in limbs]
-    outs = [mr.Buffer.empty([N]) for _ in range(8)]
+    bufs = [np.array(v, dtype=np.float32) for v in limbs]
+    outs = [np.empty(N, np.float32) for _ in range(8)]
     scalars = [np.float32(H), np.uint32(CHUNK)]
 
     def launch():
-        mr.run(kernel, grid=N, buffers=[*bufs, *outs], scalars=scalars)
+        _runtime.run(kernel, [*bufs, *outs], N, scalars=scalars)
 
     launch()  # compile outside the clock
     t0 = time.perf_counter()
     for chunk in range(1, CHUNKS + 1):
         launch()
-        limbs = [b.to_numpy() for b in outs]
+        limbs = [out.copy() for out in outs]
         for dst, limb in zip(bufs, limbs):  # feed both limbs back in
-            dst.copy_from(limb)
+            dst[...] = limb
         on_mark(chunk, tuple(limbs[0::2]))
     return time.perf_counter() - t0
 
@@ -489,8 +489,8 @@ def part_b():
             float(np.sqrt(np.mean((energy(*state) - e0) ** 2)))
         )
 
-    t_fast = palladium_run(mr.MathMode.FAST, state0, collect("f32 FAST"))
-    t_safe = palladium_run(mr.MathMode.SAFE, state0, collect("f32 SAFE"))
+    t_fast = palladium_run(palladium.MathMode.FAST, state0, collect("f32 FAST"))
+    t_safe = palladium_run(palladium.MathMode.SAFE, state0, collect("f32 SAFE"))
     t_df32 = df32_run(state0, collect("df32 SAFE"))
 
     print(f"  {'steps':>12}{'f32 FAST':>13}{'f32 SAFE':>13}{'df32 SAFE':>13}")

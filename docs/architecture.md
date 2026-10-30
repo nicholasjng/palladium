@@ -51,7 +51,7 @@ flowchart TD
     F --> G["mps descriptor and StableHLO custom call"]
     F --> H["CPU jax.ffi call and native handler"]
     G --> I["jax-mps / MLX owns execution"]
-    H --> J["metal-runtime C API owns dispatch"]
+    H --> J["in-tree runtime C API owns dispatch"]
 ```
 
 `KernelSpec` is the common boundary. It contains the kernel jaxpr, static
@@ -102,7 +102,8 @@ The generated `jax.ffi.ffi_call` names the CPU target
 **`palladium_dispatch`** and embeds source, launch geometry, math mode, and
 batch strides as static attributes.
 
-The C++ handler uses metal-runtime's C API to:
+The C++ handler uses the C API of palladium's Metal runtime
+(`native/runtime`, linked statically into the handler's library) to:
 
 1. Reuse or compile a library and pipeline, keyed by source digest, entry
    point, and math mode in a separate native LRU.

@@ -67,7 +67,7 @@ the output accumulator in the value matmul's cooperative tensor instead of
 threadgroup memory, addressed through MPP element coordinates. Threadgroup
 memory per group is `BQ×BK + 3·BQ` floats instead of `BQ×BK + BQ×D + 2·BQ`,
 which makes 128-wide key tiles affordable. On an M2 (8-core GPU) through
-metal-runtime, f32, `[1, 4096, 4, 64]`, medians of resident-buffer runs:
+direct dispatch, f32, `[1, 4096, 4, 64]`, medians of resident-buffer runs:
 
 | Tiles (q×k) | Before | After |
 |:---:|---:|---:|
@@ -117,7 +117,7 @@ near the integrator's step-size error bound. Run
   storage and can exceed Metal's stack limit.
 - `metal_call` adds CPU-FFI setup and buffer wrapping. It wraps XLA memory
   without copying, but each new wrap costs the GPU about 15 µs per MB of
-  page-table setup on first use, so metal-runtime caches wraps of 1 MB or
+  page-table setup on first use, so the runtime caches wraps of 1 MB or
   more while the memory behind them is unchanged. On an M2, a kernel reading
   and writing 128 MB took 0.6 ms more end to end than on the GPU, against
   3.5 ms before the cache, and 0.2 ms for 1 MB. Cached wraps keep freed

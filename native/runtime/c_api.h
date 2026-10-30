@@ -134,6 +134,11 @@ MR_EXPORT MRStatus mr_batch_commit(MRBatch* batch, char** out_err_msg);
 // Commits if needed, then blocks; a faulted command buffer is MR_ERROR_DISPATCH.
 MR_EXPORT MRStatus mr_batch_wait(MRBatch* batch, char** out_err_msg);
 
+// Device-side execution seconds of the whole batch, from GPUStartTime to
+// GPUEndTime; MR_ERROR_INVALID_ARGUMENT before mr_batch_wait.
+MR_EXPORT MRStatus mr_batch_gpu_time(const MRBatch* batch, double* out_seconds,
+                                     char** out_err_msg);
+
 MR_EXPORT void mr_release_batch(MRBatch* batch);
 
 #ifdef __cplusplus

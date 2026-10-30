@@ -17,10 +17,11 @@ import time
 
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import mew
 import numpy as np
 
+from palladium import _runtime
+from palladium.device import device_limits
 from palladium.emit.tensorops import declared_threadgroup_width
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
@@ -110,10 +111,8 @@ def bench_pallas_flash_attention(
     Skips when no Metal device is available. Tracing/emission/compilation is recorded
     separately; correctness is checked with NumPy before timing direct runtime dispatches.
     """
-    try:
-        mr.device_info()
-    except mr.DeviceError as error:
-        state.skip_with_error(f"No Metal device: {error}")
+    if not device_limits():
+        state.skip_with_error("No Metal device")
         return
 
     import palladium
@@ -133,19 +132,19 @@ def bench_pallas_flash_attention(
         out_shape=shape,
         compiler_params=palladium.CompilerParams(dot_general="tensorops"),
     )
-    kernel = mr.Kernel(source, "palladium_kernel")
+    kernel = _runtime.Kernel(source, "palladium_kernel")
     compile_ms = (time.perf_counter() - start) * 1000
-    output = mr.Buffer.empty(list(q.shape), dtype="float32")
-    buffers = [mr.Buffer(q), mr.Buffer(k), mr.Buffer(v), output]
+    output = np.empty(q.shape, np.float32)
+    buffers = [q, k, v, output]
     threadgroup = declared_threadgroup_width(source)
     metal_grid = (BATCH * threadgroup, HEADS, sequence_length // tile_q)
 
     def execute() -> None:
-        mr.run(kernel, grid=metal_grid, threadgroup=threadgroup, buffers=buffers)
+        _runtime.run(kernel, buffers, metal_grid, threadgroup)
 
     execute()
     np.testing.assert_allclose(
-        output.to_numpy(), _expected(sequence_length, causal, head_dim), rtol=3e-4, atol=3e-4
+        output, _expected(sequence_length, causal, head_dim), rtol=3e-4, atol=3e-4
     )
 
     state.set_counter("compile_ms", compile_ms)

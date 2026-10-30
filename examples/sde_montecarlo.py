@@ -16,12 +16,13 @@ import time
 
 import jax
 import jax.numpy as jnp
-import metal_runtime as mr
 import numpy as np
 from jax.experimental import pallas as pl
 from scipy.stats import norm
 
 import palladium
+from palladium import _runtime
+from palladium.device import device_limits
 
 N_PATHS = 1 << 20
 N_STEPS = 256
@@ -110,11 +111,11 @@ def run_handwritten():
     Notes
     -----
     Model parameters and path/step counts are module constants. The Pallas timing includes
-    conversion to NumPy; handwritten timing measures mr.run before reading its buffer.
+    conversion to NumPy; handwritten timing measures the dispatch, which writes in place.
     """
     dt = T / N_STEPS
-    kernel = mr.Kernel(GBM_MSL, "gbm_paths")
-    payoff = mr.Buffer.zeros([N_PATHS])
+    kernel = _runtime.Kernel(GBM_MSL, "gbm_paths")
+    payoff = np.zeros(N_PATHS, np.float32)
     scalars = [
         np.uint32(N_STEPS),
         np.float32(S0),
@@ -122,11 +123,11 @@ def run_handwritten():
         np.float32((R - SIGMA**2 / 2) * dt),
         np.float32(SIGMA * np.sqrt(dt)),
     ]
-    mr.run(kernel, grid=N_PATHS, buffers=[payoff], scalars=scalars)  # warm-up
+    _runtime.run(kernel, [payoff], N_PATHS, scalars=scalars)  # warm-up
     t0 = time.perf_counter()
-    mr.run(kernel, grid=N_PATHS, buffers=[payoff], scalars=scalars)
+    _runtime.run(kernel, [payoff], N_PATHS, scalars=scalars)
     t_gpu = time.perf_counter() - t0
-    return payoff.to_numpy(), t_gpu
+    return payoff, t_gpu
 
 
 def pallas_gbm_kernel(seed_ref, o_ref):
@@ -185,7 +186,7 @@ def run_pallas(seed):
     Notes
     -----
     Model parameters and path/step counts are module constants. The Pallas timing includes
-    conversion to NumPy; handwritten timing measures mr.run before reading its buffer.
+    conversion to NumPy; handwritten timing measures the dispatch, which writes in place.
     """
     f = palladium.metal_call(
         pallas_gbm_kernel,
@@ -240,7 +241,7 @@ def main():
     """Run both payoff implementations and report their prices, reference checks, and timing
     ratio.
     """
-    print(f"GBM European call, {N_PATHS:,} paths x {N_STEPS} steps ({mr.device_info()['name']})")
+    print(f"GBM European call, {N_PATHS:,} paths x {N_STEPS} steps ({device_limits()['name']})")
     p_hand, t_hand = run_handwritten()
     report("hand-written MSL (pcg_hash)", p_hand, t_hand)
 

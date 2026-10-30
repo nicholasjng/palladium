@@ -630,3 +630,38 @@ def test_cached_wrap_is_not_reused_after_its_range_is_remapped(lib, add_one):
     finally:
         lib.mr_clear_wrap_cache()
         _libc.munmap(address, size)
+
+
+def test_batch_gpu_time_is_reported_once_waited(lib, add_one):
+    """GPU time exists after mr_batch_wait and is an argument error before it."""
+    data = np.zeros(1024, np.float32)
+    err = ctypes.c_char_p()
+    buffer = ctypes.c_void_p()
+    status = lib.mr_wrap_buffer(
+        data.ctypes.data, data.nbytes, ctypes.byref(buffer), ctypes.byref(err)
+    )
+    assert status == rt.OK, err.value
+    desc = rt.LaunchDesc(
+        pipeline=add_one,
+        buffers=(ctypes.c_void_p * 1)(buffer.value),
+        buffer_offsets=(ctypes.c_size_t * 1)(0),
+        buffer_count=1,
+        grid_x=1024,
+        grid_y=1,
+        grid_z=1,
+        threadgroup_x=256,
+        threadgroup_y=1,
+        threadgroup_z=1,
+    )
+    status, batch, err = _dispatch_async(lib, desc)
+    assert status == rt.OK, err.value
+    seconds = ctypes.c_double()
+    status = lib.mr_batch_gpu_time(batch, ctypes.byref(seconds), ctypes.byref(err))
+    assert status == rt.ERROR_INVALID_ARGUMENT
+    lib.mr_free_error_message(err)
+    assert lib.mr_batch_wait(batch, ctypes.byref(err)) == rt.OK, err.value
+    status = lib.mr_batch_gpu_time(batch, ctypes.byref(seconds), ctypes.byref(err))
+    assert status == rt.OK, err.value
+    assert seconds.value > 0 and data[0] == 1.0
+    lib.mr_release_batch(batch)
+    lib.mr_release_buffer(buffer)

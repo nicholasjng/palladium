@@ -6,7 +6,7 @@ single pallas_call, and emits a Metal kernel. Two entry points run it:
 | Entry point | Execution |
 |---|---|
 | pl.pallas_call on mps | palladium is the registered Pallas backend for jax-mps; composable with jax.jit |
-| metal_call | Metal dispatch through a CPU jax.ffi target backed by metal-runtime; composable with jax.jit and jax.vmap, no plugin |
+| metal_call | Metal dispatch through a CPU jax.ffi target backed by palladium's Metal runtime; composable with jax.jit and jax.vmap, no plugin |
 
 Both accept the same kernels. See the [README](../README.md) for the install
 requirements.
