@@ -66,9 +66,11 @@ def attention_kernel(*, tile_q: int, tile_k: int, head_dim: int, causal: bool = 
         sixteen.
     tile_k : int
         Keys processed per scan step; key length must divide evenly into tiles and
-        cooperative emission requires a multiple of sixteen.
+        cooperative emission requires a multiple of sixteen,
+        or of eight for the `simdgroup_matrix` schedule.
     head_dim : int
-        Features per head; cooperative emission requires a positive multiple of sixteen.
+        Features per head; cooperative emission requires a positive multiple of sixteen,
+        or of eight for the `simdgroup_matrix` schedule.
     causal : bool, optional
         Apply the absolute-position causal mask, default False. Cooperative causal
         attention requires matching sequence lengths.
@@ -112,7 +114,8 @@ def attention_specs(
         Query rows per program; cooperative emission requires a positive multiple of
         sixteen.
     head_dim : int
-        Features per head; cooperative emission requires a positive multiple of sixteen.
+        Features per head; cooperative emission requires a positive multiple of sixteen,
+        or of eight for the `simdgroup_matrix` schedule.
     key_length : int or None, optional
         Key/value sequence length; None uses the query length.
 
@@ -157,7 +160,8 @@ def attention_call(
         sixteen.
     tile_k : int
         Keys processed per scan step; key length must divide evenly into tiles and
-        cooperative emission requires a multiple of sixteen.
+        cooperative emission requires a multiple of sixteen,
+        or of eight for the `simdgroup_matrix` schedule.
     causal : bool, optional
         Apply the absolute-position causal mask, default False. Cooperative causal
         attention requires matching sequence lengths.

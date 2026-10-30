@@ -249,3 +249,18 @@ def test_tensorops_attention_rejects_unsupported_head_dimension():
     """Verify that a head dimension not divisible by sixteen is rejected by cooperative attention."""
     with pytest.raises(EmitError, match="head dimensions must be multiples of 16"):
         palladium.emit_msl(_spec(head_dim=24), dot_general="tensorops")
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_simdgroup_attention_keeps_the_softmax_in_registers(causal):
+    """Under `dot_general="simdgroup"`, both products use `simdgroup_matrix`, scores
+    never touch threadgroup memory, and a key step has only the two barriers around
+    staging K and V; 16-row query tiles keep the `matmul2d` schedule."""
+    spec = _spec(causal=causal, tile_q=32, tile_k=16)
+    msl, stats = palladium.emit.emit_msl_stats(spec, dot_general="simdgroup")
+    assert "simdgroup_mma" in msl
+    assert "matmul2d" not in msl and "scores" not in msl
+    assert msl.count("threadgroup_barrier") == 2
+    assert stats.threadgroup_bytes == 2 * 16 * (64 + 4) * 4
+    assert ("> q_start" in msl) == causal  # masking only blocks crossing the diagonal
+    assert "matmul2d" in palladium.emit_msl(_spec(causal=causal), dot_general="simdgroup")

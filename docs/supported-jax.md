@@ -96,8 +96,15 @@ primitive. The attention form requires rank-4 `[batch, sequence, heads, D]`
 buffers and a static key-tile scan; query and key/value lengths may differ for
 noncausal attention. Causal attention requires matching lengths. Q/output use
 query tiles, while K/V are full-sequence blocks. One Metal threadgroup computes
-each query tile and runs the score and value matmuls with Metal TensorOps. Tile
-sizes and head dimensions must be multiples of 16, and both sequence lengths
+each query tile and runs the score and value matmuls with Metal TensorOps.
+Under `dot_general="simdgroup"`, and under `"auto"` on M1 and M2 GPUs, query
+tiles that are a multiple of 32 rows instead use `simdgroup_matrix` for both
+products and keep the softmax in registers, if the K and V tiles fit in
+threadgroup memory together; other tiles keep TensorOps. At 4096 tokens and 32
+heads of 64 on an M2 this ran at 2.1 TFLOPS float32 with 64x16 tiles, against
+1.5 for TensorOps at its best tiling and 2.0 for MLX. Tile
+sizes and head dimensions must be multiples of 16 (of 8 for the `simdgroup_matrix`
+schedule, so SAM2's 56-wide heads need no padding), and both sequence lengths
 must divide evenly into their tiles. Short query sequences need padding and
 output cropping. Unsupported jaxpr forms and layouts raise `EmitError`.
 The mps lowering follows the same policy: cooperative kernels reach jax-mps

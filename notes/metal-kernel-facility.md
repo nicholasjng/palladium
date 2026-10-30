@@ -95,12 +95,15 @@ remaining costs were outside the kernels. Those come first:
   softmax over 128 MB went from 6.4 to 3.4 ms end to end.
 - **N2, `"auto"` uses `simdgroup_matrix` on Apple families 7 and 8 (done).**
   4096³ float32 end to end: 2.42 TFLOPS against 1.89 for `matmul2d`. To do:
-  confirm on an M1, and measure an M3 or M4 before widening it.
-- **N3, attention in the recognizer.** At 4096 tokens and 32 heads of 64,
-  float32: 1.42 TFLOPS at 64×64 tiles, against MLX's 1.99. Next is
-  `simdgroup_matrix` for both matmuls on families 7 and 8, as for GEMM.
-  Done at ≥ 2.0 TFLOPS; this replaces the old F5 target, which needed F2–F4
-  first.
+  confirm on an M1 (with the metal-runtime that reports `apple_gpu_family`):
+  `uv run mew run --random-interleaving -k "float32-n4096|attention"
+  benchmarks/bench_roofline.py` should show `simdgroup` ahead of `tensorops`
+  in every pair. Measure an M3 or M4 before widening the families.
+- **N3, attention in the recognizer (done).** At 4096 tokens and 32 heads of
+  64, float32: 2.10 TFLOPS (1.93 causal) with `simdgroup_matrix` for both
+  products and the softmax in registers, against 1.48 for `matmul2d` and
+  MLX's 1.99. Taken by `"auto"` on families 7 and 8 for query tiles of 32 or
+  more rows. This met the old F5 target without F2–F4.
 
 The explicit model is gated on a kernel that needs it:
 
@@ -118,8 +121,9 @@ The explicit model is gated on a kernel that needs it:
   implementing `jax._src.pallas.core.Mesh`, and `mpmd_map` lowerings for
   `mps` (and `cpu` for `metal_call`). Blocked on the mps side until jax-mps
   supports jax 0.12 and takes the `mps.metal_kernel` custom call.
-- **F5, attention written with F2–F4.** Only if N3 cannot reach its target
-  inside the recognizer.
+- **F5, attention written with F2–F4: not needed for speed.** N3 met its
+  target inside the recognizer; an explicit version would only serve
+  attention variants the recognizer cannot match.
 - **F6, tensor operations (open).** `plmtl.tensor_matmul` over MPP, chosen on
   GPUs with matrix accelerators (Apple family 10). metal-runtime reports the
   family as `device_info()["apple_gpu_family"]`. Needs such a machine.

@@ -150,6 +150,98 @@ def _simd_reduction(eqn: JaxprEqn, input_shape: tuple[int, int], value: str) -> 
     return f"simd_max({value})" if eqn.primitive.name == "reduce_max" else f"simd_sum({value})"
 
 
+class _RowUpdate:
+    """Scalar expressions of one online-softmax row update, bound to a plan's
+    atoms by identity, so the emitted arithmetic is the recognized jaxpr's."""
+
+    def __init__(self, plan: OnlineSoftmaxPlan, ctype: str, rows: int, columns: int):
+        if plan.score_mask is not None and plan.score_mask.primitive.name != "le":
+            raise EmitError("cooperative causal score mask only supports `le`")
+        self.plan, self.ctype, self.shape = plan, ctype, (rows, columns)
+
+        def tile_operand(eqn: JaxprEqn):
+            return next(
+                atom
+                for atom in eqn.invars
+                if isinstance(atom, Var | Literal)
+                and tuple(shaped(atom.aval).shape) == (rows, columns)
+            )
+
+        self.score = tile_operand(plan.score_scale)
+        self.scale = next(atom for atom in plan.score_scale.invars if atom is not self.score)
+        self.center_score = tile_operand(plan.probability_center)
+        self.center_max = next(
+            atom for atom in plan.probability_center.invars if atom is not self.center_score
+        )
+        self.max_carry = next(
+            atom for atom in plan.running_max.invars if atom is not plan.score_max.outvars[0]
+        )
+        self.sum_carry = next(
+            atom
+            for atom in plan.body_invars
+            if atom in plan.sum_scale.invars and tuple(shaped(atom.aval).shape) == (rows,)
+        )
+        self.sum_factor = next(atom for atom in plan.sum_scale.invars if atom is not self.sum_carry)
+        self.sum_block = plan.probability_sum.outvars[0]
+        self.sum_scaled = next(
+            atom for atom in plan.sum_update.invars if atom is not self.sum_block
+        )
+
+    def scaled(self, score: str, scale: str) -> str:
+        return elementwise_expression(
+            self.plan.score_scale, self.ctype, ((self.score, score), (self.scale, scale))
+        )
+
+    def max_combine(self, left: str, right: str) -> str:
+        return row_reduction_expression(self.plan.score_max, self.shape, left, right)
+
+    def sum_combine(self, left: str, right: str) -> str:
+        return row_reduction_expression(self.plan.probability_sum, self.shape, left, right)
+
+    def new_max(self, block_max: str, old_max: str) -> str:
+        return elementwise_expression(
+            self.plan.running_max,
+            self.ctype,
+            ((self.plan.score_max.outvars[0], block_max), (self.max_carry, old_max)),
+        )
+
+    def old_scale(self, old_max: str, new_max: str, old_sum: str) -> str:
+        def operand(atom) -> str:
+            if any(atom is carry for carry in self.plan.body_invars):
+                return old_sum
+            if not isinstance(atom, Literal):
+                raise EmitError("online softmax must compare the running sum with a constant")
+            return literal(atom).expr
+
+        bindings = tuple((atom, operand(atom)) for atom in self.plan.nonempty.invars)
+        nonempty = elementwise_expression(self.plan.nonempty, "bool", bindings)
+        return f"{nonempty} ? exp({old_max} - {new_max}) : 0.0f"
+
+    def probability(self, score: str, new_max: str) -> str:
+        centered = elementwise_expression(
+            self.plan.probability_center,
+            self.ctype,
+            ((self.center_score, score), (self.center_max, new_max)),
+        )
+        return elementwise_expression(
+            self.plan.probability_exp,
+            self.ctype,
+            ((self.plan.probability_exp.invars[0], centered),),
+        )
+
+    def new_sum(self, block_sum: str, old_sum: str, old_scale: str) -> str:
+        scaled_sum = elementwise_expression(
+            self.plan.sum_scale,
+            self.ctype,
+            ((self.sum_carry, old_sum), (self.sum_factor, old_scale)),
+        )
+        return elementwise_expression(
+            self.plan.sum_update,
+            self.ctype,
+            ((self.sum_block, block_sum), (self.sum_scaled, scaled_sum)),
+        )
+
+
 def emit_online_softmax_simd(
     cursor: Cursor,
     plan: OnlineSoftmaxPlan,
@@ -214,34 +306,10 @@ def emit_online_softmax_simd(
         raise EmitError("online softmax row carries must match the score rows")
     if (plan.score_mask is None) != (causal_offsets is None):
         raise EmitError("causal offsets must be present exactly when a score mask is used")
-    if plan.score_mask is not None and plan.score_mask.primitive.name != "le":
-        raise EmitError("cooperative causal score mask only supports `le`")
     ctype = score_storage.ctype
+    update = _RowUpdate(plan, ctype, rows, columns)
     per_lane = -(-columns // lanes)
     partial = columns % lanes != 0
-    score_atom = next(
-        atom
-        for atom in plan.score_scale.invars
-        if isinstance(atom, Var | Literal) and tuple(shaped(atom.aval).shape) == (rows, columns)
-    )
-    scale_atom = next(atom for atom in plan.score_scale.invars if atom is not score_atom)
-    center_score = next(
-        atom
-        for atom in plan.probability_center.invars
-        if isinstance(atom, Var | Literal) and tuple(shaped(atom.aval).shape) == (rows, columns)
-    )
-    center_max = next(atom for atom in plan.probability_center.invars if atom is not center_score)
-    max_carry = next(
-        atom for atom in plan.running_max.invars if atom is not plan.score_max.outvars[0]
-    )
-    sum_carry = next(
-        atom
-        for atom in plan.body_invars
-        if atom in plan.sum_scale.invars and tuple(shaped(atom.aval).shape) == (rows,)
-    )
-    sum_factor = next(atom for atom in plan.sum_scale.invars if atom is not sum_carry)
-    sum_block = plan.probability_sum.outvars[0]
-    sum_scaled = next(atom for atom in plan.sum_update.invars if atom is not sum_block)
 
     def column(j: int) -> str:
         return "lane" if j == 0 else f"(lane + {j * lanes})"
@@ -250,12 +318,7 @@ def emit_online_softmax_simd(
         cursor.emit(f"{ctype} s[{per_lane}];")
         cursor.emit(f"{ctype} lane_max = -INFINITY;")
         for j in range(per_lane):
-            index = f"row * {columns} + {column(j)}"
-            scaled = elementwise_expression(
-                plan.score_scale,
-                ctype,
-                ((score_atom, score_storage.at(index)), (scale_atom, scale)),
-            )
+            scaled = update.scaled(score_storage.at(f"row * {columns} + {column(j)}"), scale)
             guards = []
             if partial:
                 guards.append(f"{column(j)} < {columns}")
@@ -265,66 +328,119 @@ def emit_online_softmax_simd(
                 cursor.emit(f"s[{j}] = ({' && '.join(guards)}) ? {scaled} : -INFINITY;")
             else:
                 cursor.emit(f"s[{j}] = {scaled};")
-            combine = row_reduction_expression(
-                plan.score_max, (rows, columns), "lane_max", f"s[{j}]"
-            )
-            cursor.emit(f"lane_max = {combine};")
+            cursor.emit(f"lane_max = {update.max_combine('lane_max', f's[{j}]')};")
         cursor.emit(
             f"const {ctype} block_max = {_simd_reduction(plan.score_max, (rows, columns), 'lane_max')};"
         )
         cursor.emit(f"const {ctype} old_max = {row_max.at('row')};")
         cursor.emit(f"const {ctype} old_sum = {row_sum.at('row')};")
-        new_max = elementwise_expression(
-            plan.running_max,
-            ctype,
-            ((plan.score_max.outvars[0], "block_max"), (max_carry, "old_max")),
+        cursor.emit(f"const {ctype} new_max = {update.new_max('block_max', 'old_max')};")
+        cursor.emit(
+            f"const {ctype} old_scale = {update.old_scale('old_max', 'new_max', 'old_sum')};"
         )
-        cursor.emit(f"const {ctype} new_max = {new_max};")
-
-        def nonempty_operand(atom) -> str:
-            if any(atom is carry for carry in plan.body_invars):
-                return "old_sum"
-            if not isinstance(atom, Literal):
-                raise EmitError("online softmax must compare the running sum with a constant")
-            return literal(atom).expr
-
-        nonempty_bindings = tuple((atom, nonempty_operand(atom)) for atom in plan.nonempty.invars)
-        nonempty = elementwise_expression(plan.nonempty, "bool", nonempty_bindings)
-        cursor.emit(f"const {ctype} old_scale = {nonempty} ? exp(old_max - new_max) : 0.0f;")
         cursor.emit(f"{ctype} lane_sum = 0.0f;")
         for j in range(per_lane):
-            index = f"row * {columns} + {column(j)}"
-            centered = elementwise_expression(
-                plan.probability_center, ctype, ((center_score, f"s[{j}]"), (center_max, "new_max"))
-            )
-            probability = elementwise_expression(
-                plan.probability_exp, ctype, ((plan.probability_exp.invars[0], centered),)
-            )
-            store = f"{score_storage.at(index)} = s[{j}];"
-            cursor.emit(f"s[{j}] = {probability};")
+            store = f"{score_storage.at(f'row * {columns} + {column(j)}')} = s[{j}];"
+            cursor.emit(f"s[{j}] = {update.probability(f's[{j}]', 'new_max')};")
             if partial:
                 with cursor.block(f"if ({column(j)} < {columns})"):
                     cursor.emit(store)
             else:
                 cursor.emit(store)
-            combine = row_reduction_expression(
-                plan.probability_sum, (rows, columns), "lane_sum", f"s[{j}]"
-            )
-            cursor.emit(f"lane_sum = {combine};")
+            cursor.emit(f"lane_sum = {update.sum_combine('lane_sum', f's[{j}]')};")
         cursor.emit(
             f"const {ctype} block_sum = "
             f"{_simd_reduction(plan.probability_sum, (rows, columns), 'lane_sum')};"
         )
-        scaled_sum = elementwise_expression(
-            plan.sum_scale, ctype, ((sum_carry, "old_sum"), (sum_factor, "old_scale"))
-        )
-        sum_update = elementwise_expression(
-            plan.sum_update, ctype, ((sum_block, "block_sum"), (sum_scaled, scaled_sum))
-        )
         with cursor.block("if (lane == 0)"):
-            cursor.emit(f"{row_sum.at('row')} = {sum_update};")
+            cursor.emit(
+                f"{row_sum.at('row')} = {update.new_sum('block_sum', 'old_sum', 'old_scale')};"
+            )
             cursor.emit(f"{row_max.at('row')} = new_max;")
             cursor.emit(f"{row_scale.at('row')} = old_scale;")
+
+
+def emit_online_softmax_fragments(
+    cursor: Cursor,
+    plan: OnlineSoftmaxPlan,
+    scale: str,
+    *,
+    rows: int,
+    columns: int,
+    width: int,
+    fragment_rows: int,
+    causal: tuple[str, str, str] | None = None,
+) -> None:
+    """Emit one streaming softmax update on scores held in 8x8 register fragments.
+
+    Parameters
+    ----------
+    cursor : Cursor
+        Destination for generated MSL statements.
+    plan : OnlineSoftmaxPlan
+        Matched equations defining the row-state update.
+    scale : str
+        MSL score-scale expression.
+    rows, columns : int
+        The plan's score tile shape.
+    width : int
+        Columns of the weighted-value accumulator.
+    fragment_rows : int
+        Fragment rows this SIMD group owns.
+    causal : tuple of str or None, optional
+        For a causal mask: a SIMD-group-uniform condition under which the block
+        needs masking, then the key position of element `c` of fragment `j` and
+        the query position of fragment row `i`, as MSL over `i`, `j` and `c`.
+        Required exactly when the plan has a causal mask.
+
+    Notes
+    -----
+    Expects `_s[i][j]` (scores, overwritten with probabilities) and `_o[i][d]`
+    (accumulator) as `vec<float, 2>` fragments, and per-lane row state `_m[i]`,
+    `_l[i]`. A lane holds two adjacent elements of one row of each fragment, and
+    the four lanes sharing that row differ in lane bits 0 and 3, so row
+    reductions finish with two shuffles. No threadgroup memory is involved.
+    """
+    if (plan.score_mask is None) != (causal is None):
+        raise EmitError("causal positions must be present exactly when a score mask is used")
+    update = _RowUpdate(plan, "float", rows, columns)
+    unroll = '_Pragma("clang loop unroll(full)")'
+    elements = (
+        f"{unroll} for (short j = 0; j < {columns // 8}; ++j) "
+        f"{unroll} for (short c = 0; c < 2; ++c)"
+    )
+    with cursor.block(f"{unroll} for (short i = 0; i < {fragment_rows}; ++i)"):
+        with cursor.block(elements):
+            cursor.emit(f"_s[i][j][c] = {update.scaled('_s[i][j][c]', scale)};")
+        if causal is not None:
+            needed, key, query = causal
+            with cursor.block(f"if ({needed})"), cursor.block(elements):
+                cursor.emit(f"_s[i][j][c] = ({key}) <= ({query}) ? _s[i][j][c] : -INFINITY;")
+        cursor.emit("float block_max = -INFINITY;")
+        with cursor.block(elements):
+            cursor.emit(f"block_max = {update.max_combine('block_max', '_s[i][j][c]')};")
+        for mask in (1, 8):
+            shuffled = f"simd_shuffle_xor(block_max, {mask})"
+            cursor.emit(f"block_max = {update.max_combine('block_max', shuffled)};")
+        cursor.emit(f"const float new_max = {update.new_max('block_max', '_m[i]')};")
+        cursor.emit(f"const float old_scale = {update.old_scale('_m[i]', 'new_max', '_l[i]')};")
+        cursor.emit("float block_sum = 0.0f;")
+        with cursor.block(elements):
+            cursor.emit(f"_s[i][j][c] = {update.probability('_s[i][j][c]', 'new_max')};")
+            cursor.emit(f"block_sum = {update.sum_combine('block_sum', '_s[i][j][c]')};")
+        for mask in (1, 8):
+            shuffled = f"simd_shuffle_xor(block_sum, {mask})"
+            cursor.emit(f"block_sum = {update.sum_combine('block_sum', shuffled)};")
+        cursor.emit(f"_l[i] = {update.new_sum('block_sum', '_l[i]', 'old_scale')};")
+        cursor.emit("_m[i] = new_max;")
+        rescaled = accumulator_rescale_expression(
+            plan, "float", "_o[i][d][c]", "old_scale", rows=rows, width=width
+        )
+        with cursor.block(
+            f"{unroll} for (short d = 0; d < {width // 8}; ++d) "
+            f"{unroll} for (short c = 0; c < 2; ++c)"
+        ):
+            cursor.emit(f"_o[i][d][c] = {rescaled};")
 
 
 def accumulator_rescale_expression(

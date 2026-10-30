@@ -29,7 +29,8 @@ Where kernels land (TFLOPS, share of the 3.38 matrix peak):
 | palladium Pallas matmul 2048³, best tile | 2.48 (73%), 64x32 | 3.30 (98%), 64x32 |
 | MLX attention, 4096 tokens, 32 heads of 64 | 1.99 (59%) | 2.55 (75%) |
 | torch-MPS attention, same | 1.74 (51%) | 2.48 (73%) |
-| palladium flash attention, same, 32x128 tiles | 1.34 (40%) | not measured |
+| palladium flash attention, same, `matmul2d`, 64x64 tiles | 1.48 (44%) | not measured |
+| palladium flash attention, same, `simdgroup_matrix`, 64x16 tiles | 2.10 (62%) | not measured |
 
 The vendor rows were measured with torch 2.13 and MLX 0.32.1 directly;
 `bench_vendor_matmul` measures `jnp.dot` through jax-mps instead, when the
@@ -133,9 +134,17 @@ with matrix accelerators (family 10) keep `matmul2d`.
    already showed 2x from tile shape alone). Grouped order showed no effect
    at 4096³ (Step 2 results); MLX also uses none on this device class. Done
    at the targets above.
-5. **Attention.** Head sizes padded to multiples of 16 (SAM2's 56 is not
-   supported today), larger key tiles, probabilities times V in float16, and
-   a look at `exp` throughput. Done at ≥ 2.0 TFLOPS float32.
+5. **Attention (done for float32).** Following MLX's steel attention: both
+   products on `simdgroup_matrix`, K and V staged in threadgroup memory, and
+   scores, probabilities and output in each SIMD group's registers, so a key
+   step has two barriers and the softmax rows reduce with two shuffles. 2.10
+   TFLOPS without a mask and 1.93 causal at 64x16 tiles, against 1.48 and 1.26
+   for `matmul2d`. Masking only the key blocks that cross the diagonal took
+   causal from 1.83 to 1.93. Head sizes need only be multiples of 8 on this
+   schedule: 56-wide heads ran in 59.8 ms with 64x8 tiles, against 65.7 ms
+   padded to 64. Probabilities times V in float16 was not tried: it changes
+   the results of a float32 kernel, so it would need an opt-in precision
+   setting, and nothing asks for one.
 6. **Write-up.** The roofline, each step's change and its number, in the
    style of the Mosaic GPU matmul tutorial.
 

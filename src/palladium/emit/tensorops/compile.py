@@ -22,8 +22,8 @@ def compile_kernel(
         MSL function name override; None uses ``spec.name``. The name must be a valid
         MSL identifier.
     prefer_simdgroup : bool, optional
-        Lower supported float32 matmuls with `simdgroup_matrix` instead of
-        `matmul2d`; attention is unaffected.
+        Lower supported float32 matmuls and attention with `simdgroup_matrix`
+        instead of `matmul2d`.
 
     Returns
     -------
@@ -45,5 +45,5 @@ def compile_kernel(
     fallback.
     """
     if _contains(spec.jaxpr, "scan"):
-        return lower_attention(spec, kernel_name)
+        return lower_attention(spec, kernel_name, prefer_simdgroup=prefer_simdgroup)
     return lower_matmul(spec, kernel_name, prefer_simdgroup=prefer_simdgroup)

@@ -1,11 +1,17 @@
 """Cooperative TensorOps kernels on the device: matmul tails, edge tiles, half
-precision, and attention tiles small enough that MPP leaves slots unowned."""
+precision, attention tiles small enough that MPP leaves slots unowned, and
+attention with `simdgroup_matrix`."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flash_attention import attention_kernel, attention_specs, reference_attention
+from flash_attention import (
+    attention_call,
+    attention_kernel,
+    attention_specs,
+    reference_attention,
+)
 from jax.experimental import pallas as pl
 
 import palladium
@@ -92,6 +98,53 @@ def test_attention(rng, head_dim, tile_q, tile_k, causal):
         compiler_params=palladium.CompilerParams(dot_general="tensorops"),
     )
     q, k, v = (rng.standard_normal(shape, dtype=np.float32) for _ in range(3))
+    np.testing.assert_allclose(
+        call(q, k, v), reference_attention(q, k, v, causal=causal), rtol=3e-4, atol=3e-4
+    )
+
+
+_SIMDGROUP_ATTENTION = [
+    (64, 64, 16, 256, True),  # the fastest tiling at 4096 tokens on an M2
+    (16, 32, 16, 256, True),
+    (48, 32, 64, 256, True),
+    (64, 128, 32, 256, True),  # four fragment rows per SIMD group
+    (56, 32, 8, 256, True),  # SAM2's head width and 8-key tiles: no padding
+    (64, 64, 16, 128, True),  # cross attention with fewer keys (noncausal only)
+    (32, 32, 128, 256, False),  # K and V tiles too large to stage: matmul2d
+    (64, 16, 16, 256, False),  # query tiles below 32 rows: matmul2d
+]
+
+
+@pytest.mark.parametrize(
+    "head_dim, tile_q, tile_k, key_length, simdgroup, causal",
+    [
+        (*case, causal)
+        for case in _SIMDGROUP_ATTENTION
+        for causal in (False, True)
+        if not causal or case[3] == 256
+    ],
+)
+def test_attention_with_simdgroup_matrix(
+    rng, head_dim, tile_q, tile_k, key_length, simdgroup, causal
+):
+    """Compare attention under `dot_general="simdgroup"` with NumPy over two batches
+    and three heads, and check which schedule the tiles select."""
+    shape = (2, 256, 3, head_dim)
+    kv_shape = (2, key_length, 3, head_dim)
+    tiles = {"tile_q": tile_q, "tile_k": tile_k, "causal": causal, "key_length": key_length}
+    avals = (jax.ShapeDtypeStruct(shape, jnp.float32),) + (
+        jax.ShapeDtypeStruct(kv_shape, jnp.float32),
+    ) * 2
+    spec = palladium.trace(attention_call(shape, **tiles), *avals)
+    assert ("simdgroup_mma" in palladium.emit_msl(spec, dot_general="simdgroup")) == simdgroup
+    call = attention_call(
+        shape,
+        **tiles,
+        call=palladium.metal_call,
+        compiler_params=palladium.CompilerParams(dot_general="simdgroup"),
+    )
+    q = rng.standard_normal(shape, dtype=np.float32)
+    k, v = (rng.standard_normal(kv_shape, dtype=np.float32) for _ in range(2))
     np.testing.assert_allclose(
         call(q, k, v), reference_attention(q, k, v, causal=causal), rtol=3e-4, atol=3e-4
     )

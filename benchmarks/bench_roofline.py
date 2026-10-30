@@ -1,4 +1,4 @@
-"""Measure the Apple GPU roofline and where Pallas matmuls land on it.
+"""Measure the Apple GPU roofline and where Pallas matmuls and attention land on it.
 
 Run with ``uv run mew run --random-interleaving benchmarks/bench_roofline.py``;
 add ``JAX_PLATFORMS=mps,cpu`` with jax-mps installed for the vendor rows.
@@ -13,6 +13,10 @@ add ``JAX_PLATFORMS=mps,cpu`` with jax-mps installed for the vendor rows.
   ``dot_general="simdgroup"``, checked against NumPy before timing.
 - ``bench_vendor_matmul``: ``jnp.dot`` on the mps platform, which jax-mps
   runs on MLX's kernels. Wall time per call, so it includes dispatch.
+- ``bench_pallas_attention``: the example flash attention at 4096 tokens and
+  32 heads of 64, float32, through ``matmul2d`` and ``simdgroup_matrix``, each
+  at its fastest tiling on an M2, checked on one head against NumPy. FLOPs
+  count 4·heads·tokens²·64, halved for the causal mask.
 
 Kernel rows report GPU time from the command buffer. Each row sets a
 ``tflops`` (or ``gbps``) counter from its median.
@@ -20,7 +24,9 @@ Kernel rows report GPU time from the command buffer. Each row sets a
 
 from __future__ import annotations
 
+import os
 import statistics
+import sys
 import time
 
 import jax
@@ -31,6 +37,9 @@ import numpy as np
 from jax.experimental import pallas as pl
 
 from palladium.emit.tensorops import declared_threadgroup_width
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
+from flash_attention import attention_kernel, attention_specs, reference_attention
 
 DTYPES = ("float32", "float16")
 SIZES = (2048, 4096)
@@ -48,6 +57,17 @@ MATMUL_IDS = [
 ]
 VENDOR_CASES = [{"size": size, "dtype": dtype} for size in SIZES for dtype in DTYPES]
 VENDOR_IDS = [f"{c['dtype']}-n{c['size']}" for c in VENDOR_CASES]
+
+ATTENTION_SHAPE = (1, 4096, 32, 64)
+ATTENTION_CASES = [
+    {"policy": policy, "tile_q": 64, "tile_k": tile_k, "causal": causal}
+    for policy, tile_k in (("tensorops", 64), ("simdgroup", 16))
+    for causal in (False, True)
+]
+ATTENTION_IDS = [
+    f"{c['policy']}-{'causal' if c['causal'] else 'full'}-tq{c['tile_q']}-tk{c['tile_k']}"
+    for c in ATTENTION_CASES
+]
 
 _ITERATIONS = 2048
 _SIMD_GROUPS_PER_THREADGROUP = 4
@@ -209,3 +229,49 @@ def bench_vendor_matmul(state: mew.State, size: int, dtype: str) -> None:
             return time.perf_counter() - start
 
         _run_timed(state, run, work=2 * size**3, counter="tflops", scale=1e12)
+
+
+@mew.parametrize(
+    ATTENTION_CASES, ids=ATTENTION_IDS, tags="roofline", use_manual_time=True, unit="ms"
+)
+def bench_pallas_attention(
+    state: mew.State, policy: str, tile_q: int, tile_k: int, causal: bool
+) -> None:
+    import palladium
+
+    batch, tokens, heads, dim = ATTENTION_SHAPE
+    rng = np.random.default_rng(0)
+    q, k, v = (rng.standard_normal(ATTENTION_SHAPE, dtype=np.float32) for _ in range(3))
+    grid, in_specs, out_specs = attention_specs(batch, tokens, heads, tile_q, dim)
+    shape = jax.ShapeDtypeStruct(ATTENTION_SHAPE, jnp.float32)
+    source = palladium.debug_msl(
+        attention_kernel(tile_q=tile_q, tile_k=tile_k, head_dim=dim, causal=causal),
+        shape,
+        shape,
+        shape,
+        grid=grid,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        out_shape=shape,
+        compiler_params=palladium.CompilerParams(dot_general=policy),
+    )
+    kernel = mr.Kernel(source, "palladium_kernel")
+    output = mr.Buffer.empty(list(ATTENTION_SHAPE))
+    buffers = [mr.Buffer(q), mr.Buffer(k), mr.Buffer(v), output]
+    threadgroup = declared_threadgroup_width(source)
+    launch = (batch * threadgroup, heads, tokens // tile_q)
+    _gpu_time(kernel, launch, threadgroup, buffers)
+    head = (slice(None), slice(None), slice(0, 1))
+    np.testing.assert_allclose(
+        output.to_numpy()[head],
+        reference_attention(q[head], k[head], v[head], causal=causal),
+        rtol=3e-4,
+        atol=3e-4,
+    )
+    _run_timed(
+        state,
+        lambda: _gpu_time(kernel, launch, threadgroup, buffers),
+        work=4 * heads * tokens**2 * dim / (2 if causal else 1),
+        counter="tflops",
+        scale=1e12,
+    )

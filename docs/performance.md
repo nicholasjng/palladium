@@ -78,6 +78,14 @@ metal-runtime, f32, `[1, 4096, 4, 64]`, medians of resident-buffer runs:
 | 16×128, full | n/a | 9.3 ms |
 | 32×128, causal | n/a | 6.0 ms |
 
+With `dot_general="simdgroup"` (the `"auto"` default on M1 and M2), query
+tiles of 32 or more rows use a schedule with both products on
+`simdgroup_matrix` and the scores, probabilities and output in each SIMD
+group's registers, two barriers per key step. At `[1, 4096, 32, 64]` on the M2
+it measured 65.9 ms (2.10 TFLOPS) with 64×16 tiles and 35.6 ms causal,
+against 92.5 ms and 54.6 ms for the TensorOps schedule at its best tiling,
+64×64 (`bench_pallas_attention` in `benchmarks/bench_roofline.py`).
+
 At `[1, 1024, 4, 64]` the 32×128 tiles measured 0.96 ms against 2.1 ms before.
 Wide key tiles amortize the three barriers per key step; 64×128 exceeds the
 32 KB threadgroup budget. Staging the query tile in threadgroup memory costs

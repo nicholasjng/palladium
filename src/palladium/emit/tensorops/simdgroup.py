@@ -79,6 +79,16 @@ def supports(tm: int, tn: int, k: int) -> bool:
     )
 
 
+def emit_fragment_coordinates(cursor: Cursor, lane: str) -> None:
+    """Declare `_fm` and `_fn`: this lane's row and first column in every 8x8
+    fragment, as MLX's BaseMMAFrag places them. The lane holds that element
+    and the next one in the row; the four lanes sharing a row differ in lane
+    bits 0 and 3."""
+    cursor.emit(f"const short _qid = {lane} / 4;")
+    cursor.emit(f"const short _fm = (_qid & 4) + (({lane} / 2) % 4);")
+    cursor.emit(f"const short _fn = (_qid & 2) * 2 + ({lane} % 2) * 2;")
+
+
 def emit_main_loop(cursor: Cursor, *, a: str, b: str, k: int, n: int, tm: int, tn: int) -> None:
     """Emit the accumulation of one output tile into per-lane fragments.
 
@@ -119,10 +129,7 @@ def emit_main_loop(cursor: Cursor, *, a: str, b: str, k: int, n: int, tm: int, t
     cursor.emit(f"device const float* _b_src = {b} + _b_i * {n} + _b_j;")
     cursor.emit(f"threadgroup float* _a_dst = {a_tile.expr} + _a_i * {lda} + _a_j;")
     cursor.emit(f"threadgroup float* _b_dst = {b_tile.expr} + _b_i * {ldb} + _b_j;")
-    cursor.emit("// This lane's two elements of an 8x8 fragment, as MLX's BaseMMAFrag places them.")
-    cursor.emit("const short _qid = _lane / 4;")
-    cursor.emit("const short _fm = (_qid & 4) + ((_lane / 2) % 4);")
-    cursor.emit("const short _fn = (_qid & 2) * 2 + (_lane % 2) * 2;")
+    emit_fragment_coordinates(cursor, "_lane")
     cursor.emit(f"const short _sm = 8 * (_sg / {_WN}) + _fm, _sn = 8 * (_sg % {_WN}) + _fn;")
     cursor.emit(f"simdgroup_frag _acc[{frags_m}][{frags_n}];")
     with (

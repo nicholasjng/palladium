@@ -51,9 +51,21 @@ Mosaic GPU have useful per-primitive lowering registries and cooperative
 scope models, but their rules emit MLIR for TPU or NVIDIA. They are
 architectural references, not drop-in MSL lowerings.
 
-## Attention schedule
+## Attention schedules
 
-Both MPP matmuls stay; the work between them is spread over the group. SIMD
+With `simdgroup_matrix` (`_emit_simdgroup`, chosen by `prefer_simdgroup` for
+query tiles of 32 or more rows): SIMD group `sg` owns `tile_q / 4` consecutive
+query rows as 8x8 fragment rows, with Q in registers for the whole program.
+Per key step all threads stage K and V tiles (rows padded by 4 floats, which
+keeps the fragment reads free of bank conflicts); each SIMD group then forms
+its scores, runs the softmax update on them in registers (the four lanes
+sharing a fragment row combine with `simd_shuffle_xor` 1 and 8), and
+accumulates P V into its output fragments. The score fragments are already in
+the A-operand layout of the second product. Two barriers per key step, and
+the causal mask only on blocks crossing the diagonal. 2.10 TFLOPS float32 at
+`[1, 4096, 32, 64]` with 64x16 tiles on an M2.
+
+With `matmul2d`: both MPP matmuls stay; the work between them is spread over the group. SIMD
 group `sg` owns score rows `sg, sg + 4, ...`; lane `l` owns columns
 `l, l + 32, ...`. Each lane reads its BK/32 scaled scores once into
 registers, `simd_max` gives the block max, probabilities are computed in
