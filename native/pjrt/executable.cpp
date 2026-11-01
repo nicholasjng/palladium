@@ -6,9 +6,11 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "dispatch.h"
@@ -40,6 +42,10 @@ struct Program {
     std::string code, compile_options;
     std::vector<Slot> slots;
     std::vector<Kernel> kernels;
+    // A static loop replays launches with different slots. Compile each source
+    // once per executable, retaining its library with the pipeline.
+    std::map<std::tuple<std::string, std::string, int>,
+             std::pair<std::shared_ptr<Library>, std::shared_ptr<ComputePipeline>>> pipelines;
     std::vector<int> outputs;
     int num_parameters = 0;
 
@@ -113,9 +119,14 @@ EXPORT int pp_kernel(Program* p, const char* msl, const char* function, int math
                      const int* slots, size_t num_slots, const size_t* grid,
                      const size_t* threadgroup) {
     try {
-        auto library =
-            std::make_shared<Library>(runtime().device(), msl, (MathMode)math_mode);
-        auto pipeline = library->pipeline(function);
+        auto key = std::make_tuple(std::string(msl), std::string(function), math_mode);
+        auto found = p->pipelines.find(key);
+        if (found == p->pipelines.end()) {
+            auto library = std::make_shared<Library>(runtime().device(), msl, (MathMode)math_mode);
+            auto pipeline = library->pipeline(function);
+            found = p->pipelines.emplace(std::move(key), std::make_pair(library, pipeline)).first;
+        }
+        const auto& [library, pipeline] = found->second;
         p->kernels.push_back({library, pipeline, {slots, slots + num_slots},
                               {grid[0], grid[1], grid[2]},
                               {threadgroup[0], threadgroup[1], threadgroup[2]}});
