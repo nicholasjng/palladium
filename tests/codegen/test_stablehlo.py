@@ -241,3 +241,17 @@ def test_gather_fuses_producers_without_intermediate_buffers():
     assert len(program.launches) == 1
     assert [s.kind for s in program.slots] == ["parameter", "parameter", "fresh"]
     assert program.slots[program.outputs[0]].shape == (4, 3)
+
+
+def test_scatter_initialization_precedes_atomic_updates():
+    program = _compile(lambda x, i, v: x.at[i.astype(jnp.int32)].add(v), (7, 3), (4,), (4, 3))
+    assert len(program.launches) == 2
+    init, update = program.launches
+    assert init.grid == 21 and update.grid == 12
+    assert init.slots[-1] == update.slots[-1] == program.outputs[0]
+    assert "atomic_fetch_add_explicit" in update.source
+
+
+def test_non_add_scatter_is_rejected():
+    with pytest.raises(UnsupportedProgram, match="single add update"):
+        _compile(lambda x, i: x.at[i.astype(jnp.int32)].set(1), (7, 3), (4,))

@@ -306,6 +306,27 @@ def _constant(op) -> _Constant:
 def _attributes(op) -> dict:
     a = op.attributes
     name = op.operation.name.removeprefix("stablehlo.")
+    if name == "scatter":
+        block = op.regions[0].blocks[0]
+        body = list(block.operations)
+        if (
+            len(op.results) != 1
+            or len(body) != 2
+            or body[0].operation.name != "stablehlo.add"
+            or list(body[0].operands) != list(block.arguments)
+            or body[1].operation.name != "stablehlo.return"
+            or list(body[1].operands) != list(body[0].results)
+        ):
+            raise UnsupportedProgram("metal: stablehlo.scatter requires a single add update")
+        d = stablehlo.ScatterDimensionNumbers(a["scatter_dimension_numbers"])
+        return {
+            "window": tuple(d.update_window_dims),
+            "inserted": tuple(d.inserted_window_dims),
+            "map": tuple(d.scattered_dims_to_operand_dims),
+            "vector": d.index_vector_dim,
+            "batch": tuple(d.input_batching_dims),
+            "index_batch": tuple(d.scatter_indices_batching_dims),
+        }
     if name == "gather":
         d = stablehlo.GatherDimensionNumbers(a["dimension_numbers"])
         return {
@@ -410,6 +431,7 @@ _SUPPORTED = {
     "reduce",
     "dot_general",
     "gather",
+    "scatter",
 }
 
 
@@ -647,7 +669,7 @@ class _Kernel:
                 for dim, offset in zip(window_dims, a["offset"], strict=True):
                     inner[dim] = f"({inner[dim]} + {coords[offset]})"
                 return self.value(x, tuple(inner))
-            case "reduce" | "dot_general":
+            case "reduce" | "dot_general" | "scatter":
                 return self._read(node, coords)
             case "case":
                 index, *branches = operands
@@ -999,6 +1021,9 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
             return
         for operand in node.operands:
             schedule(operand)
+        if node.name == "scatter":
+            schedule_scatter(node)
+            return
         if node.name == "dot_general":
             schedule_dot(node)
             return
@@ -1032,6 +1057,58 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
         name = f"reduce_{len(launches)}"
         kernel, source = _reduction_kernel(reduction, node, name)
         launch(kernel, source, name, [node], 128)
+
+    def schedule_scatter(node: _Op) -> None:
+        x, indices, updates = node.operands
+        if node.dtype not in (np.float32, np.int32, np.uint32) or indices.dtype not in (
+            np.int32,
+            np.uint32,
+        ):
+            raise UnsupportedProgram(
+                "metal: stablehlo.scatter requires float32/int32/uint32 data and 32-bit indices"
+            )
+        fresh(node)
+        kernel = _Kernel(node.shape)
+        name = f"scatter_init_{len(launches)}"
+        launch(kernel, kernel.source([x], name), name, [node])
+        if not math.prod(updates.shape) or not math.prod(node.shape):
+            return
+        a = node.attributes
+        kernel = _Kernel(updates.shape)
+        batch_coords = iter(c for d, c in enumerate(kernel.coords) if d not in a["window"])
+        index_coords = tuple(
+            "0u" if d == a["vector"] else next(batch_coords) for d in range(len(indices.shape))
+        )
+        inner = ["0l"] * len(node.shape)
+        for component, dim in enumerate(a["map"]):
+            read_coords = list(index_coords)
+            if a["vector"] < len(indices.shape):
+                read_coords[a["vector"]] = f"{component}u"
+            inner[dim] = f"long({kernel.value(indices, tuple(read_coords))})"
+        for dim, index_dim in zip(a["batch"], a["index_batch"], strict=True):
+            inner[dim] = f"long({index_coords[index_dim]})"
+        window_dims = [d for d in range(len(node.shape)) if d not in a["inserted"] + a["batch"]]
+        for dim, offset in zip(window_dims, a["window"], strict=True):
+            inner[dim] = f"({inner[dim]} + long({kernel.coords[offset]}))"
+        condition = (
+            " && ".join(
+                f"({c} >= 0l && {c} < {n}l)" for c, n in zip(inner, node.shape, strict=True)
+            )
+            or "true"
+        )
+        kernel.lines.append(f"if ({condition}) {{")
+        value = kernel.value(updates, kernel.coords)
+        flat = _linear(tuple(f"uint({c})" for c in inner), node.shape)
+        ctype = _ctype(node.dtype)
+        kernel.lines += [
+            f"atomic_fetch_add_explicit(reinterpret_cast<device atomic_{ctype}*>(o0) + ({flat}), {value}, memory_order_relaxed);",
+            "}",
+        ]
+        name = f"scatter_add_{len(launches)}"
+        source = kernel.render([node], name, [])
+        # This grid covers updates, not output elements.
+        launch(kernel, source, name, [node])
+        launches[-1] = dataclasses.replace(launches[-1], grid=math.prod(updates.shape), math_mode=0)
 
     def schedule_dot(node: _Op) -> None:
         from palladium._stablehlo_gemm import gemm_source

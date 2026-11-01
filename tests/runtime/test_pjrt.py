@@ -713,6 +713,39 @@ def test_gather_indexing_matches_cpu():
     """)
 
 
+def test_scatter_add_and_embedding_gradients_match_cpu():
+    _check("""
+        import jax,jax.numpy as jnp,numpy as np
+        from jax import lax
+        metal,cpu=jax.devices('metal')[0],jax.devices('cpu')[0]
+        x=np.arange(30,dtype=np.float32).reshape(5,6)
+        i=np.array([-8,-1,0,2,2,4,8],np.int32)
+        v=np.arange(42,dtype=np.float32).reshape(7,6)
+        cases=[
+            (lambda x,i,v:x.at[i].add(v),x,i,v),
+            (lambda x,i,v:(x+1).at[i].add(v*2),x,i,v),
+            (lambda x,i,v:x.at[i].add(v,mode='clip'),x,i,v),
+            (lambda x,i,v:x.at[:,i].add(v.T),x,i,np.arange(35,dtype=np.float32).reshape(7,5)),
+            (lambda x,i,v:x.at[i,i].add(v),x,np.array([0,2,2,4],np.int32),np.arange(4,dtype=np.float32)),
+            (lambda x,i,v:jax.vmap(lambda a,b,c:a.at[b].add(c))(x,i,v),x,
+             np.array([[0,5]]*5,np.int32),np.ones((5,2),np.float32)),
+            (lambda x,i,v:x.at[i].add(v),x,np.zeros(0,np.int32),np.zeros((0,6),np.float32)),
+            (lambda x,i,v:jax.grad(lambda a:jnp.sum(a[i]**2))(x),x,i,v),
+            (lambda x,i,v:lax.fori_loop(0,3,lambda _,a:a.at[i].add(v),x),x,i,v),
+        ]
+        for dtype in (np.int32,np.uint32):
+            cases.append((lambda x,i,v:x.at[i].add(v),x.astype(dtype),i,v.astype(dtype)))
+        # Thousands of colliding updates catch lost writes, not just index mapping.
+        cases.append((lambda x,i,v:x.at[i].add(v),np.zeros(4,np.float32),
+                      np.arange(10001,dtype=np.int32)%4,np.ones(10001,np.float32)))
+        for fn,x,i,v in cases:
+            run=jax.jit(fn)
+            got=run(*(jax.device_put(a,metal) for a in (x,i,v)))
+            want=run(*(jax.device_put(a,cpu) for a in (x,i,v)))
+            np.testing.assert_array_equal(np.asarray(got),np.asarray(want))
+    """)
+
+
 def test_unsupported_ops_report_unimplemented():
     """A CPU compile first, so the metal one hashes its topology for the cache key."""
     result = _run("""
