@@ -120,7 +120,9 @@ M1 status (2026-11-01): the plugin runs fused elementwise and index-mapping
 programs asynchronously, including guarded concatenate, pad and dynamic slices,
 with pooled buffers. Single-result reductions now schedule intermediate
 buffers and SIMD-group kernels, including split full reductions; variadic
-reducers, `dot_general` and `while` remain open. Steps taken, open items and the success criteria against
+reducers and `dot_general` remain open. Static counted `while` now replays body
+kernels with alternating carry buffers; dynamic conditions remain unsupported.
+Steps taken, open items and the success criteria against
 jax 0.12 are in `notes/metal-pjrt-plugin.md`.
 
 Work that costs time without proving anything: a JAX port of SAM2's image

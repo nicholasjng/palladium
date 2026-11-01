@@ -303,6 +303,74 @@ def test_reduction_special_values_and_integer_extrema():
     """)
 
 
+def test_static_loops_match_cpu():
+    _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
+        x = np.arange(12, dtype=np.float32).reshape(3, 4) / 10
+        cases = []
+        for length in (0, 1, 2, 3, 8, 200):
+            cases += [
+                (lambda x, length=length: lax.fori_loop(0, length, lambda i, y: y * 0.9 + i, x), x),
+                (lambda x, length=length: lax.scan(lambda y, _: (y * 0.9 + 1, y * 2),
+                                                  x, None, length=length), x),
+                # Three-way rotation exposes carry/output aliasing with two banks.
+                (lambda x, length=length: lax.fori_loop(0, length,
+                    lambda i, s: (s[1], s[2], s[0] + i), (x, x + 1, x + 2)), x),
+            ]
+        cases += [
+            (lambda x: lax.while_loop(lambda s: s[0] < 5,
+                lambda s: (s[0] + 1, s[1] + s[2], s[2]), (-3, x, x * 2)), x),
+            (lambda x: lax.fori_loop(0, 3, lambda i, y:
+                lax.fori_loop(0, 4, lambda j, z: z * 0.5 + j, y) + i, x), x),
+            (lambda x: lax.fori_loop(0, 4, lambda i, y:
+                y - y.mean(-1, keepdims=True) + i, x), x),
+            # A scan with xs exercises dynamic slices and the trajectory update.
+            (lambda x: lax.scan(lambda c, row: (c + row, c * 2), jnp.zeros(4), x), x),
+            (lambda x: lax.scan(lambda c, row: (c + row, c * 2), jnp.zeros(4), x,
+                               reverse=True), x),
+            (lambda x: lax.fori_loop(0, 4, lambda i, y: y + 1, x), np.zeros((0, 3), np.float32)),
+            (lambda x: lax.while_loop(lambda s: s[0] < np.uint32(2**32 - 1),
+                lambda s: (s[0] + np.uint32(1), s[1] + 1),
+                (np.uint32(2**32 - 3), x)), x),
+        ]
+        for fn, x in cases:
+            run = jax.jit(fn)
+            got, want = run(jax.device_put(x, metal)), run(jax.device_put(x, cpu))
+            for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+                np.testing.assert_allclose(np.asarray(g), np.asarray(w), rtol=2e-5, atol=1e-5)
+    """)
+
+
+def test_static_loop_buffers_survive_queued_calls():
+    _check("""
+        import jax, numpy as np
+        from jax import lax
+        device = jax.devices('metal')[0]
+        run = jax.jit(lambda x: lax.fori_loop(0, 17, lambda i, y: y + 1, x))
+        results = []
+        for i in range(40):
+            x = jax.device_put(np.full((4096,), i, np.float32), device)
+            results.append(run(x))
+            x.delete()
+        for i, y in enumerate(results):
+            np.testing.assert_array_equal(np.asarray(y), np.full((4096,), i + 17, np.float32))
+    """)
+
+
+def test_dynamic_loop_reports_unimplemented():
+    result = _run("""
+        import jax, numpy as np
+        from jax import lax
+        device = jax.devices('metal')[0]
+        run = jax.jit(lambda n: lax.while_loop(lambda i: i < n, lambda i: i + 1, 0))
+        run(jax.device_put(np.int32(3), device))
+    """)
+    assert result.returncode != 0
+    assert "UNIMPLEMENTED: metal: stablehlo.while requires" in result.stderr
+
+
 def test_unsupported_ops_report_unimplemented():
     """A CPU compile first, so the metal one hashes its topology for the cache key."""
     result = _run("""

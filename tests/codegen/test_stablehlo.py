@@ -111,3 +111,46 @@ def test_full_reduction_splits_into_partials():
     assert program.slots[partial].shape == (3,)
     assert partial == second.slots[0]
     assert first.grid == 3 * 128 and second.grid == 128
+
+
+def test_counted_loop_reuses_sources_and_bounded_storage():
+    def compile_scan(length):
+        return _compile(
+            lambda x: lax.scan(lambda c, _: (c + 1, None), x, None, length=length)[0], (4,)
+        )
+
+    short, long = compile_scan(3), compile_scan(200)
+    assert len(short.slots) == len(long.slots)
+    assert len(long.launches) > len(short.launches)
+    assert (
+        len({launch.source for launch in long.launches}) == 3
+    )  # counter init and two body kernels
+    # The result alternates output banks according to parity.
+    assert short.outputs != long.outputs
+
+
+def test_zero_trip_loop_returns_initial_value():
+    program = _compile(
+        lambda x: lax.while_loop(lambda s: s[0] < 0, lambda s: (s[0] + 1, s[1] * 2), (0, x))[1],
+        (4,),
+    )
+    assert program.outputs == [0]
+    assert not any(launch.function.startswith("fused") for launch in program.launches)
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        lambda x: lax.while_loop(lambda s: s[0] < x[0], lambda s: (s[0] + 1, s[1] + 2), (0, x))[1],
+        lambda x: lax.while_loop(lambda s: s[0] < 3, lambda s: (s[0] + 2, s[1] + 2), (0, x))[1],
+        lambda x: lax.while_loop(lambda s: s[0] <= 3, lambda s: (s[0] + 1, s[1] + 2), (0, x))[1],
+    ],
+)
+def test_unproven_loop_is_rejected(fn):
+    with pytest.raises(UnsupportedProgram, match="stablehlo.while requires"):
+        _compile(fn, (4,))
+
+
+def test_loop_replay_budget_is_checked():
+    with pytest.raises(UnsupportedProgram, match="replay limit"):
+        _compile(lambda x: lax.fori_loop(0, 100001, lambda i, y: y + 1, x), (4,))

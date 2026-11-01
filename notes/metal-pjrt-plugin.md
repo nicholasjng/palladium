@@ -25,17 +25,23 @@ Works:
   arbitrary axes, including empty reductions. Producers fuse into reduction
   reads; consumers read intermediate slots in later launches. This enables
   softmax, means, variances and normalization programs.
+- Static counted `while`, including `lax.scan` trajectories and nested loops:
+  a scalar i32/ui32 counter starting at a constant, compared with LT to a
+  constant bound, incremented by one. Body kernels replay in one command
+  buffer with alternating carry buffers and no host condition reads.
 - Asynchronous execution with completion events, a buffer pool, and at most
   16 executions in flight.
 
 Fails with UNIMPLEMENTED, naming the op (`palladium.stablehlo` raises
 `UnsupportedProgram`): variadic or other reducer bodies (including argmax and
-product), `dot_general`, `while`, `case`,
+product), `dot_general`, dynamic or unrecognized `while`, `case`,
 `gather`,
 `scatter`, `reduce_window`, `sort`, `convolution`, and any op on 64-bit
 types. So far none of `examples/training_steps.py` runs: SBI stops at
-`while`, the LLM step at `gather`, the SAM2-like step at
-`convolution` (rechecked after guarded index maps). Key creation works, but
+`dot_general`, the LLM step at `gather`, the SAM2-like step at
+`convolution` (rechecked after counted loops). Parsing past the loop does not
+yet establish RNG execution: unsupported dtypes are checked during scheduling,
+after graph construction reaches the dot. Key creation works, but
 random sampling still needs more ops, so initialize benchmark inputs on CPU:
 
 ```python
@@ -228,15 +234,23 @@ In order of what M2's SBI step needs first.
    multiply and shifts, so `jax.random.normal` needs `long` and `ulong` in
    `stablehlo.py`'s type map. Add them there, not to the emitter's
    `CTYPES`, which Pallas kernels share.
-4. **`while` without host round trips.** SBI's 200-step `lax.scan` lowers
-   to `stablehlo.while` with a counter compared against a constant. For a
-   static trip count (recognize: counter starts at a constant, the body adds
-   1, the condition is `LT` against a constant), encode the body that many
-   times into the same command buffer, alternating carry buffers. A dynamic
-   condition would need a host read per iteration (about 150 µs each) or
-   GPU-driven dispatch (indirect command buffers); leave it UNIMPLEMENTED
-   until a workload needs it. `case` with a device predicate: compute both
-   branches and select when they are cheap, else the same choice as `while`.
+4. **`while` without host round trips (counted slice done).** The compiler
+   proves the constant-start, LT-bound, unit-increment pattern, including
+   invariant bounds and hoisted constants in the PJRT artifact. It compiles
+   a body template once and rebinds its launches per iteration. Changed
+   carries have two output banks; even carry permutations are materialized,
+   so outputs cannot overwrite inputs still needed by that iteration.
+   Invariant carries retain their original slots. Body temporaries are reused
+   between iterations. Nested counted loops, reductions inside loops,
+   forward/reverse scans, zero trips and queued executions have CPU comparisons.
+   A per-graph 100,000-launch limit rejects excessive replay expansion.
+   `pp_kernel` caches libraries/pipelines per executable by source, entry point
+   and math mode, so replayed launches do not recompile identical shaders.
+
+   Dynamic conditions and other induction patterns remain UNIMPLEMENTED.
+   They would need host condition reads or GPU-driven dispatch. `case` with
+   a device predicate remains open. Trajectory updates currently copy the
+   full carried array per iteration; in-place disjoint updates are future work.
 5. **`dot_general`.** Reuse palladium's GEMM rather than writing a new one:
    build a Pallas matmul for the dot's dimension numbers (batch dimensions
    as a grid axis) and emit it with palladium's emitter. That gives the

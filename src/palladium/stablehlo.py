@@ -206,6 +206,77 @@ class _Op(_Node):
     attributes: dict
 
 
+@dataclasses.dataclass(eq=False)
+class _While:
+    inputs: list[_Node]  # carries followed by lexical captures
+    parameters: list[_Parameter]
+    results: list[_Node]  # updated carries
+    trips: int
+
+
+@dataclasses.dataclass(eq=False)
+class _LoopResult(_Node):
+    loop: _While
+    index: int
+    dtype: np.dtype
+    shape: tuple[int, ...]
+
+
+def _dependencies(node: _Node) -> list[_Node]:
+    if isinstance(node, _Op):
+        return node.operands
+    if isinstance(node, _LoopResult):
+        return node.loop.inputs
+    return []
+
+
+def _trip_count(
+    predicate: _Node, parameters: list[_Parameter], inputs: list[_Node], results: list[_Node]
+) -> int:
+    """Prove a scalar integer counter starts at a constant and advances to a bound."""
+    message = "metal: stablehlo.while requires a constant counter, LT bound and unit increment"
+
+    def invariant(value: _Node) -> _Node:
+        if isinstance(value, _Parameter) and value in parameters:
+            k = parameters.index(value)
+            if k >= len(results) or results[k] is value:
+                return inputs[k]
+        return value
+
+    if (
+        not isinstance(predicate, _Op)
+        or predicate.name != "compare"
+        or predicate.attributes["direction"] != "lt"
+    ):
+        raise UnsupportedProgram(message)
+    counter, bound = predicate.operands
+    if not isinstance(counter, _Parameter) or counter not in parameters[: len(results)]:
+        raise UnsupportedProgram(message)
+    index = parameters.index(counter)
+    if counter.shape or counter.dtype not in (np.int32, np.uint32):
+        raise UnsupportedProgram(message)
+    increment = results[index]
+    if not isinstance(increment, _Op) or increment.name != "add":
+        raise UnsupportedProgram(message)
+    a, b = increment.operands
+    one = b if a is counter else a if b is counter else None
+    if one is not None:
+        one = invariant(one)
+    if not isinstance(one, _Constant) or one.splat != 1:
+        raise UnsupportedProgram(message)
+    # An invariant carry or lexical capture can supply a constant loop bound.
+    bound = invariant(bound)
+    start = inputs[index]
+    if (
+        not isinstance(start, _Constant)
+        or start.splat is None
+        or not isinstance(bound, _Constant)
+        or bound.splat is None
+    ):
+        raise UnsupportedProgram(message)
+    return max(0, int(bound.splat) - int(start.splat))
+
+
 def _constant(op) -> _Constant:
     dtype, shape = _tensor(op.result)
     attr = ir.DenseElementsAttr(op.attributes["value"])
@@ -315,18 +386,46 @@ def _graph(module: ir.Module) -> tuple[list[_Parameter], list[_Node]]:
         if op.operation.name == "func.func"
     }
 
-    def walk(function, args: list[_Node]) -> list[_Node]:
-        block = function.regions[0].blocks[0]
-        env: dict[ir.Value, _Node] = dict(zip(block.arguments, args, strict=True))
+    def walk(block, args: list[_Node], outer: dict | None = None) -> list[_Node]:
+        env: dict[ir.Value, _Node] = dict(outer or {})
+        env.update(zip(block.arguments, args, strict=True))
         for op in block.operations:
             name = op.operation.name
-            if name == "func.return":
+            if name in ("func.return", "stablehlo.return"):
                 return [env[v] for v in op.operands]
             if name in ("func.call", "stablehlo.composite"):
                 key = "callee" if name == "func.call" else "decomposition"
                 callee = functions[ir.FlatSymbolRefAttr(op.attributes[key]).value]
-                results = walk(callee, [env[v] for v in op.operands])
+                results = walk(callee.regions[0].blocks[0], [env[v] for v in op.operands])
                 env.update(zip(op.results, results, strict=True))
+                continue
+            if name == "stablehlo.while":
+                inputs = [env[v] for v in op.operands]
+                parameters = [_Parameter(i, *_tensor(v)) for i, v in enumerate(op.operands)]
+                # Replace lexical values by parameters, then keep only used captures.
+                captures = {
+                    v: n
+                    if isinstance(n, _Constant)
+                    else _Parameter(len(parameters) + i, n.dtype, n.shape)
+                    for i, (v, n) in enumerate(env.items())
+                }
+                condition = walk(op.regions[0].blocks[0], list(parameters), captures)[0]
+                body = walk(op.regions[1].blocks[0], list(parameters), captures)
+                used: set[_Node] = set()
+                pending = [condition, *body]
+                while pending:
+                    node = pending.pop()
+                    if node not in used:
+                        used.add(node)
+                        pending.extend(_dependencies(node))
+                for value, parameter in captures.items():
+                    if isinstance(parameter, _Parameter) and parameter in used:
+                        parameters.append(parameter)
+                        inputs.append(env[value])
+                trips = _trip_count(condition, parameters, inputs, body)
+                loop = _While(inputs, parameters, body, trips)
+                for i, value in enumerate(op.results):
+                    env[value] = _LoopResult(loop, i, *_tensor(value))
                 continue
             short = name.removeprefix("stablehlo.")
             if name == "stablehlo.constant":
@@ -343,7 +442,7 @@ def _graph(module: ir.Module) -> tuple[list[_Parameter], list[_Node]]:
     main = functions["main"]
     block = main.regions[0].blocks[0]
     parameters = [_Parameter(i, *_tensor(v)) for i, v in enumerate(block.arguments)]
-    return parameters, walk(main, list(parameters))
+    return parameters, walk(block, list(parameters))
 
 
 class _Kernel:
@@ -424,7 +523,7 @@ class _Kernel:
 
     def _expression(self, node: _Node, coords: tuple[str, ...]) -> str:
         ctype = _ctype(node.dtype)
-        if isinstance(node, _Parameter):
+        if isinstance(node, (_Parameter, _LoopResult)):
             return self._read(node, coords)
         if isinstance(node, _Constant):
             if node.splat is None:
@@ -667,6 +766,11 @@ def compile_program(code: bytes) -> Program:
         module = stablehlo.deserialize_portable_artifact(ctx, code)
         parameters, results = _graph(module)
 
+    return _compile_graph(parameters, results)
+
+
+def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Program:
+
     slots = [Slot("parameter", p.dtype, p.shape) for p in parameters]
     slot_of: dict[int, int] = {id(p): k for k, p in enumerate(parameters)}
 
@@ -694,11 +798,71 @@ def compile_program(code: bytes) -> Program:
 
     visited: set[int] = set()
     temporaries: list[_Node] = []  # keep synthetic nodes alive while slot_of uses their ids
+    loop_slots: dict[_While, list[int]] = {}
+
+    def materialize(node: _Node) -> int:
+        schedule(node)
+        if id(node) not in slot_of:
+            if isinstance(node, _Constant) and node.splat is None:
+                add_constant(node)
+            else:
+                fresh(node)
+                kernel = _Kernel(node.shape)
+                name = f"init_{len(launches)}"
+                launch(kernel, kernel.source([node], name), name, [node])
+        return slot_of[id(node)]
+
+    def schedule_loop(loop: _While) -> list[int]:
+        if loop in loop_slots:
+            return loop_slots[loop]
+        current = [materialize(n) for n in loop.inputs]
+        count = len(loop.results)
+        if not loop.trips:
+            loop_slots[loop] = current[:count]
+            return loop_slots[loop]
+        # Force every changing carry into its own output slot, even swaps and
+        # constants. Only true invariants may alias a body parameter. This makes
+        # two output banks safe for permutations with any cycle length.
+        body_results: list[_Node] = [
+            result
+            if result is loop.parameters[k]
+            else _Op("reshape", [result], result.dtype, result.shape, {})
+            for k, result in enumerate(loop.results)
+        ]
+        body = _compile_graph(loop.parameters, body_results)
+        if len(launches) + loop.trips * len(body.launches) > 100_000:
+            raise UnsupportedProgram(
+                "metal: stablehlo.while exceeds the 100000-launch replay limit"
+            )
+        fixed: dict[int, int] = {}
+        banks: list[dict[int, int]] = [{}, {}]
+        output_set = set(body.outputs)
+        for k, slot in enumerate(body.slots):
+            if slot.kind == "parameter":
+                continue
+            fixed[k] = len(slots)
+            slots.append(slot)
+            if k in output_set and slot.kind == "fresh":
+                banks[0][k] = fixed[k]
+                banks[1][k] = len(slots)
+                slots.append(slot)
+        for iteration in range(loop.trips):
+            bindings = fixed | dict(enumerate(current)) | banks[iteration % 2]
+            launches.extend(
+                dataclasses.replace(item, slots=tuple(bindings[s] for s in item.slots))
+                for item in body.launches
+            )
+            current = [bindings[s] for s in body.outputs] + current[count:]
+        loop_slots[loop] = current[:count]
+        return loop_slots[loop]
 
     def schedule(node: _Node) -> None:
         if id(node) in visited:
             return
         visited.add(id(node))
+        if isinstance(node, _LoopResult):
+            slot_of[id(node)] = schedule_loop(node.loop)[node.index]
+            return
         if not isinstance(node, _Op):
             return
         for operand in node.operands:
