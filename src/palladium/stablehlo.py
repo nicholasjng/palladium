@@ -232,11 +232,30 @@ class _LoopResult(_Node):
     shape: tuple[int, ...]
 
 
+@dataclasses.dataclass(eq=False)
+class _VariadicReduce:
+    inputs: list[_Node]
+    initial: list[_Node]
+    parameters: list[_Parameter]
+    body: list[_Node]
+    dims: tuple[int, ...]
+
+
+@dataclasses.dataclass(eq=False)
+class _ReductionResult(_Node):
+    reduction: _VariadicReduce
+    index: int
+    dtype: np.dtype
+    shape: tuple[int, ...]
+
+
 def _dependencies(node: _Node) -> list[_Node]:
     if isinstance(node, _Op):
         return node.operands
     if isinstance(node, _LoopResult):
         return node.loop.inputs
+    if isinstance(node, _ReductionResult):
+        return node.reduction.inputs + node.reduction.initial
     return []
 
 
@@ -539,6 +558,48 @@ def _graph(module: ir.Module) -> tuple[list[_Parameter], list[_Node]]:
                 for i, value in enumerate(op.results):
                     env[value] = _LoopResult(loop, i, *_tensor(value))
                 continue
+            if name == "stablehlo.reduce" and len(op.results) > 1:
+                count = len(op.results)
+                block = op.regions[0].blocks[0]
+                params = [_Parameter(i, *_tensor(v)) for i, v in enumerate(block.arguments)]
+                body = walk(block, list(params), env)
+                pending, seen = list(body), set()
+                allowed = {
+                    *_ELEMENTWISE,
+                    *_EXTRA,
+                    "compare",
+                    "select",
+                    "convert",
+                    "bitcast_convert",
+                }
+                while pending:
+                    value = pending.pop()
+                    if value in seen:
+                        continue
+                    seen.add(value)
+                    if (
+                        value.shape
+                        or (isinstance(value, _Parameter) and value not in params)
+                        or (
+                            not isinstance(value, (_Constant, _Parameter))
+                            and (not isinstance(value, _Op) or value.name not in allowed)
+                        )
+                    ):
+                        raise UnsupportedProgram(
+                            "metal: variadic reduce requires a scalar elementwise body"
+                        )
+                    pending.extend(_dependencies(value))
+                inputs = [env[v] for v in op.operands]
+                reduction = _VariadicReduce(
+                    inputs[:count],
+                    inputs[count:],
+                    params,
+                    body,
+                    tuple(ir.DenseI64ArrayAttr(op.attributes["dimensions"])),
+                )
+                for k, value in enumerate(op.results):
+                    env[value] = _ReductionResult(reduction, k, *_tensor(value))
+                continue
             short = name.removeprefix("stablehlo.")
             if name == "stablehlo.constant":
                 env[op.result] = _constant(op)
@@ -635,7 +696,7 @@ class _Kernel:
 
     def _expression(self, node: _Node, coords: tuple[str, ...]) -> str:
         ctype = _ctype(node.dtype)
-        if isinstance(node, (_Parameter, _LoopResult)):
+        if isinstance(node, (_Parameter, _LoopResult, _ReductionResult)):
             return self._read(node, coords)
         if isinstance(node, _Constant):
             if node.splat is None:
@@ -953,6 +1014,56 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
     visited: set[int] = set()
     temporaries: list[_Node] = []  # keep synthetic nodes alive while slot_of uses their ids
     loop_slots: dict[_While, list[int]] = {}
+    reduction_slots: dict[_VariadicReduce, list[int]] = {}
+
+    def schedule_variadic(node: _ReductionResult) -> int:
+        reduction = node.reduction
+        if reduction in reduction_slots:
+            return reduction_slots[reduction][node.index]
+        for operand in reduction.inputs + reduction.initial:
+            schedule(operand)
+        outputs: list[_Node] = [
+            _ReductionResult(reduction, k, value.dtype, node.shape)
+            for k, value in enumerate(reduction.body)
+        ]
+        temporaries.extend(outputs)
+        for result in outputs:
+            fresh(result)
+        kernel = _Kernel(node.shape)
+        accumulators = [f"acc{k}" for k in range(len(outputs))]
+        for name, value in zip(accumulators, reduction.initial, strict=True):
+            initial = kernel.value(value, ())
+            kernel.lines.append(f"{_ctype(value.dtype)} {name} = {initial};")
+        shape = reduction.inputs[0].shape
+        dims = sorted(reduction.dims)
+        reduced_shape = tuple(shape[d] for d in dims)
+        size = math.prod(reduced_shape)
+        if size:
+            kernel.lines.append(f"for (uint r = 0u; r < {size}u; ++r) {{")
+            red_coords, out_coords = iter(_delinear("r", reduced_shape)), iter(kernel.coords)
+            coords = tuple(
+                next(red_coords) if d in dims else next(out_coords) for d in range(len(shape))
+            )
+            values = [kernel.value(value, coords) for value in reduction.inputs]
+            # Lexicographic left fold preserves JAX's first-index tie/NaN rule.
+            # Bind the actual reducer body rather than guessing an argmax pattern.
+            for param, value in zip(reduction.parameters, accumulators + values, strict=True):
+                kernel.values[(id(param), ())] = value
+            new_values = [kernel.value(value, ()) for value in reduction.body]
+            # Snapshot all results before mutating any accumulator (parallel tuple update).
+            snapshots = []
+            for value, result in zip(new_values, outputs, strict=True):
+                tmp = kernel.temporary()
+                kernel.lines.append(f"{_ctype(result.dtype)} {tmp} = {value};")
+                snapshots.append(tmp)
+            kernel.lines.extend(f"{a} = {v};" for a, v in zip(accumulators, snapshots, strict=True))
+            kernel.lines.append("}")
+        name = f"variadic_reduce_{len(launches)}"
+        stores = [f"o{k}[i] = {v};" for k, v in enumerate(accumulators)]
+        launch(kernel, kernel.render(outputs, name, stores), name, outputs)
+        launches[-1] = dataclasses.replace(launches[-1], math_mode=0)
+        reduction_slots[reduction] = [slot_of[id(result)] for result in outputs]
+        return reduction_slots[reduction][node.index]
 
     def materialize(node: _Node) -> int:
         schedule(node)
@@ -1014,6 +1125,9 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
         if id(node) in visited:
             return
         visited.add(id(node))
+        if isinstance(node, _ReductionResult):
+            slot_of[id(node)] = schedule_variadic(node)
+            return
         if isinstance(node, _LoopResult):
             slot_of[id(node)] = schedule_loop(node.loop)[node.index]
             return

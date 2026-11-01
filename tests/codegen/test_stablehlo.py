@@ -78,7 +78,6 @@ def test_guarded_index_maps_still_fuse():
     ("fn", "message"),
     [
         (lambda x: x.prod(), "stablehlo.reduce"),
-        (lambda x: x.argmax(), "stablehlo.reduce"),
         (lambda x: x.astype(jnp.int32) @ x.astype(jnp.int32), "stablehlo.dot_general"),
     ],
 )
@@ -255,3 +254,11 @@ def test_scatter_initialization_precedes_atomic_updates():
 def test_non_add_scatter_is_rejected():
     with pytest.raises(UnsupportedProgram, match="single add update"):
         _compile(lambda x, i: x.at[i.astype(jnp.int32)].set(1), (7, 3), (4,))
+
+
+def test_argmax_uses_one_variadic_reduction():
+    program = _compile(lambda x: x.argmax(1), (3, 17))
+    [launch] = program.launches
+    assert launch.function.startswith("variadic_reduce")
+    assert launch.math_mode == 0
+    assert len(launch.slots) == 3  # input, value result, index result

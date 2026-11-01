@@ -746,6 +746,41 @@ def test_scatter_add_and_embedding_gradients_match_cpu():
     """)
 
 
+def test_argmax_argmin_and_variadic_reducers_match_cpu():
+    _check("""
+        import jax,jax.numpy as jnp,ml_dtypes,numpy as np
+        from jax import lax
+        metal,cpu=jax.devices('metal')[0],jax.devices('cpu')[0]
+        rng=np.random.default_rng(4)
+        cases=[]
+        for dtype in (np.float32,np.float16,ml_dtypes.bfloat16,np.int32,np.uint32,np.bool_):
+            x=rng.integers(0,7,(3,5,37)).astype(dtype)
+            for axis in (0,1,2,None):
+                cases.append((lambda x,axis=axis:(x.argmax(axis),x.argmin(axis)),x))
+        for n in (1,33,10001):
+            x=np.zeros((5,n),np.float32)
+            x[0,:]=np.nan
+            x[1,:]=np.inf
+            x[2,:]=-np.inf
+            x[3,-1]=np.nan
+            x[4,:]=-0.0
+            x[4,-1]=0.0
+            cases.append((lambda x:(x.argmax(-1),x.argmin(-1)),x))
+        x=np.array([[2**30+1,2**30+2,2**30+2],[-2**31,2**31-1,0]],np.int32)
+        cases.append((lambda x:(x.argmax(-1),x.argmin(-1)),x))
+        cases.append((lambda x:lax.reduce((x,x*2),(np.float32(0),np.float32(0)),
+                      lambda a,b:(a[0]+b[0],a[1]+b[1]),(0,2)),
+                      np.arange(3*5*7,dtype=np.float32).reshape(3,5,7)))
+        cases.append((lambda x:lax.reduce((x,x),(np.float32(3),np.float32(4)),
+                      lambda a,b:(a[0]+b[0],a[1]+b[1]),(1,)),np.empty((3,0),np.float32)))
+        for fn,x in cases:
+            run=jax.jit(fn)
+            got,want=run(jax.device_put(x,metal)),run(jax.device_put(x,cpu))
+            for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
+                np.testing.assert_array_equal(np.asarray(g),np.asarray(w))
+    """)
+
+
 def test_unsupported_ops_report_unimplemented():
     """A CPU compile first, so the metal one hashes its topology for the cache key."""
     result = _run("""
