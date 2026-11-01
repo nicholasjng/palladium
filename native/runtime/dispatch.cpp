@@ -252,6 +252,23 @@ void CommandBatch::commit() {
     commit_locked();
 }
 
+void CommandBatch::commit(std::function<void(const char* error)> on_completed) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (committed_) throw DispatchError("cannot add a completion handler after commit");
+    command_buffer_->addCompletedHandler(
+        [on_completed = std::move(on_completed)](MTL::CommandBuffer* command_buffer) {
+            AutoreleaseScope scope;
+            if (command_buffer->status() == MTL::CommandBufferStatusError) {
+                std::string message =
+                    "kernel execution failed: " + describe(command_buffer->error());
+                on_completed(message.c_str());
+            } else {
+                on_completed(nullptr);
+            }
+        });
+    commit_locked();
+}
+
 void CommandBatch::commit_locked() {
     if (committed_) return;
     committed_ = true;

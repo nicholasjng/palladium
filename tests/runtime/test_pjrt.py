@@ -109,6 +109,30 @@ def test_programs_match_cpu():
     assert out.strip() == "15"
 
 
+def test_executions_run_ahead_of_the_gpu():
+    """Chained calls queue without waiting; an input deleted while its call is in
+    flight, and the uploads reusing pooled memory after it, leave the result intact."""
+    _check("""
+        import jax, numpy as np
+        metal = jax.devices("metal")[0]
+        step = jax.jit(lambda y: y * 0.5 + 1)
+        y, want = jax.device_put(np.zeros(1 << 20, np.float32), metal), np.zeros(1 << 20, np.float32)
+        for _ in range(64):
+            y, want = step(y), want * np.float32(0.5) + 1
+        np.testing.assert_array_equal(np.asarray(y), want)
+
+        x = np.arange(1 << 20, dtype=np.float32)
+        results = []
+        for k in range(32):
+            a = jax.device_put(x + k, metal)
+            results.append(step(a))
+            a.delete()
+            jax.device_put(np.full_like(x, -1), metal)  # same size: pooled memory
+        for k, r in enumerate(results):
+            np.testing.assert_array_equal(np.asarray(r), (x + k) * 0.5 + 1)
+    """)
+
+
 def test_unsupported_ops_report_unimplemented():
     """A CPU compile first, so the metal one hashes its topology for the cache key."""
     result = _run("""

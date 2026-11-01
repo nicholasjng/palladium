@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -100,6 +101,10 @@ class CommandBatch {
 
     // Submits without blocking.
     void commit();
+
+    // Submits without blocking; `on_completed` runs on a Metal thread once the
+    // GPU is done, with the failure message of a faulted command buffer or null.
+    void commit(std::function<void(const char* error)> on_completed);
 
     // Commits if needed, then blocks until done. Throws DispatchError on a
     // faulted command buffer. Every caller blocks, however many times.

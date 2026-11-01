@@ -1,5 +1,7 @@
 // Types and helpers shared by the `metal` PJRT plugin's translation units.
 #pragma once
+#include <condition_variable>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -17,7 +19,33 @@ struct Error : PJRT_Error {
     std::string message;
 };
 
-struct PJRT_Event {};
+// Completion of host or GPU work, shared by the PJRT_Events that report it
+// and the buffers it defines or reads.
+class Completion {
+   public:
+    // An already completed one, for work done synchronously.
+    static std::shared_ptr<Completion> done();
+
+    void set(PJRT_Error_Code code = PJRT_Error_Code_OK, std::string message = {});
+    bool ready();
+    void wait();
+    // A new error if the work failed, else null; call once ready.
+    PJRT_Error* error();
+    // Runs `f` once complete: at once if it is, else on the completing thread.
+    void then(std::function<void()> f);
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool ready_ = false;
+    PJRT_Error_Code code_ = PJRT_Error_Code_OK;
+    std::string message_;
+    std::vector<std::function<void()>> callbacks_;
+};
+
+struct PJRT_Event {
+    std::shared_ptr<Completion> completion;
+};
 
 struct PJRT_DeviceDescription {
     std::string kind, debug_string, to_string;
@@ -52,11 +80,21 @@ struct PJRT_Client {
     PJRT_TopologyDescription topology{&device.description};
 };
 
+// Buffers come from a pool keyed by size: GPU allocations cost tens of
+// microseconds and are zeroed. A released buffer returns to the pool once
+// `last_use` completes, so host copies never race GPU work still using it.
+std::unique_ptr<Buffer> acquire(size_t size_bytes);
+void release(std::unique_ptr<Buffer> buffer, std::shared_ptr<Completion> last_use);
+
 struct PJRT_Buffer {
     PJRT_Device* device;
     PJRT_Buffer_Type type;
     std::vector<int64_t> dims, minor_to_major;
     std::unique_ptr<Buffer> storage;  // null once deleted
+    // Its contents are defined, and GPU work reading or writing it has finished.
+    std::shared_ptr<Completion> ready = Completion::done(), last_use = Completion::done();
+
+    ~PJRT_Buffer() { release(std::move(storage), last_use); }
 };
 
 PJRT_Error* error(PJRT_Error_Code code, std::string message);
@@ -71,6 +109,9 @@ PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_
 
 // An error if the buffer has been deleted.
 PJRT_Error* deleted(const PJRT_Buffer* buffer);
+
+// Waits until the buffer's contents are defined; their failure as an error.
+PJRT_Error* wait_ready(const PJRT_Buffer* buffer);
 
 // Compilation and execution: PJRT_Client_Compile and the executable functions.
 void add_executable_api(PJRT_Api& api);

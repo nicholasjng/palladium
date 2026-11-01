@@ -1,17 +1,20 @@
 // Compilation and execution for the `metal` PJRT plugin. PJRT_Client_Compile
 // hands the StableHLO program to a compiler that palladium registers from
 // Python; it describes the program through the pp_* builder functions as
-// buffer slots and kernel launches, which Execute runs in one command buffer.
+// buffer slots and kernel launches, which Execute encodes into one command
+// buffer and commits without waiting.
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "dispatch.h"
 #include "errors.h"
 #include "library.h"
-#include "pjrt.h"
+#include "plugin.h"
 #include "runtime.h"
 
 namespace {
@@ -162,14 +165,36 @@ PJRT_Error* new_output(PJRT_Device* device, const Slot& slot, PJRT_Buffer** out)
     return make_buffer(device, slot.type, slot.dims.data(), slot.dims.size(), out);
 }
 
-// Runs every kernel in one command buffer and waits; returns the outputs.
-PJRT_Error* execute(const Program& p, PJRT_Device* device, PJRT_Buffer* const* args,
-                    size_t num_args, PJRT_Buffer** outputs) {
+// Executions the GPU has not finished, oldest first. Execute waits for the
+// oldest beyond kMaxInFlight, so a caller running ahead of the GPU reuses
+// pooled buffers instead of allocating for every queued call.
+constexpr size_t kMaxInFlight = 16;
+std::mutex in_flight_mutex;
+std::deque<std::shared_ptr<Completion>> in_flight;
+
+void throttle() {
+    std::unique_lock lock(in_flight_mutex);
+    while (!in_flight.empty() && (in_flight.front()->ready() || in_flight.size() >= kMaxInFlight)) {
+        std::shared_ptr<Completion> oldest = in_flight.front();
+        in_flight.pop_front();
+        lock.unlock();
+        oldest->wait();
+        lock.lock();
+    }
+}
+
+// Encodes every kernel into one command buffer and returns without waiting:
+// the outputs are defined, and `completion` set, once the GPU is done.
+PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
+                    PJRT_Buffer* const* args, size_t num_args, PJRT_Buffer** outputs,
+                    std::shared_ptr<Completion> completion) {
+    const Program& p = *program;
     if ((int)num_args != p.num_parameters) {
         return error(PJRT_Error_Code_INVALID_ARGUMENT,
                      "metal: the program takes " + std::to_string(p.num_parameters) +
                          " arguments, got " + std::to_string(num_args));
     }
+    throttle();
     std::vector<Buffer*> bound(p.slots.size());
     std::vector<std::unique_ptr<PJRT_Buffer>> fresh(p.slots.size());
     for (size_t s = 0; s < p.slots.size(); ++s) {
@@ -186,35 +211,62 @@ PJRT_Error* execute(const Program& p, PJRT_Device* device, PJRT_Buffer* const* a
             bound[s] = buffer->storage.get();
         }
     }
-    if (!p.kernels.empty()) {
-        try {
-            CommandBatch batch(runtime());
-            for (const Kernel& k : p.kernels) {
-                if (!k.grid.volume()) continue;
-                Launch launch;
-                launch.pipeline = k.pipeline.get();
-                for (int s : k.slots) launch.buffers.push_back({bound[s], 0});
-                launch.grid = k.grid;
-                launch.threadgroup =
-                    k.threadgroup.volume() ? k.threadgroup : k.pipeline->default_threadgroup(k.grid);
-                batch.add(launch);
-            }
-            batch.wait();
-        } catch (const std::exception& e) {
-            return error(PJRT_Error_Code_INTERNAL, std::string("metal: ") + e.what());
-        }
-    }
-    // A fresh slot becomes the output once; parameters, constants and
-    // repeated outputs are copied.
+    // A fresh slot becomes its first output; parameters, constants and repeated
+    // outputs are copied into new buffers once the kernels are done.
+    std::vector<std::unique_ptr<PJRT_Buffer>> results(p.outputs.size());
+    std::vector<std::pair<Buffer*, Buffer*>> copies;
     for (size_t i = 0; i < p.outputs.size(); ++i) {
         int s = p.outputs[i];
         if (fresh[s]) {
-            outputs[i] = fresh[s].release();
+            results[i] = std::move(fresh[s]);
             continue;
         }
-        if (PJRT_Error* e = new_output(device, p.slots[s], &outputs[i])) return e;
-        std::memcpy(outputs[i]->storage->contents(), bound[s]->contents(),
-                    byte_size(outputs[i]));
+        PJRT_Buffer* buffer;
+        if (PJRT_Error* e = new_output(device, p.slots[s], &buffer)) return e;
+        results[i].reset(buffer);
+        copies.emplace_back(bound[s], buffer->storage.get());
+    }
+    auto finish = [program, completion, copies](const char* failure) {
+        if (failure) return completion->set(PJRT_Error_Code_INTERNAL, failure);
+        for (auto [src, dst] : copies) std::memcpy(dst->contents(), src->contents(), dst->size());
+        completion->set();
+    };
+    try {
+        CommandBatch batch(runtime());
+        bool encoded = false;
+        for (const Kernel& k : p.kernels) {
+            if (!k.grid.volume()) continue;
+            Launch launch;
+            launch.pipeline = k.pipeline.get();
+            for (int s : k.slots) launch.buffers.push_back({bound[s], 0});
+            launch.grid = k.grid;
+            launch.threadgroup =
+                k.threadgroup.volume() ? k.threadgroup : k.pipeline->default_threadgroup(k.grid);
+            batch.add(launch);
+            encoded = true;
+        }
+        if (encoded) {
+            batch.commit(finish);
+            std::lock_guard lock(in_flight_mutex);
+            in_flight.push_back(completion);
+        } else {
+            // Nothing for the GPU: copy once the parameters are defined.
+            for (int i = 0; i < p.num_parameters; ++i) {
+                if (PJRT_Error* e = wait_ready(args[i])) return e;
+            }
+            finish(nullptr);
+        }
+    } catch (const std::exception& e) {
+        return error(PJRT_Error_Code_INTERNAL, std::string("metal: ") + e.what());
+    }
+    // Buffers keep their memory out of the pool until the GPU is done with them.
+    for (int i = 0; i < p.num_parameters; ++i) args[i]->last_use = completion;
+    for (size_t i = 0; i < results.size(); ++i) {
+        results[i]->ready = results[i]->last_use = completion;
+        outputs[i] = results[i].release();
+    }
+    for (auto& buffer : fresh) {
+        if (buffer) buffer->last_use = completion;  // computed but not an output
     }
     return nullptr;
 }
@@ -361,11 +413,14 @@ void add_executable_api(PJRT_Api& api) {
         }
         PJRT_Device* device =
             args->execute_device ? args->execute_device : &exe->client->device;
-        if (PJRT_Error* e = execute(*exe->program, device, args->argument_lists[0],
-                                    args->num_args, args->output_lists[0])) {
+        auto completion = std::make_shared<Completion>();
+        if (PJRT_Error* e = execute(exe->program, device, args->argument_lists[0],
+                                    args->num_args, args->output_lists[0], completion)) {
             return e;
         }
-        if (args->device_complete_events) args->device_complete_events[0] = new PJRT_Event{};
+        if (args->device_complete_events) {
+            args->device_complete_events[0] = new PJRT_Event{completion};
+        }
         return nullptr;
     };
 }

@@ -131,10 +131,21 @@ M1 so far (2026-11-01):
   (broadcast, reshape, transpose, slice, reverse, iota) fuse into one kernel
   per output shape, with calls and composites inlined; other ops are
   UNIMPLEMENTED. Fifteen programs match the CPU backend.
-- First numbers on the M2, `tanh(2x + 1) * x`: 162 µs per call at 1,024
-  elements against 3 µs on CPU, 0.99 ms at 4M elements against 0.92 ms.
-  Execution is synchronous and allocates every output, so the small case
-  measures a command buffer round trip plus allocation.
+- Execution is asynchronous: Execute encodes one command buffer, commits it
+  and returns; a completion handler defines the outputs and sets the events.
+  Buffers come from a pool keyed by size and return to it only once the GPU
+  work using them is done, so host copies never race the GPU; at most 16
+  executions are in flight, so a caller running ahead reuses pooled buffers.
+- On the M2, `tanh(2x + 1) * x` per call:
+
+  | Elements | Pipelined | Blocking each call | CPU backend |
+  |---|---:|---:|---:|
+  | 1,024 | 29 µs | 151 µs | 3 µs |
+  | 4M | 464 µs | 635 µs | 899 µs |
+
+  A blocking call is a command buffer round trip; pipelined small calls are
+  host overhead (jax's C API dispatch plus encoding), and large ones run at
+  about 72 GB/s against the 91 GB/s copy ceiling.
 - Lessons: the 0.12 header defines `PJRT_Error` and `PJRT_Memory` as
   function tables callers use directly; jaxlib calls some slots without a
   null check (`PJRT_Client_TopologyDescription`, `PJRT_Error_ForEachPayload`,
@@ -142,9 +153,8 @@ M1 so far (2026-11-01):
   `PJRT_LoadedExecutable_GetDeviceAssignment`, whose proto is encoded by
   hand); programs arrive as VHLO portable artifacts.
 
-Next: asynchronous execution with completion events and reused output
-buffers, then reductions, `dot_general` and `while`, which the SBI step of
-M2 needs.
+Next: reductions, `dot_general` and `while`, which the SBI step of M2
+needs; then where the 29 µs of host time per call goes.
 
 Work that costs time without proving anything: a JAX port of SAM2's image
 encoder and mask decoder (SAM2 is PyTorch) for M5, and a small JAX LoRA

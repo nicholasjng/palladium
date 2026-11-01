@@ -1,10 +1,12 @@
 // PJRT C API plugin for the `metal` platform: the system's Apple GPU as one
 // device with one memory, buffers in shared MTLBuffers on unified memory.
-// Work is synchronous so far, so every event is created ready; functions left
-// null in the API table are unsupported. Compilation is in executable.cpp.
-#include "pjrt.h"
+// Executions complete asynchronously; buffers track the work that defines and
+// uses them. Functions left null in the API table are unsupported.
+// Compilation and execution are in executable.cpp.
+#include "plugin.h"
 
 #include <cstring>
+#include <unordered_map>
 
 #include "errors.h"
 #include "metal.h"
@@ -103,6 +105,108 @@ size_t byte_size(const PJRT_Buffer* buffer) {
     return n;
 }
 
+std::shared_ptr<Completion> Completion::done() {
+    static const auto completed = [] {
+        auto c = std::make_shared<Completion>();
+        c->set();
+        return c;
+    }();
+    return completed;
+}
+
+void Completion::set(PJRT_Error_Code code, std::string message) {
+    std::vector<std::function<void()>> callbacks;
+    {
+        std::lock_guard lock(mutex_);
+        ready_ = true;
+        code_ = code;
+        message_ = std::move(message);
+        callbacks.swap(callbacks_);
+    }
+    cv_.notify_all();
+    for (auto& f : callbacks) f();
+}
+
+bool Completion::ready() {
+    std::lock_guard lock(mutex_);
+    return ready_;
+}
+
+void Completion::wait() {
+    std::unique_lock lock(mutex_);
+    cv_.wait(lock, [this] { return ready_; });
+}
+
+PJRT_Error* Completion::error() {
+    std::lock_guard lock(mutex_);
+    return code_ == PJRT_Error_Code_OK ? nullptr : ::error(code_, message_);
+}
+
+void Completion::then(std::function<void()> f) {
+    {
+        std::lock_guard lock(mutex_);
+        if (!ready_) {
+            callbacks_.push_back(std::move(f));
+            return;
+        }
+    }
+    f();
+}
+
+namespace {
+
+// Free buffers by requested size, up to kPoolLimit bytes in all. Leaked, so
+// buffers destroyed during static destruction can still return to it.
+constexpr size_t kPoolLimit = size_t(1) << 30;
+
+struct Pool {
+    std::mutex mutex;
+    std::unordered_map<size_t, std::vector<std::unique_ptr<Buffer>>> free;
+    size_t bytes = 0;
+};
+
+Pool& pool() {
+    static Pool* p = new Pool;
+    return *p;
+}
+
+}  // namespace
+
+std::unique_ptr<Buffer> acquire(size_t size_bytes) {
+    Pool& p = pool();
+    {
+        std::lock_guard lock(p.mutex);
+        auto it = p.free.find(size_bytes);
+        if (it != p.free.end() && !it->second.empty()) {
+            auto buffer = std::move(it->second.back());
+            it->second.pop_back();
+            p.bytes -= size_bytes;
+            return buffer;
+        }
+    }
+    try {
+        return std::make_unique<Buffer>(runtime().device(), size_bytes);
+    } catch (const AllocationError&) {
+        std::lock_guard lock(p.mutex);  // retry with the pool given back
+        p.free.clear();
+        p.bytes = 0;
+    }
+    return std::make_unique<Buffer>(runtime().device(), size_bytes);
+}
+
+void release(std::unique_ptr<Buffer> buffer, std::shared_ptr<Completion> last_use) {
+    if (!buffer) return;
+    // std::function needs a copyable callable, so the buffer travels as a shared_ptr.
+    std::shared_ptr<Buffer> held(std::move(buffer));
+    last_use->then([held]() mutable {
+        Pool& p = pool();
+        std::lock_guard lock(p.mutex);
+        if (p.bytes + held->size() > kPoolLimit) return;
+        p.bytes += held->size();
+        p.free[held->size()].push_back(std::make_unique<Buffer>(std::move(*held)));
+    });
+}
+
 PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_t* dims,
                         size_t num_dims, PJRT_Buffer** out) {
     if (!element_size(type)) {
@@ -116,7 +220,7 @@ PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_
     buffer->dims.assign(dims, dims + num_dims);
     for (size_t i = num_dims; i-- > 0;) buffer->minor_to_major.push_back((int64_t)i);
     try {
-        buffer->storage = std::make_unique<Buffer>(runtime().device(), byte_size(buffer.get()));
+        buffer->storage = acquire(byte_size(buffer.get()));
     } catch (const AllocationError& e) {
         return error(PJRT_Error_Code_RESOURCE_EXHAUSTED, e.what());
     }
@@ -128,6 +232,12 @@ PJRT_Error* deleted(const PJRT_Buffer* buffer) {
     return buffer->storage ? nullptr
                            : error(PJRT_Error_Code_FAILED_PRECONDITION,
                                    "metal: the buffer has been deleted");
+}
+
+PJRT_Error* wait_ready(const PJRT_Buffer* buffer) {
+    if (PJRT_Error* e = deleted(buffer)) return e;
+    buffer->ready->wait();
+    return buffer->ready->error();
 }
 
 namespace {
@@ -167,7 +277,7 @@ bool is_row_major(const PJRT_Buffer_MemoryLayout* layout, size_t rank) {
 }
 
 PJRT_Error* copy_buffer(const PJRT_Buffer* src, PJRT_Device* device, PJRT_Buffer** out) {
-    if (PJRT_Error* e = deleted(src)) return e;
+    if (PJRT_Error* e = wait_ready(src)) return e;
     if (PJRT_Error* e = make_buffer(device, src->type, src->dims.data(), src->dims.size(), out)) {
         return e;
     }
@@ -209,13 +319,22 @@ PJRT_Api make_api() {
         return nullptr;
     };
     api.PJRT_Event_IsReady = [](PJRT_Event_IsReady_Args* args) -> PJRT_Error* {
-        args->is_ready = true;
+        args->is_ready = args->event->completion->ready();
         return nullptr;
     };
-    api.PJRT_Event_Error = [](PJRT_Event_Error_Args*) -> PJRT_Error* { return nullptr; };
-    api.PJRT_Event_Await = [](PJRT_Event_Await_Args*) -> PJRT_Error* { return nullptr; };
+    api.PJRT_Event_Error = [](PJRT_Event_Error_Args* args) -> PJRT_Error* {
+        return args->event->completion->error();
+    };
+    api.PJRT_Event_Await = [](PJRT_Event_Await_Args* args) -> PJRT_Error* {
+        args->event->completion->wait();
+        return args->event->completion->error();
+    };
+    // The callback owns the error it receives.
     api.PJRT_Event_OnReady = [](PJRT_Event_OnReady_Args* args) -> PJRT_Error* {
-        args->callback(nullptr, args->user_arg);
+        std::shared_ptr<Completion> c = args->event->completion;
+        c->then([c, callback = args->callback, user_arg = args->user_arg] {
+            callback(c->error(), user_arg);
+        });
         return nullptr;
     };
 
@@ -333,7 +452,7 @@ PJRT_Api make_api() {
         } else {
             std::memcpy(dst, args->data, byte_size(buffer));
         }
-        args->done_with_host_buffer = new PJRT_Event{};
+        args->done_with_host_buffer = new PJRT_Event{Completion::done()};
         args->buffer = buffer;
         return nullptr;
     };
@@ -527,7 +646,7 @@ PJRT_Api make_api() {
         return nullptr;
     };
     api.PJRT_Buffer_Delete = [](PJRT_Buffer_Delete_Args* args) -> PJRT_Error* {
-        args->buffer->storage.reset();
+        release(std::move(args->buffer->storage), args->buffer->last_use);
         return nullptr;
     };
     api.PJRT_Buffer_IsDeleted = [](PJRT_Buffer_IsDeleted_Args* args) -> PJRT_Error* {
@@ -539,7 +658,7 @@ PJRT_Api make_api() {
         return nullptr;
     };
     api.PJRT_Buffer_ReadyEvent = [](PJRT_Buffer_ReadyEvent_Args* args) -> PJRT_Error* {
-        args->event = new PJRT_Event{};
+        args->event = new PJRT_Event{args->buffer->ready};
         return nullptr;
     };
     api.PJRT_Buffer_UnsafePointer = [](PJRT_Buffer_UnsafePointer_Args* args) -> PJRT_Error* {
@@ -570,8 +689,9 @@ PJRT_Api make_api() {
                          "metal: the host buffer holds " + std::to_string(args->dst_size) +
                              " bytes, the device buffer " + std::to_string(size));
         }
+        if (PJRT_Error* e = wait_ready(src)) return e;
         std::memcpy(args->dst, src->storage->contents(), size);
-        args->event = new PJRT_Event{};
+        args->event = new PJRT_Event{Completion::done()};
         return nullptr;
     };
     api.PJRT_Buffer_CopyToDevice = [](PJRT_Buffer_CopyToDevice_Args* args) -> PJRT_Error* {
