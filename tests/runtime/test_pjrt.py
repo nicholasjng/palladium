@@ -647,6 +647,40 @@ def test_raw_case_out_of_range_indices_select_last_branch():
     ''')
 
 
+def test_compiled_analysis_api():
+    _check("""
+        import jax,numpy as np
+        x=jax.device_put(np.arange(32,dtype=np.float32),jax.devices('metal')[0])
+        compiled=jax.jit(lambda x:x*2+1).lower(x).compile()
+        assert compiled.cost_analysis() == {}
+        # PJRT reports UNIMPLEMENTED; JAX 0.12 translates it to None here.
+        assert compiled.memory_analysis() is None
+        np.testing.assert_array_equal(np.asarray(compiled(x)),np.arange(32,dtype=np.float32)*2+1)
+    """)
+
+
+def test_executable_and_inputs_can_be_released_after_dispatch():
+    _check("""
+        import gc
+        import jax,numpy as np
+        device=jax.devices('metal')[0]
+        fn=jax.jit(lambda x:x*2+1)
+        x=jax.device_put(np.zeros(1<<20,np.float32),device)
+        compiled=fn.lower(x).compile()
+        x.delete()
+        outputs=[]
+        for i in range(32):
+            x=jax.device_put(np.full(1<<20,i,np.float32),device)
+            outputs.append(compiled(x))
+            x.delete()
+        del compiled,fn,x
+        jax.clear_caches()
+        gc.collect()
+        for i,y in enumerate(outputs):
+            np.testing.assert_array_equal(np.asarray(y),np.full(1<<20,i*2+1,np.float32))
+    """)
+
+
 def test_unsupported_ops_report_unimplemented():
     """A CPU compile first, so the metal one hashes its topology for the cache key."""
     result = _run("""

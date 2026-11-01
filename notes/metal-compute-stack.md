@@ -123,11 +123,16 @@ buffers and SIMD-group kernels, including split full reductions; variadic
 reducers remain open. Floating `dot_general` now reuses the existing Pallas
 GEMM emitter, including transposed/batched/general contractions. Static counted `while` replays body
 kernels with alternating carry buffers; dynamic conditions remain unsupported.
+Pure cond/switch branches now run without host predicate reads; expensive
+materialized branch computations are eager before selection.
 PJRT-local 64-bit integer operations now enable threefry RNG. The full SBI step
 runs and has a ten-step CPU comparison at rtol 1e-4, atol 2e-6; the first
 completed step is under five seconds. On the M1 Pro its measured pipelined
 throughput is still slower than CPU (2.83 ms versus 1.47 ms). The remaining
 M1 API/operation/performance criteria are not yet met.
+The acceptance-gate audit in `notes/metal-pjrt-plugin.md` distinguishes remaining
+operation/API work, unresolved tolerance/API wording, and the unmeasured
+M2/M4 Pro performance gates.
 Steps taken, open items and the success criteria against
 jax 0.12 are in `notes/metal-pjrt-plugin.md`.
 

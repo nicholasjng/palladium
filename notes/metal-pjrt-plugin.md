@@ -36,6 +36,11 @@ Works:
 - Floating `dot_general`: plain/transposed/batched products, multiple batch
   and contraction axes, vectors and empty dimensions. It reuses the Pallas
   GEMM emitter; gradients and dots inside counted loops work too.
+- Pure `stablehlo.case` branches (`lax.cond`/`lax.switch`), including nested
+  conditionals, tuples, gradients and composition with reductions/GEMMs/static
+  loops. Elementwise branch reads are guarded in the fused kernel. Materialized
+  branch computations run eagerly before result selection; there is no host
+  condition read, but untaken expensive branches still consume work and storage.
 - Asynchronous execution with completion events, a buffer pool, and at most
   16 executions in flight.
 - The complete SBI step compiles and executes, with a ten-step CPU comparison
@@ -43,7 +48,7 @@ Works:
 
 Fails with UNIMPLEMENTED, naming the op (`palladium.stablehlo` raises
 `UnsupportedProgram`): variadic or other reducer bodies (including argmax and
-product), integer or explicitly algorithm-selected dots, dynamic or unrecognized `while`, `case`,
+product), integer or explicitly algorithm-selected dots, dynamic or unrecognized `while`,
 `gather`,
 `scatter`, `reduce_window`, `sort`, `convolution`, float64 arithmetic and
 64-bit integer reductions. Shape-changing bitcasts and wide integer operations
@@ -260,8 +265,13 @@ In order of what M2's SBI step needs first.
    and math mode, so replayed launches do not recompile identical shaders.
 
    Dynamic conditions and other induction patterns remain UNIMPLEMENTED.
-   They would need host condition reads or GPU-driven dispatch. `case` with
-   a device predicate remains open. Trajectory updates currently copy the
+   They would need host condition reads or GPU-driven dispatch. Pure `case`
+   now lowers to guarded per-result selection: scalar/index-map producers stay
+   inside each branch, while reductions, dots and counted loops are computed
+   eagerly. All branches are validated; unsupported/effectful ops still fail,
+   including in an untaken branch. Out-of-range raw StableHLO indices select
+   the last branch; JAX switch supplies its own clamp. Selective dispatch of
+   expensive branches remains an optimization. Trajectory updates currently copy the
    full carried array per iteration; in-place disjoint updates are future work.
 5. **`dot_general` (floating slice done).** Normalize dimension numbers to
    `(batch, M, K)` and `(batch, K, N)`, preserving the specified pairing/order
@@ -381,10 +391,39 @@ batches of ten calls, waiting only on the last result). The throughput probe
 reuses initial state; the correctness test chains ten updates with new keys.
 The full step is correct at the stated tolerance, but does not yet beat CPU.
 
-M1 is still incomplete: variadic argmax, gather/scatter-add, `cond`, donation
+M1 is still incomplete: variadic argmax, gather/scatter-add, donation
 and the full API/concurrency checklist remain open. Overhead versus jax-mps
 and bandwidth targets on M2 and M4 Pro have not been established. M2 still
 needs profiling/tuning of replay, trajectory updates and reductions.
+
+### M1 completion assessment, after conditional support (2026-11-01)
+
+The milestone is not complete just because SBI runs or the test suite passes.
+The remaining acceptance gates, against the criteria below, are:
+
+| Gate | Evidence now | Remaining work |
+|---|---|---|
+| Operation groups | Elementwise/index maps, single-result reductions, floating dots, static loops, cond/switch and threefry have differential tests | Variadic argmax and JAX gather/scatter-add, with exact index/tie/duplicate semantics |
+| Ten SBI updates | Full program runs with new keys; rtol 1e-4 **plus atol 2e-6** | Explicitly agree that near-zero absolute tolerance is acceptable, or satisfy the original relative-only wording; do not silently relax the criterion |
+| Compile time | First completed SBI step measured 0.82 s on M1 Pro | Repeat on the target machines, including a documented cache state |
+| Common API/lifetimes | `lower().compile()`, empty cost analysis, and releasing Python executables/inputs after queued dispatch have tests | Donation and concurrent dispatch with shared inputs; native `last_use` writes are still unsynchronized |
+| Memory analysis contract | PJRT returns UNIMPLEMENTED, but JAX 0.12's public method returns `None` without crashing | Reconcile the criterion's “raises” wording with this observed wrapper behavior |
+| Dispatch overhead/bandwidth | Measurements here are on M1 Pro; full SBI is 2.83 ms vs CPU's 1.47 ms | On **both M2 and M4 Pro**, beat same-machine jax-mps small-call overhead and reach 80% of the copy-bandwidth baseline |
+
+Recommended order: gather/scatter-add, variadic argmax, then donation and
+shared-buffer concurrency/lifetime hardening. Start collecting the two-machine
+baselines alongside implementation, since the performance gate is the largest
+remaining uncertainty. A passing concurrency stress test alone cannot clear
+the known native shared-pointer race; fix the synchronization first.
+
+Call M1 complete only when these gates have reproducible evidence and the two
+contract ambiguities (SBI tolerance and memory-analysis behavior) have an
+explicit resolution. There is no defensible calendar completion date before
+the target-machine comparisons expose the remaining performance work. The
+current full-SBI slowdown is a warning for M2, **not an additional M1 gate**:
+M1's performance requirements are the stated dispatch and bandwidth targets.
+Dynamic while, convolution, LLM/SAM training, and Pallas custom-call integration
+are not reasons to hold M1 open beyond its listed criteria.
 
 ## Success criteria for M1, against jax 0.12
 
