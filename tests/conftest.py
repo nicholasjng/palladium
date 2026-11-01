@@ -22,6 +22,7 @@ _NO_GPU_MODULES = {
     "test_views",
     "test_stablehlo",
     "test_pjrt_benchmark",
+    "test_pjrt_sbi_audit",
 }
 
 

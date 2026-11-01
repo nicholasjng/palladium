@@ -430,17 +430,15 @@ The remaining acceptance gates, against the criteria below, are:
 | Ten SBI updates | Full program runs with new keys; rtol 1e-4 **plus atol 2e-6** | Explicitly agree that near-zero absolute tolerance is acceptable, or satisfy the original relative-only wording; do not silently relax the criterion |
 | Compile time | Latest harness: first completed SBI step 0.256 s on M1 Pro, persistent JAX cache disabled, driver cache unchanged | Repeat on the target machines, including a documented cache state |
 | Common API/lifetimes | `lower().compile()`, analysis APIs, donation/storage reuse, deletion after dispatch, and four-thread shared-input dispatch have tests; shared last-use mutation removed | Further stress/profiling on target machines; no known remaining implementation gap in the listed common API cases |
-| Memory analysis contract | PJRT returns UNIMPLEMENTED, but JAX 0.12's public method returns `None` without crashing | Reconcile the criterion's “raises” wording with this observed wrapper behavior |
+| Memory analysis contract | PJRT returns UNIMPLEMENTED; JAX 0.12 returns `None`, covered by the API test | Resolved: the criterion now describes the public JAX behavior |
 | Dispatch overhead/bandwidth | M1 Pro: 23.1 µs small-call median; elementwise reaches 89.7% of the measured copy baseline | On **both M2 and M4 Pro**, beat same-machine jax-mps small-call overhead and reach 80% of the copy-bandwidth baseline |
 
 The recommended implementation sequence is now covered. Next: collect the
 M2/M4 Pro baseline artifacts with `examples/pjrt_m1_benchmark.py`, compare
 same-machine jax-mps overhead, and tune any failed performance gates. Resolve
-the two contract questions below before declaring M1 complete.
+the SBI tolerance contract below before declaring M1 complete.
 
-Call M1 complete only when these gates have reproducible evidence and the two
-contract ambiguities (SBI tolerance and memory-analysis behavior) have an
-explicit resolution. There is no defensible calendar completion date before
+Call M1 complete only when these gates have reproducible evidence and the SBI tolerance contract has an explicit resolution. There is no defensible calendar completion date before
 the target-machine comparisons expose the remaining performance work. The
 current full-SBI slowdown is a warning for M2, **not an additional M1 gate**:
 M1's performance requirements are the stated dispatch and bandwidth targets.
@@ -503,6 +501,40 @@ sample. They do not establish either target-machine gate or a jax-mps speedup.
 Validation after these changes: 504 tests passed, 2 skipped, 4 fuzz tests
 deselected; lint and type checks on the changed Python files passed.
 
+### SBI numerical audit, 2026-11-02
+
+Run `JAX_PLATFORMS=metal,cpu uv run python examples/pjrt_sbi_audit.py --output audit.json`.
+The [M1 Pro audit artifact](metal-sbi-audit-m1-pro-2026-11-02.json) records seed 0,
+ten updates with new keys, per-leaf and per-step errors, and isolated diagnostics.
+Nonfinite values fail the audit. `required_atol` is the maximum positive
+`abs(metal - cpu) - 1e-4 * abs(cpu)`, not simply the maximum absolute error.
+
+| Comparison | Relative-only failures / elements | Required additional atol | Maximum absolute error |
+|---|---:|---:|---:|
+| Ten chained updates, parameters + optimizer + loss | 4,945 / 687,380 | 5.5341e-7 | 1.2117e-6 |
+| Each update starts from identical CPU state | 1,060 / 687,380 | 1.4464e-8 | 8.4937e-7 |
+| Chained losses alone | 0 / 10 | 0 | 9.5368e-7 |
+
+The largest tolerance excess is parameter `wa[90,1]` at step 4:
+Metal -0.000120491961 versus CPU -0.000121057470. Large relative errors near
+zero do not indicate similarly large absolute differences. All comparisons
+pass the existing rtol 1e-4 plus atol 2e-6 check; the original relative-only
+criterion is **not satisfied**.
+
+The first-step diagnostic has exactly matching sampled theta. Trajectory and
+features differ by at most 1.9074e-6 and pass relative-only tolerance. Gradients
+on identical CPU data differ by at most 1.0478e-9; AdamW on identical gradients
+changes parameters by at most 3.7253e-9. Together with the CPU-anchored updates,
+this is evidence of accumulated numerical drift, not proof that every source
+of error has been isolated.
+
+Recommendation: explicitly adopt the existing mixed tolerance for parameters
+and optimizer state, retain relative-only checking for the loss, and repeat
+this audit on M4. Do not tighten the absolute allowance to this single run's
+minimum or declare relative-only parity. No tolerance was changed by this audit.
+The memory-analysis wording is resolved separately: public JAX returns `None`
+when native compiled memory statistics report UNIMPLEMENTED; this is tested.
+
 ## Success criteria for M1, against jax 0.12
 
 All on jax and jaxlib 0.12.0.1 (PJRT C API 0.116) with
@@ -524,7 +556,7 @@ All on jax and jaxlib 0.12.0.1 (PJRT C API 0.116) with
    LLM and SAM2-like steps belong to M3 to M5.
 3. **No crashes on jax's common API surface:**
    - `lower().compile()`
-   - `compiled.cost_analysis()` (empty) and `memory_analysis()` (raises)
+   - `compiled.cost_analysis()` (empty) and `memory_analysis()` (`None` on JAX 0.12; native PJRT reports UNIMPLEMENTED)
    - `jit` with `donate_argnums`
    - deleting arrays and executables while work is in flight
    - dispatch from several Python threads
