@@ -234,3 +234,10 @@ def test_cond_materializes_reductions_before_selection():
 def test_unsupported_op_in_case_is_not_silently_discarded():
     with pytest.raises(UnsupportedProgram, match="reduce has an unsupported reducer"):
         _compile(lambda x: lax.cond(x[0] > 0, lambda y: y.sum(), lambda y: y.prod(), x), (8,))
+
+
+def test_gather_fuses_producers_without_intermediate_buffers():
+    program = _compile(lambda x, i: (x * 2)[i.astype(jnp.int32)] + 1, (7, 3), (4,))
+    assert len(program.launches) == 1
+    assert [s.kind for s in program.slots] == ["parameter", "parameter", "fresh"]
+    assert program.slots[program.outputs[0]].shape == (4, 3)

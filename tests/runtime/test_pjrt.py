@@ -681,6 +681,38 @@ def test_executable_and_inputs_can_be_released_after_dispatch():
     """)
 
 
+def test_gather_indexing_matches_cpu():
+    _check("""
+        import jax,jax.numpy as jnp,ml_dtypes,numpy as np
+        from jax import lax
+        metal,cpu=jax.devices('metal')[0],jax.devices('cpu')[0]
+        x=np.arange(30,dtype=np.float32).reshape(5,6)
+        indices=np.array([-8,-1,0,2,2,4,8],np.int32)
+        cases=[
+            (lambda x,i:x[i],x,indices),
+            (lambda x,i:x[:,i],x,indices),
+            (lambda x,i:jnp.take(x,i,axis=0,mode='fill',fill_value=-7),x,indices),
+            (lambda x,i:jnp.take(x,i,axis=1,mode='clip'),x,indices),
+            (lambda x,i:(x*2+1)[i],x,indices.reshape(1,7)),
+            (lambda x,i:x[i,i],x,np.array([0,1,4],np.int32)),
+            (lambda x,i:jnp.take_along_axis(x,i,axis=1),x,np.array([[0,5]]*5,np.int32)),
+            (lambda x,i:jax.vmap(lambda a,b:a[b])(x,i),x,np.array([[0,5],[1,2],[2,3],[3,4],[4,0]],np.int32)),
+            (lambda x,i:lax.gather(x,i,lax.GatherDimensionNumbers(offset_dims=(1,2),
+               collapsed_slice_dims=(),start_index_map=(0,1)),(2,3)),
+             x,np.array([[-2,1],[4,5],[1,2]],np.int32)),
+            (lambda x,i:x[i],x,np.zeros(0,np.int32)),
+            (lambda x,i:x[i],x,np.int32(2)),
+        ]
+        for dtype in (np.int32,np.uint32,np.bool_,np.float16,ml_dtypes.bfloat16):
+            cases.append((lambda x,i:x[i],x.astype(dtype),indices))
+        for fn,x,i in cases:
+            run=jax.jit(fn)
+            got=run(jax.device_put(x,metal),jax.device_put(i,metal))
+            want=run(jax.device_put(x,cpu),jax.device_put(i,cpu))
+            np.testing.assert_array_equal(np.asarray(got),np.asarray(want))
+    """)
+
+
 def test_unsupported_ops_report_unimplemented():
     """A CPU compile first, so the metal one hashes its topology for the cache key."""
     result = _run("""

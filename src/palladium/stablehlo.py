@@ -306,6 +306,17 @@ def _constant(op) -> _Constant:
 def _attributes(op) -> dict:
     a = op.attributes
     name = op.operation.name.removeprefix("stablehlo.")
+    if name == "gather":
+        d = stablehlo.GatherDimensionNumbers(a["dimension_numbers"])
+        return {
+            "offset": tuple(d.offset_dims),
+            "collapsed": tuple(d.collapsed_slice_dims),
+            "map": tuple(d.start_index_map),
+            "vector": d.index_vector_dim,
+            "batch": tuple(d.operand_batching_dims),
+            "index_batch": tuple(d.start_indices_batching_dims),
+            "sizes": tuple(ir.DenseI64ArrayAttr(a["slice_sizes"])),
+        }
     if name == "dot_general":
         if "algorithm" in a:
             raise UnsupportedProgram(
@@ -398,6 +409,7 @@ _SUPPORTED = {
     "dynamic_update_slice",
     "reduce",
     "dot_general",
+    "gather",
 }
 
 
@@ -610,6 +622,31 @@ class _Kernel:
         assert isinstance(node, _Op)
         a, operands = node.attributes, node.operands
         match node.name:
+            case "gather":
+                x, indices = operands
+                batch_coords = iter(c for d, c in enumerate(coords) if d not in a["offset"])
+                index_coords = tuple(
+                    "0u" if d == a["vector"] else next(batch_coords)
+                    for d in range(len(indices.shape))
+                )
+                inner = ["0u"] * len(x.shape)
+                for component, dim in enumerate(a["map"]):
+                    read_coords = list(index_coords)
+                    if a["vector"] < len(indices.shape):
+                        read_coords[a["vector"]] = f"{component}u"
+                    start = self.value(indices, tuple(read_coords))
+                    itype = _ctype(indices.dtype)
+                    inner[dim] = (
+                        f"uint(clamp({start}, {itype}(0), {itype}({x.shape[dim] - a['sizes'][dim]})))"
+                    )
+                for dim, index_dim in zip(a["batch"], a["index_batch"], strict=True):
+                    inner[dim] = index_coords[index_dim]
+                window_dims = [
+                    d for d in range(len(x.shape)) if d not in a["collapsed"] + a["batch"]
+                ]
+                for dim, offset in zip(window_dims, a["offset"], strict=True):
+                    inner[dim] = f"({inner[dim]} + {coords[offset]})"
+                return self.value(x, tuple(inner))
             case "reduce" | "dot_general":
                 return self._read(node, coords)
             case "case":
