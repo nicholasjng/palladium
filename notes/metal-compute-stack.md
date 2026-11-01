@@ -120,8 +120,11 @@ M1 status (2026-11-01): the plugin runs fused elementwise and index-mapping
 programs asynchronously, including guarded concatenate, pad and dynamic slices,
 with pooled buffers. Single-result reductions now schedule intermediate
 buffers and SIMD-group kernels, including split full reductions; variadic
-reducers and `dot_general` remain open. Static counted `while` now replays body
+reducers remain open. Floating `dot_general` now reuses the existing Pallas
+GEMM emitter, including transposed/batched/general contractions. Static counted `while` replays body
 kernels with alternating carry buffers; dynamic conditions remain unsupported.
+The full SBI step now stops at uint64 RNG operations; its isolated dense loss
+and AdamW updates have a ten-step CPU comparison.
 Steps taken, open items and the success criteria against
 jax 0.12 are in `notes/metal-pjrt-plugin.md`.
 

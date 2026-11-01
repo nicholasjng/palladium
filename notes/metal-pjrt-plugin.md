@@ -29,19 +29,20 @@ Works:
   a scalar i32/ui32 counter starting at a constant, compared with LT to a
   constant bound, incremented by one. Body kernels replay in one command
   buffer with alternating carry buffers and no host condition reads.
+- Floating `dot_general`: plain/transposed/batched products, multiple batch
+  and contraction axes, vectors and empty dimensions. It reuses the Pallas
+  GEMM emitter; gradients and dots inside counted loops work too.
 - Asynchronous execution with completion events, a buffer pool, and at most
   16 executions in flight.
 
 Fails with UNIMPLEMENTED, naming the op (`palladium.stablehlo` raises
 `UnsupportedProgram`): variadic or other reducer bodies (including argmax and
-product), `dot_general`, dynamic or unrecognized `while`, `case`,
+product), integer or explicitly algorithm-selected dots, dynamic or unrecognized `while`, `case`,
 `gather`,
 `scatter`, `reduce_window`, `sort`, `convolution`, and any op on 64-bit
 types. So far none of `examples/training_steps.py` runs: SBI stops at
-`dot_general`, the LLM step at `gather`, the SAM2-like step at
-`convolution` (rechecked after counted loops). Parsing past the loop does not
-yet establish RNG execution: unsupported dtypes are checked during scheduling,
-after graph construction reaches the dot. Key creation works, but
+`uint64` in RNG, the LLM step at `gather`, the SAM2-like step at
+`convolution` (rechecked after dot lowering). Key creation works, but
 random sampling still needs more ops, so initialize benchmark inputs on CPU:
 
 ```python
@@ -251,12 +252,20 @@ In order of what M2's SBI step needs first.
    They would need host condition reads or GPU-driven dispatch. `case` with
    a device predicate remains open. Trajectory updates currently copy the
    full carried array per iteration; in-place disjoint updates are future work.
-5. **`dot_general`.** Reuse palladium's GEMM rather than writing a new one:
-   build a Pallas matmul for the dot's dimension numbers (batch dimensions
-   as a grid axis) and emit it with palladium's emitter. That gives the
-   `simdgroup_matrix` kernel, 2.5 TFLOPS on the M2 and 6.7 on the M4 Pro.
-   SBI's MLP dots are small (512 × 128), where launch count matters more
-   than peak; fusing elementwise epilogues comes later.
+5. **`dot_general` (floating slice done).** Normalize dimension numbers to
+   `(batch, M, K)` and `(batch, K, N)`, preserving the specified pairing/order
+   of batch and contracting axes. Canonical buffers bind directly; packing
+   kernels fuse transposes, reshapes and elementwise producers when necessary.
+   `_stablehlo_gemm.py` traces a tiled Pallas matmul and calls the existing
+   cooperative emitter, with batches as a grid axis. Aligned float32 products
+   use `simdgroup_matrix`; output/K tails and f16/bf16 use Metal 4 TensorOps.
+   Both paths accumulate in float32. Matching float operands are supported,
+   including widening the result to float32 by converting packed operands.
+   Empty contraction dimensions fill zero without reading either input.
+   Integer/complex products and explicit algorithm attributes are rejected.
+   Generated sources are cached by canonical shape/dtype; native pipelines
+   retain the existing per-executable cache. Remaining: epilogue fusion,
+   avoiding transposed packing where possible, and tuning small/tail products.
 6. **Pallas kernels inside `jit`.** Register lowering rules for
    `pallas_call_p` and `mpmd_map_p` with `platform="metal"`; the stub probe
    showed both work. They emit a `stablehlo.custom_call` whose typed-FFI
@@ -317,6 +326,31 @@ taking the minimum of five batches of ten calls, blocking on each batch's
 last result. The replay implementation is correct but does not yet beat CPU.
 Full trajectory copies, multiple dispatches per iteration and strided summary
 reductions are candidates for profiling and tuning in M2.
+
+### Dot checkpoint, 2026-11-01
+
+The SBI dense loss is exposed as `sbi_loss` so its forward/backward GEMMs and
+AdamW updates can run independently of RNG. With host-generated fixed data,
+ten updates match CPU at rtol 1e-4, atol 2e-6 for parameters, optimizer state
+and losses. The observed maximum parameter difference was 1.31e-6; loss
+differences stayed below 5e-7. Tiny gradients amplify float32 summation
+differences under Adam, hence the explicit absolute tolerance. This does not
+claim the full ten-step SBI success criterion: simulation and RNG are excluded.
+
+Apple M1 Pro, float32 resident operands of ones, `(M,N,K)` below. Pipelined
+wall time is the minimum of five batches of 30 calls, waiting only on the
+last result. First call includes tracing, compilation and completion; shader
+caches may be warm. These are host timings, not GPU timestamps.
+
+| M, N, K | Metal pipelined | CPU pipelined | Metal first call |
+|---|---:|---:|---:|
+| 512, 128, 128 | 28.5 µs | 187.9 µs | 246 ms |
+| 1024, 1024, 1024 | 571.9 µs | 3281.7 µs | 115 ms |
+
+Both use the reused SIMD-group GEMM. Packing, tail and whole-training costs
+are not represented by these aligned-product measurements. Full SBI now
+reaches the missing `uint64` RNG operations; LLM and SAM remain at gather
+and convolution respectively.
 
 ## Success criteria for M1, against jax 0.12
 

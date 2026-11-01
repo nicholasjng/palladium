@@ -6,7 +6,8 @@ The plugin's PJRT_Client_Compile passes the portable artifact jax serializes to
 the plugin. A program may hold elementwise and index-mapping ops
 (broadcast, reshape, transpose, slices, concatenate, pad, reverse, iota), fused
 into one kernel per output shape. Single-result reductions end a fusion and
-materialize a buffer for subsequent kernels; unsupported ops and reducer bodies
+materialize a buffer for subsequent kernels. Floating dots reuse Palladium's
+Pallas GEMM emitter after layout normalization; unsupported ops and reducer bodies
 raise `UnsupportedProgram`.
 
 Each kernel thread computes one output element at the coordinates of its flat

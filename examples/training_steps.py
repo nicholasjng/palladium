@@ -51,6 +51,15 @@ def sbi_trajectory(theta):
     return traj
 
 
+def sbi_loss(p, x, theta):
+    """Mixture-density loss, isolated so dense training can be tested without RNG."""
+    h = jax.nn.gelu(jax.nn.gelu(x @ p["w1"]) @ p["w2"])
+    logits = h @ p["wa"]
+    mu, log_s = (h @ p["wm"]).reshape(512, 5, 4), (h @ p["ws"]).reshape(512, 5, 4)
+    lp = -0.5 * jnp.sum(((theta[:, None] - mu) / jnp.exp(log_s)) ** 2 + 2 * log_s, -1)
+    return -jnp.mean(jax.nn.logsumexp(jax.nn.log_softmax(logits) + lp, -1))
+
+
 def sbi_step(params, opt, key):
     """Simulate a Lotka-Volterra ensemble with RK4, then fit an MDN posterior."""
     k1, k2 = jax.random.split(key)
@@ -59,14 +68,7 @@ def sbi_step(params, opt, key):
     x = jnp.concatenate([traj.mean(0), traj.std(0), traj[-1]], -1)
     x = x + 0.05 * jax.random.normal(k2, (512, 6))
 
-    def loss(p):
-        h = jax.nn.gelu(jax.nn.gelu(x @ p["w1"]) @ p["w2"])
-        logits = h @ p["wa"]
-        mu, log_s = (h @ p["wm"]).reshape(512, 5, 4), (h @ p["ws"]).reshape(512, 5, 4)
-        lp = -0.5 * jnp.sum(((theta[:, None] - mu) / jnp.exp(log_s)) ** 2 + 2 * log_s, -1)
-        return -jnp.mean(jax.nn.logsumexp(jax.nn.log_softmax(logits) + lp, -1))
-
-    value, grads = jax.value_and_grad(loss)(params)
+    value, grads = jax.value_and_grad(sbi_loss)(params, x, theta)
     return adamw(params, grads, opt), value
 
 

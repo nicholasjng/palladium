@@ -409,7 +409,8 @@ def test_dot_general_matches_cpu():
             (lambda a,b: a @ b, array((2,1,7,5)), array((3,5,9))),
             (lambda a,b: a @ b, array((9,)), array((9,))),
             (lambda a,b: a @ b, array((3,9)), array((9,))),
-            (lambda a,b: jnp.outer(a,b), array((3,)), array((5,))),
+            (lambda a,b: lax.dot_general(a,b,(((),()),((),()))), array((3,)), array((5,))),
+            (lambda a,b: a @ b, array((0,3,7)), array((0,7,5))),
             (lambda a,b: lax.dot_general(a,b, (((2,0),(1,3)), ((1,),(0,)))),
              array((3,2,4,5)), array((2,4,7,3))),
             (lambda a,b: lax.dot_general(a,b, (((2,),(0,)), ((1,0),(2,1)))),
@@ -434,6 +435,37 @@ def test_dot_general_matches_cpu():
                 tol = 1e-2 if g.dtype.itemsize == 2 else 2e-5
                 np.testing.assert_allclose(np.asarray(g,np.float64),np.asarray(w,np.float64),
                                            rtol=tol,atol=tol,err_msg=f'case {index}')
+    """)
+
+
+def test_sbi_dense_training_matches_cpu_over_ten_steps():
+    _check(f"""
+        import sys
+        import jax, numpy as np
+        sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
+        from training_steps import adamw, sbi_loss
+        rng = np.random.default_rng(17)
+        shapes = {{'w1': (6,128), 'w2': (128,128), 'wa': (128,5),
+                   'wm': (128,20), 'ws': (128,20)}}
+        params = {{k: (rng.standard_normal(s) * 0.02).astype(np.float32) for k,s in shapes.items()}}
+        opt = (jax.tree.map(np.zeros_like, params), jax.tree.map(np.zeros_like, params), np.int32(0))
+        x = rng.standard_normal((512,6)).astype(np.float32)
+        theta = rng.uniform(0.5,1.5,(512,4)).astype(np.float32)
+        @jax.jit
+        def step(params,opt,x,theta):
+            loss,grads = jax.value_and_grad(sbi_loss)(params,x,theta)
+            return adamw(params,grads,opt),loss
+        state = {{name: jax.device_put((params,opt,x,theta),jax.devices(name)[0])
+                 for name in ('metal','cpu')}}
+        for _ in range(10):
+            losses = {{}}
+            for name,(p,o,a,t) in state.items():
+                (p,o),losses[name] = step(p,o,a,t)
+                state[name] = (p,o,a,t)
+            for g,w in zip(jax.tree.leaves((state['metal'][:2],losses['metal'])),
+                           jax.tree.leaves((state['cpu'][:2],losses['cpu'])),strict=True):
+                # Near-zero gradients amplify float32 reduction differences under Adam.
+                np.testing.assert_allclose(np.asarray(g),np.asarray(w),rtol=1e-4,atol=2e-6)
     """)
 
 
