@@ -204,15 +204,114 @@ def test_random_key_can_be_created_on_metal():
     """)
 
 
+def test_reductions_match_cpu():
+    _check("""
+        import jax, jax.numpy as jnp, ml_dtypes, numpy as np
+        from jax import lax
+        metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
+        rng = np.random.default_rng(5)
+        cases = []
+        for shape in ((3, 5, 37), (2, 10001), (10001,), (3, 0, 5), (0, 5), (2, 1)):
+            x = rng.uniform(-1, 1, shape).astype(np.float32)
+            for axes in [(i,) for i in range(len(shape))] + [tuple(range(len(shape)))]:
+                cases += [(lambda x, axes=axes: (x * 0.5 + 1).sum(axes), x)]
+                if all(shape[i] for i in axes):
+                    cases += [(lambda x, axes=axes: (x.max(axes), x.min(axes)), x)]
+        x = rng.uniform(0.1, 1, (7, 129)).astype(np.float32)
+        cases += [
+            (lambda x: jax.nn.softmax(x, -1), x),
+            (lambda x: (x - x.mean(-1, keepdims=True)) /
+                       jnp.sqrt(x.var(-1, keepdims=True) + 1e-5), x),
+            (lambda x: (x.sum(0).sum(), x.sum(-1).sum()), x),
+            (lambda x: jnp.sum(jnp.pad(x, ((1, 2), (3, 0))) ** 2, 0), x),
+            (lambda x: lax.reduce(x, np.float32(5), lax.max, (1,)), x),
+            (lambda x: lax.reduce(x, np.float32(5), lax.add, (0,)), np.empty(0, np.float32)),
+            (lambda x: x.sum((0, 2)), np.arange(231, dtype=np.float32).reshape(3, 7, 11)),
+            (lambda x: x.T.sum(0), x),
+        ]
+        for dtype in (np.int32, np.uint32, np.bool_, np.float16, ml_dtypes.bfloat16):
+            x = rng.integers(0, 8, (5, 257)).astype(dtype)
+            cases += [(lambda x: (x.sum(0), x.max(1), x.min(0)), x)]
+            if dtype in (np.int32, np.uint32, np.bool_):
+                cases += [(lambda x: (jnp.bitwise_and.reduce(x, 0),
+                                      jnp.bitwise_or.reduce(x, 1)), x)]
+        for fn, x in cases:
+            run = jax.jit(fn)
+            got, want = run(jax.device_put(x, metal)), run(jax.device_put(x, cpu))
+            for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+                tol = 1e-2 if g.dtype.itemsize == 2 else 2e-5
+                np.testing.assert_allclose(np.asarray(g, np.float64), np.asarray(w, np.float64),
+                                           rtol=tol, atol=1e-5)
+    """)
+
+
+def test_reduction_intermediates_survive_queued_executions():
+    _check("""
+        import jax, numpy as np
+        metal = jax.devices('metal')[0]
+        run = jax.jit(lambda x: (x - x.mean(-1, keepdims=True)).sum(-1))
+        outputs = []
+        for i in range(40):
+            x = jax.device_put(np.full((3, 10001), i, np.float32), metal)
+            outputs.append(run(x))
+            x.delete()
+        for out in outputs:
+            np.testing.assert_allclose(np.asarray(out), 0, atol=0.1)
+    """)
+
+
+def test_reduction_special_values_and_integer_extrema():
+    _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
+        for n in (37, 10001):
+            x = np.zeros((5, n), np.float32)
+            x[0, 1] = np.nan
+            x[1, 0], x[1, -1] = -np.inf, np.inf
+            x[2, :] = -0.0
+            x[3, 1] = -0.0
+            x[4, :] = np.inf
+            fn = jax.jit(lambda x: (x.min(-1), x.max(-1), x.sum(-1)))
+            got = fn(jax.device_put(x, metal))
+            # Use NumPy for special values: XLA:CPU can discard NaNs in extrema.
+            with np.errstate(invalid='ignore'):
+                want = x.min(-1), x.max(-1), x.sum(-1)
+            for g, w in zip(got, want, strict=True):
+                np.testing.assert_allclose(np.asarray(g), np.asarray(w), equal_nan=True)
+            # Check signed-zero ties explicitly; XLA may choose different zero signs.
+            minimum, maximum = map(np.asarray, got[:2])
+            assert np.signbit(minimum[2]) and np.signbit(maximum[2])
+            assert np.signbit(minimum[3]) and not np.signbit(maximum[3])
+        for dtype in (np.int32, np.uint32):
+            info = np.iinfo(dtype)
+            x = np.array([info.min, info.max, info.max - 1, 2**25 + 1], dtype=dtype)
+            fn = jax.jit(lambda x: (x.min(), x.max(), x.sum()))
+            got, want = fn(jax.device_put(x, metal)), fn(jax.device_put(x, cpu))
+            for g, w in zip(got, want, strict=True):
+                np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+        # Empty reductions return their initializer; zero-size outputs do not dispatch.
+        for fn, x in [
+            (lambda x: lax.reduce(x, np.float32(-np.inf), lax.max, (1,)),
+             np.empty((3, 0), np.float32)),
+            (lambda x: lax.reduce(x, np.float32(np.inf), lax.min, (1,)),
+             np.empty((3, 0), np.float32)),
+        ]:
+            run = jax.jit(fn)
+            np.testing.assert_array_equal(np.asarray(run(jax.device_put(x, metal))),
+                                          np.asarray(run(jax.device_put(x, cpu))))
+    """)
+
+
 def test_unsupported_ops_report_unimplemented():
     """A CPU compile first, so the metal one hashes its topology for the cache key."""
     result = _run("""
         import jax, jax.numpy as jnp, numpy as np
         assert float(jax.device_put(np.ones(3, np.float32), jax.devices("cpu")[0]).sum()) == 3
-        jax.jit(lambda x: x.sum())(jnp.ones(3, device=jax.devices("metal")[0]))
+        jax.jit(lambda x: x.prod())(jnp.ones(3, device=jax.devices("metal")[0]))
     """)
     assert result.returncode != 0
-    assert "UNIMPLEMENTED: metal: stablehlo.reduce is not supported yet" in result.stderr
+    assert "UNIMPLEMENTED: metal: stablehlo.reduce has an unsupported reducer body" in result.stderr
 
 
 def test_registers_only_when_jax_platforms_names_metal():

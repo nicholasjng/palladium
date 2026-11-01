@@ -21,11 +21,16 @@ Works:
   negative edge padding), `dynamic_slice`, and `dynamic_update_slice`.
   They fuse with producers and consumers without intermediate buffers.
 - `jax.random.key` on the Metal default device.
+- Single-result `reduce` with add, maximum, minimum, and, or bodies over
+  arbitrary axes, including empty reductions. Producers fuse into reduction
+  reads; consumers read intermediate slots in later launches. This enables
+  softmax, means, variances and normalization programs.
 - Asynchronous execution with completion events, a buffer pool, and at most
   16 executions in flight.
 
 Fails with UNIMPLEMENTED, naming the op (`palladium.stablehlo` raises
-`UnsupportedProgram`): `reduce`, `dot_general`, `while`, `case`,
+`UnsupportedProgram`): variadic or other reducer bodies (including argmax and
+product), `dot_general`, `while`, `case`,
 `gather`,
 `scatter`, `reduce_window`, `sort`, `convolution`, and any op on 64-bit
 types. So far none of `examples/training_steps.py` runs: SBI stops at
@@ -188,17 +193,29 @@ copy ceiling.
 
 In order of what M2's SBI step needs first.
 
-1. **Multi-kernel programs and `reduce`.** A reduction ends a kernel.
-   Producers fuse into the reduction's input reads: the same coordinate
-   machinery, evaluated inside the reduction loop. Consumers go into the next
-   kernel, reading an intermediate slot (a fresh slot that is not an
-   output; Execute already releases those after completion). Reduce over the
-   last axis like palladium's row programs, one threadgroup per row with
-   SIMD-group reductions (those reached 91 GB/s); other axes and full
-   reductions need a two-level scheme. Variadic reduce (argmax's
-   value-index pairs) is in the census, and palladium already lowers it for
-   jaxprs. The reduction body region is usually one of add, max, min, and,
-   or; reject anything else.
+1. **Multi-kernel programs and `reduce` (single-result slice done).**
+   Dependencies are scheduled before consumers, with each reduction computed
+   once even when returned or consumed multiple times. Producers fuse into
+   input reads inside the reduction loop; consumers read fresh intermediate
+   slots, which Execute already keeps out of the pool until completion.
+   Kernels use 128 threads per output, SIMD collectives and four threadgroup
+   partials. When there are fewer than 128 outputs and more than 4096 reduced
+   elements, independent 4096-element chunks feed a second reduction launch.
+   The same coordinate machinery handles arbitrary axes; column reductions
+   are correct but still need coalesced tiling.
+
+   The compiler validates the reducer region: exactly one binary add, max,
+   min, and or or returning its result. Other bodies and variadic reducers
+   fail explicitly. Half/bfloat accumulators and partial buffers use float32.
+   Reduction launches use SAFE math; min/max propagate NaNs and resolve
+   signed-zero ties explicitly around Metal's SIMD collectives. Elementwise
+   launches retain FAST math. The supplied initializer is combined once in
+   the final pass, and is returned for empty reductions. Non-identity
+   initializers need not match XLA's reduction schedule, which can insert
+   them multiple times ([StableHLO semantics](https://openxla.org/stablehlo/spec#reduce)).
+
+   Remaining: variadic argmax/argmin (palladium already lowers these for
+   jaxprs), coalesced column reductions, tuning small rows, and epilogue fusion.
 2. **`concatenate`, `pad`, dynamic slices (done).** `_Kernel.choose` emits
    each branch's entire producer chain inside its guard. Value and reshape
    memoization is scoped to that branch, with unique temporary names across
@@ -252,6 +269,23 @@ In order of what M2's SBI step needs first.
      programs grow.
    - Compile time: the first call of a small program takes about 90 ms.
 10. **Dropping the JAX_PLATFORMS gate** once the success criteria below hold.
+
+### Reduction measurements, 2026-11-01
+
+Apple M1 Pro, jax/jaxlib 0.12.0.1, float32 ones of shape (1024, 4096),
+resident inputs. Wall time per call: minimum of five batches of 100 compiled
+calls, blocking only on the last output in each batch. Compile + first call
+includes lowering, compilation and one completed execution; Metal's disk
+shader cache may be warm. These are host timings, not GPU timestamps.
+
+| Sum axis | Metal pipelined | CPU pipelined | Metal compile + first call |
+|---|---:|---:|---:|
+| Last (rows) | 63.9 µs | 150.9 µs | 86.3 ms |
+| First (columns) | 410.3 µs | 248.9 µs | 21.0 ms |
+| All | 71.4 µs | 140.0 µs | 25.7 ms |
+
+The column path's strided reads remain slower than CPU. These measurements
+do not establish M1's overhead target against jax-mps.
 
 ## Success criteria for M1, against jax 0.12
 

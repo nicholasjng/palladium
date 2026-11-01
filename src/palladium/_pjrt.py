@@ -43,7 +43,6 @@ _PJRT_TYPES = {
 }
 _SLOT_KINDS = {"parameter": 0, "fresh": 1, "constant": 2}
 _UNIMPLEMENTED, _INTERNAL = 12, 13
-_MATH_MODE_FAST = 2
 
 _COMPILER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
 _INT64S = ctypes.POINTER(ctypes.c_int64)
@@ -130,11 +129,13 @@ def _describe(lib: ctypes.CDLL, builder: int, code: bytes) -> None:
             builder,
             launch.source.encode(),
             launch.function.encode(),
-            _MATH_MODE_FAST,
+            launch.math_mode,
             slots,
             len(launch.slots),
             grid,
-            (ctypes.c_size_t * 3)(),
+            (ctypes.c_size_t * 3)(launch.threadgroup, 1, 1)
+            if launch.threadgroup
+            else (ctypes.c_size_t * 3)(),
         )
         if status < 0:
             raise _Recorded

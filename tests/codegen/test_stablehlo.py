@@ -77,10 +77,37 @@ def test_guarded_index_maps_still_fuse():
 @pytest.mark.parametrize(
     ("fn", "message"),
     [
-        (lambda x: x.sum(), "stablehlo.reduce"),
+        (lambda x: x.prod(), "stablehlo.reduce"),
+        (lambda x: x.argmax(), "stablehlo.reduce"),
         (lambda x: x @ x, "stablehlo.dot_general"),
     ],
 )
 def test_rejects_unsupported_ops(fn, message):
     with pytest.raises(UnsupportedProgram, match=message):
         _compile(fn, (4, 4))
+
+
+def test_reductions_materialize_once_before_consumers():
+    def fn(x):
+        s = (x * x).sum(-1)
+        return s, s, x + s[:, None], s.sum()
+
+    program = _compile(fn, (3, 17))
+    assert len(program.launches) == 3
+    assert program.outputs[0] == program.outputs[1]
+    # No materialization of x*x; consumers share the reduction's slot.
+    first, second, consumer = program.launches
+    assert first.slots == (0, program.outputs[0])
+    assert second.slots == (program.outputs[0], program.outputs[-1])
+    assert program.outputs[0] in consumer.slots[:-1]
+    assert first.threadgroup == second.threadgroup == 128
+
+
+def test_full_reduction_splits_into_partials():
+    program = _compile(lambda x: x.sum(), (10001,))
+    assert len(program.launches) == 2
+    first, second = program.launches
+    partial = first.slots[-1]
+    assert program.slots[partial].shape == (3,)
+    assert partial == second.slots[0]
+    assert first.grid == 3 * 128 and second.grid == 128

@@ -3,9 +3,11 @@
 The plugin's PJRT_Client_Compile passes the portable artifact jax serializes to
 `compile_program`, which parses it with jaxlib's MLIR bindings and returns a
 `Program`: buffer slots and kernel launches, which `palladium._pjrt` hands to
-the plugin. So far a program may hold elementwise and index-mapping ops
+the plugin. A program may hold elementwise and index-mapping ops
 (broadcast, reshape, transpose, slices, concatenate, pad, reverse, iota), fused
-into one kernel per output shape; anything else raises `UnsupportedProgram`.
+into one kernel per output shape. Single-result reductions end a fusion and
+materialize a buffer for subsequent kernels; unsupported ops and reducer bodies
+raise `UnsupportedProgram`.
 
 Each kernel thread computes one output element at the coordinates of its flat
 index. A value is generated at the coordinates it is read at, once per
@@ -27,7 +29,7 @@ from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import stablehlo
 
 from palladium.emit.core import CTYPES
-from palladium.emit.numeric import format_scalar
+from palladium.emit.numeric import extremum_identity, format_scalar
 from palladium.errors import EmitError
 
 __all__ = ["Launch", "Program", "Slot", "UnsupportedProgram", "compile_program"]
@@ -55,6 +57,8 @@ class Launch:
     function: str
     slots: tuple[int, ...]
     grid: int
+    threadgroup: int = 0
+    math_mode: int = 2  # runtime MathMode: Safe=0, Relaxed=1, Fast=2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -221,6 +225,21 @@ def _constant(op) -> _Constant:
 def _attributes(op) -> dict:
     a = op.attributes
     name = op.operation.name.removeprefix("stablehlo.")
+    if name == "reduce":
+        block = op.regions[0].blocks[0]
+        body = list(block.operations)
+        if len(op.results) != 1 or len(body) != 2:
+            raise UnsupportedProgram("metal: stablehlo.reduce requires a single binary reducer")
+        reducer, ret = body
+        kind = reducer.operation.name.removeprefix("stablehlo.")
+        if (
+            kind not in ("add", "maximum", "minimum", "and", "or")
+            or list(reducer.operands) != list(block.arguments)
+            or ret.operation.name != "stablehlo.return"
+            or list(ret.operands) != list(reducer.results)
+        ):
+            raise UnsupportedProgram("metal: stablehlo.reduce has an unsupported reducer body")
+        return {"dims": list(ir.DenseI64ArrayAttr(a["dimensions"])), "reducer": kind}
     if name == "broadcast_in_dim":
         return {"dims": list(ir.DenseI64ArrayAttr(a["broadcast_dimensions"]))}
     if name == "transpose":
@@ -284,6 +303,7 @@ _SUPPORTED = {
     "pad",
     "dynamic_slice",
     "dynamic_update_slice",
+    "reduce",
 }
 
 
@@ -312,9 +332,10 @@ def _graph(module: ir.Module) -> tuple[list[_Parameter], list[_Node]]:
             if name == "stablehlo.constant":
                 env[op.result] = _constant(op)
             elif name.startswith("stablehlo.") and short in _SUPPORTED:
+                attributes = _attributes(op)
                 dtype, shape = _tensor(op.result)
                 operands = [env[v] for v in op.operands]
-                env[op.result] = _Op(short, operands, dtype, shape, _attributes(op))
+                env[op.result] = _Op(short, operands, dtype, shape, attributes)
             else:
                 raise UnsupportedProgram(f"metal: {name} is not supported yet")
         raise UnsupportedProgram("metal: function without a return")
@@ -412,6 +433,8 @@ class _Kernel:
         assert isinstance(node, _Op)
         a, operands = node.attributes, node.operands
         match node.name:
+            case "reduce":
+                return self._read(node, coords)
             case "concatenate":
                 dim, offset, branches = a["dim"], 0, []
                 for x in operands:
@@ -530,6 +553,9 @@ class _Kernel:
 
     def source(self, outputs: list[_Node], name: str) -> str:
         stores = [f"o{k}[i] = {self.value(node, self.coords)};" for k, node in enumerate(outputs)]
+        return self.render(outputs, name, stores)
+
+    def render(self, outputs: list[_Node], name: str, stores: list[str], index: str = "i") -> str:
         params = [
             f"device const {_ctype(n.dtype)}* b{k} [[buffer({k})]]"
             for k, n in enumerate(self.buffers)
@@ -538,13 +564,85 @@ class _Kernel:
             f"device {_ctype(n.dtype)}* o{k} [[buffer({len(self.buffers) + k})]]"
             for k, n in enumerate(outputs)
         ]
-        params.append("uint i [[thread_position_in_grid]]")
+        params.append(f"uint {index} [[thread_position_in_grid]]")
         body = "\n".join(f"    {line}" for line in self.lines + stores)
         helpers = "".join(f"{s}\n\n" for s in self.helpers.values())
         return (
             "#include <metal_stdlib>\nusing namespace metal;\n\n"
             f"{helpers}kernel void {name}(\n    " + ",\n    ".join(params) + f") {{\n{body}\n}}\n"
         )
+
+
+def _identity(kind: str, ctype: str) -> str:
+    if kind in ("add", "or"):
+        return f"{ctype}(0)"
+    if kind == "and":
+        return "true" if ctype == "bool" else f"{ctype}(~0u)"
+    return extremum_identity(_ELEMENTWISE[kind], ctype)
+
+
+def _reduction_kernel(node: _Op, output: _Node, name: str, chunks: int = 1) -> tuple[_Kernel, str]:
+    """128 threads per output; large reductions can write independent partials."""
+    x, init = node.operands
+    dims = sorted(node.attributes["dims"])
+    reduced_shape = tuple(x.shape[d] for d in dims)
+    size = math.prod(reduced_shape)
+    kind = node.attributes["reducer"]
+    ctype = _ctype(node.dtype)
+    acc_type = "float" if ctype in ("half", "bfloat") else ctype
+    identity = _identity(kind, acc_type)
+    intrinsic = {"add": "sum", "maximum": "max", "minimum": "min", "and": "and", "or": "or"}[kind]
+    if ctype == "bool":
+        intrinsic = "all" if kind in ("and", "minimum") else "any"
+
+    def combine(a: str, b: str) -> str:
+        return format_scalar(_ELEMENTWISE[kind], acc_type, (a, b))
+
+    def collective() -> list[str]:
+        if acc_type == "float" and kind in ("maximum", "minimum"):
+            # Metal's extrema ignore NaNs and do not specify zero ties.
+            sign = "" if kind == "minimum" else "!"
+            zero, other = ("-0.0f", "0.0f") if kind == "minimum" else ("0.0f", "-0.0f")
+            return [
+                "{",
+                "bool nan = simd_any(isnan(acc));",
+                f"bool zero = simd_any(acc == 0.0f && {sign}signbit(acc));",
+                f"acc = simd_{intrinsic}(acc);",
+                f"acc = nan ? NAN : (acc == 0.0f ? (zero ? {zero} : {other}) : acc);",
+                "}",
+            ]
+        return [f"acc = simd_{intrinsic}(acc);"]
+
+    kernel = _Kernel(output.shape)
+    kernel.lines.insert(0, "uint i = g / 128u;")
+    kernel.lines += [f"{acc_type} acc = {identity};", "uint t = g % 128u;"]
+    start = f"{kernel.coords[-1]} * 4096u + t" if chunks > 1 else "t"
+    end = f"min(({kernel.coords[-1]} + 1u) * 4096u, {size}u)" if chunks > 1 else f"{size}u"
+    # Zero-sized inputs have no read at all (nor zero divisors in coordinates).
+    if size:
+        kernel.lines.append(f"for (uint r = {start}; r < {end}; r += 128u) {{")
+        red_coords = iter(_delinear("r", reduced_shape))
+        out_coords = iter(kernel.coords)
+        coords = tuple(
+            next(red_coords) if d in dims else next(out_coords) for d in range(len(x.shape))
+        )
+        value = kernel.value(x, coords)
+        kernel.lines += [f"acc = {combine('acc', f'{acc_type}({value})')};", "}"]
+        kernel.values.clear()
+        kernel.reshaped.clear()
+    kernel.lines += collective() + [
+        f"threadgroup {acc_type} partial[4];",
+        "if (t % 32u == 0u) partial[t / 32u] = acc;",
+        "threadgroup_barrier(mem_flags::mem_threadgroup);",
+        "if (t < 32u) {",
+        f"acc = t < 4u ? partial[t] : {identity};",
+    ]
+    kernel.lines += collective() + ["if (t == 0u) {"]
+    if chunks == 1:
+        initial = kernel.value(init, ())
+        kernel.lines.append(f"acc = {combine('acc', f'{acc_type}({initial})')};")
+    kernel.lines += [f"o0[i] = {_ctype(output.dtype)}(acc);", "}", "}"]
+    return kernel, kernel.render([output], name, [], index="g")
 
 
 def compile_program(code: bytes) -> Program:
@@ -577,6 +675,68 @@ def compile_program(code: bytes) -> Program:
         slot_of[id(node)] = len(slots)
         slots.append(Slot("constant", node.dtype, node.shape, node.array.tobytes()))
 
+    def fresh(node: _Node) -> None:
+        _ctype(node.dtype)
+        slot_of[id(node)] = len(slots)
+        slots.append(Slot("fresh", node.dtype, node.shape))
+
+    launches = []
+
+    def launch(
+        kernel: _Kernel, source: str, name: str, nodes: list[_Node], threads: int = 0
+    ) -> None:
+        for operand in kernel.buffers:
+            if id(operand) not in slot_of:
+                add_constant(operand)
+        bound = [slot_of[id(n)] for n in kernel.buffers] + [slot_of[id(n)] for n in nodes]
+        grid = math.prod(nodes[0].shape) * (threads or 1)
+        launches.append(Launch(source, name, tuple(bound), grid, threads, 0 if threads else 2))
+
+    visited: set[int] = set()
+    temporaries: list[_Node] = []  # keep synthetic nodes alive while slot_of uses their ids
+
+    def schedule(node: _Node) -> None:
+        if id(node) in visited:
+            return
+        visited.add(id(node))
+        if not isinstance(node, _Op):
+            return
+        for operand in node.operands:
+            schedule(operand)
+        if node.name != "reduce":
+            return
+        x, init = node.operands
+        size = math.prod(x.shape[d] for d in node.attributes["dims"])
+        # Split long, low-output-count reductions so full reductions occupy the GPU.
+        chunks = math.ceil(size / 4096) if size > 4096 and math.prod(node.shape) < 128 else 1
+        reduction = node
+        if chunks > 1:
+            dtype = (
+                np.dtype(np.float32)
+                if node.dtype in (np.float16, ml_dtypes.bfloat16)
+                else node.dtype
+            )
+            partial = _Parameter(-1, dtype, (*node.shape, chunks))
+            temporaries.append(partial)
+            fresh(partial)
+            name = f"reduce_{len(launches)}"
+            kernel, source = _reduction_kernel(node, partial, name, chunks)
+            launch(kernel, source, name, [partial], 128)
+            reduction = _Op(
+                "reduce",
+                [partial, init],
+                node.dtype,
+                node.shape,
+                {"dims": [len(node.shape)], "reducer": node.attributes["reducer"]},
+            )
+        fresh(node)
+        name = f"reduce_{len(launches)}"
+        kernel, source = _reduction_kernel(reduction, node, name)
+        launch(kernel, source, name, [node], 128)
+
+    for node in results:
+        schedule(node)
+
     computed: dict[tuple[int, ...], list[_Node]] = {}
     for node in results:
         if id(node) in slot_of:
@@ -584,19 +744,12 @@ def compile_program(code: bytes) -> Program:
         if isinstance(node, _Constant) and node.splat is None:
             add_constant(node)
             continue
-        _ctype(node.dtype)
-        slot_of[id(node)] = len(slots)
-        slots.append(Slot("fresh", node.dtype, node.shape))
+        fresh(node)
         computed.setdefault(node.shape, []).append(node)
 
-    launches = []
     for shape, nodes in computed.items():
         kernel = _Kernel(shape)
         name = f"fused_{len(launches)}"
         source = kernel.source(nodes, name)
-        for node in kernel.buffers:
-            if id(node) not in slot_of:  # a constant array read by the kernel
-                add_constant(node)
-        bound = [slot_of[id(n)] for n in kernel.buffers] + [slot_of[id(n)] for n in nodes]
-        launches.append(Launch(source, name, tuple(bound), math.prod(shape)))
+        launch(kernel, source, name, nodes)
     return Program(slots, launches, [slot_of[id(n)] for n in results])
