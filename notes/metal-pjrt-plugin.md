@@ -482,6 +482,16 @@ artifacts; require `elementwise_fraction_of_copy >= 0.8` and SBI first call
 under 5 seconds. The correctness suite remains a separate prerequisite.
 JAX persistent caching is disabled; the Metal driver's cache is not cleared.
 
+Schema version 2 also records Git/jj revisions and working-copy dirtiness.
+With `--output`, the artifact is atomically checkpointed before and after each
+section: an unsupported SBI step does not erase latency/bandwidth measurements.
+Failed sections contain their exception and the process exits nonzero; an
+interrupted section remains marked `running`. Successful sections remain usable.
+Timing batches are calibrated to at least `--sample-seconds` (default 0.2 s)
+before collecting five samples, with the actual calls per sample recorded.
+Large elementwise calls synchronize individually to bound memory use; small
+calls remain pipelined. Copy samples average GPU time across repeated calls.
+
 [M1 Pro artifact, 2026-11-01](metal-m1-pro-2026-11-01.json): 23.1 µs median
 small-call latency, 127.0 GB/s elementwise versus 141.6 GB/s copy (89.7%),
 and 0.256 s SBI compile plus first execution. These are five-sample medians
