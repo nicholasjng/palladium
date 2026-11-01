@@ -390,6 +390,53 @@ def test_sbi_trajectory_and_summary_match_cpu():
     """)
 
 
+def test_dot_general_matches_cpu():
+    _check("""
+        import jax, jax.numpy as jnp, ml_dtypes, numpy as np
+        from jax import lax
+        metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
+        rng = np.random.default_rng(71)
+        def array(shape):
+            return rng.uniform(-0.5, 0.5, shape).astype(np.float32)
+        cases = []
+        for m, n, k in ((32, 48, 64), (17, 19, 7), (1, 1, 13), (512, 128, 6),
+                        (128, 5, 128), (3, 5, 0), (0, 5, 3), (3, 0, 5)):
+            a, b = array((m,k)), array((k,n))
+            cases += [(lambda a,b: a @ b, a,b), (lambda a,b: a.T @ b.T, a.T,b.T)]
+        cases += [
+            (lambda a,b: a @ b, array((3,32,16)), array((3,16,48))),
+            (lambda a,b: a @ b, array((2,3,7,5)), array((2,3,5,9))),
+            (lambda a,b: a @ b, array((2,1,7,5)), array((3,5,9))),
+            (lambda a,b: a @ b, array((9,)), array((9,))),
+            (lambda a,b: a @ b, array((3,9)), array((9,))),
+            (lambda a,b: jnp.outer(a,b), array((3,)), array((5,))),
+            (lambda a,b: lax.dot_general(a,b, (((2,0),(1,3)), ((1,),(0,)))),
+             array((3,2,4,5)), array((2,4,7,3))),
+            (lambda a,b: lax.dot_general(a,b, (((2,),(0,)), ((1,0),(2,1)))),
+             array((2,3,4,5)), array((4,2,3,6))),
+            (lambda a,b: (jax.nn.softmax((a * 2) @ b, -1), (a @ b).sum()),
+             array((17,7)), array((7,19))),
+            (lambda a,b: lax.fori_loop(0,3,lambda i,x: x @ b, a),
+             array((16,16)), array((16,16))),
+            (lambda a,b: jax.value_and_grad(lambda x: jnp.sum((x @ b)**2))(a),
+             array((17,7)), array((7,19))),
+        ]
+        for dtype in (np.float16, ml_dtypes.bfloat16):
+            a,b = array((17,13)).astype(dtype), array((13,19)).astype(dtype)
+            cases += [(lambda a,b:a@b, a,b),
+                      (lambda a,b:lax.dot_general(a,b,(((1,),(0,)),((),())),
+                                                 preferred_element_type=jnp.float32), a,b)]
+        for index, (fn, a,b) in enumerate(cases):
+            run = jax.jit(fn)
+            got = run(jax.device_put(a,metal),jax.device_put(b,metal))
+            want = run(jax.device_put(a,cpu),jax.device_put(b,cpu))
+            for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
+                tol = 1e-2 if g.dtype.itemsize == 2 else 2e-5
+                np.testing.assert_allclose(np.asarray(g,np.float64),np.asarray(w,np.float64),
+                                           rtol=tol,atol=tol,err_msg=f'case {index}')
+    """)
+
+
 def test_unsupported_ops_report_unimplemented():
     """A CPU compile first, so the metal one hashes its topology for the cache key."""
     result = _run("""

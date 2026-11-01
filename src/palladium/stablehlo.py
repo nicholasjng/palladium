@@ -56,7 +56,7 @@ class Launch:
     source: str
     function: str
     slots: tuple[int, ...]
-    grid: int
+    grid: int | tuple[int, int, int]
     threadgroup: int = 0
     math_mode: int = 2  # runtime MathMode: Safe=0, Relaxed=1, Fast=2
 
@@ -296,6 +296,18 @@ def _constant(op) -> _Constant:
 def _attributes(op) -> dict:
     a = op.attributes
     name = op.operation.name.removeprefix("stablehlo.")
+    if name == "dot_general":
+        if "algorithm" in a:
+            raise UnsupportedProgram(
+                "metal: stablehlo.dot_general explicit algorithms are not supported"
+            )
+        dims = stablehlo.DotDimensionNumbers(a["dot_dimension_numbers"])
+        return {
+            "lhs_batch": tuple(dims.lhs_batching_dimensions),
+            "rhs_batch": tuple(dims.rhs_batching_dimensions),
+            "lhs_contract": tuple(dims.lhs_contracting_dimensions),
+            "rhs_contract": tuple(dims.rhs_contracting_dimensions),
+        }
     if name == "reduce":
         block = op.regions[0].blocks[0]
         body = list(block.operations)
@@ -375,6 +387,7 @@ _SUPPORTED = {
     "dynamic_slice",
     "dynamic_update_slice",
     "reduce",
+    "dot_general",
 }
 
 
@@ -532,7 +545,7 @@ class _Kernel:
         assert isinstance(node, _Op)
         a, operands = node.attributes, node.operands
         match node.name:
-            case "reduce":
+            case "reduce" | "dot_general":
                 return self._read(node, coords)
             case "concatenate":
                 dim, offset, branches = a["dim"], 0, []
@@ -867,6 +880,9 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
             return
         for operand in node.operands:
             schedule(operand)
+        if node.name == "dot_general":
+            schedule_dot(node)
+            return
         if node.name != "reduce":
             return
         x, init = node.operands
@@ -897,6 +913,66 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
         name = f"reduce_{len(launches)}"
         kernel, source = _reduction_kernel(reduction, node, name)
         launch(kernel, source, name, [node], 128)
+
+    def schedule_dot(node: _Op) -> None:
+        from palladium._stablehlo_gemm import gemm_source
+
+        lhs, rhs = node.operands
+        floats = (np.dtype(np.float32), np.dtype(np.float16), np.dtype(ml_dtypes.bfloat16))
+        if lhs.dtype != rhs.dtype or lhs.dtype not in floats or node.dtype not in floats:
+            raise UnsupportedProgram(
+                "metal: stablehlo.dot_general requires matching floating operands"
+            )
+        if node.dtype != lhs.dtype and node.dtype != np.float32:
+            raise UnsupportedProgram(
+                "metal: stablehlo.dot_general only supports widening results to float32"
+            )
+        a = node.attributes
+        lb, rb, lc, rc = (
+            a[key] for key in ("lhs_batch", "rhs_batch", "lhs_contract", "rhs_contract")
+        )
+        lf = tuple(d for d in range(len(lhs.shape)) if d not in lb + lc)
+        rf = tuple(d for d in range(len(rhs.shape)) if d not in rb + rc)
+        batch = math.prod(lhs.shape[d] for d in lb)
+        m, n = math.prod(lhs.shape[d] for d in lf), math.prod(rhs.shape[d] for d in rf)
+        k = math.prod(lhs.shape[d] for d in lc)
+        fresh(node)
+        if not math.prod(node.shape):
+            return
+        if not k:
+            zero = _Constant(node.dtype, node.shape, 0)
+            kernel = _Kernel(node.shape)
+            name = f"empty_dot_{len(launches)}"
+            # Use the dot's output slot for the zero-producing kernel.
+            launch(kernel, kernel.source([zero], name), name, [node])
+            return
+
+        def pack(value: _Node, perm: tuple[int, ...], shape: tuple[int, ...]) -> int:
+            if perm != tuple(range(len(value.shape))):
+                value = _Op(
+                    "transpose",
+                    [value],
+                    value.dtype,
+                    tuple(value.shape[d] for d in perm),
+                    {"perm": perm},
+                )
+            if value.dtype != node.dtype:
+                value = _Op("convert", [value], node.dtype, value.shape, {})
+            # Buffer metadata may retain its original shape: a canonical reshape
+            # changes neither the storage nor its row-major element order.
+            if id(value) in slot_of:
+                return slot_of[id(value)]
+            value = _Op("reshape", [value], value.dtype, shape, {})
+            temporaries.append(value)
+            return materialize(value)
+
+        left = pack(lhs, lb + lf + lc, (batch, m, k))
+        right = pack(rhs, rb + rc + rf, (batch, k, n))
+        try:
+            source, grid = gemm_source(batch, m, n, k, node.dtype)
+        except EmitError as e:
+            raise UnsupportedProgram(f"metal: stablehlo.dot_general: {e}") from e
+        launches.append(Launch(source, "gemm", (left, right, slot_of[id(node)]), grid, 128))
 
     for node in results:
         schedule(node)

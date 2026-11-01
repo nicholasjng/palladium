@@ -124,7 +124,8 @@ def _describe(lib: ctypes.CDLL, builder: int, code: bytes) -> None:
             raise _Recorded
     for launch in program.launches:
         slots = (ctypes.c_int * len(launch.slots))(*launch.slots)
-        grid = (ctypes.c_size_t * 3)(launch.grid, 1, 1)
+        dims = (launch.grid, 1, 1) if isinstance(launch.grid, int) else launch.grid
+        grid = (ctypes.c_size_t * 3)(*dims)
         status = lib.pp_kernel(
             builder,
             launch.source.encode(),

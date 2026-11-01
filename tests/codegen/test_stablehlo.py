@@ -13,10 +13,10 @@ from jaxlib.mlir.dialects import stablehlo
 from palladium.stablehlo import UnsupportedProgram, compile_program
 
 
-def _compile(fn, *shapes, dtype=np.float32):
+def _compile(fn, *shapes, dtype=np.float32, version="1.0.0"):
     lowered = jax.jit(fn).lower(*(jax.ShapeDtypeStruct(s, dtype) for s in shapes))
     text = str(lowered.compiler_ir("stablehlo"))
-    return compile_program(stablehlo.serialize_portable_artifact_str(text, "1.0.0"))
+    return compile_program(stablehlo.serialize_portable_artifact_str(text, version))
 
 
 def test_one_kernel_per_output_shape():
@@ -79,7 +79,7 @@ def test_guarded_index_maps_still_fuse():
     [
         (lambda x: x.prod(), "stablehlo.reduce"),
         (lambda x: x.argmax(), "stablehlo.reduce"),
-        (lambda x: x @ x, "stablehlo.dot_general"),
+        (lambda x: x.astype(jnp.int32) @ x.astype(jnp.int32), "stablehlo.dot_general"),
     ],
 )
 def test_rejects_unsupported_ops(fn, message):
@@ -154,3 +154,44 @@ def test_unproven_loop_is_rejected(fn):
 def test_loop_replay_budget_is_checked():
     with pytest.raises(UnsupportedProgram, match="replay limit"):
         _compile(lambda x: lax.fori_loop(0, 100001, lambda i, y: y + 1, x), (4,))
+
+
+def test_aligned_dot_reuses_simdgroup_emitter_without_input_copies():
+    program = _compile(lambda a, b: a @ b, (32, 64), (64, 48))
+    [launch] = program.launches
+    assert launch.slots == (0, 1, program.outputs[0])
+    assert "simdgroup_multiply_accumulate" in launch.source
+    assert launch.grid == (128, 1, 3) and launch.threadgroup == 128
+
+
+def test_dot_tail_uses_existing_tensorops_emitter():
+    program = _compile(lambda a, b: a @ b, (3, 7), (7, 5))
+    [launch] = program.launches
+    assert "matmul2d" in launch.source
+
+
+def test_dot_dependencies_materialize_before_consumers():
+    program = _compile(lambda a, b: (a * 2) @ b.T + 1, (32, 16), (48, 16))
+    assert len(program.launches) == 4  # two packed operands, GEMM, epilogue
+    gemm = program.launches[2]
+    assert gemm.function == "gemm"
+    assert gemm.slots[:2] == tuple(l.slots[-1] for l in program.launches[:2])
+    assert gemm.slots[-1] in program.launches[-1].slots[:-1]
+
+
+def test_empty_dot_never_reads_inputs():
+    program = _compile(lambda a, b: a @ b, (3, 0), (0, 5))
+    [launch] = program.launches
+    assert launch.slots == (program.outputs[0],)
+
+
+def test_dot_explicit_algorithm_is_rejected():
+    with pytest.raises(UnsupportedProgram, match="explicit algorithms"):
+        _compile(
+            lambda a, b: lax.dot_general(
+                a, b, (((1,), (0,)), ((), ())), precision=lax.DotAlgorithmPreset.F32_F32_F32
+            ),
+            (16, 16),
+            (16, 16),
+            version=stablehlo.get_current_version(),
+        )
