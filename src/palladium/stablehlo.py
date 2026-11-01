@@ -1195,19 +1195,34 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
 
     def schedule_scatter(node: _Op) -> None:
         x, indices, updates = node.operands
-        if node.dtype not in (np.float32, np.int32, np.uint32) or indices.dtype not in (
+        narrow = node.dtype in (np.float16, ml_dtypes.bfloat16)
+        if (
+            not narrow and node.dtype not in (np.float32, np.int32, np.uint32)
+        ) or indices.dtype not in (
             np.int32,
             np.uint32,
         ):
             raise UnsupportedProgram(
-                "metal: stablehlo.scatter requires float32/int32/uint32 data and 32-bit indices"
+                "metal: stablehlo.scatter requires floating or int32/uint32 data and 32-bit indices"
             )
         fresh(node)
         kernel = _Kernel(node.shape)
         name = f"scatter_init_{len(launches)}"
-        launch(kernel, kernel.source([x], name), name, [node])
         if not math.prod(updates.shape) or not math.prod(node.shape):
+            launch(kernel, kernel.source([x], name), name, [node])
             return
+        target: _Node = node
+        if narrow:
+            # One 32-bit atomic word per element, including odd-sized outputs.
+            # Packing adjacent halves would require aligned/padded allocations.
+            target = _Parameter(-1, np.dtype(np.uint32), node.shape)
+            temporaries.append(target)
+            fresh(target)
+            value = kernel.value(x, kernel.coords)
+            source = kernel.render([target], name, [f"o0[i] = uint(as_type<ushort>({value}));"])
+        else:
+            source = kernel.source([x], name)
+        launch(kernel, source, name, [target])
         a = node.attributes
         kernel = _Kernel(updates.shape)
         batch_coords = iter(c for d, c in enumerate(kernel.coords) if d not in a["window"])
@@ -1235,15 +1250,33 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
         value = kernel.value(updates, kernel.coords)
         flat = _linear(tuple(f"uint({c})" for c in inner), node.shape)
         ctype = _ctype(node.dtype)
-        kernel.lines += [
-            f"atomic_fetch_add_explicit(reinterpret_cast<device atomic_{ctype}*>(o0) + ({flat}), {value}, memory_order_relaxed);",
-            "}",
-        ]
+        if narrow:
+            # Round after every successful update, as a narrow scalar add does.
+            kernel.lines += [
+                f"device atomic_uint* address = reinterpret_cast<device atomic_uint*>(o0) + ({flat});",
+                "uint expected = atomic_load_explicit(address, memory_order_relaxed);",
+                "uint desired;",
+                "do {",
+                f"{ctype} next = {ctype}(float(as_type<{ctype}>(ushort(expected))) + float({value}));",
+                "desired = uint(as_type<ushort>(next));",
+                "} while (!atomic_compare_exchange_weak_explicit(address, &expected, desired, memory_order_relaxed, memory_order_relaxed));",
+            ]
+        else:
+            kernel.lines.append(
+                f"atomic_fetch_add_explicit(reinterpret_cast<device atomic_{ctype}*>(o0) + ({flat}), {value}, memory_order_relaxed);"
+            )
+        kernel.lines.append("}")
         name = f"scatter_add_{len(launches)}"
-        source = kernel.render([node], name, [])
+        source = kernel.render([target], name, [])
         # This grid covers updates, not output elements.
-        launch(kernel, source, name, [node])
+        launch(kernel, source, name, [target])
         launches[-1] = dataclasses.replace(launches[-1], grid=math.prod(updates.shape), math_mode=0)
+        if narrow:
+            kernel = _Kernel(node.shape)
+            value = kernel.value(target, kernel.coords)
+            name = f"scatter_unpack_{len(launches)}"
+            source = kernel.render([node], name, [f"o0[i] = as_type<{ctype}>(ushort({value}));"])
+            launch(kernel, source, name, [node])
 
     def schedule_dot(node: _Op) -> None:
         from palladium._stablehlo_gemm import gemm_source

@@ -788,7 +788,7 @@ def test_gather_indexing_matches_cpu():
 
 def test_scatter_add_and_embedding_gradients_match_cpu():
     _check("""
-        import jax,jax.numpy as jnp,numpy as np
+        import jax,jax.numpy as jnp,ml_dtypes,numpy as np
         from jax import lax
         metal,cpu=jax.devices('metal')[0],jax.devices('cpu')[0]
         x=np.arange(30,dtype=np.float32).reshape(5,6)
@@ -806,8 +806,18 @@ def test_scatter_add_and_embedding_gradients_match_cpu():
             (lambda x,i,v:jax.grad(lambda a:jnp.sum(a[i]**2))(x),x,i,v),
             (lambda x,i,v:lax.fori_loop(0,3,lambda _,a:a.at[i].add(v),x),x,i,v),
         ]
-        for dtype in (np.int32,np.uint32):
+        for dtype in (np.int32,np.uint32,np.float16,ml_dtypes.bfloat16):
             cases.append((lambda x,i,v:x.at[i].add(v),x.astype(dtype),i,v.astype(dtype)))
+        # Overlapping windows exercise the update-window coordinate mapping.
+        dims=lax.ScatterDimensionNumbers(update_window_dims=(1,),
+                inserted_window_dims=(),scatter_dims_to_operand_dims=(0,))
+        for dtype in (np.float32,np.float16,ml_dtypes.bfloat16):
+            cases.append((lambda x,i,v:lax.scatter_add(x,i,v,dims,mode='drop'),
+                          np.zeros(7,dtype),np.array([[0],[3],[2]],np.int32),
+                          np.ones((3,4),dtype)))
+            # Odd-sized storage and heavy contention, including narrow rounding.
+            cases.append((lambda x,i,v:x.at[i].add(v),np.zeros(5,dtype),
+                          np.zeros(10001,np.int32),np.ones(10001,dtype)))
         # Thousands of colliding updates catch lost writes, not just index mapping.
         cases.append((lambda x,i,v:x.at[i].add(v),np.zeros(4,np.float32),
                       np.arange(10001,dtype=np.int32)%4,np.ones(10001,np.float32)))
@@ -816,6 +826,20 @@ def test_scatter_add_and_embedding_gradients_match_cpu():
             got=run(*(jax.device_put(a,metal) for a in (x,i,v)))
             want=run(*(jax.device_put(a,cpu) for a in (x,i,v)))
             np.testing.assert_array_equal(np.asarray(got),np.asarray(want))
+        # StableHLO bounds-checks each result index. XLA CPU drops whole windows
+        # crossing an edge, so use the specification's scalar reference here.
+        for dtype in (np.float32,np.float16,ml_dtypes.bfloat16):
+            x=np.zeros(7,dtype)
+            i=np.array([[-1],[5],[2]],np.int32)
+            v=np.ones((3,4),dtype)
+            got=jax.jit(lambda x,i,v:lax.scatter_add(x,i,v,dims,mode='drop'))(
+                *(jax.device_put(a,metal) for a in (x,i,v)))
+            want=x.copy()
+            for row,start in enumerate(i[:,0]):
+                for offset in range(v.shape[1]):
+                    if 0<=start+offset<len(want):
+                        want[start+offset]+=v[row,offset]
+            np.testing.assert_array_equal(np.asarray(got),want)
     """)
 
 
