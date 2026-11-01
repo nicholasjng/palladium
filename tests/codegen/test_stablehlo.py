@@ -215,3 +215,22 @@ def test_unsupported_wide_operations_fail_explicitly():
             _compile(lambda x: x.sum(), (4,), dtype=np.int64)
         with pytest.raises(UnsupportedProgram, match="shape-changing"):
             _compile(lambda x: lax.bitcast_convert_type(x, jnp.int64), (2, 2), dtype=np.int32)
+
+
+def test_elementwise_cond_fuses_with_guarded_branch_reads():
+    program = _compile(lambda x: lax.cond(x[0] > 0, lambda y: y * 2, lambda y: y + 3, x), (8,))
+    [launch] = program.launches
+    assert "if (" in launch.source and "else {" in launch.source
+    assert [s.kind for s in program.slots] == ["parameter", "fresh"]
+
+
+def test_cond_materializes_reductions_before_selection():
+    program = _compile(lambda x: lax.cond(x[0] > 0, lambda y: y.sum(), lambda y: y.max(), x), (8,))
+    assert len(program.launches) == 3
+    assert all(l.function.startswith("reduce") for l in program.launches[:2])
+    assert {l.slots[-1] for l in program.launches[:2]} <= set(program.launches[-1].slots[:-1])
+
+
+def test_unsupported_op_in_case_is_not_silently_discarded():
+    with pytest.raises(UnsupportedProgram, match="reduce has an unsupported reducer"):
+        _compile(lambda x: lax.cond(x[0] > 0, lambda y: y.sum(), lambda y: y.prod(), x), (8,))

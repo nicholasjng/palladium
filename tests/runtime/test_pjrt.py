@@ -557,6 +557,96 @@ def test_full_sbi_training_matches_cpu_over_ten_steps():
     """)
 
 
+def test_cond_and_switch_match_cpu():
+    _check("""
+        import jax, jax.numpy as jnp, ml_dtypes, numpy as np
+        from jax import lax
+        metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
+        x = np.arange(12,dtype=np.float32).reshape(3,4) / 10 + 0.1
+        cases = [
+            (lambda p,x:lax.cond(p>0,lambda y:y*2,lambda y:y-3,x),x),
+            (lambda p,x:lax.switch(p,(lambda y:y,lambda y:y.T.reshape(y.shape),
+                                     lambda y:y[::-1]+1),x),x),
+            (lambda p,x:lax.cond(p>0,lambda y:(y,y.sum(),y[:,0]),
+                                     lambda y:(y*3,y.max(),y[:,-1]),x),x),
+            (lambda p,x:lax.cond(p>0,lambda y:lax.cond(p>1,lambda z:z+1,lambda z:z-1,y),
+                                     lambda y:y*2,x),x),
+            (lambda p,x:lax.cond(p>0,lambda y:y@ y.T,lambda y:y[:, :3]+1,x),x),
+            (lambda p,x:lax.cond(p>0,lambda y:lax.fori_loop(0,3,lambda i,z:z+1,y),
+                                     lambda y:y*2,x),x),
+            (lambda p,x:lax.fori_loop(0,5,lambda i,y:lax.cond(i<p,lambda z:z*2,
+                                                            lambda z:z+1,y),x),x),
+            (lambda p,x:lax.cond(p>0,lambda y:jnp.log(y),lambda y:jnp.log(-y),x),x),
+            (lambda p,x:lax.cond(p>0,lambda y:y.sum(),lambda y:jnp.log(-y).sum(),x),x),
+            (lambda p,x:jax.grad(lambda y:lax.cond(p>0,lambda z:(z*z).sum(),
+                                                   lambda z:(z*3).sum(),y))(x),x),
+            (lambda p,x:lax.cond(x.sum()>p,lambda y:y*2,lambda y:y-2,x),x),
+            (lambda p,x:lax.cond(p>0,lambda y:y+1,lambda y:y-1,x),np.zeros((0,3),np.float32)),
+        ]
+        for dtype in (np.int32,np.uint32,np.bool_,np.float16,ml_dtypes.bfloat16):
+            cases.append((lambda p,x:lax.cond(p>0,lambda y:y,lambda y:y[::-1],x),x.astype(dtype)))
+        for fn,x in cases:
+            run=jax.jit(fn)
+            for p in (-100,0,1,2,100):
+                got=run(jax.device_put(np.int32(p),metal),jax.device_put(x,metal))
+                want=run(jax.device_put(np.int32(p),cpu),jax.device_put(x,cpu))
+                for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
+                    np.testing.assert_allclose(np.asarray(g,np.float64),np.asarray(w,np.float64),
+                                               rtol=2e-5,atol=1e-5,equal_nan=True)
+    """)
+
+
+def test_cond_predicates_and_inputs_survive_queued_calls():
+    _check("""
+        import jax,numpy as np
+        from jax import lax
+        metal=jax.devices('metal')[0]
+        run=jax.jit(lambda p,x:lax.cond(p,lambda y:y+1,lambda y:y-1,x))
+        results=[]
+        for i in range(40):
+            p=jax.device_put(np.bool_(i%2),metal)
+            x=jax.device_put(np.full(4096,i,np.float32),metal)
+            results.append(run(p,x))
+            p.delete()
+            x.delete()
+        for i,y in enumerate(results):
+            np.testing.assert_array_equal(np.asarray(y),np.full(4096,i+(1 if i%2 else -1),np.float32))
+    """)
+
+
+def test_raw_case_out_of_range_indices_select_last_branch():
+    # JAX switch clamps before lowering; exercise raw StableHLO's different
+    # negative-index behavior through its generated kernel as well.
+    _check('''
+        import numpy as np
+        from jaxlib.mlir.dialects import stablehlo
+        from palladium.stablehlo import compile_program
+        from palladium._runtime import Kernel, run
+        module = """module {
+          func.func @main(%index: tensor<i32>) -> tensor<i32> {
+            %result = "stablehlo.case"(%index) ({
+              %c = stablehlo.constant dense<10> : tensor<i32>
+              stablehlo.return %c : tensor<i32>
+            }, {
+              %c = stablehlo.constant dense<20> : tensor<i32>
+              stablehlo.return %c : tensor<i32>
+            }, {
+              %c = stablehlo.constant dense<30> : tensor<i32>
+              stablehlo.return %c : tensor<i32>
+            }) : (tensor<i32>) -> tensor<i32>
+            return %result : tensor<i32>
+          }
+        }"""
+        program = compile_program(stablehlo.serialize_portable_artifact_str(module, '1.0.0'))
+        [launch] = program.launches
+        kernel = Kernel(launch.source, launch.function)
+        for index, expected in ((-100,30),(-1,30),(0,10),(1,20),(2,30),(3,30),(100,30)):
+            buffers = [np.array(index,np.int32), np.array(0,np.int32)]
+            run(kernel,[buffers[s] for s in launch.slots],launch.grid)
+            assert buffers[program.outputs[0]].item() == expected
+    ''')
+
+
 def test_unsupported_ops_report_unimplemented():
     """A CPU compile first, so the metal one hashes its topology for the cache key."""
     result = _run("""

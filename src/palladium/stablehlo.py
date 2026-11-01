@@ -466,6 +466,17 @@ def _graph(module: ir.Module) -> tuple[list[_Parameter], list[_Node]]:
                 results = walk(callee.regions[0].blocks[0], [env[v] for v in op.operands])
                 env.update(zip(op.results, results, strict=True))
                 continue
+            if name == "stablehlo.case":
+                # Regions have no arguments and capture their enclosing values.
+                # Parse every branch: unsupported/effectful operations must still
+                # fail explicitly, even when a constant selector would skip them.
+                branches = [walk(region.blocks[0], [], env) for region in op.regions]
+                index = env[op.operands[0]]
+                for k, value in enumerate(op.results):
+                    env[value] = _Op(
+                        "case", [index, *(b[k] for b in branches)], *_tensor(value), {}
+                    )
+                continue
             if name == "stablehlo.while":
                 inputs = [env[v] for v in op.operands]
                 parameters = [_Parameter(i, *_tensor(v)) for i, v in enumerate(op.operands)]
@@ -601,6 +612,15 @@ class _Kernel:
         match node.name:
             case "reduce" | "dot_general":
                 return self._read(node, coords)
+            case "case":
+                index, *branches = operands
+                selector = self.value(index, ())
+                # StableHLO sends any out-of-range index to the last branch.
+                # JAX switch inserts its own clamp before this operation.
+                return self.choose(
+                    node.dtype,
+                    [(f"{selector} == {k}", branch, coords) for k, branch in enumerate(branches)],
+                )
             case "concatenate":
                 dim, offset, branches = a["dim"], 0, []
                 for x in operands:
