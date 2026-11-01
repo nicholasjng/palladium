@@ -1,10 +1,11 @@
-# A vertically integrated Metal compute stack for JAX (plan, not started)
+# A vertically integrated Metal compute stack for JAX (plan; M1 in progress)
 
 Goal: run whole JAX training programs on Apple GPUs through a PJRT plugin
 we own, with no MLX involvement, for three workloads: ODE ensembles for
-simulation-based inference, SAM2 fine-tuning, and LLM fine-tuning. Planned
-as a fresh repository; palladium's emitter and runtime are the starting
-material. This complements the kernel facility in
+simulation-based inference, SAM2 fine-tuning, and LLM fine-tuning. It is
+built inside palladium, on its emitter and runtime; the plugin's
+implementation record is `notes/metal-pjrt-plugin.md`. This complements the
+kernel facility in
 `notes/metal-kernel-facility.md`: that note is about writing kernels, this
 one about running whole programs.
 
@@ -23,12 +24,12 @@ one about running whole programs.
 
 ## What the plugin has to execute
 
-A StableHLO census of representative training steps (2026-10-30, jax 0.12;
-SBI: RK4 ensemble plus a mixture-density posterior; LLM: decoder block with
-RoPE, causal attention, SwiGLU and cross-entropy; SAM2-like: conv patch
-embedding, windowed attention, max-pooling, transposed-conv upsampling,
-focal plus dice loss; all with AdamW) found 31–38 distinct ops per program,
-about 50 in total:
+A StableHLO census of representative training steps
+(`examples/training_steps.py`, jax 0.12; SBI: RK4 ensemble plus a
+mixture-density posterior; LLM: decoder block with RoPE, causal attention,
+SwiGLU and cross-entropy; SAM2-like: conv patch embedding, windowed
+attention, max-pooling, transposed-conv upsampling, focal plus dice loss;
+all with AdamW) found 30–37 distinct ops per program, about 50 in total:
 
 | Group | Ops | Kinds | Work |
 |---|---|---|---|
@@ -115,46 +116,10 @@ first-step compile time, peak memory, and agreement with a CPU or XLA
 reference: a faster step that compiles for a minute or drifts numerically is
 not a win.
 
-M1 so far (2026-11-01):
-
-- Plugin, `native/pjrt/`, against the PJRT C API 0.116 that jaxlib 0.12
-  pins. One `metal` device with one `device` memory, buffers in shared
-  MTLBuffers (host data is copied in, strided arrays included), copies to
-  the host and other devices, memory stats, and `apple_gpu_family` as a
-  device attribute. `palladium._pjrt` registers it through the
-  `jax_plugins` entry point, only when JAX_PLATFORMS names `metal`.
-- Compiler in Python: `PJRT_Client_Compile` calls back into
-  `palladium.stablehlo`, which deserializes the portable artifact with
-  jaxlib's MLIR bindings and returns buffer slots and kernel launches; the
-  plugin compiles the MSL once and runs every launch in one command buffer.
-  Elementwise ops (through palladium's scalar templates) and index maps
-  (broadcast, reshape, transpose, slice, reverse, iota) fuse into one kernel
-  per output shape, with calls and composites inlined; other ops are
-  UNIMPLEMENTED. Fifteen programs match the CPU backend.
-- Execution is asynchronous: Execute encodes one command buffer, commits it
-  and returns; a completion handler defines the outputs and sets the events.
-  Buffers come from a pool keyed by size and return to it only once the GPU
-  work using them is done, so host copies never race the GPU; at most 16
-  executions are in flight, so a caller running ahead reuses pooled buffers.
-- On the M2, `tanh(2x + 1) * x` per call:
-
-  | Elements | Pipelined | Blocking each call | CPU backend |
-  |---|---:|---:|---:|
-  | 1,024 | 29 µs | 151 µs | 3 µs |
-  | 4M | 464 µs | 635 µs | 899 µs |
-
-  A blocking call is a command buffer round trip; pipelined small calls are
-  host overhead (jax's C API dispatch plus encoding), and large ones run at
-  about 72 GB/s against the 91 GB/s copy ceiling.
-- Lessons: the 0.12 header defines `PJRT_Error` and `PJRT_Memory` as
-  function tables callers use directly; jaxlib calls some slots without a
-  null check (`PJRT_Client_TopologyDescription`, `PJRT_Error_ForEachPayload`,
-  `PJRT_TopologyDescription_Fingerprint` for cache keys,
-  `PJRT_LoadedExecutable_GetDeviceAssignment`, whose proto is encoded by
-  hand); programs arrive as VHLO portable artifacts.
-
-Next: reductions, `dot_general` and `while`, which the SBI step of M2
-needs; then where the 29 µs of host time per call goes.
+M1 status (2026-11-01): the plugin runs fused elementwise and index-mapping
+programs asynchronously, with pooled buffers; reductions, `dot_general` and
+`while` come next. Steps taken, open items and the success criteria against
+jax 0.12 are in `notes/metal-pjrt-plugin.md`.
 
 Work that costs time without proving anything: a JAX port of SAM2's image
 encoder and mask decoder (SAM2 is PyTorch) for M5, and a small JAX LoRA
@@ -167,14 +132,15 @@ the StableHLO the plugin receives, so the plugin needs no LLVM, MLIR or
 StableHLO build and no StableHLO pin of its own, and palladium keeps one
 emitter. C++ passes inside the plugin, built against a pinned LLVM/StableHLO
 prefix, wait for M6 to show that Python codegen limits compile time or
-fusion. Add an `applegpu`
-dialect when fused StableHLO and Pallas kernels need one shared lowering
-target, around M3–M5, not before: the wins so far came from schedule
-decisions (registers versus threadgroup memory, barrier counts, tile shapes),
-not from IR infrastructure, and the planned expression-tree refactor
-(`notes/expression-trees.md`) fixes the Python emitter's main weakness for
-far less. If Pallas should lower into the dialect, follow the Mosaic
-backends: jaxpr to MLIR from Python through jaxlib's MLIR bindings.
+fusion.
+
+Add an `applegpu` dialect when fused StableHLO and Pallas kernels need one
+shared lowering target, around M3–M5, not before: the wins so far came from
+schedule decisions (registers versus threadgroup memory, barrier counts,
+tile shapes), not from IR infrastructure, and the planned expression-tree
+refactor (`notes/expression-trees.md`) fixes the Python emitter's main
+weakness for far less. If Pallas should lower into the dialect, follow the
+Mosaic backends: jaxpr to MLIR from Python through jaxlib's MLIR bindings.
 
 Model in the dialect what produced the wins: 8x8 SIMD-group fragments and
 their lane layout, threadgroup memory and barriers, SIMD-group collectives,
