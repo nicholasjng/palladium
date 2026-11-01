@@ -526,6 +526,34 @@ def test_threefry_random_matches_cpu():
             run=jax.jit(fn)
             np.testing.assert_array_equal(np.asarray(run(jax.device_put(key,metal))),
                                           np.asarray(run(jax.device_put(key,cpu))))
+        with jax.enable_x64():
+            run = jax.jit(lambda k:jax.random.bits(k,(7,),dtype=np.uint64))
+            np.testing.assert_array_equal(np.asarray(run(jax.device_put(key,metal))),
+                                          np.asarray(run(jax.device_put(key,cpu))))
+    """)
+
+
+def test_full_sbi_training_matches_cpu_over_ten_steps():
+    _check(f"""
+        import sys
+        import jax, numpy as np
+        sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
+        from training_steps import steps
+        cpu = jax.devices('cpu')[0]
+        with jax.default_device(cpu):
+            fn,params,opt,key = steps()['sbi']
+            keys = [jax.random.fold_in(key,i) for i in range(10)]
+        state = {{name:jax.device_put((params,opt),jax.devices(name)[0])
+                 for name in ('metal','cpu')}}
+        run = jax.jit(fn)
+        for key in keys:
+            losses = {{}}
+            for name,(p,o) in state.items():
+                state[name],losses[name] = run(p,o,jax.device_put(key,jax.devices(name)[0]))
+            for g,w in zip(jax.tree.leaves((state['metal'],losses['metal'])),
+                           jax.tree.leaves((state['cpu'],losses['cpu'])),strict=True):
+                np.testing.assert_allclose(np.asarray(g),np.asarray(w),rtol=1e-4,atol=2e-6,
+                                           equal_nan=False)
     """)
 
 

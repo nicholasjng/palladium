@@ -21,6 +21,10 @@ Works:
   negative edge padding), `dynamic_slice`, and `dynamic_update_slice`.
   They fuse with producers and consumers without intermediate buffers.
 - `jax.random.key` on the Metal default device.
+- PJRT-local int64/uint64 elementwise arithmetic, comparisons, conversions,
+  same-width bitcasts and index maps, including exact wide literals and bounded
+  shifts. Threefry key split/fold-in, random bits, and float32 uniform/normal
+  samples run on Metal.
 - Single-result `reduce` with add, maximum, minimum, and, or bodies over
   arbitrary axes, including empty reductions. Producers fuse into reduction
   reads; consumers read intermediate slots in later launches. This enables
@@ -34,16 +38,18 @@ Works:
   GEMM emitter; gradients and dots inside counted loops work too.
 - Asynchronous execution with completion events, a buffer pool, and at most
   16 executions in flight.
+- The complete SBI step compiles and executes, with a ten-step CPU comparison
+  of losses, parameters and optimizer state (details and tolerance below).
 
 Fails with UNIMPLEMENTED, naming the op (`palladium.stablehlo` raises
 `UnsupportedProgram`): variadic or other reducer bodies (including argmax and
 product), integer or explicitly algorithm-selected dots, dynamic or unrecognized `while`, `case`,
 `gather`,
-`scatter`, `reduce_window`, `sort`, `convolution`, and any op on 64-bit
-types. So far none of `examples/training_steps.py` runs: SBI stops at
-`uint64` in RNG, the LLM step at `gather`, the SAM2-like step at
-`convolution` (rechecked after dot lowering). Key creation works, but
-random sampling still needs more ops, so initialize benchmark inputs on CPU:
+`scatter`, `reduce_window`, `sort`, `convolution`, float64 arithmetic and
+64-bit integer reductions. Shape-changing bitcasts and wide integer operations
+without explicit lowering (such as power) are rejected too. In
+`examples/training_steps.py`, SBI now runs; LLM still stops at `gather` and
+SAM2-like at `convolution`. CPU setup remains useful for reference inputs:
 
 ```python
 with jax.default_device(jax.devices("cpu")[0]):
@@ -231,10 +237,15 @@ In order of what M2's SBI step needs first.
    operand minus slice/update size, preserving unsigned values above INT_MAX.
    CPU differential tests cover nesting, empty and scalar tensors, negative
    and oversized offsets, and integer, boolean and floating operands.
-3. **64-bit integers.** threefry computes its counters with `ui64` iota,
-   multiply and shifts, so `jax.random.normal` needs `long` and `ulong` in
-   `stablehlo.py`'s type map. Add them there, not to the emitter's
-   `CTYPES`, which Pallas kernels share.
+3. **64-bit integers (RNG slice done).** `long` and `ulong` live only in the
+   PJRT compiler's type map; the shared Pallas `CTYPES` contract is unchanged.
+   Wide literals never pass through float32. Wrapping arithmetic uses unsigned
+   intermediates, shifts guard counts at/above 64 (arithmetic right shifts
+   sign-extend), and divide/remainder handle zero and signed-min/-1 explicitly.
+   CPU tests cover extrema, values above 2^53, wrapping, shifts, population
+   counts, conversions and bitcasts. RNG bits (uint32/uint64), split and fold-in
+   match exactly; float32 uniform/normal match at rtol 2e-5, atol 1e-6.
+   Wide reductions and 64-bit loop counters remain unsupported.
 4. **`while` without host round trips (counted slice done).** The compiler
    proves the constant-start, LT-bound, unit-increment pattern, including
    invariant bounds and hoisted constants in the PJRT artifact. It compiles
@@ -348,9 +359,32 @@ caches may be warm. These are host timings, not GPU timestamps.
 | 1024, 1024, 1024 | 571.9 µs | 3281.7 µs | 115 ms |
 
 Both use the reused SIMD-group GEMM. Packing, tail and whole-training costs
-are not represented by these aligned-product measurements. Full SBI now
-reaches the missing `uint64` RNG operations; LLM and SAM remain at gather
-and convolution respectively.
+are not represented by these aligned-product measurements. At this checkpoint,
+SBI reached missing uint64 RNG operations, subsequently implemented below.
+
+### Full SBI checkpoint, 2026-11-01
+
+The actual `sbi_step` now executes RNG, the 200-step RK4 simulation, summary
+statistics, the MDN loss/gradients and AdamW together on Metal. A permanent
+PJRT test initializes on CPU, folds in a distinct key for each of ten updates,
+and compares every updated parameter, optimizer-state leaf and loss against
+CPU. It passes with rtol 1e-4 and **atol 2e-6**; measured maximum state
+difference was 1.22e-6 and maximum loss difference was 9.54e-7. This includes
+an absolute tolerance for near-zero parameters; it does not establish literal
+relative-only agreement there.
+
+On the Apple M1 Pro, the first completed Metal update took 0.82 s during
+validation, below the five-second compilation target. A later process with
+warm shader caches took 0.27 s. Pipelined full-step calls on fixed resident
+inputs measured 2.83 ms on Metal versus 1.47 ms on CPU (minimum of five
+batches of ten calls, waiting only on the last result). The throughput probe
+reuses initial state; the correctness test chains ten updates with new keys.
+The full step is correct at the stated tolerance, but does not yet beat CPU.
+
+M1 is still incomplete: variadic argmax, gather/scatter-add, `cond`, donation
+and the full API/concurrency checklist remain open. Overhead versus jax-mps
+and bandwidth targets on M2 and M4 Pro have not been established. M2 still
+needs profiling/tuning of replay, trajectory updates and reductions.
 
 ## Success criteria for M1, against jax 0.12
 
