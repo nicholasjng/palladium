@@ -4,8 +4,8 @@ The plugin's PJRT_Client_Compile passes the portable artifact jax serializes to
 `compile_program`, which parses it with jaxlib's MLIR bindings and returns a
 `Program`: buffer slots and kernel launches, which `palladium._pjrt` hands to
 the plugin. So far a program may hold elementwise and index-mapping ops
-(broadcast, reshape, transpose, slice, reverse, iota), fused into one kernel
-per output shape; anything else raises `UnsupportedProgram`.
+(broadcast, reshape, transpose, slices, concatenate, pad, reverse, iota), fused
+into one kernel per output shape; anything else raises `UnsupportedProgram`.
 
 Each kernel thread computes one output element at the coordinates of its flat
 index. A value is generated at the coordinates it is read at, once per
@@ -227,6 +227,13 @@ def _attributes(op) -> dict:
         return {"perm": list(ir.DenseI64ArrayAttr(a["permutation"]))}
     if name == "iota":
         return {"dim": ir.IntegerAttr(a["iota_dimension"]).value}
+    if name == "concatenate":
+        return {"dim": ir.IntegerAttr(a["dimension"]).value}
+    if name == "pad":
+        return {
+            key: list(ir.DenseI64ArrayAttr(a[attr]))
+            for key, attr in (("low", "edge_padding_low"), ("interior", "interior_padding"))
+        }
     if name == "slice":
         return {
             "start": list(ir.DenseI64ArrayAttr(a["start_indices"])),
@@ -273,6 +280,10 @@ _SUPPORTED = {
     "iota",
     "slice",
     "reverse",
+    "concatenate",
+    "pad",
+    "dynamic_slice",
+    "dynamic_update_slice",
 }
 
 
@@ -323,6 +334,7 @@ class _Kernel:
         self.helpers: dict[str, str] = {}
         self.buffers: list[_Node] = []  # read nodes, bound before the outputs
         self.values: dict[tuple[int, tuple[str, ...]], str] = {}
+        self.next_value = 0
         self.reshaped: dict[tuple[tuple[str, ...], tuple[int, ...]], str] = {}
         self.coords = tuple(f"c{k}" for k in range(len(shape)))
         self.lines += [
@@ -344,10 +356,43 @@ class _Kernel:
             if _ATOM.fullmatch(expr):
                 self.values[key] = expr
             else:
-                name = f"v{len(self.values)}"
+                name = self.temporary()
                 self.lines.append(f"{_ctype(node.dtype)} {name} = {expr};")
                 self.values[key] = name
         return self.values[key]
+
+    def temporary(self) -> str:
+        name = f"v{self.next_value}"
+        self.next_value += 1
+        return name
+
+    def choose(self, dtype: np.dtype, branches: list[tuple[str, _Node, tuple[str, ...]]]) -> str:
+        """Emit reads inside their guards; branch-local values must not escape.
+
+        The final branch is unconditional. Parent-scope memoized values remain
+        available, but neither values nor reshape shortcuts cross sibling scopes.
+        """
+        result = self.temporary()
+        self.lines.append(f"{_ctype(dtype)} {result};")
+        for k, (condition, node, coords) in enumerate(branches):
+            last = k == len(branches) - 1
+            prefix = "" if k == 0 else "else "
+            self.lines.append(prefix + ("{" if last else f"if ({condition}) {{"))
+            values, reshaped = self.values.copy(), self.reshaped.copy()
+            value = self.value(node, coords)
+            self.lines.append(f"{result} = {value};")
+            self.values, self.reshaped = values, reshaped
+            self.lines.append("}")
+        return result
+
+    def offsets(self, starts: list[_Node], limits: tuple[int, ...]) -> tuple[str, ...]:
+        offsets = []
+        for start, limit in zip(starts, limits, strict=True):
+            # Preserve unsigned values above INT_MAX when clamping.
+            ctype = _ctype(start.dtype)
+            value = self.value(start, ())
+            offsets.append(f"uint(clamp({ctype}({value}), {ctype}(0), {ctype}({limit})))")
+        return tuple(offsets)
 
     def _flat(self, coords: tuple[str, ...], shape: tuple[int, ...]) -> str:
         return "i" if coords == self.coords and shape == self.shape else _linear(coords, shape)
@@ -367,6 +412,61 @@ class _Kernel:
         assert isinstance(node, _Op)
         a, operands = node.attributes, node.operands
         match node.name:
+            case "concatenate":
+                dim, offset, branches = a["dim"], 0, []
+                for x in operands:
+                    size = x.shape[dim]
+                    if size:
+                        inner = list(coords)
+                        inner[dim] = f"({coords[dim]} - {offset}u)"
+                        branches.append((f"{coords[dim]} < {offset + size}u", x, tuple(inner)))
+                    offset += size
+                # No thread runs for an empty output, but its source must be valid.
+                return self.choose(node.dtype, branches) if branches else _literal(0, ctype)
+            case "pad":
+                x, padding = operands
+                if not math.prod(x.shape):
+                    return self.value(padding, ())
+                inner, conditions = [], []
+                for c, n, low, interior in zip(
+                    coords, x.shape, a["low"], a["interior"], strict=True
+                ):
+                    shifted, step = f"(int({c}) - ({low}))", interior + 1
+                    conditions += [
+                        f"{shifted} >= 0",
+                        f"{shifted} / {step} < {n}",
+                        f"{shifted} % {step} == 0",
+                    ]
+                    inner.append(f"uint({shifted} / {step})")
+                return self.choose(
+                    node.dtype,
+                    [
+                        (" && ".join(conditions) or "true", x, tuple(inner)),
+                        ("", padding, ()),
+                    ],
+                )
+            case "dynamic_slice":
+                x, *starts = operands
+                limits = tuple(n - s for n, s in zip(x.shape, node.shape, strict=True))
+                offsets = self.offsets(starts, limits)
+                return self.value(
+                    x, tuple(f"({c} + {s})" for c, s in zip(coords, offsets, strict=True))
+                )
+            case "dynamic_update_slice":
+                x, update, *starts = operands
+                if not math.prod(update.shape):
+                    return self.value(x, coords)
+                limits = tuple(n - s for n, s in zip(x.shape, update.shape, strict=True))
+                offsets = self.offsets(starts, limits)
+                condition = (
+                    " && ".join(
+                        f"({c} >= {s} && {c} - {s} < {n}u)"
+                        for c, s, n in zip(coords, offsets, update.shape, strict=True)
+                    )
+                    or "true"
+                )
+                inner = tuple(f"({c} - {s})" for c, s in zip(coords, offsets, strict=True))
+                return self.choose(node.dtype, [(condition, update, inner), ("", x, coords)])
             case "broadcast_in_dim":
                 [x] = operands
                 inner = tuple(

@@ -133,6 +133,77 @@ def test_executions_run_ahead_of_the_gpu():
     """)
 
 
+def test_guarded_index_maps_match_cpu():
+    """Guarded operands may themselves contain reads, reshapes and guards."""
+    _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
+        x = np.arange(12, dtype=np.float32).reshape(3, 4)
+        y = np.arange(8, dtype=np.float32).reshape(2, 4) + 20
+        cases = [
+            (lambda x, y: jnp.concatenate([x * 2, y + 1, x], 0), x, y),
+            (lambda x: jnp.concatenate([x[:, :0], x, x[:, :1], x[:, :0]], 1), x),
+            (lambda x, p: lax.pad(x * 2, p, ((2, 1, 1), (1, 3, 2))), x, np.float32(-7)),
+            (lambda x, p: lax.pad(x, p, ((-1, 2, 1), (2, -3, 2))), x, np.float32(9)),
+            (lambda x, p: lax.pad(x, p, ((2, 3, 0), (1, 1, 0))),
+             np.zeros((0, 4), np.float32), np.float32(5)),
+            (lambda x: jnp.concatenate([x, x], 0), np.zeros((0, 4), np.float32)),
+            (lambda x: lax.pad(x, np.float32(0), ((-3, 0, 0), (0, 0, 0))), x),
+            (lambda x, y: jnp.concatenate([
+                lax.pad(x.T.reshape(2, 6), np.float32(-1), ((1, 0, 0), (0, 0, 0))),
+                y.T.reshape(1, 8)[:, :6], x.reshape(2, 6)], 0), x, y),
+            # A branch's reshape shortcut must not affect later uses of x.
+            (lambda x: (jnp.concatenate([x.T.reshape(2, 6), x.reshape(2, 6)], 0),
+                        x.T.reshape(2, 6) + x.reshape(2, 6)), x),
+        ]
+        for dtype in (np.int32, np.uint32):
+            for starts in ((0, 0), (1, 2), (100, 100), ((-100, -1) if dtype == np.int32
+                                                     else (2**32 - 1, 2**32 - 1))):
+                i, j = map(dtype, starts)
+                cases += [
+                    (lambda x, i, j: lax.dynamic_slice(x * 2, (i, j), (2, 2)), x, i, j),
+                    (lambda x, y, i, j: lax.dynamic_update_slice(x + 1, y * 3, (i, j)),
+                     x, y[:, :2], i, j),
+                    (lambda x, i, j: lax.dynamic_slice(x, (i, j), (0, 2)), x, i, j),
+                    (lambda x, y, i, j: lax.dynamic_update_slice(x, y, (i, j)),
+                     x, y[:0], i, j),
+                ]
+        cases += [
+            (lambda x, y: lax.dynamic_update_slice(x, y, ()), np.float32(2), np.float32(3)),
+            (lambda x: lax.dynamic_slice(x, (), ()), np.float32(2)),
+            (lambda x: lax.pad(x, np.float32(-1), ()), np.float32(2)),
+            (lambda x, i: lax.dynamic_slice(x, (i,), (2,), allow_negative_indices=False),
+             np.arange(300, dtype=np.float32), np.int32(-100)),
+            (lambda x, i: lax.dynamic_slice(x, (i,), (2,)),
+             np.arange(300, dtype=np.float32), np.uint32(250)),
+            (lambda x, y, i: lax.dynamic_update_slice(x, y, (i,), allow_negative_indices=False),
+             np.arange(300, dtype=np.float32), np.ones(2, np.float32), np.int32(-100)),
+        ]
+        for dtype in (np.int32, np.bool_, np.float16):
+            cases += [
+                (lambda x, y: jnp.concatenate([x, y, x], 0), x.astype(dtype), y.astype(dtype)),
+                (lambda x, p: lax.pad(x, p, ((1, 2, 1), (2, -1, 0))),
+                 x.astype(dtype), dtype(1)),
+            ]
+        for fn, *args in cases:
+            run = jax.jit(fn)
+            got = run(*(jax.device_put(a, metal) for a in args))
+            want = run(*(jax.device_put(a, cpu) for a in args))
+            for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
+                np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+    """)
+
+
+def test_random_key_can_be_created_on_metal():
+    _check("""
+        import jax, numpy as np
+        key = jax.random.key(17)
+        assert key.devices() == {jax.devices('metal')[0]}
+        np.testing.assert_array_equal(np.asarray(jax.random.key_data(key)), [0, 17])
+    """)
+
+
 def test_unsupported_ops_report_unimplemented():
     """A CPU compile first, so the metal one hashes its topology for the cache key."""
     result = _run("""

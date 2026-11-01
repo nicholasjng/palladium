@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax import lax
 from jaxlib.mlir.dialects import stablehlo
 
 from palladium.stablehlo import UnsupportedProgram, compile_program
@@ -53,6 +54,24 @@ def test_constant_arrays_read_by_a_kernel_become_slots():
     program = _compile(lambda x: x + jnp.array([1.0, 2.0], jnp.float32), (2,))
     assert [s.kind for s in program.slots] == ["parameter", "fresh", "constant"]
     assert program.launches[0].slots == (0, 2, 1)
+
+
+def test_padding_empty_operand_never_binds_it():
+    # A padding-only result must not read an empty input, even speculatively.
+    program = _compile(lambda x, p: lax.pad(x, p, ((2, 3, 0), (1, 1, 0))), (0, 4), ())
+    [launch] = program.launches
+    assert 0 not in launch.slots
+    assert program.slots[program.outputs[0]].shape == (5, 6)
+
+
+def test_guarded_index_maps_still_fuse():
+    program = _compile(
+        lambda x, y: jnp.concatenate([lax.pad(x * 2, np.float32(-1), ((1, 0, 1),)), y]),
+        (4,),
+        (3,),
+    )
+    assert len(program.launches) == 1
+    assert [s.kind for s in program.slots] == ["parameter", "parameter", "fresh"]
 
 
 @pytest.mark.parametrize(

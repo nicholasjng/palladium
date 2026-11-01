@@ -17,17 +17,21 @@ Works:
   bool, f16, bf16; comparisons, select, convert, bitcast, shifts) and index
   maps (broadcast, reshape, transpose, slice, reverse, iota), with constants,
   multiple outputs, inputs returned as outputs, calls and composites.
+- Guarded index maps: `concatenate`, `pad` (including interior padding and
+  negative edge padding), `dynamic_slice`, and `dynamic_update_slice`.
+  They fuse with producers and consumers without intermediate buffers.
+- `jax.random.key` on the Metal default device.
 - Asynchronous execution with completion events, a buffer pool, and at most
   16 executions in flight.
 
 Fails with UNIMPLEMENTED, naming the op (`palladium.stablehlo` raises
 `UnsupportedProgram`): `reduce`, `dot_general`, `while`, `case`,
-`concatenate`, `pad`, `dynamic_slice`, `dynamic_update_slice`, `gather`,
+`gather`,
 `scatter`, `reduce_window`, `sort`, `convolution`, and any op on 64-bit
 types. So far none of `examples/training_steps.py` runs: SBI stops at
-`concatenate`, the LLM step at `gather`, the SAM2-like step at
-`convolution`. Even `jax.random.key(0)` needs `concatenate` when `metal` is
-the default device, so create keys and other setup on the CPU:
+`while`, the LLM step at `gather`, the SAM2-like step at
+`convolution` (rechecked after guarded index maps). Key creation works, but
+random sampling still needs more ops, so initialize benchmark inputs on CPU:
 
 ```python
 with jax.default_device(jax.devices("cpu")[0]):
@@ -195,11 +199,14 @@ In order of what M2's SBI step needs first.
    value-index pairs) is in the census, and palladium already lowers it for
    jaxprs. The reduction body region is usually one of add, max, min, and,
    or; reject anything else.
-2. **`concatenate`, `pad`, dynamic slices.** These need guarded reads:
-   `_Kernel.value` emits each operand's value as a variable up front, so a
-   branch outside its range would read out of bounds. Either emit a branch's
-   reads inside an `if`, or clamp the index and select. Dynamic slice
-   offsets are scalar operands, read from their buffers in the kernel.
+2. **`concatenate`, `pad`, dynamic slices (done).** `_Kernel.choose` emits
+   each branch's entire producer chain inside its guard. Value and reshape
+   memoization is scoped to that branch, with unique temporary names across
+   scopes. Empty operands are never read; padding supports cropping and
+   interior holes. Dynamic offsets are scalar buffer reads, clamped to the
+   operand minus slice/update size, preserving unsigned values above INT_MAX.
+   CPU differential tests cover nesting, empty and scalar tensors, negative
+   and oversized offsets, and integer, boolean and floating operands.
 3. **64-bit integers.** threefry computes its counters with `ui64` iota,
    multiply and shifts, so `jax.random.normal` needs `long` and `ulong` in
    `stablehlo.py`'s type map. Add them there, not to the emitter's
