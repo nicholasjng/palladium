@@ -469,6 +469,66 @@ def test_sbi_dense_training_matches_cpu_over_ten_steps():
     """)
 
 
+def test_wide_integer_operations_match_cpu():
+    _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        jax.config.update('jax_enable_x64', True)
+        metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
+        for dtype in (np.int64,np.uint64):
+            info = np.iinfo(dtype)
+            a = np.array([info.min,info.max,2**32+1,2**53+1,0,1,17],dtype)
+            b = np.array([1,2,3,5,0,63,64],dtype)
+            shifts = np.array([0,1,31,32,63,64,info.max],dtype)
+            cases = [
+                (lambda a,b: (a+b,a-b,a*b,-a,jnp.abs(a)),a,b),
+                (lambda a,b: (lax.div(a,b),lax.rem(a,b)),a,b),
+                (lambda a,b: (a&b,a|b,a^b,~a,jnp.minimum(a,b),jnp.maximum(a,b)),a,b),
+                (lambda a,b: (a<b,jnp.where(a<b,a,b),jnp.sign(a)),a,b),
+                (lambda a,b: (lax.shift_left(a,b),lax.shift_right_logical(a,b),
+                              lax.shift_right_arithmetic(a,b)),a,shifts),
+                (lambda a,b: (lax.population_count(a),lax.clz(a)),a,b),
+                (lambda a,b: (a.astype(jnp.uint32),a.astype(jnp.float32),
+                              lax.bitcast_convert_type(a,jnp.uint64)),a,b),
+                (lambda a,b: a+jnp.array([info.max,info.min,1,0,2**40,2**53,7],dtype),a,b),
+                (lambda a,b: (a+dtype(info.max),a+dtype(info.min)),a,b),
+            ]
+            if dtype == np.int64:
+                cases.append((lambda a,b:(lax.div(a,b),lax.rem(a,b)),a,np.full_like(a,-1)))
+            for fn,a,b in cases:
+                run=jax.jit(fn)
+                got=run(jax.device_put(a,metal),jax.device_put(b,metal))
+                want=run(jax.device_put(a,cpu),jax.device_put(b,cpu))
+                for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
+                    np.testing.assert_array_equal(np.asarray(g),np.asarray(w))
+    """)
+
+
+def test_threefry_random_matches_cpu():
+    _check("""
+        import jax, numpy as np
+        metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
+        with jax.default_device(cpu):
+            key=jax.random.key(17)
+        for shape in ((),(0,),(1,),(7,),(512,6)):
+            for fn in (lambda k:jax.random.uniform(k,shape),lambda k:jax.random.normal(k,shape),
+                       lambda k:jax.random.bits(k,shape)):
+                run=jax.jit(fn)
+                got=run(jax.device_put(key,metal))
+                want=run(jax.device_put(key,cpu))
+                if got.dtype.kind == 'u':
+                    np.testing.assert_array_equal(np.asarray(got),np.asarray(want))
+                else:
+                    np.testing.assert_allclose(np.asarray(got),np.asarray(want),rtol=2e-5,atol=1e-6)
+        # Key splitting and folding exercise the same counters with different layouts.
+        for fn in (lambda k:jax.random.key_data(jax.random.split(k,7)),
+                   lambda k:jax.random.key_data(jax.random.fold_in(k,23))):
+            run=jax.jit(fn)
+            np.testing.assert_array_equal(np.asarray(run(jax.device_put(key,metal))),
+                                          np.asarray(run(jax.device_put(key,cpu))))
+    """)
+
+
 def test_unsupported_ops_report_unimplemented():
     """A CPU compile first, so the metal one hashes its topology for the cache key."""
     result = _run("""

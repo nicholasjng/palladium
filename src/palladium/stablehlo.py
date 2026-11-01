@@ -130,12 +130,21 @@ def _tensor(value: ir.Value) -> tuple[np.dtype, tuple[int, ...]]:
 
 
 def _ctype(dtype: np.dtype) -> str:
+    # PJRT-only types: do not broaden the shared Pallas emitter's type contract.
+    if dtype == np.int64:
+        return "long"
+    if dtype == np.uint64:
+        return "ulong"
     if dtype not in CTYPES:
         raise UnsupportedProgram(f"metal: kernels on {dtype} are not supported")
     return CTYPES[dtype]
 
 
 def _literal(value: float, ctype: str) -> str:
+    if ctype == "ulong":
+        return f"{int(value) % (1 << 64)}ul"
+    if ctype == "long":
+        return "(-9223372036854775807l - 1l)" if int(value) == -(1 << 63) else f"{int(value)}l"
     if ctype in ("float", "half", "bfloat"):
         if math.isinf(value):
             expr = "-INFINITY" if value < 0 else "INFINITY"
@@ -392,6 +401,50 @@ _SUPPORTED = {
 }
 
 
+def _wide_scalar(name: str, ctype: str, values: list[str]) -> str:
+    """64-bit integer expressions, with wrapping arithmetic and bounded shifts."""
+    a, *rest = values
+    b = rest[0] if rest else ""
+
+    def bits(expr: str) -> str:
+        return f"as_type<long>({expr})" if ctype == "long" else expr
+
+    if name in ("add", "subtract", "multiply"):
+        op = {"add": "+", "subtract": "-", "multiply": "*"}[name]
+        return bits(f"(ulong({a}) {op} ulong({b}))")
+    if name in ("negate", "abs"):
+        negative = bits(f"(0ul - ulong({a}))")
+        return negative if name == "negate" else f"({a} < 0 ? {negative} : {a})"
+    if name == "shift_right_arithmetic":
+        expr = f"(as_type<long>(ulong({a})) >> uint(min(ulong({b}), 63ul)))"
+        return expr if ctype == "long" else f"as_type<ulong>({expr})"
+    if name in ("shift_left", "shift_right_logical"):
+        op = "<<" if name == "shift_left" else ">>"
+        return bits(f"(ulong({b}) < 64ul ? (ulong({a}) {op} uint(ulong({b}) & 63ul)) : 0ul)")
+    if name in ("maximum", "minimum"):
+        return f"{('max' if name == 'maximum' else 'min')}({a}, {b})"
+    if name == "clamp":
+        low, value, high = values
+        return f"min(max({value}, {low}), {high})"
+    if name in ("and", "or", "xor"):
+        op = {"and": "&", "or": "|", "xor": "^"}[name]
+        return f"({a} {op} {b})"
+    if name == "not":
+        return f"(~{a})"
+    if name == "sign":
+        return f"{ctype}(({a} > 0) - ({a} < 0))"
+    if name in ("popcnt", "count_leading_zeros"):
+        return f"{ctype}({'popcount' if name == 'popcnt' else 'clz'}(ulong({a})))"
+    if name in ("divide", "remainder"):
+        zero = f"{ctype}(~0ul)" if name == "divide" else a
+        expr = f"({a} {'/' if name == 'divide' else '%'} {b})"
+        if ctype == "long":
+            overflow = bits(f"(0ul - ulong({a}))") if name == "divide" else "0l"
+            expr = f"({b} == -1l ? {overflow} : {expr})"
+        return f"({b} == 0 ? {zero} : {expr})"
+    raise UnsupportedProgram(f"metal: stablehlo.{name} on {ctype} is not supported")
+
+
 def _graph(module: ir.Module) -> tuple[list[_Parameter], list[_Node]]:
     """The main function as a DAG of nodes, calls and composites inlined."""
     functions = {
@@ -641,6 +694,10 @@ class _Kernel:
                 )
             case "iota":
                 return f"{ctype}({coords[a['dim']]})"
+        if node.name == "bitcast_convert" and node.dtype.itemsize != operands[0].dtype.itemsize:
+            raise UnsupportedProgram(
+                "metal: shape-changing stablehlo.bitcast_convert is not supported"
+            )
         values = [self.value(x, coords) for x in operands]
         match node.name:
             case "convert":
@@ -653,6 +710,8 @@ class _Kernel:
                 pred, on_true, on_false = values
                 return format_scalar("select_n", ctype, (pred, on_false, on_true))
         operand_ctype = _ctype(operands[0].dtype)
+        if operand_ctype in ("long", "ulong"):
+            return _wide_scalar(node.name, operand_ctype, values)
         if node.name in _EXTRA:
             kind = "float" if operand_ctype in ("float", "half", "bfloat") else operand_ctype
             if kind not in _EXTRA[node.name]:
@@ -697,6 +756,8 @@ def _identity(kind: str, ctype: str) -> str:
 def _reduction_kernel(node: _Op, output: _Node, name: str, chunks: int = 1) -> tuple[_Kernel, str]:
     """128 threads per output; large reductions can write independent partials."""
     x, init = node.operands
+    if node.dtype in (np.int64, np.uint64):
+        raise UnsupportedProgram("metal: stablehlo.reduce on 64-bit integers is not supported")
     dims = sorted(node.attributes["dims"])
     reduced_shape = tuple(x.shape[d] for d in dims)
     size = math.prod(reduced_shape)

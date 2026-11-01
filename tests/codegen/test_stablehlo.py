@@ -195,3 +195,23 @@ def test_dot_explicit_algorithm_is_rejected():
             (16, 16),
             version=stablehlo.get_current_version(),
         )
+
+
+def test_wide_integer_types_stay_local_to_pjrt():
+    from palladium.emit.core import CTYPES
+
+    assert np.dtype(np.uint64) not in CTYPES and np.dtype(np.int64) not in CTYPES
+    with jax.enable_x64():
+        program = _compile(
+            lambda x: (x + np.uint64(2**63 + 1)) >> np.uint64(32), (4,), dtype=np.uint64
+        )
+    assert "ulong" in program.launches[0].source
+    assert "9223372036854775809ul" in program.launches[0].source
+
+
+def test_unsupported_wide_operations_fail_explicitly():
+    with jax.enable_x64():
+        with pytest.raises(UnsupportedProgram, match="reduce on 64-bit"):
+            _compile(lambda x: x.sum(), (4,), dtype=np.int64)
+        with pytest.raises(UnsupportedProgram, match="shape-changing"):
+            _compile(lambda x: lax.bitcast_convert_type(x, jnp.int64), (2, 2), dtype=np.int32)
