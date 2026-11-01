@@ -1,0 +1,40 @@
+{
+  "timestamp_utc": "2026-11-01T19:59:30.377344+00:00",
+  "platform": "metal",
+  "device": "Apple M1 Pro",
+  "os": "macOS-26.7.2-arm64-arm-64bit-Mach-O",
+  "python": "3.14.7",
+  "jax": "0.12.0.1",
+  "jaxlib": "0.12.0.1",
+  "cache": "fresh process; JAX persistent cache disabled; Metal driver cache unchanged",
+  "repeats": 5,
+  "small_calls_per_batch": 1000,
+  "large_mib_per_buffer": 256,
+  "small_seconds_per_call": [
+    2.5954666998586618e-05,
+    2.305533400794957e-05,
+    2.2384416006389074e-05,
+    2.384904198697768e-05,
+    2.2471040996606462e-05
+  ],
+  "small_median_us": 23.05533400794957,
+  "large_seconds_per_call": [
+    0.006096249999245629,
+    0.005932917003519833,
+    0.0034784169984050095,
+    0.003364165997481905,
+    0.00422887499735225
+  ],
+  "elementwise_median_gbps": 126.95360168747986,
+  "copy_gpu_seconds": [
+    0.003934708336601034,
+    0.0038809999969089404,
+    0.003792500006966293,
+    0.0033059999987017363,
+    0.003312999993795529
+  ],
+  "copy_median_gbps": 141.56121582434886,
+  "elementwise_fraction_of_copy": 0.8968106196898284,
+  "sbi_compile_and_first_call_seconds": 0.256332459000987,
+  "sbi_first_loss": 2.1272225379943848
+}

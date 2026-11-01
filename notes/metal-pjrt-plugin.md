@@ -4,8 +4,9 @@ Implementation record and handoff for milestone M1 of
 `notes/metal-compute-stack.md`: a PJRT plugin that runs `jax.jit` programs
 on the Apple GPU without MLX. This note says what exists, how it was built
 and why, what to keep invariant, what comes next, and when M1 counts as
-done. Status as of 2026-11-01, on jax and jaxlib 0.12.0.1, measured on an
-M2 (Apple GPU family 8).
+done. Status as of 2026-11-01, on jax and jaxlib 0.12.0.1. Initial
+measurements were on M2; the recent operation and lifetime work was validated
+on Apple M1 Pro. Each measurement section identifies its machine.
 
 ## Status
 
@@ -29,6 +30,13 @@ Works:
   arbitrary axes, including empty reductions. Producers fuse into reduction
   reads; consumers read intermediate slots in later launches. This enables
   softmax, means, variances and normalization programs.
+- Variadic scalar elementwise reducers, including argmax/argmin with first-index
+  ties and NaN behavior, using a sequential fold per output element. SIMD
+  acceleration of these reducers remains future tuning.
+- Gather for JAX indexing, including batching, windows, negative indices and
+  clip/fill lowering. Scatter-add supports float32, float16, bfloat16, int32
+  and uint32 data with 32-bit indices, including duplicate indices and
+  embedding gradients. Non-add and variadic scatter bodies remain unsupported.
 - Static counted `while`, including `lax.scan` trajectories and nested loops:
   a scalar i32/ui32 counter starting at a constant, compared with LT to a
   constant bound, incremented by one. Body kernels replay in one command
@@ -43,26 +51,32 @@ Works:
   condition read, but untaken expensive branches still consume work and storage.
 - Asynchronous execution with completion events, a buffer pool, and at most
   16 executions in flight.
+- Donation via `tf.aliasing_output`: ordered GPU copyback transfers input
+  storage to the output after all reads. Runtime non-donatable inputs and
+  repeated arguments retain their storage. This still allocates temporary
+  outputs; in-place kernel planning is not implemented.
+- Concurrent calls with shared inputs retain independent storage owners until
+  GPU completion. Passthrough and repeated outputs are copied on the GPU queue.
 - The complete SBI step compiles and executes, with a ten-step CPU comparison
   of losses, parameters and optimizer state (details and tolerance below).
 
 Fails with UNIMPLEMENTED, naming the op (`palladium.stablehlo` raises
-`UnsupportedProgram`): variadic or other reducer bodies (including argmax and
+`UnsupportedProgram`): unsupported reducer bodies (including single-result
 product), integer or explicitly algorithm-selected dots, dynamic or unrecognized `while`,
-`gather`,
-`scatter`, `reduce_window`, `sort`, `convolution`, float64 arithmetic and
+non-add scatter and unsupported scatter dtypes, `reduce_window`, `sort`,
+`convolution`, float64 arithmetic and
 64-bit integer reductions. Shape-changing bitcasts and wide integer operations
 without explicit lowering (such as power) are rejected too. In
-`examples/training_steps.py`, SBI now runs; LLM still stops at `gather` and
-SAM2-like at `convolution`. CPU setup remains useful for reference inputs:
+`examples/training_steps.py`, SBI and LLM now run. The LLM has a one-update
+CPU regression test with varied repeated tokens at rtol 1e-4, atol 2e-6; this
+is not an M3 performance claim. SAM2-like still stops at `convolution`. CPU setup remains useful for reference inputs:
 
 ```python
 with jax.default_device(jax.devices("cpu")[0]):
     key = jax.random.key(0)
 ```
 
-Not supported by design yet: donation (jax refuses it for unknown
-platforms), host callbacks (`jax.debug.print`, `pure_callback`), `eigh` and
+Not supported by design yet: host callbacks (`jax.debug.print`, `pure_callback`), `eigh` and
 `svd`, the persistent compilation cache (executables do not serialize),
 more than one device.
 
@@ -147,7 +161,7 @@ almost always means jaxlib called an API slot the plugin left null. Run with
      fresh buffer per execution, or a constant uploaded once.
    - `pp_kernel(msl, function, math_mode, slots, grid, threadgroup)`:
      compiles the MSL now; an empty threadgroup lets the pipeline choose.
-   - `pp_output(slot)` and `pp_error(code, message)`.
+   - `pp_output(slot)`, `pp_alias(parameter, output)` and `pp_error(code, message)`.
 
    `UnsupportedProgram` becomes UNIMPLEMENTED; any other exception becomes
    INTERNAL with its traceback. No exception may unwind into the plugin.
@@ -165,13 +179,16 @@ almost always means jaxlib called an API slot the plugin left null. Run with
    constants become constant slots. Math mode is FAST, palladium's default.
 7. **Execution.** `Execute` binds slots to buffers, encodes every launch
    into one command buffer, commits it with a completion handler and
-   returns. The handler copies outputs that are not fresh slots (inputs or
-   constants returned directly, repeated outputs) and sets the execution's
-   `Completion`, which is every output's `ready` and every input's and
-   output's `last_use`.
+   returns. Passthrough/repeated outputs and donation copybacks use blit
+   commands after the compute launches. The handler retains program and
+   storage owners, then sets the execution's `Completion`, which is each
+   output's `ready`. GPU copies ensure subsequent commands cannot race a
+   delayed host completion callback.
 8. **Buffer reuse.** Buffers come from a pool keyed by requested size (up
    to 1 GiB), since a fresh 16 MB MTLBuffer is zeroed on allocation. A
-   released buffer returns to the pool only when its `last_use` completes.
+   released buffer returns to the pool when its last storage owner disappears.
+   Each dispatch holds independent owners of all input, intermediate and output
+   storage until completion; it does not mutate a shared last-use pointer.
    `test_executions_run_ahead_of_the_gpu` fails on every element when the
    deferral is removed. Without a bound on executions in flight, a caller
    running ahead allocated a new output per queued call and large calls got
@@ -223,8 +240,9 @@ In order of what M2's SBI step needs first.
    are correct but still need coalesced tiling.
 
    The compiler validates the reducer region: exactly one binary add, max,
-   min, and or or returning its result. Other bodies and variadic reducers
-   fail explicitly. Half/bfloat accumulators and partial buffers use float32.
+   min, and or or returning its result. Other single-result bodies
+   fail explicitly. Variadic scalar elementwise bodies have a separate
+   sequential-fold implementation, including argmax/argmin. Half/bfloat accumulators and partial buffers use float32.
    Reduction launches use SAFE math; min/max propagate NaNs and resolve
    signed-zero ties explicitly around Metal's SIMD collectives. Elementwise
    launches retain FAST math. The supplied initializer is combined once in
@@ -232,8 +250,8 @@ In order of what M2's SBI step needs first.
    initializers need not match XLA's reduction schedule, which can insert
    them multiple times ([StableHLO semantics](https://openxla.org/stablehlo/spec#reduce)).
 
-   Remaining: variadic argmax/argmin (palladium already lowers these for
-   jaxprs), coalesced column reductions, tuning small rows, and epilogue fusion.
+   Remaining: parallel variadic reductions, coalesced column reductions,
+   tuning small rows, and epilogue fusion.
 2. **`concatenate`, `pad`, dynamic slices (done).** `_Kernel.choose` emits
    each branch's entire producer chain inside its guard. Value and reshape
    memoization is scoped to that branch, with unique temporary names across
@@ -293,12 +311,13 @@ In order of what M2's SBI step needs first.
    `backend_config` must be a dictionary, carrying the MSL and launch.
    `stablehlo.py` turns that custom call into a `Launch`. This brings
    `metal_call` and `plmtl` kernels into whole programs.
-7. **Donation.** jax refuses donation unless the platform is listed in
-   `jax._src.interpreters.mlir._platforms_with_donation` (jax-mps appends
-   `mps` there); `_pjrt.initialize` can append `metal`. Then check how the
-   aliases arrive (expected: `tf.aliasing_output` argument attributes) and
-   let the output take over the input's storage. Optimizer state makes this
-   matter from M2 on.
+7. **Donation (correctness implemented).** `_pjrt.initialize` appends `metal`
+   to JAX's private donation-platform list. Argument `tf.aliasing_output`
+   attributes pass through the compiler to native execution. Outputs compute
+   into fresh storage, then copy back into donated storage after all reads and
+   passthrough snapshots. This handles permutations and repeated outputs.
+   PJRT runtime non-donatable indices override the compile-time aliases.
+   Remaining: avoid temporary allocation/copyback when in-place execution is safe.
 8. **Host time per call.** 29 µs pipelined against 3 µs on CPU. Profile
    the split between jax's C API dispatch and Execute (command buffer and
    encoder creation, per-launch vectors, `std::function` and `shared_ptr`
@@ -307,10 +326,11 @@ In order of what M2's SBI step needs first.
    pins jax 0.11).
 9. **Smaller gaps.**
    - A failed execution does not fail executions that consume its outputs.
-   - `PJRT_Buffer::last_use` is assigned without a lock, a race if two
-     threads execute with the same buffer.
-   - Each kernel compiles its own MTLLibrary; cache by source hash once
-     programs grow.
+   - Concurrent read-only uses of shared buffers are covered. Concurrently
+     deleting or donating the same Python array from another thread is not
+     part of this guarantee.
+   - Libraries/pipelines are cached per executable; sharing across executables
+     remains future work.
    - Compile time: the first call of a small program takes about 90 ms.
 10. **Dropping the JAX_PLATFORMS gate** once the success criteria below hold.
 
@@ -391,30 +411,29 @@ batches of ten calls, waiting only on the last result). The throughput probe
 reuses initial state; the correctness test chains ten updates with new keys.
 The full step is correct at the stated tolerance, but does not yet beat CPU.
 
-M1 is still incomplete: variadic argmax, gather/scatter-add, donation
-and the full API/concurrency checklist remain open. Overhead versus jax-mps
-and bandwidth targets on M2 and M4 Pro have not been established. M2 still
+The operation groups and common API/concurrency cases now have tests,
+including argmax, gather/scatter-add and donation. M1 is still incomplete.
+Overhead versus jax-mps and bandwidth targets on M2 and M4 Pro have not been established. M2 still
 needs profiling/tuning of replay, trajectory updates and reductions.
 
-### M1 completion assessment, after conditional support (2026-11-01)
+### M1 completion assessment, after indexing and lifetime support (2026-11-01)
 
 The milestone is not complete just because SBI runs or the test suite passes.
 The remaining acceptance gates, against the criteria below, are:
 
 | Gate | Evidence now | Remaining work |
 |---|---|---|
-| Operation groups | Elementwise/index maps, single-result reductions, floating dots, static loops, cond/switch and threefry have differential tests | Variadic argmax and JAX gather/scatter-add, with exact index/tie/duplicate semantics |
+| Operation groups | All listed groups have differential tests, now including argmax/argmin and JAX gather/scatter-add in f32/f16/bf16 | Scoped coverage, not every StableHLO dtype/body; partially out-of-bounds low-level scatter windows differ from CPU as described below |
 | Ten SBI updates | Full program runs with new keys; rtol 1e-4 **plus atol 2e-6** | Explicitly agree that near-zero absolute tolerance is acceptable, or satisfy the original relative-only wording; do not silently relax the criterion |
-| Compile time | First completed SBI step measured 0.82 s on M1 Pro | Repeat on the target machines, including a documented cache state |
-| Common API/lifetimes | `lower().compile()`, empty cost analysis, and releasing Python executables/inputs after queued dispatch have tests | Donation and concurrent dispatch with shared inputs; native `last_use` writes are still unsynchronized |
+| Compile time | Latest harness: first completed SBI step 0.256 s on M1 Pro, persistent JAX cache disabled, driver cache unchanged | Repeat on the target machines, including a documented cache state |
+| Common API/lifetimes | `lower().compile()`, analysis APIs, donation/storage reuse, deletion after dispatch, and four-thread shared-input dispatch have tests; shared last-use mutation removed | Further stress/profiling on target machines; no known remaining implementation gap in the listed common API cases |
 | Memory analysis contract | PJRT returns UNIMPLEMENTED, but JAX 0.12's public method returns `None` without crashing | Reconcile the criterion's “raises” wording with this observed wrapper behavior |
-| Dispatch overhead/bandwidth | Measurements here are on M1 Pro; full SBI is 2.83 ms vs CPU's 1.47 ms | On **both M2 and M4 Pro**, beat same-machine jax-mps small-call overhead and reach 80% of the copy-bandwidth baseline |
+| Dispatch overhead/bandwidth | M1 Pro: 23.1 µs small-call median; elementwise reaches 89.7% of the measured copy baseline | On **both M2 and M4 Pro**, beat same-machine jax-mps small-call overhead and reach 80% of the copy-bandwidth baseline |
 
-Recommended order: gather/scatter-add, variadic argmax, then donation and
-shared-buffer concurrency/lifetime hardening. Start collecting the two-machine
-baselines alongside implementation, since the performance gate is the largest
-remaining uncertainty. A passing concurrency stress test alone cannot clear
-the known native shared-pointer race; fix the synchronization first.
+The recommended implementation sequence is now covered. Next: collect the
+M2/M4 Pro baseline artifacts with `examples/pjrt_m1_benchmark.py`, compare
+same-machine jax-mps overhead, and tune any failed performance gates. Resolve
+the two contract questions below before declaring M1 complete.
 
 Call M1 complete only when these gates have reproducible evidence and the two
 contract ambiguities (SBI tolerance and memory-analysis behavior) have an
@@ -424,6 +443,52 @@ current full-SBI slowdown is a warning for M2, **not an additional M1 gate**:
 M1's performance requirements are the stated dispatch and bandwidth targets.
 Dynamic while, convolution, LLM/SAM training, and Pallas custom-call integration
 are not reasons to hold M1 open beyond its listed criteria.
+
+### Indexing compatibility and validation
+
+Gather fuses source/index expressions into reads. Scatter initializes fresh
+output storage and uses atomic adds for f32/i32/u32. For f16/bf16 it uses one
+atomic uint word per element, compare/exchange with rounding after each
+successful update, then unpacks; odd-sized outputs never access a neighboring
+halfword outside their allocation. Duplicate floating updates have an
+implementation-dependent order, so general floating results are not promised
+bitwise identical to CPU.
+
+There is one observed low-level compatibility difference: a `lax.scatter_add`
+window of length 4 starting at -1 or 5 in a length-7 operand is discarded as a
+whole by XLA CPU. Our lowering retains its in-bounds elements, following the
+[StableHLO scatter specification](https://openxla.org/stablehlo/spec#scatter).
+A scalar reference tests this behavior separately. The common `x[idx]` and
+`x.at[idx].add` cases in the M1 census match CPU; do not describe arbitrary
+out-of-bounds window scatter as CPU-compatible.
+
+### Reproducing the remaining performance gates
+
+Run in fresh processes on **each** target machine, using separate environments
+for current JAX and jax-mps (which pins JAX 0.11). Do not run other GPU workloads
+concurrently:
+
+```sh
+JAX_PLATFORMS=metal,cpu uv run python examples/pjrt_m1_benchmark.py --platform metal --output metal.json
+# In the jax-mps environment:
+JAX_PLATFORMS=mps,cpu python examples/pjrt_m1_benchmark.py --platform mps --output mps.json
+```
+
+The JSON records versions, machine, cache policy, timing samples, SBI compile
+plus first completed call, and median small-call microseconds. Metal also
+records a 256 MiB elementwise wall-time bandwidth and the same copy kernel/GPU
+time used by `bench_copy_bandwidth`. Compare `small_median_us` across the two
+artifacts; require `elementwise_fraction_of_copy >= 0.8` and SBI first call
+under 5 seconds. The correctness suite remains a separate prerequisite.
+JAX persistent caching is disabled; the Metal driver's cache is not cleared.
+
+[M1 Pro artifact, 2026-11-01](metal-m1-pro-2026-11-01.json): 23.1 µs median
+small-call latency, 127.0 GB/s elementwise versus 141.6 GB/s copy (89.7%),
+and 0.256 s SBI compile plus first execution. These are five-sample medians
+except for the single first-call measurement; the artifact retains every
+sample. They do not establish either target-machine gate or a jax-mps speedup.
+Validation after these changes: 504 tests passed, 2 skipped, 4 fuzz tests
+deselected; lint and type checks on the changed Python files passed.
 
 ## Success criteria for M1, against jax 0.12
 

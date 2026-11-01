@@ -557,6 +557,26 @@ def test_full_sbi_training_matches_cpu_over_ten_steps():
     """)
 
 
+def test_llm_training_step_matches_cpu():
+    _check(f"""
+        import sys
+        import jax,numpy as np
+        sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
+        from training_steps import steps
+        with jax.default_device(jax.devices('cpu')[0]):
+            fn,params,opt,_=steps()['llm']
+        tokens=np.arange(4*129,dtype=np.int32).reshape(4,129)%128
+        outputs={{}}
+        run=jax.jit(fn)
+        for name in ('metal','cpu'):
+            outputs[name]=run(*jax.device_put((params,opt,tokens),jax.devices(name)[0]))
+        for got,want in zip(jax.tree.leaves(outputs['metal']),
+                            jax.tree.leaves(outputs['cpu']),strict=True):
+            np.testing.assert_allclose(np.asarray(got),np.asarray(want),
+                                       rtol=1e-4,atol=2e-6,equal_nan=False)
+    """)
+
+
 def test_cond_and_switch_match_cpu():
     _check("""
         import jax, jax.numpy as jnp, ml_dtypes, numpy as np
