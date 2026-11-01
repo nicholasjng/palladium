@@ -6,6 +6,7 @@
 #include "plugin.h"
 
 #include <cstring>
+#include <algorithm>
 #include <unordered_map>
 
 #include "errors.h"
@@ -112,6 +113,48 @@ std::shared_ptr<Completion> Completion::done() {
         return c;
     }();
     return completed;
+}
+
+std::shared_ptr<Completion> Completion::join(
+    std::vector<std::shared_ptr<Completion>> dependencies) {
+    std::vector<std::shared_ptr<Completion>> unique;
+    for (auto& dependency : dependencies) {
+        if (dependency != done() && std::find(unique.begin(), unique.end(), dependency) == unique.end()) {
+            unique.push_back(std::move(dependency));
+        }
+    }
+    if (unique.empty()) return done();
+    if (unique.size() == 1) return unique.front();
+    struct Pending {
+        std::mutex mutex;
+        size_t remaining;
+        std::vector<std::shared_ptr<Completion>> dependencies;
+        std::shared_ptr<Completion> result = std::make_shared<Completion>();
+    };
+    auto pending = std::make_shared<Pending>();
+    pending->remaining = unique.size();
+    pending->dependencies = std::move(unique);
+    for (const auto& dependency : pending->dependencies) {
+        dependency->then([pending] {
+            {
+                std::lock_guard lock(pending->mutex);
+                if (--pending->remaining) return;
+            }
+            // Every dependency is now ready, even if its callback ran later
+            // than a consumer's GPU completion handler. Never block a Metal
+            // callback thread waiting for another callback to run.
+            for (const auto& dependency : pending->dependencies) {
+                if (auto* e = dependency->error()) {
+                    const auto* failure = static_cast<Error*>(e);
+                    pending->result->set(failure->code, failure->message);
+                    delete failure;
+                    return;
+                }
+            }
+            pending->result->set();
+        });
+    }
+    return pending->result;
 }
 
 void Completion::set(PJRT_Error_Code code, std::string message) {

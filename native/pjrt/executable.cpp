@@ -293,10 +293,7 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
             std::lock_guard lock(in_flight_mutex);
             in_flight.push_back(completion);
         } else {
-            // Nothing for the GPU: copy once the parameters are defined.
-            for (int i = 0; i < p.num_parameters; ++i) {
-                if (PJRT_Error* e = wait_ready(args[i])) return e;
-            }
+            // Empty work still joins its input readiness below, asynchronously.
             finish(nullptr);
         }
     } catch (const std::exception& e) {
@@ -455,9 +452,21 @@ void add_executable_api(PJRT_Api& api) {
         PJRT_Device* device =
             args->execute_device ? args->execute_device : &exe->client->device;
         auto completion = std::make_shared<Completion>();
+        std::vector<std::shared_ptr<Completion>> dependencies;
+        for (size_t i = 0; i < args->num_args; ++i) {
+            dependencies.push_back(args->argument_lists[0][i]->ready);
+        }
         if (PJRT_Error* e = execute(exe->program, device, args->argument_lists[0],
                                     args->num_args, args->output_lists[0], completion, args->options)) {
             return e;
+        }
+        // Queue ordering covers GPU data dependencies, but completion callbacks
+        // may run out of order. Publish success only after both the GPU work and
+        // all input completions have succeeded, including transitive failures.
+        dependencies.push_back(completion);
+        completion = Completion::join(std::move(dependencies));
+        for (size_t i = 0; i < exe->program->outputs.size(); ++i) {
+            args->output_lists[0][i]->ready = completion;
         }
         if (args->device_complete_events) {
             args->device_complete_events[0] = new PJRT_Event{completion};

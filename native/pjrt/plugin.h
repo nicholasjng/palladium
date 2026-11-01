@@ -26,6 +26,10 @@ class Completion {
     // An already completed one, for work done synchronously.
     static std::shared_ptr<Completion> done();
 
+    // Complete after all dependencies, preserving the first error in input
+    // order. Registration never waits; duplicate dependencies are coalesced.
+    static std::shared_ptr<Completion> join(std::vector<std::shared_ptr<Completion>> dependencies);
+
     void set(PJRT_Error_Code code = PJRT_Error_Code_OK, std::string message = {});
     bool ready();
     void wait();

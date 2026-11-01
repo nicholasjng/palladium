@@ -325,7 +325,10 @@ In order of what M2's SBI step needs first.
    environment (`uv sync --group mps --no-group latest-jax`, since jax-mps
    pins jax 0.11).
 9. **Smaller gaps.**
-   - A failed execution does not fail executions that consume its outputs.
+   - Dependency failures now propagate through output readiness and execution
+     events. GPU work may already be queued, but its results cannot report
+     success when an input failed. Readiness joins use callbacks, without
+     blocking dispatch or Metal callback threads.
    - Concurrent read-only uses of shared buffers are covered. Concurrently
      deleting or donating the same Python array from another thread is not
      part of this guarantee.
@@ -535,6 +538,18 @@ On a jaxlib upgrade:
 1. Bump the header commit and its hash in `CMakeLists.txt`.
 2. Rebuild.
 3. Rerun the tests above.
+
+The native dependency-error regression deliberately fails producer readiness
+events, without causing GPU faults. It covers already-failed and late-failed
+inputs, transitive chains, passthrough/empty/donated outputs, event errors,
+host reads, and handle destruction while work is pending. Run after rebuilding:
+
+```sh
+cmake --build build/cp314-cp314t-macosx_26_0_arm64 --target palladium_pjrt_dependencies_test
+ctest --test-dir build/cp314-cp314t-macosx_26_0_arm64 -R pjrt_dependencies --output-on-failure
+```
+
+Substitute the local build-directory tag when using another Python ABI.
 
 StableHLO needs no pin of its own, because it is read with jaxlib's
 bindings.
