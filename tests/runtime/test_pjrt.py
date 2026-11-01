@@ -681,6 +681,46 @@ def test_executable_and_inputs_can_be_released_after_dispatch():
     """)
 
 
+def test_donation_reuses_storage_after_reads_complete():
+    _check("""
+        import jax,jax.numpy as jnp,numpy as np
+        from jax import lax
+        metal=jax.devices('metal')[0]
+        host=np.arange(4096,dtype=np.float32)
+        cases=[lambda x:x+1, lambda x:x[::-1], lambda x:x,
+               lambda x:jnp.zeros_like(x),
+               lambda x:lax.fori_loop(0,3,lambda _,a:a+1,x)]
+        for case,fn in enumerate(cases):
+            for data in (host,np.empty(0,np.float32)):
+                x=jax.device_put(data,metal)
+                pointer=x.unsafe_buffer_pointer()
+                before=jax.jit(lambda x:x*2)(x)
+                y=jax.jit(fn,donate_argnums=(0,),keep_unused=True)(x)
+                assert x.is_deleted(), (case,data.shape)
+                assert y.unsafe_buffer_pointer()==pointer
+                np.testing.assert_array_equal(np.asarray(before),data*2)
+                expected=jax.jit(fn)(jax.device_put(data,jax.devices('cpu')[0]))
+                np.testing.assert_array_equal(np.asarray(y),np.asarray(expected))
+        x,y=(jax.device_put(a,metal) for a in (host,host+100))
+        px,py=x.unsafe_buffer_pointer(),y.unsafe_buffer_pointer()
+        a,b,c=jax.jit(lambda x,y:(y,x,y),donate_argnums=(0,1))(x,y)
+        assert x.is_deleted() and y.is_deleted()
+        assert a.unsafe_buffer_pointer()==px and b.unsafe_buffer_pointer()==py
+        for got,want in ((a,host+100),(b,host),(c,host+100)):
+            np.testing.assert_array_equal(np.asarray(got),want)
+        # Repeated arguments are marked non-donatable by the PJRT caller.
+        x=jax.device_put(host,metal)
+        result=jax.jit(lambda x,y:x+y,donate_argnums=(0,))(x,x)
+        np.testing.assert_array_equal(np.asarray(result),host*2)
+        np.testing.assert_array_equal(np.asarray(x),host)
+        # Keep chaining donated outputs without synchronizing each update.
+        step=jax.jit(lambda x:x+1,donate_argnums=(0,))
+        for _ in range(50):
+            x=step(x)
+        np.testing.assert_array_equal(np.asarray(x),host+50)
+    """)
+
+
 def test_concurrent_dispatch_retains_shared_inputs():
     _check("""
         from concurrent.futures import ThreadPoolExecutor

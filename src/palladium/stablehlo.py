@@ -67,6 +67,7 @@ class Program:
     slots: list[Slot]
     launches: list[Launch]
     outputs: list[int]
+    aliases: tuple[tuple[int, int], ...] = ()  # parameter, output
 
 
 _DTYPES = {
@@ -980,8 +981,28 @@ def compile_program(code: bytes) -> Program:
     with mlir.make_ir_context() as ctx:
         module = stablehlo.deserialize_portable_artifact(ctx, code)
         parameters, results = _graph(module)
+        main = next(
+            op
+            for op in module.body.operations
+            if op.operation.name == "func.func"
+            and ir.StringAttr(op.attributes["sym_name"]).value == "main"
+        )
+        aliases = []
+        if "arg_attrs" in main.attributes:
+            for i, attrs in enumerate(ir.ArrayAttr(main.attributes["arg_attrs"])):
+                attrs = ir.DictAttr(attrs)
+                if "tf.aliasing_output" in attrs:
+                    output = ir.IntegerAttr(attrs["tf.aliasing_output"]).value
+                    if (
+                        not 0 <= output < len(results)
+                        or parameters[i].dtype != results[output].dtype
+                        or parameters[i].shape != results[output].shape
+                        or output in [o for _, o in aliases]
+                    ):
+                        raise UnsupportedProgram("metal: incompatible input/output alias")
+                    aliases.append((i, output))
 
-    return _compile_graph(parameters, results)
+    return dataclasses.replace(_compile_graph(parameters, results), aliases=tuple(aliases))
 
 
 def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Program:

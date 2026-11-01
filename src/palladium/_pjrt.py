@@ -22,6 +22,7 @@ from pathlib import Path
 import ml_dtypes
 import numpy as np
 from jax._src import config, xla_bridge
+from jax._src.interpreters import mlir
 
 _LIBRARY_NAME = "libpalladium_pjrt.dylib"
 
@@ -75,6 +76,7 @@ _SIGNATURES = {
         ],
     ),
     "pp_output": (None, [ctypes.c_void_p, ctypes.c_int]),
+    "pp_alias": (None, [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]),
 }
 
 
@@ -142,6 +144,8 @@ def _describe(lib: ctypes.CDLL, builder: int, code: bytes) -> None:
             raise _Recorded
     for slot in program.outputs:
         lib.pp_output(builder, slot)
+    for parameter, output in program.aliases:
+        lib.pp_alias(builder, parameter, output)
 
 
 @_COMPILER
@@ -166,3 +170,5 @@ def initialize() -> None:
     if "metal" in (config.jax_platforms.value or "").split(","):
         xla_bridge.register_plugin("metal", library_path=str(library_path()))
         library().palladium_pjrt_set_compiler(_compile)
+        if "metal" not in mlir._platforms_with_donation:
+            mlir._platforms_with_donation.append("metal")

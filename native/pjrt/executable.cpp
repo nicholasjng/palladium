@@ -4,6 +4,7 @@
 // buffer slots and kernel launches, which Execute encodes into one command
 // buffer and commits without waiting.
 #include <cstring>
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <map>
@@ -47,6 +48,7 @@ struct Program {
     std::map<std::tuple<std::string, std::string, int>,
              std::pair<std::shared_ptr<Library>, std::shared_ptr<ComputePipeline>>> pipelines;
     std::vector<int> outputs;
+    std::vector<std::pair<int, int>> aliases;  // parameter, output
     int num_parameters = 0;
 
     // What the output queries return, kept alive here.
@@ -138,6 +140,9 @@ EXPORT int pp_kernel(Program* p, const char* msl, const char* function, int math
 }
 
 EXPORT void pp_output(Program* p, int slot) { p->outputs.push_back(slot); }
+EXPORT void pp_alias(Program* p, int parameter, int output) {
+    p->aliases.emplace_back(parameter, output);
+}
 
 }  // extern "C"
 
@@ -198,7 +203,7 @@ void throttle() {
 // the outputs are defined, and `completion` set, once the GPU is done.
 PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
                     PJRT_Buffer* const* args, size_t num_args, PJRT_Buffer** outputs,
-                    std::shared_ptr<Completion> completion) {
+                    std::shared_ptr<Completion> completion, const PJRT_ExecuteOptions* options) {
     const Program& p = *program;
     if ((int)num_args != p.num_parameters) {
         return error(PJRT_Error_Code_INVALID_ARGUMENT,
@@ -241,6 +246,22 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
         copies.emplace_back(bound[s], buffer->storage.get());
         retained.push_back(buffer->storage);
     }
+    std::vector<int> donated;
+    for (auto [parameter, output] : p.aliases) {
+        bool allowed = true;
+        if (options) {
+            for (size_t i = 0; i < options->num_non_donatable_input_indices; ++i) {
+                if (options->non_donatable_input_indices[i] == parameter) allowed = false;
+            }
+        }
+        // A repeated argument must remain available through its other position.
+        if (std::count(args, args + num_args, args[parameter]) != 1) allowed = false;
+        if (!allowed) continue;
+        auto storage = args[parameter]->storage;
+        copies.emplace_back(results[output]->storage.get(), storage.get());
+        results[output]->storage = std::move(storage);
+        donated.push_back(parameter);
+    }
     // Independent owners avoid a shared last-use marker, whose update can race
     // or occur in a different order from command-buffer submission.
     auto finish = [program, completion, retained = std::move(retained)](const char* failure) {
@@ -281,6 +302,9 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
     } catch (const std::exception& e) {
         return error(PJRT_Error_Code_INTERNAL, std::string("metal: ") + e.what());
     }
+    // Publish deletion only after successful submission. All original reads and
+    // output snapshots precede the copybacks, including swapped/aliased outputs.
+    for (int parameter : donated) args[parameter]->storage.reset();
     for (size_t i = 0; i < results.size(); ++i) {
         results[i]->ready = completion;
         outputs[i] = results[i].release();
@@ -432,7 +456,7 @@ void add_executable_api(PJRT_Api& api) {
             args->execute_device ? args->execute_device : &exe->client->device;
         auto completion = std::make_shared<Completion>();
         if (PJRT_Error* e = execute(exe->program, device, args->argument_lists[0],
-                                    args->num_args, args->output_lists[0], completion)) {
+                                    args->num_args, args->output_lists[0], completion, args->options)) {
             return e;
         }
         if (args->device_complete_events) {
