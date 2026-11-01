@@ -194,17 +194,13 @@ std::unique_ptr<Buffer> acquire(size_t size_bytes) {
     return std::make_unique<Buffer>(runtime().device(), size_bytes);
 }
 
-void release(std::unique_ptr<Buffer> buffer, std::shared_ptr<Completion> last_use) {
+void release(std::unique_ptr<Buffer> buffer) {
     if (!buffer) return;
-    // std::function needs a copyable callable, so the buffer travels as a shared_ptr.
-    std::shared_ptr<Buffer> held(std::move(buffer));
-    last_use->then([held]() mutable {
-        Pool& p = pool();
-        std::lock_guard lock(p.mutex);
-        if (p.bytes + held->size() > kPoolLimit) return;
-        p.bytes += held->size();
-        p.free[held->size()].push_back(std::make_unique<Buffer>(std::move(*held)));
-    });
+    Pool& p = pool();
+    std::lock_guard lock(p.mutex);
+    if (p.bytes + buffer->size() > kPoolLimit) return;
+    p.bytes += buffer->size();
+    p.free[buffer->size()].push_back(std::move(buffer));
 }
 
 PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_t* dims,
@@ -220,7 +216,9 @@ PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_
     buffer->dims.assign(dims, dims + num_dims);
     for (size_t i = num_dims; i-- > 0;) buffer->minor_to_major.push_back((int64_t)i);
     try {
-        buffer->storage = acquire(byte_size(buffer.get()));
+        buffer->storage = std::shared_ptr<Buffer>(
+            acquire(byte_size(buffer.get())).release(),
+            [](Buffer* storage) { release(std::unique_ptr<Buffer>(storage)); });
     } catch (const AllocationError& e) {
         return error(PJRT_Error_Code_RESOURCE_EXHAUSTED, e.what());
     }
@@ -646,7 +644,7 @@ PJRT_Api make_api() {
         return nullptr;
     };
     api.PJRT_Buffer_Delete = [](PJRT_Buffer_Delete_Args* args) -> PJRT_Error* {
-        release(std::move(args->buffer->storage), args->buffer->last_use);
+        args->buffer->storage.reset();
         return nullptr;
     };
     api.PJRT_Buffer_IsDeleted = [](PJRT_Buffer_IsDeleted_Args* args) -> PJRT_Error* {

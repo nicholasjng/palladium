@@ -99,6 +99,9 @@ class CommandBatch {
     // Validates, then encodes. Throws before touching the encoder if invalid.
     void add(const Launch& launch);
 
+    // Copies on the GPU in submission order, after preceding launches.
+    void copy(const Buffer& source, Buffer& destination);
+
     // Submits without blocking.
     void commit();
 

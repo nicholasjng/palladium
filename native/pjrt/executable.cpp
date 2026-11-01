@@ -207,12 +207,14 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
     }
     throttle();
     std::vector<Buffer*> bound(p.slots.size());
+    std::vector<std::shared_ptr<Buffer>> retained;
     std::vector<std::unique_ptr<PJRT_Buffer>> fresh(p.slots.size());
     for (size_t s = 0; s < p.slots.size(); ++s) {
         const Slot& slot = p.slots[s];
         if (slot.kind == Slot::Parameter) {
             if (PJRT_Error* e = deleted(args[slot.parameter])) return e;
             bound[s] = args[slot.parameter]->storage.get();
+            retained.push_back(args[slot.parameter]->storage);
         } else if (slot.kind == Slot::Constant) {
             bound[s] = slot.constant.get();
         } else {
@@ -220,6 +222,7 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
             if (PJRT_Error* e = new_output(device, slot, &buffer)) return e;
             fresh[s].reset(buffer);
             bound[s] = buffer->storage.get();
+            retained.push_back(buffer->storage);
         }
     }
     // A fresh slot becomes its first output; parameters, constants and repeated
@@ -236,10 +239,12 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
         if (PJRT_Error* e = new_output(device, p.slots[s], &buffer)) return e;
         results[i].reset(buffer);
         copies.emplace_back(bound[s], buffer->storage.get());
+        retained.push_back(buffer->storage);
     }
-    auto finish = [program, completion, copies](const char* failure) {
+    // Independent owners avoid a shared last-use marker, whose update can race
+    // or occur in a different order from command-buffer submission.
+    auto finish = [program, completion, retained = std::move(retained)](const char* failure) {
         if (failure) return completion->set(PJRT_Error_Code_INTERNAL, failure);
-        for (auto [src, dst] : copies) std::memcpy(dst->contents(), src->contents(), dst->size());
         completion->set();
     };
     try {
@@ -256,6 +261,12 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
             batch.add(launch);
             encoded = true;
         }
+        // A host memcpy in the completion handler can lag the next command
+        // buffer. GPU copies make passthrough/repeated outputs safe to chain.
+        for (auto [src, dst] : copies) {
+            batch.copy(*src, *dst);
+            encoded |= dst->size() != 0;
+        }
         if (encoded) {
             batch.commit(finish);
             std::lock_guard lock(in_flight_mutex);
@@ -270,14 +281,9 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
     } catch (const std::exception& e) {
         return error(PJRT_Error_Code_INTERNAL, std::string("metal: ") + e.what());
     }
-    // Buffers keep their memory out of the pool until the GPU is done with them.
-    for (int i = 0; i < p.num_parameters; ++i) args[i]->last_use = completion;
     for (size_t i = 0; i < results.size(); ++i) {
-        results[i]->ready = results[i]->last_use = completion;
+        results[i]->ready = completion;
         outputs[i] = results[i].release();
-    }
-    for (auto& buffer : fresh) {
-        if (buffer) buffer->last_use = completion;  // computed but not an output
     }
     return nullptr;
 }

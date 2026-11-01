@@ -81,20 +81,18 @@ struct PJRT_Client {
 };
 
 // Buffers come from a pool keyed by size: GPU allocations cost tens of
-// microseconds and are zeroed. A released buffer returns to the pool once
-// `last_use` completes, so host copies never race GPU work still using it.
+// microseconds and are zeroed. Each dispatch retains the storage it uses;
+// only the final owner returns it to the pool.
 std::unique_ptr<Buffer> acquire(size_t size_bytes);
-void release(std::unique_ptr<Buffer> buffer, std::shared_ptr<Completion> last_use);
+void release(std::unique_ptr<Buffer> buffer);
 
 struct PJRT_Buffer {
     PJRT_Device* device;
     PJRT_Buffer_Type type;
     std::vector<int64_t> dims, minor_to_major;
-    std::unique_ptr<Buffer> storage;  // null once deleted
-    // Its contents are defined, and GPU work reading or writing it has finished.
-    std::shared_ptr<Completion> ready = Completion::done(), last_use = Completion::done();
-
-    ~PJRT_Buffer() { release(std::move(storage), last_use); }
+    std::shared_ptr<Buffer> storage;  // null once deleted; dispatches retain their own copy
+    // Its contents are defined. Published once, before returning the buffer.
+    std::shared_ptr<Completion> ready = Completion::done();
 };
 
 PJRT_Error* error(PJRT_Error_Code code, std::string message);

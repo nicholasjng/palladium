@@ -681,6 +681,39 @@ def test_executable_and_inputs_can_be_released_after_dispatch():
     """)
 
 
+def test_concurrent_dispatch_retains_shared_inputs():
+    _check("""
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        import gc,jax,numpy as np
+        metal=jax.devices('metal')[0]
+        host=np.arange(65536,dtype=np.float32)
+        shared=jax.device_put(host,metal)
+        run=jax.jit(lambda x,y:(x+y,x,y,x+y)).lower(shared,shared).compile()
+        step=jax.jit(lambda x:x+1).lower(shared).compile()
+        barrier=Barrier(4)
+        def worker(k):
+            local=jax.device_put(np.full_like(host,k),metal)
+            barrier.wait()
+            for _ in range(40):
+                result=run(shared,local)
+                # Chain consumers of both computed and passthrough outputs.
+                result=tuple(step(a) for a in result)
+            return result
+        with ThreadPoolExecutor(4) as pool:
+            results=list(pool.map(worker,range(4)))
+        shared.delete()
+        del run,step
+        gc.collect()
+        # Exercise pool reuse after releasing handles with work still queued.
+        noise=[jax.device_put(np.full_like(host,-11),metal) for _ in range(24)]
+        for k,result in enumerate(results):
+            expected=(host+k+1,host+1,np.full_like(host,k+1),host+k+1)
+            for got,want in zip(result,expected,strict=True):
+                np.testing.assert_array_equal(np.asarray(got),want)
+    """)
+
+
 def test_gather_indexing_matches_cpu():
     _check("""
         import jax,jax.numpy as jnp,ml_dtypes,numpy as np

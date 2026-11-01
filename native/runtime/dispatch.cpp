@@ -223,6 +223,12 @@ void CommandBatch::add(const Launch& launch) {
     if (committed_) throw DispatchError("cannot add to a batch that has already been committed");
     validate(launch, non_uniform_, max_threadgroup_memory_);
 
+    if (!encoder_) {
+        AutoreleaseScope scope;
+        encoder_ = NS::RetainPtr(command_buffer_->computeCommandEncoder());
+        if (!encoder_) throw DispatchError("could not create a Metal compute command encoder");
+    }
+
     encoder_->setComputePipelineState(launch.pipeline->handle());
     NS::UInteger index = 0;
     for (const auto& [buffer, offset] : launch.buffers) {
@@ -245,6 +251,22 @@ void CommandBatch::add(const Launch& launch) {
         encoder_->dispatchThreadgroups(MTL::Size::Make(grid.x / tg.x, grid.y / tg.y, grid.z / tg.z),
                                        mtl_tg);
     }
+}
+
+void CommandBatch::copy(const Buffer& source, Buffer& destination) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (committed_) throw DispatchError("cannot copy in a batch that has already been committed");
+    if (source.size() != destination.size()) throw DispatchError("copy buffer sizes must match");
+    if (!source.size()) return;
+    AutoreleaseScope scope;
+    if (encoder_) {
+        encoder_->endEncoding();
+        encoder_.reset();
+    }
+    auto blit = command_buffer_->blitCommandEncoder();
+    if (!blit) throw DispatchError("could not create a Metal blit command encoder");
+    blit->copyFromBuffer(source.handle(), 0, destination.handle(), 0, source.size());
+    blit->endEncoding();
 }
 
 void CommandBatch::commit() {
@@ -274,7 +296,7 @@ void CommandBatch::commit_locked() {
     committed_ = true;
 
     AutoreleaseScope scope;
-    encoder_->endEncoding();
+    if (encoder_) encoder_->endEncoding();
     command_buffer_->commit();
 }
 
