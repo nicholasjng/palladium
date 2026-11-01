@@ -1,0 +1,502 @@
+"""StableHLO programs to Metal kernels, for the `metal` PJRT plugin.
+
+The plugin's PJRT_Client_Compile passes the portable artifact jax serializes to
+`compile_program`, which parses it with jaxlib's MLIR bindings and returns a
+`Program`: buffer slots and kernel launches, which `palladium._pjrt` hands to
+the plugin. So far a program may hold elementwise and index-mapping ops
+(broadcast, reshape, transpose, slice, reverse, iota), fused into one kernel
+per output shape; anything else raises `UnsupportedProgram`.
+
+Each kernel thread computes one output element at the coordinates of its flat
+index. A value is generated at the coordinates it is read at, once per
+coordinate tuple, so index-mapping ops cost index arithmetic, not memory.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import math
+import re
+from collections.abc import Sequence
+from typing import Literal
+
+import ml_dtypes
+import numpy as np
+from jax._src.interpreters import mlir
+from jaxlib.mlir import ir
+from jaxlib.mlir.dialects import stablehlo
+
+from palladium.emit.core import CTYPES
+from palladium.emit.numeric import format_scalar
+from palladium.errors import EmitError
+
+__all__ = ["Launch", "Program", "Slot", "UnsupportedProgram", "compile_program"]
+
+
+class UnsupportedProgram(Exception):
+    """The program uses an op or dtype the Metal compiler does not handle yet."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Slot:
+    """A buffer of the program: a parameter, an output it computes, or a constant."""
+
+    kind: Literal["parameter", "fresh", "constant"]
+    dtype: np.dtype
+    shape: tuple[int, ...]
+    data: bytes | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Launch:
+    """One kernel over `grid` threads, its buffers bound to `slots` in order."""
+
+    source: str
+    function: str
+    slots: tuple[int, ...]
+    grid: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Program:
+    slots: list[Slot]
+    launches: list[Launch]
+    outputs: list[int]
+
+
+_DTYPES = {
+    "f32": np.dtype(np.float32),
+    "f16": np.dtype(np.float16),
+    "bf16": np.dtype(ml_dtypes.bfloat16),
+    "f64": np.dtype(np.float64),
+    "i1": np.dtype(np.bool_),
+    "i8": np.dtype(np.int8),
+    "i16": np.dtype(np.int16),
+    "i32": np.dtype(np.int32),
+    "i64": np.dtype(np.int64),
+    "ui8": np.dtype(np.uint8),
+    "ui16": np.dtype(np.uint16),
+    "ui32": np.dtype(np.uint32),
+    "ui64": np.dtype(np.uint64),
+}
+
+# StableHLO op names to the JAX primitive names of palladium's scalar templates.
+_ELEMENTWISE = {
+    "add": "add",
+    "subtract": "sub",
+    "multiply": "mul",
+    "divide": "div",
+    "maximum": "max",
+    "minimum": "min",
+    "power": "pow",
+    "atan2": "atan2",
+    "negate": "neg",
+    "abs": "abs",
+    "exponential": "exp",
+    "exponential_minus_one": "expm1",
+    "log": "log",
+    "log_plus_one": "log1p",
+    "sine": "sin",
+    "cosine": "cos",
+    "tan": "tan",
+    "tanh": "tanh",
+    "sqrt": "sqrt",
+    "rsqrt": "rsqrt",
+    "logistic": "logistic",
+    "floor": "floor",
+    "ceil": "ceil",
+    "is_finite": "is_finite",
+    "clamp": "clamp",
+    "and": "and",
+    "or": "or",
+    "xor": "xor",
+    "shift_left": "shift_left",
+    "shift_right_logical": "shift_right_logical",
+    "shift_right_arithmetic": "shift_right_arithmetic",
+}
+
+
+def _tensor(value: ir.Value) -> tuple[np.dtype, tuple[int, ...]]:
+    t = ir.RankedTensorType(value.type)
+    name = str(t.element_type)
+    if name not in _DTYPES:
+        raise UnsupportedProgram(f"metal: element type {name} is not supported")
+    return _DTYPES[name], tuple(t.shape)
+
+
+def _ctype(dtype: np.dtype) -> str:
+    if dtype not in CTYPES:
+        raise UnsupportedProgram(f"metal: kernels on {dtype} are not supported")
+    return CTYPES[dtype]
+
+
+def _literal(value: float, ctype: str) -> str:
+    if ctype in ("float", "half", "bfloat"):
+        if math.isinf(value):
+            expr = "-INFINITY" if value < 0 else "INFINITY"
+        elif math.isnan(value):
+            expr = "NAN"
+        else:
+            expr = f"{np.float32(value)!s}f"
+        return expr if ctype == "float" else f"{ctype}({expr})"
+    return f"{ctype}({int(value)})"
+
+
+# A name or literal, which a value can stand for without a variable of its own.
+_ATOM = re.compile(r"-?[\w.]+(\(-?[\w.]+\))?")
+
+
+def _strides(shape: Sequence[int]) -> list[int]:
+    strides, step = [], 1
+    for n in reversed(shape):
+        strides.append(step)
+        step *= n
+    return strides[::-1]
+
+
+def _linear(coords: Sequence[str], shape: Sequence[int]) -> str:
+    terms = [
+        c if s == 1 else f"{c} * {s}u"
+        for c, s, n in zip(coords, _strides(shape), shape, strict=True)
+        if n > 1
+    ]
+    return " + ".join(terms) or "0u"
+
+
+def _delinear(flat: str, shape: Sequence[int]) -> tuple[str, ...]:
+    """Coordinates of a flat row-major index into `shape`."""
+    base = flat if _ATOM.fullmatch(flat) else f"({flat})"
+    coords = []
+    for k, (s, n) in enumerate(zip(_strides(shape), shape, strict=True)):
+        quotient = base if s == 1 else f"{base} / {s}u"
+        coords.append("0u" if n == 1 else quotient if k == 0 else f"{quotient} % {n}u")
+    return tuple(coords)
+
+
+class _Node:
+    dtype: np.dtype
+    shape: tuple[int, ...]
+
+
+@dataclasses.dataclass(eq=False)
+class _Parameter(_Node):
+    index: int
+    dtype: np.dtype
+    shape: tuple[int, ...]
+
+
+@dataclasses.dataclass(eq=False)
+class _Constant(_Node):
+    dtype: np.dtype
+    shape: tuple[int, ...]
+    splat: float | None  # None: `array` holds the elements
+    array: np.ndarray | None = None
+
+
+@dataclasses.dataclass(eq=False)
+class _Op(_Node):
+    name: str  # StableHLO op name without the dialect
+    operands: list[_Node]
+    dtype: np.dtype
+    shape: tuple[int, ...]
+    attributes: dict
+
+
+def _constant(op) -> _Constant:
+    dtype, shape = _tensor(op.result)
+    attr = ir.DenseElementsAttr(op.attributes["value"])
+    if attr.is_splat:
+        value = attr.get_splat_value()
+        for kind in (ir.BoolAttr, ir.FloatAttr, ir.IntegerAttr):
+            if isinstance(value, kind):
+                return _Constant(dtype, shape, value.value)
+    if dtype == ml_dtypes.bfloat16:
+        fp = ir.DenseFPElementsAttr(attr)
+        array = np.array([fp[i] for i in range(len(fp))], dtype).reshape(shape)
+    else:
+        array = np.array(attr, dtype).reshape(shape)
+    return _Constant(dtype, shape, None, array)
+
+
+def _attributes(op) -> dict:
+    a = op.attributes
+    name = op.operation.name.removeprefix("stablehlo.")
+    if name == "broadcast_in_dim":
+        return {"dims": list(ir.DenseI64ArrayAttr(a["broadcast_dimensions"]))}
+    if name == "transpose":
+        return {"perm": list(ir.DenseI64ArrayAttr(a["permutation"]))}
+    if name == "iota":
+        return {"dim": ir.IntegerAttr(a["iota_dimension"]).value}
+    if name == "slice":
+        return {
+            "start": list(ir.DenseI64ArrayAttr(a["start_indices"])),
+            "strides": list(ir.DenseI64ArrayAttr(a["strides"])),
+        }
+    if name == "reverse":
+        return {"dims": list(ir.DenseI64ArrayAttr(a["dimensions"]))}
+    if name == "compare":
+        # #stablehlo<comparison_direction LT>
+        return {"direction": str(a["comparison_direction"]).split()[-1].rstrip(">").lower()}
+    return {}
+
+
+# Templates palladium's scalar table lacks, by operand ctype class.
+_EXTRA = {
+    "sign": {
+        "float": "(isnan({a}) ? {a} : sign({a}))",
+        "int": "int(({a} > 0) - ({a} < 0))",
+        "uint": "uint({a} > 0u)",
+    },
+    "remainder": {
+        "float": "fmod({a}, {b})",
+        "int": "({b} == 0 ? {a} : ({b} == -1 ? 0 : {a} % {b}))",
+        "uint": "({b} == 0u ? {a} : {a} % {b})",
+    },
+    "round_nearest_even": {"float": "rint({a})"},
+    "round_nearest_afz": {"float": "round({a})"},
+    "cbrt": {"float": "cbrt({a})"},
+    "popcnt": {"int": "popcount({a})", "uint": "popcount({a})"},
+    "count_leading_zeros": {"int": "clz({a})", "uint": "clz({a})"},
+    "not": {"bool": "!{a}", "int": "~{a}", "uint": "~{a}"},
+}
+
+_SUPPORTED = {
+    *_ELEMENTWISE,
+    *_EXTRA,
+    "compare",
+    "select",
+    "convert",
+    "bitcast_convert",
+    "broadcast_in_dim",
+    "reshape",
+    "transpose",
+    "iota",
+    "slice",
+    "reverse",
+}
+
+
+def _graph(module: ir.Module) -> tuple[list[_Parameter], list[_Node]]:
+    """The main function as a DAG of nodes, calls and composites inlined."""
+    functions = {
+        ir.StringAttr(op.attributes["sym_name"]).value: op
+        for op in module.body.operations
+        if op.operation.name == "func.func"
+    }
+
+    def walk(function, args: list[_Node]) -> list[_Node]:
+        block = function.regions[0].blocks[0]
+        env: dict[ir.Value, _Node] = dict(zip(block.arguments, args, strict=True))
+        for op in block.operations:
+            name = op.operation.name
+            if name == "func.return":
+                return [env[v] for v in op.operands]
+            if name in ("func.call", "stablehlo.composite"):
+                key = "callee" if name == "func.call" else "decomposition"
+                callee = functions[ir.FlatSymbolRefAttr(op.attributes[key]).value]
+                results = walk(callee, [env[v] for v in op.operands])
+                env.update(zip(op.results, results, strict=True))
+                continue
+            short = name.removeprefix("stablehlo.")
+            if name == "stablehlo.constant":
+                env[op.result] = _constant(op)
+            elif name.startswith("stablehlo.") and short in _SUPPORTED:
+                dtype, shape = _tensor(op.result)
+                operands = [env[v] for v in op.operands]
+                env[op.result] = _Op(short, operands, dtype, shape, _attributes(op))
+            else:
+                raise UnsupportedProgram(f"metal: {name} is not supported yet")
+        raise UnsupportedProgram("metal: function without a return")
+
+    main = functions["main"]
+    block = main.regions[0].blocks[0]
+    parameters = [_Parameter(i, *_tensor(v)) for i, v in enumerate(block.arguments)]
+    return parameters, walk(main, list(parameters))
+
+
+class _Kernel:
+    """Generates one kernel computing the outputs of one shape."""
+
+    def __init__(self, shape: tuple[int, ...]):
+        self.shape = shape
+        self.lines: list[str] = []
+        self.helpers: dict[str, str] = {}
+        self.buffers: list[_Node] = []  # read nodes, bound before the outputs
+        self.values: dict[tuple[int, tuple[str, ...]], str] = {}
+        self.reshaped: dict[tuple[tuple[str, ...], tuple[int, ...]], str] = {}
+        self.coords = tuple(f"c{k}" for k in range(len(shape)))
+        self.lines += [
+            f"uint {c} = {e};" for c, e in zip(self.coords, _delinear("i", shape), strict=True)
+        ]
+
+    def require(self, name: str, source: str) -> None:
+        self.helpers[name] = source
+
+    def buffer(self, node: _Node) -> str:
+        if node not in self.buffers:
+            self.buffers.append(node)
+        return f"b{self.buffers.index(node)}"
+
+    def value(self, node: _Node, coords: tuple[str, ...]) -> str:
+        key = (id(node), coords)
+        if key not in self.values:
+            expr = self._expression(node, coords)
+            if _ATOM.fullmatch(expr):
+                self.values[key] = expr
+            else:
+                name = f"v{len(self.values)}"
+                self.lines.append(f"{_ctype(node.dtype)} {name} = {expr};")
+                self.values[key] = name
+        return self.values[key]
+
+    def _flat(self, coords: tuple[str, ...], shape: tuple[int, ...]) -> str:
+        return "i" if coords == self.coords and shape == self.shape else _linear(coords, shape)
+
+    def _read(self, node: _Node, coords: tuple[str, ...]) -> str:
+        flat = self.reshaped.get((coords, node.shape)) or self._flat(coords, node.shape)
+        return f"{self.buffer(node)}[{flat}]"
+
+    def _expression(self, node: _Node, coords: tuple[str, ...]) -> str:
+        ctype = _ctype(node.dtype)
+        if isinstance(node, _Parameter):
+            return self._read(node, coords)
+        if isinstance(node, _Constant):
+            if node.splat is None:
+                return self._read(node, coords)
+            return _literal(node.splat, ctype)
+        assert isinstance(node, _Op)
+        a, operands = node.attributes, node.operands
+        match node.name:
+            case "broadcast_in_dim":
+                [x] = operands
+                inner = tuple(
+                    "0u" if n == 1 else coords[d] for n, d in zip(x.shape, a["dims"], strict=True)
+                )
+                return self.value(x, inner)
+            case "reshape":
+                [x] = operands
+                flat = self._flat(coords, node.shape)
+                inner = _delinear(flat, x.shape)
+                self.reshaped[(inner, x.shape)] = flat  # a read there is at `flat`
+                return self.value(x, inner)
+            case "transpose":
+                [x] = operands
+                inner = [""] * len(coords)
+                for k, p in enumerate(a["perm"]):
+                    inner[p] = coords[k]
+                return self.value(x, tuple(inner))
+            case "slice":
+                [x] = operands
+                return self.value(
+                    x,
+                    tuple(
+                        f"({s}u + {c} * {t}u)" if (s, t) != (0, 1) else c
+                        for c, s, t in zip(coords, a["start"], a["strides"], strict=True)
+                    ),
+                )
+            case "reverse":
+                [x] = operands
+                return self.value(
+                    x,
+                    tuple(
+                        f"({n - 1}u - {c})" if k in a["dims"] else c
+                        for k, (c, n) in enumerate(zip(coords, node.shape, strict=True))
+                    ),
+                )
+            case "iota":
+                return f"{ctype}({coords[a['dim']]})"
+        values = [self.value(x, coords) for x in operands]
+        match node.name:
+            case "convert":
+                return f"{ctype}({values[0]})"
+            case "bitcast_convert":
+                return f"as_type<{ctype}>({values[0]})"
+            case "compare":
+                return format_scalar(a["direction"], ctype, tuple(values))
+            case "select":
+                pred, on_true, on_false = values
+                return format_scalar("select_n", ctype, (pred, on_false, on_true))
+        operand_ctype = _ctype(operands[0].dtype)
+        if node.name in _EXTRA:
+            kind = "float" if operand_ctype in ("float", "half", "bfloat") else operand_ctype
+            if kind not in _EXTRA[node.name]:
+                raise UnsupportedProgram(f"metal: stablehlo.{node.name} on {operand_ctype}")
+            template = _EXTRA[node.name][kind]
+            return template.format(**dict(zip("ab", values, strict=False)))
+        try:
+            return format_scalar(_ELEMENTWISE[node.name], operand_ctype, tuple(values), self)
+        except EmitError as e:
+            raise UnsupportedProgram(f"metal: stablehlo.{node.name}: {e}") from e
+
+    def source(self, outputs: list[_Node], name: str) -> str:
+        stores = [f"o{k}[i] = {self.value(node, self.coords)};" for k, node in enumerate(outputs)]
+        params = [
+            f"device const {_ctype(n.dtype)}* b{k} [[buffer({k})]]"
+            for k, n in enumerate(self.buffers)
+        ]
+        params += [
+            f"device {_ctype(n.dtype)}* o{k} [[buffer({len(self.buffers) + k})]]"
+            for k, n in enumerate(outputs)
+        ]
+        params.append("uint i [[thread_position_in_grid]]")
+        body = "\n".join(f"    {line}" for line in self.lines + stores)
+        helpers = "".join(f"{s}\n\n" for s in self.helpers.values())
+        return (
+            "#include <metal_stdlib>\nusing namespace metal;\n\n"
+            f"{helpers}kernel void {name}(\n    " + ",\n    ".join(params) + f") {{\n{body}\n}}\n"
+        )
+
+
+def compile_program(code: bytes) -> Program:
+    """Compile a serialized StableHLO portable artifact.
+
+    Parameters
+    ----------
+    code : bytes
+        The program as PJRT_Client_Compile receives it.
+
+    Returns
+    -------
+    Program
+        Slots, launches in order, and the output slots.
+
+    Raises
+    ------
+    UnsupportedProgram
+        An op or dtype is not supported yet.
+    """
+    with mlir.make_ir_context() as ctx:
+        module = stablehlo.deserialize_portable_artifact(ctx, code)
+        parameters, results = _graph(module)
+
+    slots = [Slot("parameter", p.dtype, p.shape) for p in parameters]
+    slot_of: dict[int, int] = {id(p): k for k, p in enumerate(parameters)}
+
+    def add_constant(node: _Node) -> None:
+        assert isinstance(node, _Constant) and node.array is not None
+        slot_of[id(node)] = len(slots)
+        slots.append(Slot("constant", node.dtype, node.shape, node.array.tobytes()))
+
+    computed: dict[tuple[int, ...], list[_Node]] = {}
+    for node in results:
+        if id(node) in slot_of:
+            continue
+        if isinstance(node, _Constant) and node.splat is None:
+            add_constant(node)
+            continue
+        _ctype(node.dtype)
+        slot_of[id(node)] = len(slots)
+        slots.append(Slot("fresh", node.dtype, node.shape))
+        computed.setdefault(node.shape, []).append(node)
+
+    launches = []
+    for shape, nodes in computed.items():
+        kernel = _Kernel(shape)
+        name = f"fused_{len(launches)}"
+        source = kernel.source(nodes, name)
+        for node in kernel.buffers:
+            if id(node) not in slot_of:  # a constant array read by the kernel
+                add_constant(node)
+        bound = [slot_of[id(n)] for n in kernel.buffers] + [slot_of[id(n)] for n in nodes]
+        launches.append(Launch(source, name, tuple(bound), math.prod(shape)))
+    return Program(slots, launches, [slot_of[id(n)] for n in results])

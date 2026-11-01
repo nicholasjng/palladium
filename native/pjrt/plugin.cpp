@@ -1,69 +1,14 @@
 // PJRT C API plugin for the `metal` platform: the system's Apple GPU as one
 // device with one memory, buffers in shared MTLBuffers on unified memory.
-// Work is synchronous so far, so every event is created ready. Compilation is
-// not implemented yet; functions left null in the API table are unsupported.
-#include <cstring>
-#include <map>
-#include <memory>
-#include <mutex>
-#include <string>
-#include <utility>
-#include <vector>
+// Work is synchronous so far, so every event is created ready; functions left
+// null in the API table are unsupported. Compilation is in executable.cpp.
+#include "pjrt.h"
 
-#include "buffer.h"
+#include <cstring>
+
 #include "errors.h"
 #include "metal.h"
 #include "runtime.h"
-#include "xla/pjrt/c/pjrt_c_api.h"
-
-// The header defines PJRT_Error and PJRT_Memory as a function table that
-// callers may use directly; these extend them.
-struct Error : PJRT_Error {
-    PJRT_Error_Code code;
-    std::string message;
-};
-
-struct PJRT_Event {};
-
-struct PJRT_DeviceDescription {
-    std::string kind, debug_string, to_string;
-    int64_t apple_gpu_family;
-    PJRT_NamedValue attributes[1];
-};
-
-struct Memory : PJRT_Memory {
-    PJRT_Device* device;
-    std::mutex mutex;
-    std::map<const void*, std::pair<void*, void (*)(void*)>> user_data;
-    ~Memory() {
-        for (auto& [key, entry] : user_data) {
-            if (entry.second) entry.second(entry.first);
-        }
-    }
-};
-
-struct PJRT_Device {
-    PJRT_DeviceDescription description;
-    Memory memory;
-    PJRT_Memory* memory_ptr = &memory;
-};
-
-struct PJRT_TopologyDescription {
-    PJRT_DeviceDescription* description;
-};
-
-struct PJRT_Client {
-    PJRT_Device device;
-    PJRT_Device* device_ptr = &device;
-    PJRT_TopologyDescription topology{&device.description};
-};
-
-struct PJRT_Buffer {
-    PJRT_Device* device;
-    PJRT_Buffer_Type type;
-    std::vector<int64_t> dims, minor_to_major;
-    std::unique_ptr<Buffer> storage;  // null once deleted
-};
 
 namespace {
 
@@ -107,6 +52,8 @@ const PJRT_Memory_FunctionTable kMemoryTable = {
     },
 };
 
+}  // namespace
+
 PJRT_Error* error(PJRT_Error_Code code, std::string message) {
     auto* e = new Error;
     e->vtable = &kErrorTable;
@@ -115,9 +62,6 @@ PJRT_Error* error(PJRT_Error_Code code, std::string message) {
     return e;
 }
 
-Memory* as_memory(PJRT_Memory* m) { return static_cast<Memory*>(m); }
-
-// Bytes per element, or 0 for types that are not byte-addressable.
 size_t element_size(PJRT_Buffer_Type type) {
     switch (type) {
         case PJRT_Buffer_Type_PRED:
@@ -159,7 +103,6 @@ size_t byte_size(const PJRT_Buffer* buffer) {
     return n;
 }
 
-// Allocates a dense row-major buffer; the caller fills it.
 PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_t* dims,
                         size_t num_dims, PJRT_Buffer** out) {
     if (!element_size(type)) {
@@ -180,6 +123,16 @@ PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_
     *out = buffer.release();
     return nullptr;
 }
+
+PJRT_Error* deleted(const PJRT_Buffer* buffer) {
+    return buffer->storage ? nullptr
+                           : error(PJRT_Error_Code_FAILED_PRECONDITION,
+                                   "metal: the buffer has been deleted");
+}
+
+namespace {
+
+Memory* as_memory(PJRT_Memory* m) { return static_cast<Memory*>(m); }
 
 // Copies a strided host array into dense row-major memory, one memcpy per
 // dense block.
@@ -211,12 +164,6 @@ bool is_row_major(const PJRT_Buffer_MemoryLayout* layout, size_t rank) {
         if (layout->tiled.minor_to_major[i] != (int64_t)(rank - 1 - i)) return false;
     }
     return true;
-}
-
-PJRT_Error* deleted(const PJRT_Buffer* buffer) {
-    return buffer->storage ? nullptr
-                           : error(PJRT_Error_Code_FAILED_PRECONDITION,
-                                   "metal: the buffer has been deleted");
 }
 
 PJRT_Error* copy_buffer(const PJRT_Buffer* src, PJRT_Device* device, PJRT_Buffer** out) {
@@ -363,9 +310,6 @@ PJRT_Api make_api() {
         [](PJRT_Client_TopologyDescription_Args* args) -> PJRT_Error* {
         args->topology = &args->client->topology;
         return nullptr;
-    };
-    api.PJRT_Client_Compile = [](PJRT_Client_Compile_Args*) -> PJRT_Error* {
-        return error(PJRT_Error_Code_UNIMPLEMENTED, "metal: compilation is not implemented yet");
     };
 
     api.PJRT_Client_BufferFromHostBuffer =
@@ -636,6 +580,7 @@ PJRT_Api make_api() {
     api.PJRT_Buffer_CopyToMemory = [](PJRT_Buffer_CopyToMemory_Args* args) -> PJRT_Error* {
         return copy_buffer(args->buffer, as_memory(args->dst_memory)->device, &args->dst_buffer);
     };
+    add_executable_api(api);
     return api;
 }
 

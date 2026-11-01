@@ -87,7 +87,7 @@ file(DOWNLOAD
   EXPECTED_HASH SHA256=174b44736ccb200cb402c2466822220971ba578e1e8dfd690c56f822a9e71582)
 
 # The `metal` PJRT plugin, loaded by jax through palladium._pjrt.
-add_library(palladium_pjrt SHARED native/pjrt/plugin.cpp)
+add_library(palladium_pjrt SHARED native/pjrt/plugin.cpp native/pjrt/executable.cpp)
 target_include_directories(palladium_pjrt PRIVATE "${PJRT_INCLUDE_DIR}")
 target_link_libraries(palladium_pjrt PRIVATE palladium::runtime)
 set_target_properties(palladium_pjrt PROPERTIES CXX_VISIBILITY_PRESET hidden)

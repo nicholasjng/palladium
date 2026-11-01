@@ -20,6 +20,7 @@ _NO_GPU_MODULES = {
     "test_tensorops_flash_attention",
     "test_cursor",
     "test_views",
+    "test_stablehlo",
 }
 
 

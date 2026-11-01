@@ -1,19 +1,82 @@
 """The `metal` PJRT plugin (`native/pjrt`), registered with jax through the
 `jax_plugins` entry point, which calls `initialize` on backend discovery.
 
-The plugin has a device and buffers but no compiler yet, so it registers only
-when JAX_PLATFORMS names `metal` (e.g. `JAX_PLATFORMS=metal,cpu`); otherwise
+The plugin compiles through a callback into Python: `palladium.stablehlo`
+turns the program into buffer slots and kernel launches, which `_compile`
+describes to the plugin through its pp_* builder functions. Execution stays
+native.
+
+It registers only when JAX_PLATFORMS names `metal` (e.g.
+`JAX_PLATFORMS=metal,cpu`): most programs do not compile yet, and otherwise
 every jax process would bring it up and warn that it is experimental.
 """
 
 from __future__ import annotations
 
+import ctypes
+import functools
 import importlib.resources
+import traceback
 from pathlib import Path
 
+import ml_dtypes
+import numpy as np
 from jax._src import config, xla_bridge
 
 _LIBRARY_NAME = "libpalladium_pjrt.dylib"
+
+# PJRT_Buffer_Type by dtype.
+_PJRT_TYPES = {
+    np.dtype(np.bool_): 1,
+    np.dtype(np.int8): 2,
+    np.dtype(np.int16): 3,
+    np.dtype(np.int32): 4,
+    np.dtype(np.int64): 5,
+    np.dtype(np.uint8): 6,
+    np.dtype(np.uint16): 7,
+    np.dtype(np.uint32): 8,
+    np.dtype(np.uint64): 9,
+    np.dtype(np.float16): 10,
+    np.dtype(np.float32): 11,
+    np.dtype(np.float64): 12,
+    np.dtype(ml_dtypes.bfloat16): 13,
+}
+_SLOT_KINDS = {"parameter": 0, "fresh": 1, "constant": 2}
+_UNIMPLEMENTED, _INTERNAL = 12, 13
+_MATH_MODE_FAST = 2
+
+_COMPILER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
+_INT64S = ctypes.POINTER(ctypes.c_int64)
+_SIGNATURES = {
+    "palladium_pjrt_set_compiler": (None, [_COMPILER]),
+    "pp_error": (None, [ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p]),
+    "pp_slot": (
+        ctypes.c_int,
+        [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            _INT64S,
+            ctypes.c_size_t,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ],
+    ),
+    "pp_kernel": (
+        ctypes.c_int,
+        [
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(ctypes.c_size_t),
+        ],
+    ),
+    "pp_output": (None, [ctypes.c_void_p, ctypes.c_int]),
+}
 
 
 def library_path() -> Path:
@@ -24,6 +87,80 @@ def library_path() -> Path:
     return Path(str(candidate))
 
 
+@functools.cache
+def library() -> ctypes.CDLL:
+    """The plugin, loaded once with the builder signatures declared; the same
+    image jax loads, so the compiler set here is the one it calls."""
+    lib = ctypes.CDLL(str(library_path()))
+    for name, (restype, argtypes) in _SIGNATURES.items():
+        function = getattr(lib, name)
+        function.restype = restype
+        function.argtypes = argtypes
+    return lib
+
+
+class _Recorded(Exception):
+    """A builder call failed; the plugin holds its error."""
+
+
+def _describe(lib: ctypes.CDLL, builder: int, code: bytes) -> None:
+    from palladium.stablehlo import compile_program
+
+    program = compile_program(code)
+    for slot in program.slots:
+        dims = (ctypes.c_int64 * len(slot.shape))(*slot.shape)
+        data = slot.data or b""
+        if slot.dtype not in _PJRT_TYPES:
+            raise ValueError(f"metal: no PJRT type for {slot.dtype}")
+        status = lib.pp_slot(
+            builder,
+            _SLOT_KINDS[slot.kind],
+            _PJRT_TYPES[slot.dtype],
+            dims,
+            len(slot.shape),
+            data,
+            len(data),
+        )
+        if status < 0:
+            raise _Recorded
+    for launch in program.launches:
+        slots = (ctypes.c_int * len(launch.slots))(*launch.slots)
+        grid = (ctypes.c_size_t * 3)(launch.grid, 1, 1)
+        status = lib.pp_kernel(
+            builder,
+            launch.source.encode(),
+            launch.function.encode(),
+            _MATH_MODE_FAST,
+            slots,
+            len(launch.slots),
+            grid,
+            (ctypes.c_size_t * 3)(),
+        )
+        if status < 0:
+            raise _Recorded
+    for slot in program.outputs:
+        lib.pp_output(builder, slot)
+
+
+@_COMPILER
+def _compile(code: int, size: int, builder: int) -> int:
+    from palladium.stablehlo import UnsupportedProgram
+
+    lib = library()
+    try:
+        _describe(lib, builder, ctypes.string_at(code, size))
+    except _Recorded:
+        return 1
+    except UnsupportedProgram as e:
+        lib.pp_error(builder, _UNIMPLEMENTED, str(e).encode())
+        return 1
+    except Exception:  # noqa: BLE001 - an exception must not unwind into the plugin
+        lib.pp_error(builder, _INTERNAL, f"metal: {traceback.format_exc()}".encode())
+        return 1
+    return 0
+
+
 def initialize() -> None:
     if "metal" in (config.jax_platforms.value or "").split(","):
         xla_bridge.register_plugin("metal", library_path=str(library_path()))
+        library().palladium_pjrt_set_compiler(_compile)

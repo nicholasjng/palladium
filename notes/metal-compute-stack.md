@@ -115,19 +115,36 @@ first-step compile time, peak memory, and agreement with a CPU or XLA
 reference: a faster step that compiles for a minute or drifts numerically is
 not a win.
 
-M1 so far (2026-11-01): the plugin skeleton, `native/pjrt/plugin.cpp`
-against the PJRT C API 0.116 that jaxlib 0.12 pins. One `metal` device with
-one `device` memory, buffers in shared MTLBuffers (host data is copied in,
-strided arrays included), copies to the host and other devices, memory
-stats, and the device's `apple_gpu_family` as a device attribute. All work
-is synchronous and every event is born ready; `PJRT_Client_Compile` returns
-UNIMPLEMENTED. `palladium._pjrt` registers it through the `jax_plugins`
-entry point, but only when JAX_PLATFORMS names `metal`, until it can run
-programs. Lessons: the 0.12 header defines `PJRT_Error` and `PJRT_Memory`
-as function tables the caller may use directly, and jaxlib calls some
-slots without a null check (`PJRT_Client_TopologyDescription`,
-`PJRT_Error_ForEachPayload`, `PJRT_TopologyDescription_Fingerprint` for
-compilation cache keys). Next: `Compile` taking StableHLO through MLIR.
+M1 so far (2026-11-01):
+
+- Plugin, `native/pjrt/`, against the PJRT C API 0.116 that jaxlib 0.12
+  pins. One `metal` device with one `device` memory, buffers in shared
+  MTLBuffers (host data is copied in, strided arrays included), copies to
+  the host and other devices, memory stats, and `apple_gpu_family` as a
+  device attribute. `palladium._pjrt` registers it through the
+  `jax_plugins` entry point, only when JAX_PLATFORMS names `metal`.
+- Compiler in Python: `PJRT_Client_Compile` calls back into
+  `palladium.stablehlo`, which deserializes the portable artifact with
+  jaxlib's MLIR bindings and returns buffer slots and kernel launches; the
+  plugin compiles the MSL once and runs every launch in one command buffer.
+  Elementwise ops (through palladium's scalar templates) and index maps
+  (broadcast, reshape, transpose, slice, reverse, iota) fuse into one kernel
+  per output shape, with calls and composites inlined; other ops are
+  UNIMPLEMENTED. Fifteen programs match the CPU backend.
+- First numbers on the M2, `tanh(2x + 1) * x`: 162 µs per call at 1,024
+  elements against 3 µs on CPU, 0.99 ms at 4M elements against 0.92 ms.
+  Execution is synchronous and allocates every output, so the small case
+  measures a command buffer round trip plus allocation.
+- Lessons: the 0.12 header defines `PJRT_Error` and `PJRT_Memory` as
+  function tables callers use directly; jaxlib calls some slots without a
+  null check (`PJRT_Client_TopologyDescription`, `PJRT_Error_ForEachPayload`,
+  `PJRT_TopologyDescription_Fingerprint` for cache keys,
+  `PJRT_LoadedExecutable_GetDeviceAssignment`, whose proto is encoded by
+  hand); programs arrive as VHLO portable artifacts.
+
+Next: asynchronous execution with completion events and reused output
+buffers, then reductions, `dot_general` and `while`, which the SBI step of
+M2 needs.
 
 Work that costs time without proving anything: a JAX port of SAM2's image
 encoder and mask decoder (SAM2 is PyTorch) for M5, and a small JAX LoRA
@@ -135,8 +152,12 @@ training stack for M4.
 
 ## MLIR, an `applegpu` dialect, and PDLL
 
-Use MLIR inside the plugin, where StableHLO already arrives as MLIR and the
-fusion passes live (jax-mps's passes do this today). Add an `applegpu`
+Compile in Python first (decided 2026-11-01): jaxlib's MLIR bindings read
+the StableHLO the plugin receives, so the plugin needs no LLVM, MLIR or
+StableHLO build and no StableHLO pin of its own, and palladium keeps one
+emitter. C++ passes inside the plugin, built against a pinned LLVM/StableHLO
+prefix, wait for M6 to show that Python codegen limits compile time or
+fusion. Add an `applegpu`
 dialect when fused StableHLO and Pallas kernels need one shared lowering
 target, around M3–M5, not before: the wins so far came from schedule
 decisions (registers versus threadgroup memory, barrier counts, tile shapes),
