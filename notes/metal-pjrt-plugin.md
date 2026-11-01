@@ -301,6 +301,23 @@ shader cache may be warm. These are host timings, not GPU timestamps.
 The column path's strided reads remain slower than CPU. These measurements
 do not establish M1's overhead target against jax-mps.
 
+### Counted-loop checkpoint, 2026-11-01
+
+`examples/training_steps.py` now exposes `sbi_trajectory(theta)`, the same
+200-step RK4 ensemble used by `sbi_step`. With 512 parameter vectors sampled
+on the host in [0.5, 1.5], the complete trajectory and concatenated
+mean/std/final-state summary match CPU within rtol 2e-5, atol 1e-5 in a PJRT
+subprocess test. This isolates the simulation from the remaining RNG and
+MLP gaps; it is not the full SBI training-step milestone.
+
+On the Apple M1 Pro, the trajectory-plus-summary program's first completed
+call took 91 ms on Metal and 56 ms on CPU (shader cache may be warm).
+Pipelined wall time per call was 2.59 ms on Metal versus 0.345 ms on CPU,
+taking the minimum of five batches of ten calls, blocking on each batch's
+last result. The replay implementation is correct but does not yet beat CPU.
+Full trajectory copies, multiple dispatches per iteration and strided summary
+reductions are candidates for profiling and tuning in M2.
+
 ## Success criteria for M1, against jax 0.12
 
 All on jax and jaxlib 0.12.0.1 (PJRT C API 0.116) with

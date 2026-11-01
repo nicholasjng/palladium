@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 
 def _run(script: str, platforms: str | None = "metal,cpu") -> subprocess.CompletedProcess:
@@ -369,6 +370,24 @@ def test_dynamic_loop_reports_unimplemented():
     """)
     assert result.returncode != 0
     assert "UNIMPLEMENTED: metal: stablehlo.while requires" in result.stderr
+
+
+def test_sbi_trajectory_and_summary_match_cpu():
+    _check(f"""
+        import sys
+        import jax, jax.numpy as jnp, numpy as np
+        sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
+        from training_steps import sbi_trajectory
+        metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
+        theta = np.random.default_rng(17).uniform(0.5, 1.5, (512, 4)).astype(np.float32)
+        def simulate(theta):
+            traj = sbi_trajectory(theta)
+            return traj, jnp.concatenate([traj.mean(0), traj.std(0), traj[-1]], -1)
+        run = jax.jit(simulate)
+        got, want = run(jax.device_put(theta, metal)), run(jax.device_put(theta, cpu))
+        for g, w in zip(got, want, strict=True):
+            np.testing.assert_allclose(np.asarray(g), np.asarray(w), rtol=2e-5, atol=1e-5)
+    """)
 
 
 def test_unsupported_ops_report_unimplemented():

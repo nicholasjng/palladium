@@ -29,10 +29,8 @@ def adamw(params, grads, state, lr=1e-3, b1=0.9, b2=0.999, wd=0.01):
     return jax.tree.map(update, params, m, v), (m, v, t)
 
 
-def sbi_step(params, opt, key):
-    """Simulate a Lotka-Volterra ensemble with RK4, then fit an MDN posterior."""
-    k1, k2 = jax.random.split(key)
-    theta = jax.random.uniform(k1, (512, 4), minval=0.5, maxval=1.5)
+def sbi_trajectory(theta):
+    """The SBI workload's 200-step RK4 ensemble, independently testable from its MLP."""
 
     def rhs(y):
         x, z = y[..., 0], y[..., 1]
@@ -49,7 +47,15 @@ def sbi_step(params, opt, key):
         y = y + h / 6 * (a + 2 * b + 2 * c + d)
         return y, y
 
-    _, traj = lax.scan(rk4, jnp.ones((512, 2)), None, length=200)
+    _, traj = lax.scan(rk4, jnp.ones((theta.shape[0], 2)), None, length=200)
+    return traj
+
+
+def sbi_step(params, opt, key):
+    """Simulate a Lotka-Volterra ensemble with RK4, then fit an MDN posterior."""
+    k1, k2 = jax.random.split(key)
+    theta = jax.random.uniform(k1, (512, 4), minval=0.5, maxval=1.5)
+    traj = sbi_trajectory(theta)
     x = jnp.concatenate([traj.mean(0), traj.std(0), traj[-1]], -1)
     x = x + 0.05 * jax.random.normal(k2, (512, 6))
 
