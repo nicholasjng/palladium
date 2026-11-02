@@ -942,6 +942,130 @@ def test_argmax_argmin_and_variadic_reducers_match_cpu():
     """)
 
 
+def test_pallas_kernels_inside_jit_match_cpu():
+    """pallas_call and metal_call run as launches of the program, on every path;
+    the reference is the same kernel in Pallas's interpreter on CPU."""
+    _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        from jax.experimental import pallas as pl
+        import palladium
+        from pjrt_tolerance import assert_normwise_close
+        metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
+
+        def pair(x_ref,y_ref,o_ref,p_ref):
+            o_ref[...] = x_ref[...]*2
+            p_ref[...] = x_ref[...]+y_ref[...]
+        def scale(x_ref,o_ref):
+            o_ref[...] = x_ref[...]*0.5+1
+        def first_half(x_ref,o_ref):
+            o_ref[...] = x_ref[...]*10
+        spec = pl.BlockSpec((4,),lambda i:(i,))
+        kwargs = {
+            'pair':dict(grid=(2,),in_specs=[spec,spec],out_specs=[spec,spec],
+                        out_shape=[jax.ShapeDtypeStruct((8,),jnp.float32)]*2),
+            'scale':dict(grid=(2,),in_specs=[spec],out_specs=spec,
+                         out_shape=jax.ShapeDtypeStruct((8,),jnp.float32),
+                         compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE)),
+            'half':dict(grid=(1,),in_specs=[pl.BlockSpec((4,),lambda i:(0,))],
+                        out_specs=pl.BlockSpec((4,),lambda i:(0,)),
+                        out_shape=jax.ShapeDtypeStruct((8,),jnp.float32),
+                        input_output_aliases={0:0}),
+        }
+        kernels = {'pair':pair,'scale':scale,'half':first_half}
+        def programs(make):
+            k = {name:make(kernels[name],**kw) for name,kw in kwargs.items()}
+            return [
+                lambda x,y:[3*o for o in k['pair'](jnp.sin(x),y)],
+                lambda x,y:lax.fori_loop(0,4,lambda i,z:k['scale'](z)+i,x),
+                lambda x,y:k['half'](x+y),
+                lambda x,y:jax.vmap(k['pair'],in_axes=(0,None))(jnp.stack([x,y,x*y]),y),
+            ]
+        x = np.linspace(-1,1,8,dtype=np.float32); y = np.arange(8,dtype=np.float32)
+        references = programs(lambda f,**kw:pl.pallas_call(f,**kw,interpret=True))
+        for make in (pl.pallas_call,palladium.metal_call):
+            for fn,ref in zip(programs(make),references,strict=True):
+                got = jax.jit(fn)(jax.device_put(x,metal),jax.device_put(y,metal))
+                with jax.default_device(cpu):
+                    want = jax.jit(ref)(x,y)
+                for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
+                    assert_normwise_close(g,w)
+    """)
+
+
+def test_plmtl_threadgroup_kernels_run_inside_jit():
+    """A tiled matmul with threadgroup scratch: its launch fixes the threadgroup."""
+    _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        from jax.experimental import pallas as pl
+        from palladium import plmtl
+        from pjrt_tolerance import assert_normwise_close
+        def matmul(a_ref,b_ref,o_ref,a_tile,b_tile):
+            i,j = pl.program_id(0),pl.program_id(1)
+            def step(kb,acc):
+                a_tile[...] = a_ref[pl.ds(i*64,64),pl.ds(kb*16,16)]
+                b_tile[...] = b_ref[pl.ds(kb*16,16),pl.ds(j*64,64)]
+                return acc+jnp.dot(a_tile[...],b_tile[...])
+            acc = lax.fori_loop(0,8,step,jnp.zeros((64,64),jnp.float32))
+            o_ref[pl.ds(i*64,64),pl.ds(j*64,64)] = acc
+        call = plmtl.kernel(matmul,out_type=jax.ShapeDtypeStruct((128,128),jnp.float32),
+                            mesh=plmtl.Mesh((2,2)),
+                            scratch_types=[plmtl.THREADGROUP((64,16),jnp.float32),
+                                           plmtl.THREADGROUP((16,64),jnp.float32)])
+        rng = np.random.default_rng(0)
+        a,b = (rng.standard_normal((128,128),np.float32) for _ in range(2))
+        metal = jax.devices('metal')[0]
+        got = jax.jit(lambda a,b:call(a,b)+1)(jax.device_put(a,metal),jax.device_put(b,metal))
+        assert_normwise_close(got,(a.astype(np.float64)@b+1).astype(np.float32))
+    """)
+
+
+def test_cnf_training_matches_cpu_over_ten_steps():
+    """The CNF update with Palladium's adjoint kernels, and in plain JAX, whose
+    backward loop needs fusions split to stay within 31 buffers per kernel."""
+    _check(f"""
+        import sys
+        import jax, numpy as np
+        sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
+        import cnf_density as cnf
+        from pjrt_tolerance import assert_normwise_close
+        metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
+        data = cnf.mixture_data(256)
+        def train(device, variant):
+            with jax.default_device(device):
+                update,_ = cnf.make_training_step(256,variant=variant)
+                state = jax.device_put(cnf.initial_state(),device)
+                history = []
+                for _ in range(10):
+                    state,loss = update(state,jax.device_put(data,device))
+                    history.append((state,loss))
+                return history
+        want = train(cpu,'jax')
+        for variant in ('reverse','jax'):
+            for got,ref in zip(train(metal,variant),want,strict=True):
+                for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(ref),strict=True):
+                    assert np.isfinite(np.asarray(g)).all()
+                    assert_normwise_close(g,w,rtol=1e-4)
+    """)
+
+
+def test_programs_over_the_buffer_limit_match_cpu():
+    _check("""
+        import jax, numpy as np
+        from pjrt_tolerance import assert_normwise_close
+        metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
+        xs = [np.full(5,k,np.float32)+np.arange(5,dtype=np.float32) for k in range(40)]
+        for fn in (lambda *xs:tuple(x+1 for x in xs[:20]),
+                   lambda *xs:sum(x*k for k,x in enumerate(xs))):
+            run = jax.jit(fn)
+            got = run(*jax.device_put(xs,metal))
+            want = run(*jax.device_put(xs,cpu))
+            for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
+                assert_normwise_close(g,w)
+    """)
+
+
 def test_unsupported_ops_report_unimplemented():
     """A CPU compile first, so the metal one hashes its topology for the cache key."""
     result = _run("""

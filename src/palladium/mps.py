@@ -4,7 +4,9 @@ Importing palladium wraps the ``pallas_call`` lowering: on ``mps`` it emits
 a ``palladium.dispatch`` StableHLO custom call whose ``backend_config`` is
 ``MpsDispatchDescriptor.to_json()``, and jax-mps's handler builds an MLX
 kernel from it on its own Metal stream. Every other platform keeps JAX's
-own lowering. Metal-side options travel as ``compiler_params``::
+own lowering, except ``metal``: there `palladium.ffi.pallas_lowering` emits
+the ``palladium_dispatch`` call that `metal_call` uses, for the palladium PJRT
+plugin. Metal-side options travel as ``compiler_params``::
 
     pl.pallas_call(kernel, out_shape=..., compiler_params=palladium.CompilerParams(
         dot_general="tensorops", threadgroup=128))
@@ -24,6 +26,7 @@ from jax._src.pallas.pallas_call import pallas_call_p
 
 from palladium.emit import emit_msl
 from palladium.emit.core import shaped
+from palladium.ffi import pallas_lowering
 from palladium.launch import CompilerParams, MathMode, check_threadgroup, launch_geometry
 from palladium.trace import KernelSpec, spec_from_params
 
@@ -278,7 +281,7 @@ def _palladium_lowering(ctx: mlir.LoweringRuleContext, *in_nodes, interpret: Any
 
 
 def _install() -> None:
-    """Route pallas_call lowering for the ``mps`` platform through Palladium.
+    """Route pallas_call lowering for ``mps`` and ``metal`` through Palladium.
 
     Registered as the primitive's common rule wrapping JAX's own, since JAX
     accepts platform-specific registrations only for platforms it already
@@ -292,7 +295,7 @@ def _install() -> None:
         return mlir.lower_per_platform(
             ctx,
             "pallas_call",
-            {"mps": _palladium_lowering},
+            {"mps": _palladium_lowering, "metal": pallas_lowering},
             original,
             jax_effects.no_effects,
             *in_nodes,

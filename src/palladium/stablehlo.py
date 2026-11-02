@@ -7,8 +7,11 @@ the plugin. A program may hold elementwise and index-mapping ops
 (broadcast, reshape, transpose, slices, concatenate, pad, reverse, iota), fused
 into one kernel per output shape. Single-result reductions end a fusion and
 materialize a buffer for subsequent kernels. Floating dots reuse Palladium's
-Pallas GEMM emitter after layout normalization; unsupported ops and reducer bodies
-raise `UnsupportedProgram`.
+Pallas GEMM emitter after layout normalization. Palladium kernels
+(`pallas_call` lowered for `metal`, `metal_call`, `plmtl`) arrive as
+`palladium_dispatch` custom calls and launch their own MSL. Kernels bind at
+most 31 buffers, Metal's limit. Unsupported ops and reducer bodies raise
+`UnsupportedProgram`.
 
 Each kernel thread computes one output element at the coordinates of its flat
 index. A value is generated at the coordinates it is read at, once per
@@ -62,7 +65,7 @@ class Launch:
     function: str
     slots: tuple[int, ...]
     grid: int | tuple[int, int, int]
-    threadgroup: int = 0
+    threadgroup: int | tuple[int, int, int] = 0  # threads, or 0: the pipeline chooses
     math_mode: int = 2  # runtime MathMode: Safe=0, Relaxed=1, Fast=2
     offsets: tuple[int, ...] = ()
 
@@ -316,6 +319,36 @@ class _ReductionResult(_Node):
     shape: tuple[int, ...]
 
 
+@dataclasses.dataclass(eq=False)
+class _Dispatch:
+    """A palladium kernel with its own launch: a `palladium_dispatch` custom call.
+
+    `pallas_call` (lowered for `metal`) and `metal_call` both emit this call;
+    its typed-FFI attributes carry the MSL and the launch geometry. Buffers
+    bind inputs then results, in order. `aliases` maps a result to the input
+    whose values it starts with.
+    """
+
+    inputs: list[_Node]
+    results: list[_DispatchResult]
+    source: str
+    function: str
+    grid: tuple[int, int, int]
+    threadgroup: tuple[int, int, int]  # zeros: the pipeline chooses
+    math_mode: int
+    batch: int  # launches, each offset by `strides` bytes per buffer
+    strides: tuple[int, ...]
+    aliases: dict[int, int]
+
+
+@dataclasses.dataclass(eq=False)
+class _DispatchResult(_Node):
+    dispatch: _Dispatch
+    index: int
+    dtype: np.dtype
+    shape: tuple[int, ...]
+
+
 def _dependencies(node: _Node) -> list[_Node]:
     if isinstance(node, _Op):
         return node.operands
@@ -323,6 +356,8 @@ def _dependencies(node: _Node) -> list[_Node]:
         return node.loop.inputs
     if isinstance(node, _ReductionResult):
         return node.reduction.inputs + node.reduction.initial
+    if isinstance(node, _DispatchResult):
+        return node.dispatch.inputs
     return []
 
 
@@ -478,6 +513,73 @@ def _attributes(op) -> dict:
         # #stablehlo<comparison_direction LT>
         return {"direction": str(a["comparison_direction"]).split()[-1].rstrip(">").lower()}
     return {}
+
+
+_DISPATCH_TARGET = "palladium_dispatch"
+# Buffer arguments one Metal kernel can bind.
+_MAX_BUFFERS = 31
+
+
+def _row_major(attributes, name: str, values) -> bool:
+    """Whether the layouts attribute `name`, if any, is row-major for `values`."""
+    if name not in attributes:
+        return True
+    return all(
+        [int(d) for d in ir.DenseIntElementsAttr(layout)]
+        == list(range(len(_tensor(v)[1]) - 1, -1, -1))
+        for layout, v in zip(ir.ArrayAttr(attributes[name]), values, strict=True)
+    )
+
+
+def _dispatch(op, inputs: list[_Node]) -> _Dispatch:
+    """A `palladium_dispatch` custom call as a launch description."""
+    a = op.attributes
+    target = ir.StringAttr(a["call_target_name"]).value
+    if target != _DISPATCH_TARGET:
+        raise UnsupportedProgram(f"metal: custom call {target!r} is not supported")
+    if "mhlo.backend_config" not in a:
+        raise UnsupportedProgram(f"metal: {target} requires typed-FFI attributes")
+    if not _row_major(a, "operand_layouts", op.operands) or not _row_major(
+        a, "result_layouts", op.results
+    ):
+        raise UnsupportedProgram(f"metal: {target} requires row-major layouts")
+    config = ir.DictAttr(a["mhlo.backend_config"])
+
+    def integer(name: str) -> int:
+        return ir.IntegerAttr(config[name]).value
+
+    aliases = {}
+    if "output_operand_aliases" in a:
+        for attr in ir.ArrayAttr(a["output_operand_aliases"]):
+            alias = stablehlo.OutputOperandAlias(attr)
+            output = list(alias.output_tuple_indices)
+            if list(alias.operand_tuple_indices) or len(output) > 1:
+                raise UnsupportedProgram(f"metal: {target} has a nested alias")
+            aliases[output[0] if output else 0] = alias.operand_index
+    strides = tuple(int(s) for s in ir.DenseIntElementsAttr(config["elem_strides"]))
+    if len(strides) != len(op.operands) + len(op.results):
+        raise UnsupportedProgram(f"metal: {target} needs one stride per buffer")
+    dispatch = _Dispatch(
+        inputs,
+        [],
+        ir.StringAttr(config["msl_source"]).value,
+        ir.StringAttr(config["function_name"]).value,
+        (integer("grid_x"), integer("grid_y"), integer("grid_z")),
+        (integer("threadgroup_x"), integer("threadgroup_y"), integer("threadgroup_z")),
+        integer("math_mode"),
+        integer("batch_size"),
+        strides,
+        aliases,
+    )
+    dispatch.results = [
+        _DispatchResult(dispatch, k, *_tensor(value)) for k, value in enumerate(op.results)
+    ]
+    for k, value in enumerate(dispatch.results):
+        if k in aliases:
+            source = inputs[aliases[k]]
+            if (source.dtype, source.shape) != (value.dtype, value.shape):
+                raise UnsupportedProgram(f"metal: {target} aliases mismatched buffers")
+    return dispatch
 
 
 # Templates palladium's scalar table lacks, by operand ctype class.
@@ -670,6 +772,10 @@ def _graph(module: ir.Module) -> tuple[list[_Parameter], list[_Node]]:
                 for k, value in enumerate(op.results):
                     env[value] = _ReductionResult(reduction, k, *_tensor(value))
                 continue
+            if name == "stablehlo.custom_call":
+                dispatch = _dispatch(op, [env[v] for v in op.operands])
+                env.update(zip(op.results, dispatch.results, strict=True))
+                continue
             short = name.removeprefix("stablehlo.")
             if name == "stablehlo.constant":
                 env[op.result] = _constant(op)
@@ -713,8 +819,9 @@ class _Scope:
 class _Kernel:
     """Generates one kernel computing the outputs of one shape."""
 
-    def __init__(self, shape: tuple[int, ...]):
+    def __init__(self, shape: tuple[int, ...], stored: set[int] | frozenset[int] = frozenset()):
         self.shape = shape
+        self.stored = stored  # ids of ops already in buffers: read, not recomputed
         self.lines: list[str] = []
         self.helpers: dict[str, str] = {}
         self.buffers: list[_Node] = []  # read nodes, bound before the outputs
@@ -876,7 +983,9 @@ class _Kernel:
 
     def _expression(self, node: _Node, coords: tuple[str, ...]) -> str:
         ctype = _ctype(node.dtype)
-        if isinstance(node, (_Parameter, _LoopResult, _ReductionResult)):
+        if id(node) in self.stored or isinstance(
+            node, (_Parameter, _LoopResult, _ReductionResult, _DispatchResult)
+        ):
             return self._read(node, coords)
         if isinstance(node, _Constant):
             if node.splat is None:
@@ -1090,7 +1199,13 @@ def _identity(kind: str, ctype: str) -> str:
     return extremum_identity(_ELEMENTWISE[kind], ctype)
 
 
-def _reduction_kernel(node: _Op, output: _Node, name: str, chunks: int = 1) -> tuple[_Kernel, str]:
+def _reduction_kernel(
+    node: _Op,
+    output: _Node,
+    name: str,
+    chunks: int = 1,
+    stored: set[int] | frozenset[int] = frozenset(),
+) -> tuple[_Kernel, str]:
     """128 threads per output; large reductions can write independent partials."""
     x, init = node.operands
     if node.dtype in (np.int64, np.uint64):
@@ -1124,7 +1239,7 @@ def _reduction_kernel(node: _Op, output: _Node, name: str, chunks: int = 1) -> t
             ]
         return [f"acc = simd_{intrinsic}(acc);"]
 
-    kernel = _Kernel(output.shape)
+    kernel = _Kernel(output.shape, stored)
     kernel.lines.insert(0, "uint i = g / 128u;")
     kernel.lines += [f"{acc_type} acc = {identity};", "uint t = g % 128u;"]
     start = f"{kernel.coords[-1]} * 4096u + t" if chunks > 1 else "t"
@@ -1296,6 +1411,7 @@ def _compile_graph(
         slots.append(Slot("fresh", node.dtype, node.shape))
 
     launches = []
+    stored: set[int] = set()  # ops materialized to keep kernels within _MAX_BUFFERS
 
     def launch(
         kernel: _Kernel,
@@ -1309,6 +1425,10 @@ def _compile_graph(
             if id(operand) not in slot_of:
                 add_constant(operand)
         bound = [slot_of[id(n)] for n in kernel.buffers] + [slot_of[id(n)] for n in nodes]
+        if len(bound) > _MAX_BUFFERS:
+            raise UnsupportedProgram(
+                f"metal: a kernel needs {len(bound)} buffers, over Metal's {_MAX_BUFFERS}"
+            )
         size = math.prod(nodes[0].shape) if size is None else size
         grid = size * (threads or 1)
         launches.append(Launch(source, name, tuple(bound), grid, threads, 0 if threads else 2))
@@ -1317,6 +1437,7 @@ def _compile_graph(
     temporaries: list[_Node] = []  # keep synthetic nodes alive while slot_of uses their ids
     loop_slots: dict[_While, list[int]] = {}
     reduction_slots: dict[_VariadicReduce, list[int]] = {}
+    dispatch_slots: dict[_Dispatch, list[int]] = {}
 
     def schedule_variadic(node: _ReductionResult) -> int:
         reduction = node.reduction
@@ -1331,7 +1452,7 @@ def _compile_graph(
         temporaries.extend(outputs)
         for result in outputs:
             fresh(result)
-        kernel = _Kernel(node.shape)
+        kernel = _Kernel(node.shape, stored)
         accumulators = [f"acc{k}" for k in range(len(outputs))]
         for name, value in zip(accumulators, reduction.initial, strict=True):
             initial = kernel.value(value, ())
@@ -1367,17 +1488,86 @@ def _compile_graph(
         reduction_slots[reduction] = [slot_of[id(result)] for result in outputs]
         return reduction_slots[reduction][node.index]
 
+    def schedule_dispatch(node: _DispatchResult) -> int:
+        dispatch = node.dispatch
+        if dispatch in dispatch_slots:
+            return dispatch_slots[dispatch][node.index]
+        inputs = [materialize(x) for x in dispatch.inputs]
+        outputs = []
+        for k, result in enumerate(dispatch.results):
+            if k in dispatch.aliases:
+                # The result starts as a copy of its input; the kernel updates it.
+                source = dispatch.inputs[dispatch.aliases[k]]
+                copy = _Op("reshape", [source], result.dtype, result.shape, {})
+                temporaries.append(copy)
+                slot_of[id(result)] = materialize(copy)
+            else:
+                fresh(result)
+            outputs.append(slot_of[id(result)])
+        threadgroup = dispatch.threadgroup if math.prod(dispatch.threadgroup) else 0
+        for element in range(dispatch.batch):
+            launches.append(
+                Launch(
+                    dispatch.source,
+                    dispatch.function,
+                    tuple(inputs + outputs),
+                    dispatch.grid,
+                    threadgroup,
+                    dispatch.math_mode,
+                    tuple(element * s for s in dispatch.strides) if element else (),
+                )
+            )
+        dispatch_slots[dispatch] = outputs
+        return outputs[node.index]
+
     def materialize(node: _Node) -> int:
         schedule(node)
         if id(node) not in slot_of:
             if isinstance(node, _Constant) and node.splat is None:
                 add_constant(node)
             else:
-                fresh(node)
-                kernel = _Kernel(node.shape)
                 name = f"init_{len(launches)}"
-                launch(kernel, kernel.source([node], name), name, [node])
+                kernel = _Kernel(node.shape, stored)
+                source = kernel.source([node], name)
+                if len(kernel.buffers) >= _MAX_BUFFERS:
+                    shrink(node)
+                    name = f"init_{len(launches)}"
+                    kernel = _Kernel(node.shape, stored)
+                    source = kernel.source([node], name)
+                fresh(node)
+                launch(kernel, source, name, [node])
         return slot_of[id(node)]
+
+    def reads(node: _Node) -> set[int]:
+        """Buffers a kernel computing `node` binds."""
+        kernel = _Kernel(node.shape, stored)
+        kernel.value(node, kernel.coords_of(node.shape))
+        return {id(b) for b in kernel.buffers}
+
+    def shrink(node: _Node) -> None:
+        """Materialize subexpressions of `node` until one kernel can compute it.
+
+        Metal binds at most _MAX_BUFFERS buffers per kernel. A fused value
+        that reads more stores its largest operand that fits in one kernel,
+        descending into operands too large themselves; a stored operand then
+        costs a store and a read instead of index arithmetic.
+        """
+        while len(reads(node)) >= _MAX_BUFFERS:
+            operands = [
+                o
+                for o in _dependencies(node)
+                if isinstance(o, _Op) and id(o) not in slot_of and id(o) not in stored
+            ]
+            if not operands:
+                raise UnsupportedProgram(
+                    f"metal: a value reads {len(reads(node))} buffers, over Metal's {_MAX_BUFFERS}"
+                )
+            largest = max(operands, key=lambda o: len(reads(o)))
+            if len(reads(largest)) < _MAX_BUFFERS:
+                materialize(largest)
+                stored.add(id(largest))
+            else:
+                shrink(largest)
 
     def constant_slot(array: np.ndarray) -> int:
         slots.append(Slot("constant", array.dtype, array.shape, array.tobytes()))
@@ -1477,6 +1667,9 @@ def _compile_graph(
         if isinstance(node, _LoopResult):
             slot_of[id(node)] = schedule_loop(node.loop)[node.index]
             return
+        if isinstance(node, _DispatchResult):
+            slot_of[id(node)] = schedule_dispatch(node)
+            return
         if not isinstance(node, _Op):
             return
         for operand in node.operands:
@@ -1504,7 +1697,7 @@ def _compile_graph(
             temporaries.append(partial)
             fresh(partial)
             name = f"reduce_{len(launches)}"
-            kernel, source = _reduction_kernel(node, partial, name, chunks)
+            kernel, source = _reduction_kernel(node, partial, name, chunks, stored)
             launch(kernel, source, name, [partial], 128)
             reduction = _Op(
                 "reduce",
@@ -1515,7 +1708,7 @@ def _compile_graph(
             )
         fresh(node)
         name = f"reduce_{len(launches)}"
-        kernel, source = _reduction_kernel(reduction, node, name)
+        kernel, source = _reduction_kernel(reduction, node, name, stored=stored)
         launch(kernel, source, name, [node], 128)
 
     def schedule_scatter(node: _Op) -> None:
@@ -1531,7 +1724,7 @@ def _compile_graph(
                 "metal: stablehlo.scatter requires floating or int32/uint32 data and 32-bit indices"
             )
         fresh(node)
-        kernel = _Kernel(node.shape)
+        kernel = _Kernel(node.shape, stored)
         name = f"scatter_init_{len(launches)}"
         if not math.prod(updates.shape) or not math.prod(node.shape):
             launch(kernel, kernel.source([x], name), name, [node])
@@ -1549,7 +1742,7 @@ def _compile_graph(
             source = kernel.source([x], name)
         launch(kernel, source, name, [target])
         a = node.attributes
-        kernel = _Kernel(updates.shape)
+        kernel = _Kernel(updates.shape, stored)
         batch_coords = iter(c for d, c in enumerate(kernel.coords) if d not in a["window"])
         index_coords = tuple(
             "0u" if d == a["vector"] else next(batch_coords) for d in range(len(indices.shape))
@@ -1597,7 +1790,7 @@ def _compile_graph(
         launch(kernel, source, name, [target])
         launches[-1] = dataclasses.replace(launches[-1], grid=math.prod(updates.shape), math_mode=0)
         if narrow:
-            kernel = _Kernel(node.shape)
+            kernel = _Kernel(node.shape, stored)
             value = kernel.value(target, kernel.coords)
             name = f"scatter_unpack_{len(launches)}"
             source = kernel.render([node], name, [f"o0[i] = as_type<{ctype}>(ushort({value}));"])
@@ -1630,7 +1823,7 @@ def _compile_graph(
             return
         if not k:
             zero = _Constant(node.dtype, node.shape, 0)
-            kernel = _Kernel(node.shape)
+            kernel = _Kernel(node.shape, stored)
             name = f"empty_dot_{len(launches)}"
             # Use the dot's output slot for the zero-producing kernel.
             launch(kernel, kernel.source([zero], name), name, [node])
@@ -1684,17 +1877,18 @@ def _compile_graph(
     for update, target in updates:
         in_place.setdefault(math.prod(update.operands[1].shape), []).append((update, target))
 
-    for size in [*computed, *(s for s in in_place if s not in computed)]:
-        nodes = computed.get(size, [])
-        shape = nodes[0].shape if nodes else in_place[size][0][0].operands[1].shape
-        kernel = _Kernel(shape)
-        name = f"fused_{len(launches)}"
-        stores = [
-            f"o{k}[i] = {kernel.value(node, kernel.coords_of(node.shape))};"
-            for k, node in enumerate(nodes)
-        ]
-        targets: list[_Node] = list(nodes)
-        for update, target in in_place.get(size, []):
+    def fuse(shape: tuple[int, ...], items: list) -> tuple[_Kernel, list[str], list[_Node]]:
+        """One kernel storing each item: a node, or an (update, target) pair."""
+        kernel = _Kernel(shape, stored)
+        stores: list[str] = []
+        targets: list[_Node] = []
+        for item in items:
+            if isinstance(item, _Node):
+                coords = kernel.coords_of(item.shape)
+                stores.append(f"o{len(targets)}[i] = {kernel.value(item, coords)};")
+                targets.append(item)
+                continue
+            update, target = item
             x, value, *starts = update.operands
             limits = tuple(n - s for n, s in zip(x.shape, value.shape, strict=True))
             offsets = kernel.offsets(starts, limits)
@@ -1704,5 +1898,30 @@ def _compile_graph(
             )
             stores.append(f"o{len(targets)}[{flat}] = {kernel.value(value, coords)};")
             targets.append(target)
-        launch(kernel, kernel.render(targets, name, stores), name, targets, size=size)
+        return kernel, stores, targets
+
+    def bins(shape: tuple[int, ...], items: list) -> list[list]:
+        """Items in groups whose kernels bind at most _MAX_BUFFERS buffers."""
+        kernel, _, targets = fuse(shape, items)
+        if len(kernel.buffers) + len(targets) <= _MAX_BUFFERS:
+            return [items]
+        groups: list[list] = []
+        reads: set[int] = set()
+        for item in items:
+            shrink(item if isinstance(item, _Node) else item[0].operands[1])
+            needed = {id(b) for b in fuse(shape, [item])[0].buffers}
+            if not groups or len(reads | needed) + len(groups[-1]) + 1 > _MAX_BUFFERS:
+                groups.append([])
+                reads = set()
+            groups[-1].append(item)
+            reads |= needed
+        return groups
+
+    for size in [*computed, *(s for s in in_place if s not in computed)]:
+        nodes = computed.get(size, [])
+        shape = nodes[0].shape if nodes else in_place[size][0][0].operands[1].shape
+        for items in bins(shape, [*nodes, *in_place.get(size, [])]):
+            kernel, stores, targets = fuse(shape, items)
+            name = f"fused_{len(launches)}"
+            launch(kernel, kernel.render(targets, name, stores), name, targets, size=size)
     return Program(slots, launches, [slot_of[id(n)] for n in results])

@@ -3,8 +3,10 @@
     JAX_PLATFORMS=metal,cpu uv run python examples/pjrt_m2_profile.py [--output m2.json]
 
 For the full step and its two halves (the 200-step RK4 simulation; the MDN
-loss, gradients and AdamW), runs calls pipelined, as training does, and
-splits the time per step into:
+loss, gradients and AdamW), and for the CNF update of `cnf_density.py` (256
+points, 16 RK4 steps; Palladium's adjoint kernels through `pallas_call`, or
+plain JAX), runs calls pipelined, as training does, and splits the time per
+step into:
 
 - wall: elapsed time per step over a batch, synchronizing only at its end;
 - host: time to return from each call, minus waits for the in-flight bound,
@@ -27,6 +29,7 @@ import statistics
 import time
 from pathlib import Path
 
+import cnf_density
 import jax
 import jaxlib
 import numpy as np
@@ -47,10 +50,15 @@ def _workloads(device) -> dict:
         loss, grads = jax.value_and_grad(sbi_loss)(params, x, theta)
         return adamw(params, grads, opt), loss
 
+    with jax.default_device(jax.devices("cpu")[0]):
+        cnf_state, cnf_data = cnf_density.initial_state(), cnf_density.mixture_data(256)
+    cnf_inputs = jax.device_put((cnf_state, cnf_data), device)
     return {
         "sbi_step": (fn, jax.device_put((params, opt, key), device)),
         "simulation": (sbi_trajectory, jax.device_put((theta,), device)),
         "dense_update": (dense, jax.device_put((params, opt, x, theta), device)),
+        "cnf_update": (cnf_density.make_training_step(256)[0], cnf_inputs),
+        "cnf_update_jax": (cnf_density.make_training_step(256, variant="jax")[0], cnf_inputs),
     }
 
 
@@ -99,7 +107,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--workload",
-        choices=("sbi_step", "simulation", "dense_update"),
+        choices=("sbi_step", "simulation", "dense_update", "cnf_update", "cnf_update_jax"),
         action="append",
         help="profile only these (repeatable); default: all",
     )

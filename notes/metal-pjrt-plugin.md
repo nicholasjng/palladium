@@ -60,6 +60,12 @@ Works:
   GPU completion. Passthrough and repeated outputs are copied on the GPU queue.
 - The complete SBI step compiles and executes, with a ten-step CPU comparison
   of losses, parameters and optimizer state (details and tolerance below).
+- Palladium kernels inside `jit`: `pl.pallas_call` (any math mode, aliases)
+  and `metal_call` (including under `jax.vmap`) become launches of the
+  program, also inside counted loops. The CNF update of
+  `examples/cnf_density.py` matches CPU over ten steps.
+- Kernels bind at most 31 buffers, Metal's limit: wider fusions split by
+  output, and values reading more buffers store intermediate operands.
 
 Fails with UNIMPLEMENTED, naming the op (`palladium.stablehlo` raises
 `UnsupportedProgram`): unsupported reducer bodies (including single-result
@@ -330,12 +336,20 @@ In order of what M2's SBI step needs first.
    when M×N has few tiles (this product runs one threadgroup). This is not an
    M1 gate: the SBI step contracts at most 128 elements and the tests cover
    K ≤ 128. It matters for M3's GEMMs.
-6. **Pallas kernels inside `jit`.** Register lowering rules for
-   `pallas_call_p` and `mpmd_map_p` with `platform="metal"`; the stub probe
-   showed both work. They emit a `stablehlo.custom_call` whose typed-FFI
-   `backend_config` must be a dictionary, carrying the MSL and launch.
-   `stablehlo.py` turns that custom call into a `Launch`. This brings
-   `metal_call` and `plmtl` kernels into whole programs.
+6. **Pallas kernels inside `jit` (done for `pallas_call`, `metal_call` and
+   `plmtl`).** On `metal`, `pallas_call` lowers through
+   `palladium.ffi.pallas_lowering` (registered next to the jax-mps rule in
+   `palladium/mps.py`) to the same typed-FFI custom call, `palladium_dispatch`,
+   that `metal_call` and `plmtl.kernel` emit on every platform. Its
+   `mhlo.backend_config` dictionary carries the MSL, function name, thread
+   grid, threadgroup, math mode, and the `batch_size`/`elem_strides` of
+   `metal_call`'s vmap rule. `stablehlo.py` turns the call into one `Launch`
+   per batch element, binding inputs then results, offset by the strides.
+   An aliased result starts as a copy of its input, so elements the kernel
+   does not write keep the input's values. Other custom-call targets and
+   non-row-major layouts are rejected. Remaining: a `metal` rule for
+   `pl.kernel`'s `mpmd_map` outside `plmtl`; avoiding the copy for an aliased
+   input that is not read again.
 7. **Donation (correctness implemented).** `_pjrt.initialize` appends `metal`
    to JAX's private donation-platform list. Argument `tf.aliasing_output`
    attributes pass through the compiler to native execution. Outputs compute
@@ -689,6 +703,38 @@ Profiling with symbols: the installed plugin is stripped by default.
 symbols for Instruments or `sample`; a later plain `uv sync` strips it again.
 The unstripped library in `build/<wheel tag>` also resolves offsets with
 `nm -n`.
+
+### Pallas kernels and the CNF premise check (2026-11-02, M2)
+
+M2's premise test from `notes/metal-compute-stack.md`: the CNF update of
+`examples/cnf_density.py` (256 points, width 4, 16 RK4 steps, checkpoint
+interval 4, Palladium's forward and adjoint kernels, Adam). jax-mps with
+`JAX_MPS_ASYNC_DISPATCH=1` took 149 µs per pipelined update, 61 µs of it GPU
+time (xla-metal-replay `notes/plan.md`, 2026-10-28, which places it on the M1
+machine; not rerun here, since PyPI jax-mps has no `palladium.dispatch`
+handler).
+`examples/pjrt_m2_profile.py` on the M2:
+
+| Workload, pipelined | Wall | Host | Encode | GPU busy | GPU/wall | Launches |
+|---|---:|---:|---:|---:|---:|---:|
+| CNF update, Palladium kernels (`pallas_call`) | 0.058 ms | 0.017 ms | 0.010 ms | 0.052 ms | 90.7% | 10 |
+| CNF update, plain JAX | 1.863 ms | 0.856 ms | 0.822 ms | 1.843 ms | 98.9% | 705 |
+
+For comparison on the M2 (min of five batches of 200): XLA:CPU takes 0.91 ms
+for the plain-JAX update, and the same kernels through `metal_call` on the
+CPU platform 0.49–0.52 ms, since every FFI call waits for its command buffer.
+**The premise holds**: owning execution leaves about 6 µs of host time
+outside the GPU's 52 µs, where jax-mps spent about 88 µs outside 61 µs. All
+three Metal paths match CPU over ten updates at normwise rtol 1e-4
+(`test_cnf_training_matches_cpu_over_ten_steps`).
+
+Plain JAX on `metal` loses to XLA:CPU, as the replay estimate predicted
+(2.58 ms there). It needs 705 launches per update, mostly small kernels in the
+backward loop, where one fused value read 50 buffers, above Metal's
+31-buffer limit for a kernel. `_compile_graph` now splits fusions whose
+outputs and reads exceed 31 buffers into several kernels, and stores the
+largest operand that fits in one kernel when a single value reads more
+(descending into operands that are too large themselves).
 
 ### Recomputation in guarded branches
 

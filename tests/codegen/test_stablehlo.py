@@ -343,3 +343,96 @@ def test_rk4_simulation_kernel_computes_each_value_once():
     # The StableHLO body has 46 arithmetic ops; recomputation once reached 4,032.
     assert len(re.findall(r"\n\s+float v\d+ =", source)) <= 80, source
     assert len(re.findall(r"\bb\d+\[", source)) <= 10, source
+
+
+def _double_and_sum(x_ref, y_ref, o_ref, p_ref):
+    o_ref[...] = x_ref[...] * 2
+    p_ref[...] = x_ref[...] + y_ref[...]
+
+
+def test_palladium_dispatch_binds_inputs_then_results():
+    """`metal_call` (and `pallas_call` lowered for metal) is one launch of its MSL."""
+    from jax.experimental import pallas as pl
+
+    import palladium
+
+    spec = pl.BlockSpec((4,), lambda i: (i,))
+    call = palladium.metal_call(
+        _double_and_sum,
+        grid=(2,),
+        in_specs=[spec, spec],
+        out_specs=[spec, spec],
+        out_shape=[jax.ShapeDtypeStruct((8,), jnp.float32)] * 2,
+        compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE),
+    )
+    program = _compile(lambda x, y: call(x + 1, y), (8,), (8,))
+    fused, dispatch = program.launches
+    assert fused.slots == (0, 2)  # x + 1, materialized for the kernel
+    assert dispatch.slots == (2, 1, *program.outputs)
+    assert dispatch.function == "palladium_kernel" and "kernel void" in dispatch.source
+    assert dispatch.grid == (2, 1, 1) and dispatch.threadgroup == 0
+    assert dispatch.math_mode == 0 and dispatch.offsets == ()
+
+
+def test_aliased_dispatch_result_starts_as_a_copy_of_its_input():
+    """An aliased result keeps the input's values wherever the kernel does not write."""
+    from jax.experimental import pallas as pl
+
+    import palladium
+
+    def first_half(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 10
+
+    call = palladium.metal_call(
+        first_half,
+        grid=(1,),
+        in_specs=[pl.BlockSpec((4,), lambda i: (0,))],
+        out_specs=pl.BlockSpec((4,), lambda i: (0,)),
+        out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
+        input_output_aliases={0: 0},
+    )
+    program = _compile(call, (8,))
+    copy, dispatch = program.launches
+    [output] = program.outputs
+    assert copy.slots == (0, output) and dispatch.slots == (0, output)
+
+
+def test_vmapped_dispatch_launches_once_per_batch_element_at_offsets():
+    from jax.experimental import pallas as pl
+
+    import palladium
+
+    spec = pl.BlockSpec((4,), lambda i: (i,))
+    call = palladium.metal_call(
+        _double_and_sum,
+        grid=(2,),
+        in_specs=[spec, spec],
+        out_specs=[spec, spec],
+        out_shape=[jax.ShapeDtypeStruct((8,), jnp.float32)] * 2,
+    )
+    # y is shared by the batch: stride 0.
+    program = _compile(jax.vmap(call, in_axes=(0, None)), (3, 8), (8,))
+    assert [launch.offsets for launch in program.launches] == [
+        (),
+        (32, 0, 32, 32),
+        (64, 0, 64, 64),
+    ]
+
+
+def test_unknown_custom_calls_are_unsupported():
+    def fn(x):
+        return jax.ffi.ffi_call("somebody_elses_kernel", jax.ShapeDtypeStruct(x.shape, x.dtype))(x)
+
+    with pytest.raises(UnsupportedProgram, match="somebody_elses_kernel"):
+        _compile(fn, (4,))
+
+
+def test_kernels_bind_at_most_31_buffers():
+    """Metal's limit: wide fusions split by output, deep ones by operand."""
+    wide = _compile(lambda *xs: tuple(x + 1 for x in xs), *[(4,)] * 20)
+    deep = _compile(lambda *xs: sum(x * k for k, x in enumerate(xs)), *[(4,)] * 40)
+    for program in (wide, deep):
+        assert all(len(launch.slots) <= 31 for launch in program.launches)
+    assert len(wide.launches) == 2
+    # The sum is split once: one stored partial, then the rest.
+    assert len(deep.launches) == 2

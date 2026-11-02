@@ -173,6 +173,8 @@ def _describe(lib: ctypes.CDLL, builder: int, code: bytes) -> None:
         slots = (ctypes.c_int * len(launch.slots))(*launch.slots)
         dims = (launch.grid, 1, 1) if isinstance(launch.grid, int) else launch.grid
         grid = (ctypes.c_size_t * 3)(*dims)
+        group = launch.threadgroup
+        group = (group, 1, 1) if isinstance(group, int) else group
         status = lib.pp_kernel(
             builder,
             launch.source.encode(),
@@ -181,9 +183,7 @@ def _describe(lib: ctypes.CDLL, builder: int, code: bytes) -> None:
             slots,
             len(launch.slots),
             grid,
-            (ctypes.c_size_t * 3)(launch.threadgroup, 1, 1)
-            if launch.threadgroup
-            else (ctypes.c_size_t * 3)(),
+            (ctypes.c_size_t * 3)(*group) if group[0] else (ctypes.c_size_t * 3)(),
             (ctypes.c_size_t * len(launch.offsets))(*launch.offsets) if launch.offsets else None,
         )
         if status < 0:

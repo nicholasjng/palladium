@@ -289,10 +289,6 @@ class FfiCallable:
             for a, b in zip(args, batched, strict=True)
         ]
         spec, msl_source, source_id = self._spec_and_msl(tuple(unbatched))
-        grid, threadgroup = launch_geometry(spec, msl_source, self._params.threadgroup_dims)
-        # MRLaunchDesc takes 3 grid dims; a (0, 0, 0) threadgroup lets the
-        # runtime choose.
-        threadgroup = threadgroup or (0, 0, 0)
         in_strides = [
             np.dtype(u.dtype).itemsize * math.prod(u.shape) if b else 0
             for u, b in zip(unbatched, batched, strict=True)
@@ -314,21 +310,73 @@ class FfiCallable:
             input_output_aliases=dict(spec.aliases) or None,
         )(
             *args,
-            source_id=source_id,
-            msl_source=msl_source,
-            function_name=spec.name,
-            grid_x=int(grid[0]),
-            grid_y=int(grid[1]),
-            grid_z=int(grid[2]),
-            threadgroup_x=int(threadgroup[0]),
-            threadgroup_y=int(threadgroup[1]),
-            threadgroup_z=int(threadgroup[2]),
-            math_mode=_runtime.MATH_MODES[self._params.math_mode],
+            **launch_attributes(spec, msl_source, self._params, source_id),
             batch_size=1 if axis_size is None else int(axis_size),
             elem_strides=np.asarray(in_strides + out_strides, dtype=np.int64),
         )
         # ffi_call returns a list for several outputs; pallas_call a tuple.
         return tuple(outs) if len(out_structs) > 1 else outs
+
+
+def launch_attributes(
+    spec: KernelSpec, msl_source: str, params: CompilerParams, source_id: str | None = None
+) -> dict[str, Any]:
+    """The `palladium_dispatch` attributes describing one launch of `msl_source`.
+
+    The CPU FFI handler and the `metal` PJRT compiler read the same attributes,
+    plus `batch_size` and `elem_strides`, which the caller adds.
+    """
+    grid, threadgroup = launch_geometry(spec, msl_source, params.threadgroup_dims)
+    # MRLaunchDesc takes 3 grid dims; a (0, 0, 0) threadgroup lets the
+    # runtime choose.
+    threadgroup = threadgroup or (0, 0, 0)
+    return {
+        "source_id": source_id or hashlib.sha256(msl_source.encode()).hexdigest(),
+        "msl_source": msl_source,
+        "function_name": spec.name,
+        "grid_x": int(grid[0]),
+        "grid_y": int(grid[1]),
+        "grid_z": int(grid[2]),
+        "threadgroup_x": int(threadgroup[0]),
+        "threadgroup_y": int(threadgroup[1]),
+        "threadgroup_z": int(threadgroup[2]),
+        "math_mode": _runtime.MATH_MODES[params.math_mode],
+    }
+
+
+def pallas_lowering(ctx, *in_nodes, interpret: Any = False, **params):
+    """Lower one `pallas_call` for the `metal` PJRT platform.
+
+    Emits the same `palladium_dispatch` custom call as `metal_call`; the
+    plugin's compiler turns it into a launch inside the program's command
+    buffers. Unlike the jax-mps path, every math mode and aliasing work.
+    """
+    from palladium.trace import spec_from_params
+
+    options = params.get("compiler_params")
+    if options is None:
+        options = CompilerParams()
+    elif not isinstance(options, CompilerParams):
+        raise TypeError(
+            f"pallas_call on metal lowers through Palladium, which takes "
+            f"palladium.CompilerParams, not {type(options).__name__}"
+        )
+    spec = spec_from_params(params)
+    check_dtypes(tuple(ctx.avals_in))
+    check_threadgroup(spec, options.threadgroup_dims)
+    msl_source = emit_msl(spec, dot_general=options.dot_general, program=options.program)
+    count = len(ctx.avals_in) + len(ctx.avals_out)
+    rule = jax.ffi.ffi_lowering(
+        _TARGET_NAME,
+        operand_output_aliases=dict(spec.aliases) or None,
+    )
+    return rule(
+        ctx,
+        *in_nodes,
+        **launch_attributes(spec, msl_source, options),
+        batch_size=1,
+        elem_strides=np.zeros(count, dtype=np.int64),
+    )
 
 
 def metal_call(kernel: Callable, **pallas_kwargs) -> FfiCallable:
