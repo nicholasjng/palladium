@@ -90,6 +90,15 @@ struct PJRT_Client {
 std::unique_ptr<Buffer> acquire(size_t size_bytes);
 void release(std::unique_ptr<Buffer> buffer);
 
+// Pool counters since the last reset: requests served from the pool, new
+// MTLBuffers created (and their bytes and seconds), and releases the pool
+// dropped because it was full.
+struct PoolCounters {
+    uint64_t hits, misses, miss_bytes, dropped;
+    double miss_seconds;
+};
+PoolCounters pool_counters(bool reset);
+
 struct PJRT_Buffer {
     PJRT_Device* device;
     PJRT_Buffer_Type type;

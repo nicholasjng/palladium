@@ -193,12 +193,13 @@ std::mutex in_flight_mutex;
 std::deque<std::shared_ptr<Completion>> in_flight;
 
 // Execution counters for profiling, read through palladium_pjrt_stats. GPU
-// intervals come from completion handlers; on one serial queue they arrive
-// in start order, so `gpu_busy` merges overlapping intervals incrementally.
+// intervals come from completion handlers, which Metal may call out of start
+// order, so their union is computed when read.
 struct Stats {
     std::mutex mutex;
     uint64_t executions = 0, command_buffers = 0, launches = 0;
-    double encode = 0, throttle = 0, gpu_sum = 0, gpu_busy = 0, gpu_last_end = 0;
+    double encode = 0, throttle = 0;
+    std::vector<std::pair<double, double>> gpu;  // command-buffer intervals
 };
 Stats& stats() {
     static Stats* s = new Stats;  // leaked: completion handlers may outlive statics
@@ -213,9 +214,19 @@ void record_gpu(double start, double end) {
     if (!(end > start)) return;
     Stats& s = stats();
     std::lock_guard lock(s.mutex);
-    s.gpu_sum += end - start;
-    s.gpu_busy += std::max(0.0, end - std::max(start, s.gpu_last_end));
-    s.gpu_last_end = std::max(s.gpu_last_end, end);
+    s.gpu.emplace_back(start, end);
+}
+
+// Sum and union length of the recorded intervals.
+std::pair<double, double> gpu_time(std::vector<std::pair<double, double>> intervals) {
+    std::sort(intervals.begin(), intervals.end());
+    double sum = 0, busy = 0, covered = -1e300;
+    for (auto [start, end] : intervals) {
+        sum += end - start;
+        busy += std::max(0.0, end - std::max(start, covered));
+        covered = std::max(covered, end);
+    }
+    return {sum, busy};
 }
 
 void throttle() {
@@ -371,17 +382,23 @@ extern "C" {
 struct PalladiumPjrtStats {
     uint64_t executions, command_buffers, launches;
     double encode_seconds, throttle_seconds, gpu_busy_seconds, gpu_sum_seconds;
+    // Buffer pool: hits, new MTLBuffers (count, bytes, seconds), dropped releases.
+    uint64_t pool_hits, pool_misses, allocated_bytes, pool_dropped;
+    double allocation_seconds;
 };
 
 EXPORT void palladium_pjrt_stats(PalladiumPjrtStats* out, int reset) {
     Stats& s = stats();
     std::lock_guard lock(s.mutex);
-    *out = {s.executions, s.command_buffers, s.launches, s.encode,
-            s.throttle,   s.gpu_busy,        s.gpu_sum};
+    PoolCounters pool = pool_counters(reset);
+    auto [gpu_sum, gpu_busy] = gpu_time(s.gpu);
+    *out = {s.executions, s.command_buffers, s.launches, s.encode,      s.throttle,
+            gpu_busy,     gpu_sum,           pool.hits,  pool.misses,   pool.miss_bytes,
+            pool.dropped, pool.miss_seconds};
     if (reset) {
         s.executions = s.command_buffers = s.launches = 0;
-        s.encode = s.throttle = s.gpu_sum = s.gpu_busy = 0;
-        // Keep gpu_last_end: a later interval must not re-count overlap.
+        s.encode = s.throttle = 0;
+        s.gpu.clear();
     }
 }
 

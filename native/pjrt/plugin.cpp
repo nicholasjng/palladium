@@ -7,6 +7,7 @@
 
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <unordered_map>
 
 #include "errors.h"
@@ -206,6 +207,7 @@ struct Pool {
     std::mutex mutex;
     std::unordered_map<size_t, std::vector<std::unique_ptr<Buffer>>> free;
     size_t bytes = 0;
+    PoolCounters counters{};
 };
 
 Pool& pool() {
@@ -224,24 +226,48 @@ std::unique_ptr<Buffer> acquire(size_t size_bytes) {
             auto buffer = std::move(it->second.back());
             it->second.pop_back();
             p.bytes -= size_bytes;
+            ++p.counters.hits;
             return buffer;
         }
     }
+    auto start = std::chrono::steady_clock::now();
+    auto count = [&] {
+        std::lock_guard lock(p.mutex);
+        ++p.counters.misses;
+        p.counters.miss_bytes += size_bytes;
+        p.counters.miss_seconds +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    };
     try {
-        return std::make_unique<Buffer>(runtime().device(), size_bytes);
+        auto buffer = std::make_unique<Buffer>(runtime().device(), size_bytes);
+        count();
+        return buffer;
     } catch (const AllocationError&) {
         std::lock_guard lock(p.mutex);  // retry with the pool given back
         p.free.clear();
         p.bytes = 0;
     }
-    return std::make_unique<Buffer>(runtime().device(), size_bytes);
+    auto buffer = std::make_unique<Buffer>(runtime().device(), size_bytes);
+    count();
+    return buffer;
+}
+
+PoolCounters pool_counters(bool reset) {
+    Pool& p = pool();
+    std::lock_guard lock(p.mutex);
+    PoolCounters counters = p.counters;
+    if (reset) p.counters = {};
+    return counters;
 }
 
 void release(std::unique_ptr<Buffer> buffer) {
     if (!buffer) return;
     Pool& p = pool();
     std::lock_guard lock(p.mutex);
-    if (p.bytes + buffer->size() > kPoolLimit) return;
+    if (p.bytes + buffer->size() > kPoolLimit) {
+        ++p.counters.dropped;
+        return;
+    }
     p.bytes += buffer->size();
     p.free[buffer->size()].push_back(std::move(buffer));
 }

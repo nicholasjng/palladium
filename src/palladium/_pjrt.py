@@ -55,6 +55,11 @@ class _Stats(ctypes.Structure):
         ("throttle_seconds", ctypes.c_double),
         ("gpu_busy_seconds", ctypes.c_double),
         ("gpu_sum_seconds", ctypes.c_double),
+        ("pool_hits", ctypes.c_uint64),
+        ("pool_misses", ctypes.c_uint64),
+        ("allocated_bytes", ctypes.c_uint64),
+        ("pool_dropped", ctypes.c_uint64),
+        ("allocation_seconds", ctypes.c_double),
     ]
 
 
@@ -129,8 +134,11 @@ def stats(reset: bool = False) -> dict[str, float]:
         ``executions``, ``command_buffers`` and ``launches`` encoded;
         ``encode_seconds`` and ``throttle_seconds`` of host time inside
         Execute; ``gpu_busy_seconds`` (union of command-buffer GPU intervals)
-        and ``gpu_sum_seconds``. GPU time is recorded by completion handlers,
-        so synchronize on the last outputs before reading.
+        and ``gpu_sum_seconds``; the buffer pool's ``pool_hits``, new
+        MTLBuffers (``pool_misses``, ``allocated_bytes``,
+        ``allocation_seconds``) and releases it dropped when full
+        (``pool_dropped``). GPU time is recorded by completion handlers, so
+        synchronize on the last outputs before reading.
     """
     out = _Stats()
     library().palladium_pjrt_stats(ctypes.byref(out), int(reset))
