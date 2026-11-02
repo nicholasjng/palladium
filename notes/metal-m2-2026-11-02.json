@@ -1,0 +1,69 @@
+{
+  "schema_version": 2,
+  "timestamp_utc": "2026-11-02T13:22:46.119030+00:00",
+  "platform": "metal",
+  "os": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "python": "3.15.2",
+  "executable": "/Users/nicholasjunge/Code/palladium/.venv/bin/python",
+  "jax": "0.12.0.1",
+  "jaxlib": "0.12.0.1",
+  "revision": {
+    "git_commit": "972ad132cd5f590dd37a972104b92488d33b0162",
+    "jj_commit": "b4dfe85656d79eed1236a20faa64e194d1c2d016",
+    "working_copy_dirty": false
+  },
+  "cache": "fresh process; JAX persistent cache disabled; Metal driver cache unchanged",
+  "repeats": 5,
+  "small_min_calls_per_sample": 1000,
+  "minimum_sample_wall_seconds": 0.2,
+  "large_mib_per_buffer": 256,
+  "sections": {
+    "device": {
+      "status": "ok"
+    },
+    "small": {
+      "status": "ok"
+    },
+    "large": {
+      "status": "ok"
+    },
+    "copy": {
+      "status": "ok"
+    },
+    "sbi": {
+      "status": "ok"
+    }
+  },
+  "device": "Apple M2",
+  "small_seconds_per_call": [
+    2.5951868852311918e-05,
+    2.6207193425368856e-05,
+    2.644712419186761e-05,
+    2.6183135348418203e-05,
+    2.566019210385354e-05
+  ],
+  "small_calls_per_sample": 8334,
+  "small_median_us": 26.183135348418205,
+  "large_seconds_per_call": [
+    0.0064296274709597446,
+    0.006359258558779188,
+    0.006371143381864599,
+    0.006542091911850388,
+    0.006646321088363252
+  ],
+  "large_calls_per_sample": 34,
+  "elementwise_median_gbps": 83.4995362367179,
+  "copy_gpu_seconds": [
+    0.006131480653753637,
+    0.006076976189173625,
+    0.006250040179501022,
+    0.006282617560438146,
+    0.006198520831406183
+  ],
+  "copy_calls_per_sample": 28,
+  "copy_median_gbps": 86.61274626679065,
+  "elementwise_fraction_of_copy": 0.9640559829325441,
+  "sbi_compile_and_first_call_seconds": 2.51123908298905,
+  "sbi_first_loss": 2.1272225379943848,
+  "complete": true
+}

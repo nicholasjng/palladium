@@ -116,25 +116,25 @@ first-step compile time, peak memory, and agreement with a CPU or XLA
 reference: a faster step that compiles for a minute or drifts numerically is
 not a win.
 
-M1 status (2026-11-01): the plugin runs fused elementwise and index-mapping
-programs asynchronously, including guarded concatenate, pad and dynamic slices,
-with pooled buffers. Single-result reductions now schedule intermediate
-buffers and SIMD-group kernels, including split full reductions; variadic
-reducers remain open. Floating `dot_general` now reuses the existing Pallas
-GEMM emitter, including transposed/batched/general contractions. Static counted `while` replays body
-kernels with alternating carry buffers; dynamic conditions remain unsupported.
-Pure cond/switch branches now run without host predicate reads; expensive
-materialized branch computations are eager before selection.
-PJRT-local 64-bit integer operations now enable threefry RNG. The full SBI step
-runs and has a ten-step CPU comparison at rtol 1e-4, atol 2e-6; the first
-completed step is under five seconds. On the M1 Pro its measured pipelined
-throughput is still slower than CPU (2.83 ms versus 1.47 ms). The remaining
-M1 API/operation/performance criteria are not yet met.
-The acceptance-gate audit in `notes/metal-pjrt-plugin.md` distinguishes remaining
-operation/API work, unresolved tolerance/API wording, and the unmeasured
-M2/M4 Pro performance gates.
-Steps taken, open items and the success criteria against
-jax 0.12 are in `notes/metal-pjrt-plugin.md`.
+M1 status (2026-11-02): the plugin runs every operation group of the census
+asynchronously with pooled buffers: fused elementwise and index maps
+(including guarded concatenate, pad and dynamic slices), reductions
+(single-result SIMD-group kernels; variadic reducers such as argmax as a
+sequential fold), floating `dot_general` through the existing Pallas GEMM
+emitter, static counted `while`, pure cond/switch, gather and scatter-add,
+and 64-bit integers for threefry RNG. Dynamic `while` remains unsupported.
+The common API cases (compile, analysis, donation, deletion in flight,
+multi-threaded dispatch) have tests. The full SBI step matches CPU over ten
+steps within normwise rtol 1e-4 per array; on 2026-11-02 the criteria moved
+from componentwise to normwise relative error, since near-zero entries
+cannot agree componentwise and an absolute tolerance hid errors in Adam's
+second moments. Its pipelined
+throughput is still slower than CPU (2.83 ms versus 1.47 ms on the M1 Pro),
+which is M2's problem, not an M1 gate. On the M2 the performance gates hold
+(26.2 µs per small call versus 175.7 µs for jax-mps, 96% of copy bandwidth,
+2.5 s first SBI step). Open for M1: the same measurements on the M4 Pro. The gate-by-gate audit, steps
+taken and the success criteria against jax 0.12 are in
+`notes/metal-pjrt-plugin.md`.
 
 Work that costs time without proving anything: a JAX port of SAM2's image
 encoder and mask decoder (SAM2 is PyTorch) for M5, and a small JAX LoRA

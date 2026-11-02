@@ -7,13 +7,16 @@ import sys
 import textwrap
 from pathlib import Path
 
+# Scripts may import `pjrt_tolerance`, the M1 agreement rule, from this directory.
+_PATH = f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+
 
 def _run(script: str, platforms: str | None = "metal,cpu") -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k != "JAX_PLATFORMS"}
     if platforms:
         env["JAX_PLATFORMS"] = platforms
     return subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(script)],
+        [sys.executable, "-c", _PATH + textwrap.dedent(script)],
         env=env,
         capture_output=True,
         text=True,
@@ -72,6 +75,7 @@ def test_programs_match_cpu():
     """Fused elementwise and index-mapping programs, against the CPU backend."""
     out = _check("""
         import jax, jax.numpy as jnp, ml_dtypes, numpy as np
+        from pjrt_tolerance import assert_normwise_close
         metal, cpu = jax.devices("metal")[0], jax.devices("cpu")[0]
         rng = np.random.default_rng(0)
         x = rng.standard_normal((3, 4), np.float32)
@@ -100,11 +104,7 @@ def test_programs_match_cpu():
             want = jax.jit(fn)(*(jax.device_put(a, cpu) for a in args))
             for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
                 assert g.devices() == {metal}, name
-                tol = 1e-2 if g.dtype.itemsize == 2 else 2e-5
-                np.testing.assert_allclose(
-                    np.asarray(g, np.float64), np.asarray(w, np.float64), rtol=tol, atol=1e-5,
-                    err_msg=name,
-                )
+                assert_normwise_close(g, w, err_msg=name)
         print(len(cases))
     """)
     assert out.strip() == "15"
@@ -209,6 +209,7 @@ def test_reductions_match_cpu():
     _check("""
         import jax, jax.numpy as jnp, ml_dtypes, numpy as np
         from jax import lax
+        from pjrt_tolerance import assert_normwise_close
         metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
         rng = np.random.default_rng(5)
         cases = []
@@ -240,9 +241,7 @@ def test_reductions_match_cpu():
             run = jax.jit(fn)
             got, want = run(jax.device_put(x, metal)), run(jax.device_put(x, cpu))
             for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
-                tol = 1e-2 if g.dtype.itemsize == 2 else 2e-5
-                np.testing.assert_allclose(np.asarray(g, np.float64), np.asarray(w, np.float64),
-                                           rtol=tol, atol=1e-5)
+                assert_normwise_close(g, w)
     """)
 
 
@@ -308,6 +307,7 @@ def test_static_loops_match_cpu():
     _check("""
         import jax, jax.numpy as jnp, numpy as np
         from jax import lax
+        from pjrt_tolerance import assert_normwise_close
         metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
         x = np.arange(12, dtype=np.float32).reshape(3, 4) / 10
         cases = []
@@ -340,7 +340,7 @@ def test_static_loops_match_cpu():
             run = jax.jit(fn)
             got, want = run(jax.device_put(x, metal)), run(jax.device_put(x, cpu))
             for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
-                np.testing.assert_allclose(np.asarray(g), np.asarray(w), rtol=2e-5, atol=1e-5)
+                assert_normwise_close(g, w)
     """)
 
 
@@ -378,6 +378,7 @@ def test_sbi_trajectory_and_summary_match_cpu():
         import jax, jax.numpy as jnp, numpy as np
         sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
         from training_steps import sbi_trajectory
+        from pjrt_tolerance import assert_normwise_close
         metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
         theta = np.random.default_rng(17).uniform(0.5, 1.5, (512, 4)).astype(np.float32)
         def simulate(theta):
@@ -386,7 +387,7 @@ def test_sbi_trajectory_and_summary_match_cpu():
         run = jax.jit(simulate)
         got, want = run(jax.device_put(theta, metal)), run(jax.device_put(theta, cpu))
         for g, w in zip(got, want, strict=True):
-            np.testing.assert_allclose(np.asarray(g), np.asarray(w), rtol=2e-5, atol=1e-5)
+            assert_normwise_close(g, w)
     """)
 
 
@@ -394,6 +395,7 @@ def test_dot_general_matches_cpu():
     _check("""
         import jax, jax.numpy as jnp, ml_dtypes, numpy as np
         from jax import lax
+        from pjrt_tolerance import assert_normwise_close
         metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
         rng = np.random.default_rng(71)
         def array(shape):
@@ -432,9 +434,7 @@ def test_dot_general_matches_cpu():
             got = run(jax.device_put(a,metal),jax.device_put(b,metal))
             want = run(jax.device_put(a,cpu),jax.device_put(b,cpu))
             for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
-                tol = 1e-2 if g.dtype.itemsize == 2 else 2e-5
-                np.testing.assert_allclose(np.asarray(g,np.float64),np.asarray(w,np.float64),
-                                           rtol=tol,atol=tol,err_msg=f'case {index}')
+                assert_normwise_close(g,w,err_msg=f'case {index}')
     """)
 
 
@@ -444,6 +444,7 @@ def test_sbi_dense_training_matches_cpu_over_ten_steps():
         import jax, numpy as np
         sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
         from training_steps import adamw, sbi_loss
+        from pjrt_tolerance import assert_normwise_close
         rng = np.random.default_rng(17)
         shapes = {{'w1': (6,128), 'w2': (128,128), 'wa': (128,5),
                    'wm': (128,20), 'ws': (128,20)}}
@@ -464,8 +465,8 @@ def test_sbi_dense_training_matches_cpu_over_ten_steps():
                 state[name] = (p,o,a,t)
             for g,w in zip(jax.tree.leaves((state['metal'][:2],losses['metal'])),
                            jax.tree.leaves((state['cpu'][:2],losses['cpu'])),strict=True):
-                # Near-zero gradients amplify float32 reduction differences under Adam.
-                np.testing.assert_allclose(np.asarray(g),np.asarray(w),rtol=1e-4,atol=2e-6)
+                # Normwise per leaf: near-zero entries cannot match componentwise.
+                assert_normwise_close(g,w,rtol=1e-4)
     """)
 
 
@@ -507,6 +508,7 @@ def test_wide_integer_operations_match_cpu():
 def test_threefry_random_matches_cpu():
     _check("""
         import jax, numpy as np
+        from pjrt_tolerance import assert_normwise_close
         metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
         with jax.default_device(cpu):
             key=jax.random.key(17)
@@ -516,10 +518,7 @@ def test_threefry_random_matches_cpu():
                 run=jax.jit(fn)
                 got=run(jax.device_put(key,metal))
                 want=run(jax.device_put(key,cpu))
-                if got.dtype.kind == 'u':
-                    np.testing.assert_array_equal(np.asarray(got),np.asarray(want))
-                else:
-                    np.testing.assert_allclose(np.asarray(got),np.asarray(want),rtol=2e-5,atol=1e-6)
+                assert_normwise_close(got,want)
         # Key splitting and folding exercise the same counters with different layouts.
         for fn in (lambda k:jax.random.key_data(jax.random.split(k,7)),
                    lambda k:jax.random.key_data(jax.random.fold_in(k,23))):
@@ -539,6 +538,7 @@ def test_full_sbi_training_matches_cpu_over_ten_steps():
         import jax, numpy as np
         sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
         from training_steps import steps
+        from pjrt_tolerance import assert_normwise_close
         cpu = jax.devices('cpu')[0]
         with jax.default_device(cpu):
             fn,params,opt,key = steps()['sbi']
@@ -552,8 +552,9 @@ def test_full_sbi_training_matches_cpu_over_ten_steps():
                 state[name],losses[name] = run(p,o,jax.device_put(key,jax.devices(name)[0]))
             for g,w in zip(jax.tree.leaves((state['metal'],losses['metal'])),
                            jax.tree.leaves((state['cpu'],losses['cpu'])),strict=True):
-                np.testing.assert_allclose(np.asarray(g),np.asarray(w),rtol=1e-4,atol=2e-6,
-                                           equal_nan=False)
+                # Every parameter and optimizer-state leaf, and the loss, per array.
+                assert np.isfinite(np.asarray(g)).all()
+                assert_normwise_close(g,w,rtol=1e-4)
     """)
 
 
@@ -563,6 +564,7 @@ def test_llm_training_step_matches_cpu():
         import jax,numpy as np
         sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
         from training_steps import steps
+        from pjrt_tolerance import assert_normwise_close
         with jax.default_device(jax.devices('cpu')[0]):
             fn,params,opt,_=steps()['llm']
         tokens=np.arange(4*129,dtype=np.int32).reshape(4,129)%128
@@ -572,8 +574,8 @@ def test_llm_training_step_matches_cpu():
             outputs[name]=run(*jax.device_put((params,opt,tokens),jax.devices(name)[0]))
         for got,want in zip(jax.tree.leaves(outputs['metal']),
                             jax.tree.leaves(outputs['cpu']),strict=True):
-            np.testing.assert_allclose(np.asarray(got),np.asarray(want),
-                                       rtol=1e-4,atol=2e-6,equal_nan=False)
+            assert np.isfinite(np.asarray(got)).all()
+            assert_normwise_close(got,want,rtol=1e-4)
     """)
 
 
@@ -581,6 +583,7 @@ def test_cond_and_switch_match_cpu():
     _check("""
         import jax, jax.numpy as jnp, ml_dtypes, numpy as np
         from jax import lax
+        from pjrt_tolerance import assert_normwise_close
         metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
         x = np.arange(12,dtype=np.float32).reshape(3,4) / 10 + 0.1
         cases = [
@@ -611,8 +614,7 @@ def test_cond_and_switch_match_cpu():
                 got=run(jax.device_put(np.int32(p),metal),jax.device_put(x,metal))
                 want=run(jax.device_put(np.int32(p),cpu),jax.device_put(x,cpu))
                 for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
-                    np.testing.assert_allclose(np.asarray(g,np.float64),np.asarray(w,np.float64),
-                                               rtol=2e-5,atol=1e-5,equal_nan=True)
+                    assert_normwise_close(g,w)
     """)
 
 

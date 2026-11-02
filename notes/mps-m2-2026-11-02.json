@@ -1,0 +1,56 @@
+{
+  "schema_version": 2,
+  "timestamp_utc": "2026-11-02T13:29:33.481687+00:00",
+  "platform": "mps",
+  "os": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "python": "3.15.0",
+  "executable": "/private/tmp/claude-501/-Users-nicholasjunge-Code-palladium/5df927b4-fa75-4795-bf39-37a652cf5432/scratchpad/venv-mps/bin/python",
+  "jax": "0.11.2",
+  "jaxlib": "0.11.2",
+  "revision": {
+    "git_commit": "972ad132cd5f590dd37a972104b92488d33b0162",
+    "jj_commit": "504692ca3dcae7dd94f8b4b2debfb0d4874210ff",
+    "working_copy_dirty": true
+  },
+  "cache": "fresh process; JAX persistent cache disabled; Metal driver cache unchanged",
+  "repeats": 5,
+  "small_min_calls_per_sample": 1000,
+  "minimum_sample_wall_seconds": 0.2,
+  "large_mib_per_buffer": 256,
+  "sections": {
+    "device": {
+      "status": "ok"
+    },
+    "small": {
+      "status": "ok"
+    },
+    "large": {
+      "status": "ok"
+    },
+    "sbi": {
+      "status": "ok"
+    }
+  },
+  "device": "gpu",
+  "small_seconds_per_call": [
+    0.00017570410758101693,
+    0.00017626940036530078,
+    0.0001674401084666602,
+    0.00017336963580340652,
+    0.00017630713579131575
+  ],
+  "small_calls_per_sample": 1134,
+  "small_median_us": 175.70410758101693,
+  "large_seconds_per_call": [
+    0.007133283612934212,
+    0.007164143838904678,
+    0.007115489225872161,
+    0.0071452177418846515,
+    0.007053818548053143
+  ],
+  "large_calls_per_sample": 31,
+  "elementwise_median_gbps": 75.26280197615233,
+  "sbi_compile_and_first_call_seconds": 3.961501500016311,
+  "sbi_first_loss": 2.1272222995758057,
+  "complete": true
+}
