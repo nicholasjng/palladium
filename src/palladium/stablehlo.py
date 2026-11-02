@@ -17,6 +17,7 @@ coordinate tuple, so index-mapping ops cost index arithmetic, not memory.
 
 from __future__ import annotations
 
+import ast
 import dataclasses
 import math
 import re
@@ -165,6 +166,40 @@ def _literal(value: float, ctype: str) -> str:
 _ATOM = re.compile(r"-?[\w.]+(\(-?[\w.]+\))?")
 
 
+def _index(expr: str) -> int | None:
+    """The value of a constant unsigned index expression (+, -, * only), else None."""
+    try:
+        tree = ast.parse(re.sub(r"\b(\d+)u\b", r"\1", expr), mode="eval").body
+    except SyntaxError:
+        return None
+
+    def evaluate(node: ast.AST) -> int:
+        if isinstance(node, ast.Constant) and type(node.value) is int:
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+            a, b = evaluate(node.left), evaluate(node.right)
+            return (
+                a + b
+                if isinstance(node.op, ast.Add)
+                else a - b
+                if isinstance(node.op, ast.Sub)
+                else a * b
+            )
+        raise ValueError
+
+    try:
+        value = evaluate(tree)
+    except ValueError:
+        return None
+    return value if 0 <= value < 1 << 32 else None
+
+
+def _fold(expr: str) -> str:
+    """A constant index expression as a literal; other expressions unchanged."""
+    value = _index(expr)
+    return expr if value is None else f"{value}u"
+
+
 def _strides(shape: Sequence[int]) -> list[int]:
     strides, step = [], 1
     for n in reversed(shape):
@@ -182,13 +217,38 @@ def _linear(coords: Sequence[str], shape: Sequence[int]) -> str:
     return " + ".join(terms) or "0u"
 
 
+def _paren(expr: str) -> str:
+    """`expr` as one operand: unchanged if an atom or already fully parenthesized."""
+    if _ATOM.fullmatch(expr):
+        return expr
+    if expr.startswith("(") and expr.endswith(")"):
+        depth = 0
+        for k, ch in enumerate(expr):
+            depth += {"(": 1, ")": -1}.get(ch, 0)
+            if depth == 0 and k < len(expr) - 1:
+                break
+        else:
+            return expr
+    return f"({expr})"
+
+
 def _delinear(flat: str, shape: Sequence[int]) -> tuple[str, ...]:
-    """Coordinates of a flat row-major index into `shape`."""
-    base = flat if _ATOM.fullmatch(flat) else f"({flat})"
+    """Coordinates of a flat row-major index into `shape`.
+
+    One spelling per coordinate, so equal reads memoize together: every
+    non-atom is parenthesized once, and the leading non-unit dimension needs
+    no modulus (the flat index is below the size).
+    """
+    base = _paren(flat)
     coords = []
-    for k, (s, n) in enumerate(zip(_strides(shape), shape, strict=True)):
-        quotient = base if s == 1 else f"{base} / {s}u"
-        coords.append("0u" if n == 1 else quotient if k == 0 else f"{quotient} % {n}u")
+    leading = True
+    for s, n in zip(_strides(shape), shape, strict=True):
+        if n == 1:
+            coords.append("0u")
+            continue
+        quotient = base if s == 1 else f"({base} / {s}u)"
+        coords.append(quotient if leading else f"({quotient} % {n}u)")
+        leading = False
     return tuple(coords)
 
 
@@ -628,6 +688,28 @@ def _graph(module: ir.Module) -> tuple[list[_Parameter], list[_Node]]:
     return parameters, walk(block, list(parameters))
 
 
+# Identifiers in generated expressions, for deciding where a value is defined.
+_IDENTIFIER = re.compile(r"[A-Za-z_]\w*")
+
+
+@dataclasses.dataclass
+class _Scope:
+    """Memoized values of the kernel body or of one guarded branch.
+
+    `names` are the variables the scope defines (temporaries and shifted
+    coordinates). `insert` is the line index, in the enclosing scope, just
+    before the branch chain: values hoisted out of this branch go there.
+    """
+
+    insert: int = -1
+    hoist: bool = True  # may values leave this branch?
+    names: set[str] = dataclasses.field(default_factory=set)
+    values: dict[tuple[int, tuple[str, ...]], str] = dataclasses.field(default_factory=dict)
+    reshaped: dict[tuple[tuple[str, ...], tuple[int, ...]], str] = dataclasses.field(
+        default_factory=dict
+    )
+
+
 class _Kernel:
     """Generates one kernel computing the outputs of one shape."""
 
@@ -636,17 +718,26 @@ class _Kernel:
         self.lines: list[str] = []
         self.helpers: dict[str, str] = {}
         self.buffers: list[_Node] = []  # read nodes, bound before the outputs
-        self.values: dict[tuple[int, tuple[str, ...]], str] = {}
+        self.scopes = [_Scope()]  # the body, then open guarded branches
         self.next_value = 0
-        self.reshaped: dict[tuple[tuple[str, ...], tuple[int, ...]], str] = {}
         self.coords = tuple(f"c{k}" for k in range(len(shape)))
+        # Expressions the coordinate variables stand for, so reads spelled
+        # either way memoize together.
+        self.named = dict(zip(_delinear("i", shape), self.coords, strict=True))
         self.lines += [
             f"uint {c} = {e};" for c, e in zip(self.coords, _delinear("i", shape), strict=True)
         ]
 
     def coords_of(self, shape: tuple[int, ...]) -> tuple[str, ...]:
-        """Coordinates in `shape` of this thread's flat index."""
-        return self.coords if shape == self.shape else _delinear("i", shape)
+        """Coordinates in `shape` of this thread's flat index.
+
+        Expressions the kernel already names (its own coordinates) use those
+        names, so a value read through another shape of equal size, such as
+        an added unit dimension, hits the same memoized values.
+        """
+        if shape == self.shape:
+            return self.coords
+        return tuple(self.named.get(e, e) for e in _delinear("i", shape))
 
     def require(self, name: str, source: str) -> None:
         self.helpers[name] = source
@@ -656,39 +747,107 @@ class _Kernel:
             self.buffers.append(node)
         return f"b{self.buffers.index(node)}"
 
+    @property
+    def values(self) -> dict[tuple[int, tuple[str, ...]], str]:
+        """Values memoized in the kernel body (outside any guarded branch)."""
+        return self.scopes[0].values
+
+    @property
+    def reshaped(self) -> dict[tuple[tuple[str, ...], tuple[int, ...]], str]:
+        return self.scopes[0].reshaped
+
+    def _level(self, coords: tuple[str, ...]) -> int:
+        """The outermost open scope where a value at `coords` may be computed.
+
+        Coordinates that use none of a branch's own names are computed from
+        enclosing coordinates by index maps, which stay in bounds without the
+        branch's guard; such a value can be computed once before the chain.
+        """
+        used = {name for c in coords for name in _IDENTIFIER.findall(c)}
+        for depth in range(len(self.scopes) - 1, 0, -1):
+            scope = self.scopes[depth]
+            if not scope.hoist or used & scope.names:
+                return depth
+        return 0
+
     def value(self, node: _Node, coords: tuple[str, ...]) -> str:
+        coords = tuple(self.named.get(c, c) for c in coords)
         key = (id(node), coords)
-        if key not in self.values:
-            expr = self._expression(node, coords)
-            if _ATOM.fullmatch(expr):
-                self.values[key] = expr
-            else:
-                name = self.temporary()
-                self.lines.append(f"{_ctype(node.dtype)} {name} = {expr};")
-                self.values[key] = name
-        return self.values[key]
+        for scope in reversed(self.scopes):
+            if key in scope.values:
+                return scope.values[key]
+        level = self._level(coords)
+        if level < len(self.scopes) - 1:
+            # Generate it as if at `level`, then insert before the branch chain.
+            inner, lines = self.scopes[level + 1 :], self.lines
+            self.scopes, self.lines = self.scopes[: level + 1], []
+            try:
+                result = self.value(node, coords)
+            finally:
+                hoisted, self.lines = self.lines, lines
+                self.scopes += inner
+            index = inner[0].insert
+            self.lines[index:index] = hoisted
+            for scope in inner:
+                scope.insert += len(hoisted)
+            return result
+        scope = self.scopes[-1]
+        expr = self._expression(node, coords)
+        if _ATOM.fullmatch(expr):
+            scope.values[key] = expr
+        else:
+            name = self.temporary()
+            self.lines.append(f"{_ctype(node.dtype)} {name} = {expr};")
+            scope.values[key] = name
+        return scope.values[key]
 
     def temporary(self) -> str:
         name = f"v{self.next_value}"
         self.next_value += 1
+        self.scopes[-1].names.add(name)
         return name
 
-    def choose(self, dtype: np.dtype, branches: list[tuple[str, _Node, tuple[str, ...]]]) -> str:
-        """Emit reads inside their guards; branch-local values must not escape.
+    def choose(
+        self,
+        dtype: np.dtype,
+        branches: list[tuple[str, _Node, tuple[str, ...]]],
+        hoist: bool = True,
+        parent: tuple[str, ...] = (),
+    ) -> str:
+        """Emit each branch's reads inside its guard; the final branch is unconditional.
 
-        The final branch is unconditional. Parent-scope memoized values remain
-        available, but neither values nor reshape shortcuts cross sibling scopes.
+        A branch's shifted coordinates (those differing from `parent`) and its
+        temporaries are its own names, so its values never escape to siblings.
+        Callers guarantee that unshifted coordinates index the branch operand
+        within bounds. With `hoist`, a value that uses no branch name is
+        computed once before the chain instead of in every branch. Without it
+        (`case`), branches stay lazy.
         """
         result = self.temporary()
         self.lines.append(f"{_ctype(dtype)} {result};")
+        insert = len(self.lines)
         for k, (condition, node, coords) in enumerate(branches):
             last = k == len(branches) - 1
             prefix = "" if k == 0 else "else "
             self.lines.append(prefix + ("{" if last else f"if ({condition}) {{"))
-            values, reshaped = self.values.copy(), self.reshaped.copy()
-            value = self.value(node, coords)
-            self.lines.append(f"{result} = {value};")
-            self.values, self.reshaped = values, reshaped
+            scope = _Scope(insert, hoist)
+            self.scopes.append(scope)
+            try:
+                bound = []
+                for j, c in enumerate(coords):
+                    if _ATOM.fullmatch(c) or (j < len(parent) and c == parent[j]):
+                        bound.append(c)
+                    else:
+                        name = f"k{self.next_value}"
+                        self.next_value += 1
+                        scope.names.add(name)
+                        self.lines.append(f"uint {name} = {c};")
+                        bound.append(name)
+                value = self.value(node, tuple(bound))
+                self.lines.append(f"{result} = {value};")
+            finally:
+                self.scopes.pop()
+            insert = scope.insert
             self.lines.append("}")
         return result
 
@@ -705,7 +864,14 @@ class _Kernel:
         return "i" if coords == self.coords and shape == self.shape else _linear(coords, shape)
 
     def _read(self, node: _Node, coords: tuple[str, ...]) -> str:
-        flat = self.reshaped.get((coords, node.shape)) or self._flat(coords, node.shape)
+        flat = next(
+            (
+                s.reshaped[(coords, node.shape)]
+                for s in reversed(self.scopes)
+                if (coords, node.shape) in s.reshaped
+            ),
+            None,
+        ) or self._flat(coords, node.shape)
         return f"{self.buffer(node)}[{flat}]"
 
     def _expression(self, node: _Node, coords: tuple[str, ...]) -> str:
@@ -751,12 +917,23 @@ class _Kernel:
                 selector = self.value(index, ())
                 # StableHLO sends any out-of-range index to the last branch.
                 # JAX switch inserts its own clamp before this operation.
+                # Untaken branches stay unevaluated: no hoisting across them.
                 return self.choose(
                     node.dtype,
                     [(f"{selector} == {k}", branch, coords) for k, branch in enumerate(branches)],
+                    hoist=False,
                 )
             case "concatenate":
                 dim, offset, branches = a["dim"], 0, []
+                position = _index(coords[dim])
+                if position is not None:
+                    # A constant coordinate selects its operand statically.
+                    for x in operands:
+                        if position < offset + x.shape[dim]:
+                            inner = list(coords)
+                            inner[dim] = f"{position - offset}u"
+                            return self.value(x, tuple(inner))
+                        offset += x.shape[dim]
                 for x in operands:
                     size = x.shape[dim]
                     if size:
@@ -765,7 +942,10 @@ class _Kernel:
                         branches.append((f"{coords[dim]} < {offset + size}u", x, tuple(inner)))
                     offset += size
                 # No thread runs for an empty output, but its source must be valid.
-                return self.choose(node.dtype, branches) if branches else _literal(0, ctype)
+                # Operands match the output in every other dimension.
+                if not branches:
+                    return _literal(0, ctype)
+                return self.choose(node.dtype, branches, parent=coords)
             case "pad":
                 x, padding = operands
                 if not math.prod(x.shape):
@@ -809,7 +989,10 @@ class _Kernel:
                     or "true"
                 )
                 inner = tuple(f"({c} - {s})" for c, s in zip(coords, offsets, strict=True))
-                return self.choose(node.dtype, [(condition, update, inner), ("", x, coords)])
+                # The operand has the output's shape: its unshifted reads are in bounds.
+                return self.choose(
+                    node.dtype, [(condition, update, inner), ("", x, coords)], parent=coords
+                )
             case "broadcast_in_dim":
                 [x] = operands
                 inner = tuple(
@@ -820,7 +1003,7 @@ class _Kernel:
                 [x] = operands
                 flat = self._flat(coords, node.shape)
                 inner = _delinear(flat, x.shape)
-                self.reshaped[(inner, x.shape)] = flat  # a read there is at `flat`
+                self.scopes[-1].reshaped[(inner, x.shape)] = flat  # a read there is at `flat`
                 return self.value(x, inner)
             case "transpose":
                 [x] = operands
@@ -833,7 +1016,7 @@ class _Kernel:
                 return self.value(
                     x,
                     tuple(
-                        f"({s}u + {c} * {t}u)" if (s, t) != (0, 1) else c
+                        _fold(f"({s}u + {c} * {t}u)") if (s, t) != (0, 1) else c
                         for c, s, t in zip(coords, a["start"], a["strides"], strict=True)
                     ),
                 )
@@ -842,7 +1025,7 @@ class _Kernel:
                 return self.value(
                     x,
                     tuple(
-                        f"({n - 1}u - {c})" if k in a["dims"] else c
+                        _fold(f"({n - 1}u - {c})") if k in a["dims"] else c
                         for k, (c, n) in enumerate(zip(coords, node.shape, strict=True))
                     ),
                 )

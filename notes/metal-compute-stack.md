@@ -137,6 +137,13 @@ and 10.2 µs versus 126.4 µs on the M4 Pro; elementwise bandwidth at 96% and
 taken and the success criteria against jax 0.12 are in
 `notes/metal-pjrt-plugin.md`.
 
+M2 status (2026-11-02, in progress): on the M2, a pipelined SBI step takes
+0.61 ms (XLA:CPU 1.33 ms, jax-mps 18.7 ms), with the GPU busy 98% of the wall
+time, after loop replay dropped from 657 to 256 launches per step and fused
+kernels stopped recomputing values in guarded branches. Open: the
+same measurements on the M4 Pro, the CNF premise check (needs Pallas kernels
+inside `jit`), and diffrax (host callbacks, dynamic `while`).
+
 Work that costs time without proving anything: a JAX port of SAM2's image
 encoder and mask decoder (SAM2 is PyTorch) for M5, and a small JAX LoRA
 training stack for M4.

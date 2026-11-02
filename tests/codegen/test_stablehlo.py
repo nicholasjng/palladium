@@ -297,3 +297,49 @@ def test_argmax_uses_one_variadic_reduction():
     assert launch.function.startswith("variadic_reduce")
     assert launch.math_mode == 0
     assert len(launch.slots) == 3  # input, value result, index result
+
+
+def test_concatenate_siblings_share_values_independent_of_the_guarded_dimension():
+    """A value both operands need is computed once, before the branch chain."""
+
+    def fn(x):
+        shared = x * 3 + 1  # not an atom: it gets a temporary
+        return jnp.concatenate([shared[:, None], (shared * 2)[:, None]], 1)
+
+    [launch] = _compile(fn, (5,)).launches
+    body = launch.source.split("{", 1)[1]
+    assert body.count("* 3.0f") == 1, body
+    assert body.index("* 3.0f") < body.index("if ("), body
+
+
+def test_cond_branches_stay_lazy():
+    """Selection evaluates only the taken branch: nothing moves before it."""
+    [launch] = _compile(
+        lambda p, x: lax.cond(p > 0, lambda y: jnp.exp(y), lambda y: jnp.exp(y) + 1, x),
+        (),
+        (5,),
+    ).launches
+    body = launch.source.split("{", 1)[1]
+    assert body.count("exp(") == 2 and body.index("if (") < body.index("exp("), body
+
+
+def test_pad_reads_stay_inside_their_guard():
+    """The operand is smaller than the output: its reads need the guard."""
+
+    def fn(v):
+        return lax.pad(jnp.broadcast_to(v[:, None], (3, 4)), np.float32(0), ((1, 1, 0), (0, 0, 0)))
+
+    [launch] = _compile(fn, (3,)).launches
+    body = launch.source.split("{", 1)[1]
+    assert body.index("if (") < body.index("b0["), body
+
+
+def test_rk4_simulation_kernel_computes_each_value_once():
+    """The SBI trajectory's loop body: stacked RK4 stages share their components."""
+    from training_steps import sbi_trajectory  # examples/ is on the path (conftest)
+
+    program = _compile(sbi_trajectory, (512, 4))
+    source = max((launch.source for launch in program.launches), key=len)
+    # The StableHLO body has 46 arithmetic ops; recomputation once reached 4,032.
+    assert len(re.findall(r"\n\s+float v\d+ =", source)) <= 80, source
+    assert len(re.findall(r"\bb\d+\[", source)) <= 10, source

@@ -631,55 +631,101 @@ work: rerun with SAFE elementwise math first.
 
 ## M2 baseline: where an SBI step's time goes (2026-11-02, M2)
 
-M2 requires GPU time to be most of a step's wall time. The plugin now counts
-executions, command buffers and launches, host seconds inside Execute
-(encoding; waiting for the in-flight bound), and GPU time from each command
-buffer's `GPUStartTime`/`GPUEndTime`: their union (busy) and their sum.
-`palladium._pjrt.stats(reset=...)` reads them; `examples/pjrt_m2_profile.py`
-reports them per step for the SBI step and its two halves:
+M2 requires GPU time to be most of a step's wall time. The plugin counts
+executions, command buffers and launches; host seconds inside Execute
+(encoding; waiting for the in-flight bound); buffer-pool hits, new MTLBuffers
+and their creation time; and GPU time from each command buffer's
+`GPUStartTime`/`GPUEndTime`, as the sum and the exact union (busy) of the
+intervals. `palladium._pjrt.stats(reset=...)` reads them;
+`examples/pjrt_m2_profile.py` reports them per step for the SBI step and its
+two halves. Completion handlers arrive out of start order, so the union is
+computed when read; an earlier incremental merge assumed start order and
+reported about half the true busy time.
 
-| Workload, pipelined | Wall | Host | Encode | GPU busy | GPU/wall | Launches |
-|---|---:|---:|---:|---:|---:|---:|
-| Full SBI step | 2.145 ms | 0.844 ms | 0.738 ms | 1.133 ms | 52.8% | 657 |
-| Simulation (200 RK4 steps) | 1.805 ms | 0.652 ms | 0.623 ms | 0.927 ms | 51.4% | 603 |
-| Dense update (MDN loss, grads, AdamW) | 0.304 ms | 0.059 ms | 0.040 ms | 0.152 ms | 50.1% | 48 |
-
-Medians of five calibrated batches on the Apple M2, fixed resident inputs.
-For comparison, the same step takes 1.32 ms on XLA:CPU and 18.66 ms on
-jax-mps 0.11.1 (min of five batches of 20).
-
-The step is not host-bound. With 64 calls queued, the host spends 1.6 of its
-1.9 ms per call blocked by the 16-execution in-flight bound, so the queue is
-always full. Yet command buffers execute during only about half of the wall
-time (busy 1.05 ms of 2.12 ms per call). Their GPU intervals overlap (sum
-3.5 ms against busy 1.05 ms per call), so consecutive command buffers are
-scheduled concurrently, but some gap between them remains. A single isolated
-call takes 6.2 ms of GPU time against about 1.1 ms pipelined, which suggests
-the GPU clocks down when work is sparse. Neither effect is explained yet;
-a Metal System Trace in Instruments is the next tool.
-
-The simulation dominated: 603 of 657 launches, three per RK4 iteration, each
-over only 512×2 elements. One launch computed the loop counter, whose values
-are known when replaying; a second rewrote the whole 200×512×2 trajectory
-(204,800 threads) to append one row. Binding induction variables to constant
-arrays, updating scan outputs in place, and grouping kernels by element count
-leave one 1,024-thread launch per iteration:
+The simulation dominated the original step: 603 of 657 launches, three per
+RK4 iteration, each over only 512×2 elements. One launch computed the loop
+counter, whose values are known when replaying; a second rewrote the whole
+200×512×2 trajectory (204,800 threads) to append one row. Binding induction
+variables to constant arrays, updating scan outputs in place, and grouping
+kernels by element count leave one 1,024-thread launch per iteration:
 
 | SBI step on the M2, pipelined | Before | After |
 |---|---:|---:|
-| Full step wall | 2.145 ms | 0.996 ms |
-| Simulation wall | 1.805 ms | 0.657 ms |
+| Full step wall | 2.145 ms | 1.005 ms |
+| Simulation wall | 1.805 ms | 0.650 ms |
 | Launches per step | 657 | 256 |
-| Host encoding per step | 0.738 ms | 0.297 ms |
-| GPU busy per step | 1.133 ms | 0.505 ms |
-| GPU busy / wall | 52.8% | 50.7% |
+| Host encoding per step | 0.738 ms | 0.274 ms |
 
-The full step now beats XLA:CPU on this machine (1.32 ms) by 1.3×. GPU busy
-time is still only half the wall time, so the unexplained gaps between
-command buffers, not launch count, are now the main obstacle to M2's GPU-time
-target. The RK4 body kernel also recomputes earlier stages inside each
-concatenate branch, because value memoization is scoped per guarded branch;
-that costs GPU arithmetic, not launches.
+After the change, per step (medians of five calibrated batches, fixed
+resident inputs):
+
+| Workload, pipelined | Wall | Host | Encode | GPU busy | GPU/wall | Launches |
+|---|---:|---:|---:|---:|---:|---:|
+| Full SBI step | 1.005 ms | 0.327 ms | 0.274 ms | 0.989 ms | 98.4% | 256 |
+| Simulation (200 RK4 steps) | 0.650 ms | 0.239 ms | 0.224 ms | 0.639 ms | 98.2% | 202 |
+| Dense update (MDN loss, grads, AdamW) | 0.302 ms | 0.057 ms | 0.039 ms | 0.290 ms | 95.8% | 48 |
+
+**On the M2, pipelined SBI steps meet M2's GPU-time target**: the GPU is busy
+98% of the wall time, and a Metal System Trace shows no gaps between command
+buffers. The host is not the limit: it spends most of each call waiting for
+the 16-execution in-flight bound. The step takes 1.0 ms against 1.32 ms on
+XLA:CPU and 18.66 ms on jax-mps 0.11.1 (min of five batches of 20). The GPU
+busy time is a command buffer's whole residency, including any time it
+waits behind an overlapping predecessor; it is not pure kernel time.
+
+Buffer allocation is negligible after warm-up: over 1,000 steady-state steps,
+15 new MTLBuffers took 0.8 ms in total (70 pool requests per step). Warm-up
+creates about 90 MiB, one set per execution in flight, in about 3 ms. In a
+`sample` of the same run, the pool-miss path (Execute → `make_buffer` →
+`acquire` → `Buffer::Buffer` → `AGXBuffer initWithDevice`) has 2 samples.
+But 23 of the 65 samples inside Execute wait on the pool's mutex: each step
+locks it about 70 times while Metal's completion threads lock it to return
+the previous steps' buffers. Not on the critical path while the GPU is the
+bottleneck; acquiring and releasing an execution's buffers under one lock
+would remove it for small, host-bound calls.
+
+Profiling with symbols: the installed plugin is stripped by default.
+`uv sync --reinstall-package palladium -C install.strip=false` keeps its
+symbols for Instruments or `sample`; a later plain `uv sync` strips it again.
+The unstripped library in `build/<wheel tag>` also resolves offsets with
+`nm -n`.
+
+### Recomputation in guarded branches
+
+The RK4 right-hand side stacks each stage's two components with
+`concatenate`, and the next stage slices them apart again. Guarded branches
+used to keep their memoized values private, and equal coordinates had several
+spellings (`c0`, `(i / 2u)`, `((i / 2u))`, `i / 2u % 512u`), so each stage
+recomputed the stages before it. The loop kernel did 4,032 float operations
+and 1,795 buffer reads per thread for a body of 46 arithmetic ops.
+
+Now each guarded branch is a scope of its own names: the coordinates its guard
+shifts and the temporaries it defines. A value whose coordinates use none of
+them is computed once before the branch chain. That is safe for `concatenate`
+and `dynamic_update_slice`: unshifted coordinates index their operands within
+bounds, since those match the output in every unshifted dimension. `pad`
+shifts every coordinate, so its operand reads stay guarded, and `case`
+branches are never hoisted, so untaken branches stay unevaluated. Constant
+index arithmetic is folded, a concatenate read at a constant coordinate
+selects its operand without a guard, and coordinates have one canonical
+spelling. The loop kernel now has 58 float operations and 8 buffer reads per
+thread.
+
+| SBI on the M2, pipelined | Before | After |
+|---|---:|---:|
+| Full step wall | 1.005 ms | 0.614 ms |
+| Simulation wall | 0.650 ms | 0.243 ms |
+| GPU busy / wall (step) | 98.4% | 97.8% |
+
+The step takes 0.614 ms against 1.33 ms on XLA:CPU (2.2× faster) and 18.66 ms
+on jax-mps. The dense update (0.30 ms, 48 launches) is now half of it. The
+simulation's 202 launches take about 1.2 µs each, close to a per-launch floor.
+
+Open: a single isolated step took 6.2 ms of GPU time before the loop changes,
+against about 1.1 ms pipelined, which suggests low GPU clocks under sparse
+work; not yet re-measured. Unary calls such as `exp(v2)` count as atoms and
+are inlined at each use rather than given a temporary; the Metal compiler
+likely merges them, but that is unverified. The M4 Pro has not been profiled.
 
 ## Success criteria for M1, against jax 0.12
 
