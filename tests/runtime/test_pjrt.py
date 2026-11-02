@@ -265,7 +265,7 @@ def test_reduction_special_values_and_integer_extrema():
         import jax, jax.numpy as jnp, numpy as np
         from jax import lax
         metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
-        for n in (37, 10001):
+        for n in (4, 37, 10001):  # 4: folded into the consumer
             x = np.zeros((5, n), np.float32)
             x[0, 1] = np.nan
             x[1, 0], x[1, -1] = -np.inf, np.inf
@@ -283,6 +283,16 @@ def test_reduction_special_values_and_integer_extrema():
             minimum, maximum = map(np.asarray, got[:2])
             assert np.signbit(minimum[2]) and np.signbit(maximum[2])
             assert np.signbit(minimum[3]) and not np.signbit(maximum[3])
+        # Folded extrema of values computed in the same kernel: NaNs from
+        # infinities and zero signs survive (fast math would lose both).
+        y = np.array([[1, -1, 2, 3], [1, 2, 3, 4], [0.5, 0.25, -2, 8]], np.float32)
+        for fn in (lambda y: jnp.log(y).max(-1), lambda y: jnp.log(y).min(-1),
+                   lambda y: (y * jnp.inf - jnp.inf).max(-1), lambda y: (-0.0 * y).max(-1)):
+            got = np.asarray(jax.jit(fn)(jax.device_put(y, metal)))
+            want = np.asarray(jax.jit(fn)(jax.device_put(y, cpu)))
+            np.testing.assert_array_equal(got, want)
+            numbers = ~np.isnan(want)  # a NaN's sign is unspecified
+            assert np.array_equal(np.signbit(got[numbers]), np.signbit(want[numbers]))
         for dtype in (np.int32, np.uint32):
             info = np.iinfo(dtype)
             x = np.array([info.min, info.max, info.max - 1, 2**25 + 1], dtype=dtype)

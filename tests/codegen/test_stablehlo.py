@@ -92,7 +92,7 @@ def test_reductions_materialize_once_before_consumers():
         s = (x * x).sum(-1)
         return s, s, x + s[:, None], s.sum()
 
-    program = _compile(fn, (3, 17))
+    program = _compile(fn, (17, 17))  # both reductions are long: not folded
     assert len(program.launches) == 3
     assert program.outputs[0] == program.outputs[1]
     # No materialization of x*x; consumers share the reduction's slot.
@@ -259,7 +259,7 @@ def test_elementwise_cond_fuses_with_guarded_branch_reads():
 
 
 def test_cond_materializes_reductions_before_selection():
-    program = _compile(lambda x: lax.cond(x[0] > 0, lambda y: y.sum(), lambda y: y.max(), x), (8,))
+    program = _compile(lambda x: lax.cond(x[0] > 0, lambda y: y.sum(), lambda y: y.max(), x), (32,))
     assert len(program.launches) == 3
     assert all(l.function.startswith("reduce") for l in program.launches[:2])
     assert {l.slots[-1] for l in program.launches[:2]} <= set(program.launches[-1].slots[:-1])
@@ -436,3 +436,42 @@ def test_kernels_bind_at_most_31_buffers():
     assert len(wide.launches) == 2
     # The sum is split once: one stored partial, then the rest.
     assert len(deep.launches) == 2
+
+
+def test_short_reductions_fold_into_their_consumers():
+    """No launch of 128 threads per output to add four numbers."""
+
+    def fn(x):
+        p = jax.nn.softmax(x, axis=-1)  # max and sum over 4 elements
+        return p * x.sum(0)  # and over 3
+
+    [launch] = _compile(fn, (3, 4)).launches
+    assert launch.grid == 12 and launch.threadgroup == 0
+    assert launch.math_mode == 1  # RELAXED: a float maximum keeps its NaN rules
+    [launch] = _compile(lambda x: (x * 2).sum(-1) + 1, (5, 16)).launches
+    assert launch.grid == 5 and launch.math_mode == 2
+    assert launch.source.count("b0[") == 16
+    assert [launch.function[:6] for launch in _compile(lambda x: x.sum(-1), (5, 17)).launches] == [
+        "reduce"
+    ]
+
+
+def test_short_reductions_read_in_branches_are_stored_once():
+    """Branch coordinates get fresh names, so folds there would be regenerated."""
+    program = _compile(lambda x: jnp.concatenate([x[:, 0], x.sum(-1)]), (4, 3))
+    stored, fused = program.launches
+    assert stored.grid == 4 and stored.slots[-1] in fused.slots[:-1]
+    # At the body's coordinates, the reduction folds into the one kernel.
+    assert len(_compile(lambda x: x.sum(-1) * 2, (4, 3)).launches) == 1
+
+
+def test_plain_jax_cnf_kernels_stay_small():
+    """Folding at branch coordinates once made one of these kernels 9 MB of MSL."""
+    import cnf_density  # examples/ is on the path (conftest)
+
+    update, _ = cnf_density.make_training_step(256, variant="jax")
+    exported = jax.export.export(update, platforms=["metal"])(
+        cnf_density.initial_state(), cnf_density.mixture_data(256)
+    )
+    program = compile_program(exported.mlir_module_serialized)
+    assert max(len(launch.source) for launch in program.launches) < 100_000

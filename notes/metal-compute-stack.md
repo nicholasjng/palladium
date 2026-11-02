@@ -142,7 +142,7 @@ M2 status (2026-11-02, in progress): on the M2, a pipelined SBI step takes
 time, after loop replay dropped from 657 to 256 launches per step and fused
 kernels stopped recomputing values in guarded branches; on the M4 Pro it
 takes 0.225 ms with the GPU busy 99.9%. The premise check holds: with
-Palladium kernels inside `jit`, the CNF update takes 58 µs on the M2, 52 µs of
+Palladium kernels inside `jit`, the CNF update takes 57 µs on the M2, 51 µs of
 it GPU time, against 149 µs (61 µs GPU) recorded for jax-mps with async
 dispatch. Open: CPU and jax-mps throughput on the M4 Pro, a long-run loss
 comparison against CPU, and diffrax (host callbacks, dynamic `while`).

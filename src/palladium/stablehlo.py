@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import itertools
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Literal
 
 import ml_dtypes
@@ -516,6 +517,17 @@ def _attributes(op) -> dict:
 
 
 _DISPATCH_TARGET = "palladium_dispatch"
+# Reductions over at most this many elements are folded into their consumer's
+# kernel, unrolled per output element, rather than given 128 threads per output.
+_SHORT_REDUCTION = 16
+
+
+def _short(node: _Op) -> bool:
+    x = node.operands[0]
+    size = math.prod(x.shape[d] for d in node.attributes["dims"])
+    return node.dtype not in (np.int64, np.uint64) and size <= _SHORT_REDUCTION
+
+
 # Buffer arguments one Metal kernel can bind.
 _MAX_BUFFERS = 31
 
@@ -819,9 +831,18 @@ class _Scope:
 class _Kernel:
     """Generates one kernel computing the outputs of one shape."""
 
-    def __init__(self, shape: tuple[int, ...], stored: set[int] | frozenset[int] = frozenset()):
+    def __init__(
+        self,
+        shape: tuple[int, ...],
+        stored: set[int] | frozenset[int] = frozenset(),
+        store: Callable[[_Node], None] | None = None,
+    ):
         self.shape = shape
         self.stored = stored  # ids of ops already in buffers: read, not recomputed
+        # Puts an op in a buffer (adding it to `stored`) before this kernel runs.
+        self.store = store
+        # Needs RELAXED math, not FAST: folds a float maximum or minimum.
+        self.relaxed = False
         self.lines: list[str] = []
         self.helpers: dict[str, str] = {}
         self.buffers: list[_Node] = []  # read nodes, bound before the outputs
@@ -1019,6 +1040,14 @@ class _Kernel:
                 for dim, offset in zip(window_dims, a["offset"], strict=True):
                     inner[dim] = f"({inner[dim]} + {coords[offset]})"
                 return self.value(x, tuple(inner))
+            case "reduce" if _short(node):
+                if len(self.scopes) == 1 or self.store is None:
+                    return self._fold_reduction(node, coords)
+                # Branches name their shifted coordinates afresh, so a fold
+                # at branch coordinates would be regenerated, producers and
+                # all, in every branch that reads it: store it once instead.
+                self.store(node)
+                return self._read(node, coords)
             case "reduce" | "dot_general" | "scatter":
                 return self._read(node, coords)
             case "case":
@@ -1169,6 +1198,34 @@ class _Kernel:
         except EmitError as e:
             raise UnsupportedProgram(f"metal: stablehlo.{node.name}: {e}") from e
 
+    def _fold_reduction(self, node: _Op, coords: tuple[str, ...]) -> str:
+        """A short reduction as a left fold from its initial value, unrolled.
+
+        Like XLA's sequential reduce. Each step gets a temporary: the extremum
+        templates repeat their operands. Under FAST math, producers such as
+        `x * inf - inf` lose their NaNs and extrema their zero signs; RELAXED
+        keeps both (measured on the M2) at FAST's speed, unlike SAFE.
+        """
+        x, init = node.operands
+        dims = sorted(node.attributes["dims"])
+        kind = node.attributes["reducer"]
+        ctype = _ctype(node.dtype)
+        acc_type = "float" if ctype in ("half", "bfloat") else ctype
+        if acc_type == "float" and kind in ("maximum", "minimum"):
+            self.relaxed = True
+        acc = f"{acc_type}({self.value(init, ())})"
+        for index in itertools.product(*(range(x.shape[d]) for d in dims)):
+            fixed, outer = iter(index), iter(coords)
+            inner = tuple(
+                f"{next(fixed)}u" if d in dims else next(outer) for d in range(len(x.shape))
+            )
+            value = f"{acc_type}({self.value(x, inner)})"
+            name = self.temporary()
+            step = format_scalar(_ELEMENTWISE[kind], acc_type, (acc, value))
+            self.lines.append(f"{acc_type} {name} = {step};")
+            acc = name
+        return f"{ctype}({acc})"
+
     def source(self, outputs: list[_Node], name: str) -> str:
         stores = [f"o{k}[i] = {self.value(node, self.coords)};" for k, node in enumerate(outputs)]
         return self.render(outputs, name, stores)
@@ -1204,7 +1261,7 @@ def _reduction_kernel(
     output: _Node,
     name: str,
     chunks: int = 1,
-    stored: set[int] | frozenset[int] = frozenset(),
+    new_kernel: Callable[[tuple[int, ...]], _Kernel] = _Kernel,
 ) -> tuple[_Kernel, str]:
     """128 threads per output; large reductions can write independent partials."""
     x, init = node.operands
@@ -1239,7 +1296,7 @@ def _reduction_kernel(
             ]
         return [f"acc = simd_{intrinsic}(acc);"]
 
-    kernel = _Kernel(output.shape, stored)
+    kernel = new_kernel(output.shape)
     kernel.lines.insert(0, "uint i = g / 128u;")
     kernel.lines += [f"{acc_type} acc = {identity};", "uint t = g % 128u;"]
     start = f"{kernel.coords[-1]} * 4096u + t" if chunks > 1 else "t"
@@ -1411,7 +1468,14 @@ def _compile_graph(
         slots.append(Slot("fresh", node.dtype, node.shape))
 
     launches = []
-    stored: set[int] = set()  # ops materialized to keep kernels within _MAX_BUFFERS
+    stored: set[int] = set()  # ops materialized for the buffer limit or for branches
+
+    def store(node: _Node) -> None:
+        materialize(node)
+        stored.add(id(node))
+
+    def new_kernel(shape: tuple[int, ...]) -> _Kernel:
+        return _Kernel(shape, stored, store)
 
     def launch(
         kernel: _Kernel,
@@ -1431,7 +1495,9 @@ def _compile_graph(
             )
         size = math.prod(nodes[0].shape) if size is None else size
         grid = size * (threads or 1)
-        launches.append(Launch(source, name, tuple(bound), grid, threads, 0 if threads else 2))
+        # Reductions run SAFE; RELAXED keeps folded extrema's infinities and NaNs.
+        mode = 0 if threads else 1 if kernel.relaxed else 2
+        launches.append(Launch(source, name, tuple(bound), grid, threads, mode))
 
     visited: set[int] = set()
     temporaries: list[_Node] = []  # keep synthetic nodes alive while slot_of uses their ids
@@ -1452,7 +1518,7 @@ def _compile_graph(
         temporaries.extend(outputs)
         for result in outputs:
             fresh(result)
-        kernel = _Kernel(node.shape, stored)
+        kernel = new_kernel(node.shape)
         accumulators = [f"acc{k}" for k in range(len(outputs))]
         for name, value in zip(accumulators, reduction.initial, strict=True):
             initial = kernel.value(value, ())
@@ -1527,12 +1593,12 @@ def _compile_graph(
                 add_constant(node)
             else:
                 name = f"init_{len(launches)}"
-                kernel = _Kernel(node.shape, stored)
+                kernel = new_kernel(node.shape)
                 source = kernel.source([node], name)
                 if len(kernel.buffers) >= _MAX_BUFFERS:
                     shrink(node)
                     name = f"init_{len(launches)}"
-                    kernel = _Kernel(node.shape, stored)
+                    kernel = new_kernel(node.shape)
                     source = kernel.source([node], name)
                 fresh(node)
                 launch(kernel, source, name, [node])
@@ -1540,7 +1606,7 @@ def _compile_graph(
 
     def reads(node: _Node) -> set[int]:
         """Buffers a kernel computing `node` binds."""
-        kernel = _Kernel(node.shape, stored)
+        kernel = new_kernel(node.shape)
         kernel.value(node, kernel.coords_of(node.shape))
         return {id(b) for b in kernel.buffers}
 
@@ -1680,8 +1746,8 @@ def _compile_graph(
         if node.name == "dot_general":
             schedule_dot(node)
             return
-        if node.name != "reduce":
-            return
+        if node.name != "reduce" or _short(node):
+            return  # short reductions are folded into the kernels that read them
         x, init = node.operands
         size = math.prod(x.shape[d] for d in node.attributes["dims"])
         # Split long, low-output-count reductions so full reductions occupy the GPU.
@@ -1697,7 +1763,7 @@ def _compile_graph(
             temporaries.append(partial)
             fresh(partial)
             name = f"reduce_{len(launches)}"
-            kernel, source = _reduction_kernel(node, partial, name, chunks, stored)
+            kernel, source = _reduction_kernel(node, partial, name, chunks, new_kernel)
             launch(kernel, source, name, [partial], 128)
             reduction = _Op(
                 "reduce",
@@ -1708,7 +1774,7 @@ def _compile_graph(
             )
         fresh(node)
         name = f"reduce_{len(launches)}"
-        kernel, source = _reduction_kernel(reduction, node, name, stored=stored)
+        kernel, source = _reduction_kernel(reduction, node, name, new_kernel=new_kernel)
         launch(kernel, source, name, [node], 128)
 
     def schedule_scatter(node: _Op) -> None:
@@ -1724,7 +1790,7 @@ def _compile_graph(
                 "metal: stablehlo.scatter requires floating or int32/uint32 data and 32-bit indices"
             )
         fresh(node)
-        kernel = _Kernel(node.shape, stored)
+        kernel = new_kernel(node.shape)
         name = f"scatter_init_{len(launches)}"
         if not math.prod(updates.shape) or not math.prod(node.shape):
             launch(kernel, kernel.source([x], name), name, [node])
@@ -1742,7 +1808,7 @@ def _compile_graph(
             source = kernel.source([x], name)
         launch(kernel, source, name, [target])
         a = node.attributes
-        kernel = _Kernel(updates.shape, stored)
+        kernel = new_kernel(updates.shape)
         batch_coords = iter(c for d, c in enumerate(kernel.coords) if d not in a["window"])
         index_coords = tuple(
             "0u" if d == a["vector"] else next(batch_coords) for d in range(len(indices.shape))
@@ -1790,7 +1856,7 @@ def _compile_graph(
         launch(kernel, source, name, [target])
         launches[-1] = dataclasses.replace(launches[-1], grid=math.prod(updates.shape), math_mode=0)
         if narrow:
-            kernel = _Kernel(node.shape, stored)
+            kernel = new_kernel(node.shape)
             value = kernel.value(target, kernel.coords)
             name = f"scatter_unpack_{len(launches)}"
             source = kernel.render([node], name, [f"o0[i] = as_type<{ctype}>(ushort({value}));"])
@@ -1823,7 +1889,7 @@ def _compile_graph(
             return
         if not k:
             zero = _Constant(node.dtype, node.shape, 0)
-            kernel = _Kernel(node.shape, stored)
+            kernel = new_kernel(node.shape)
             name = f"empty_dot_{len(launches)}"
             # Use the dot's output slot for the zero-producing kernel.
             launch(kernel, kernel.source([zero], name), name, [node])
@@ -1879,7 +1945,7 @@ def _compile_graph(
 
     def fuse(shape: tuple[int, ...], items: list) -> tuple[_Kernel, list[str], list[_Node]]:
         """One kernel storing each item: a node, or an (update, target) pair."""
-        kernel = _Kernel(shape, stored)
+        kernel = new_kernel(shape)
         stores: list[str] = []
         targets: list[_Node] = []
         for item in items:

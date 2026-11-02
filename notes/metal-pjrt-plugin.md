@@ -262,8 +262,10 @@ In order of what M2's SBI step needs first.
    initializers need not match XLA's reduction schedule, which can insert
    them multiple times ([StableHLO semantics](https://openxla.org/stablehlo/spec#reduce)).
 
-   Remaining: parallel variadic reductions, coalesced column reductions,
-   tuning small rows, and epilogue fusion.
+   Reductions over at most 16 elements fold into their consumers instead
+   (see the CNF section below). Remaining: parallel variadic reductions,
+   coalesced column reductions, one thread per output for rows of 17 to
+   about 128 elements, and epilogue fusion.
 2. **`concatenate`, `pad`, dynamic slices (done).** `_Kernel.choose` emits
    each branch's entire producer chain inside its guard. Value and reshape
    memoization is scoped to that branch, with unique temporary names across
@@ -717,8 +719,9 @@ handler).
 
 | Workload, pipelined | Wall | Host | Encode | GPU busy | GPU/wall | Launches |
 |---|---:|---:|---:|---:|---:|---:|
-| CNF update, Palladium kernels (`pallas_call`) | 0.058 ms | 0.017 ms | 0.010 ms | 0.052 ms | 90.7% | 10 |
-| CNF update, plain JAX | 1.863 ms | 0.856 ms | 0.822 ms | 1.843 ms | 98.9% | 705 |
+| CNF update, Palladium kernels (`pallas_call`) | 0.057 ms | 0.016 ms | 0.009 ms | 0.051 ms | 90.1% | 9 |
+| CNF update, plain JAX (before the fixes below) | 1.863 ms | 0.856 ms | 0.822 ms | 1.843 ms | 98.9% | 705 |
+| CNF update, plain JAX (after) | 0.551 ms | 0.273 ms | 0.263 ms | 0.541 ms | 98.2% | 464 |
 
 For comparison on the M2 (min of five batches of 200): XLA:CPU takes 0.91 ms
 for the plain-JAX update, and the same kernels through `metal_call` on the
@@ -728,13 +731,42 @@ outside the GPU's 52 µs, where jax-mps spent about 88 µs outside 61 µs. All
 three Metal paths match CPU over ten updates at normwise rtol 1e-4
 (`test_cnf_training_matches_cpu_over_ten_steps`).
 
-Plain JAX on `metal` loses to XLA:CPU, as the replay estimate predicted
-(2.58 ms there). It needs 705 launches per update, mostly small kernels in the
-backward loop, where one fused value read 50 buffers, above Metal's
-31-buffer limit for a kernel. `_compile_graph` now splits fusions whose
-outputs and reads exceed 31 buffers into several kernels, and stores the
-largest operand that fits in one kernel when a single value reads more
-(descending into operands that are too large themselves).
+Plain JAX on `metal` first lost to XLA:CPU (1.86 ms against 0.91 ms), as
+the replay estimate predicted (2.58 ms there). Two fixes:
+
+- **Metal's 31-buffer limit.** One fused value in the backward loop read 50
+  buffers. `_compile_graph` now splits fusions whose outputs and reads exceed
+  31 buffers into several kernels, and stores the largest operand that fits
+  in one kernel when a single value reads more (descending into operands
+  that are too large themselves).
+- **Short reductions.** The gap was kernel work, not launch overhead: a
+  trivial launch costs 0.70 µs of GPU time (705 launches ≈ 0.49 ms), and
+  the update's time grew 12× for 16× the batch with the same launches. 517
+  of the 705 launches were reductions over axes of 1, 2 or 4 elements, each
+  with 128 threads per output; one costs 4–6 µs. Reductions over at most 16
+  elements now fold into the kernel that reads them, unrolled from the
+  initial value as XLA's sequential reduce. A kernel that folds a float
+  maximum or minimum runs RELAXED: under FAST, `x * inf - inf` lost its NaN
+  and maxima of negative zeros their sign; SAFE kept both but slowed the
+  SBI dense update by 10% through its `exp` and `log`; RELAXED keeps both at
+  FAST's speed (M2). Folding recomputes a short reduction in every thread
+  that reads it, which measured faster than storing it in both workloads.
+  It folds only at the kernel body's coordinates, though: guarded branches
+  name their shifted coordinates afresh, so a fold read inside branches was
+  regenerated, producers and all, in each one. Folding everywhere made one
+  plain-JAX CNF kernel 9.2 MB of MSL and its compile 18.4 s (from 0.08 s);
+  a short reduction read at branch coordinates is now stored once by a
+  one-thread-per-output kernel and read from its buffer (compile 0.11 s,
+  largest kernel 16 KB; `test_plain_jax_cnf_kernels_stay_small`).
+
+| Plain-JAX CNF update, M2 | Metal before | Metal after | XLA:CPU |
+|---|---:|---:|---:|
+| n = 256 | 1.83 ms, 705 launches | 0.56 ms, 464 launches | 0.91 ms |
+| n = 1,024 | 5.76 ms | 0.86 ms | 8.12 ms |
+| n = 4,096 | 22.0 ms | 2.40 ms | 30.3 ms |
+
+The SBI step is unchanged within noise (0.62 ms, 249 launches); its dense
+update dropped from 48 to 41 launches (0.30 ms).
 
 ### Recomputation in guarded branches
 
