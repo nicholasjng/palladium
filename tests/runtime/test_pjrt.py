@@ -332,6 +332,18 @@ def test_static_loops_match_cpu():
             (lambda x: lax.scan(lambda c, row: (c + row, c * 2), jnp.zeros(4), x,
                                reverse=True), x),
             (lambda x: lax.fori_loop(0, 4, lambda i, y: y + 1, x), np.zeros((0, 3), np.float32)),
+            # A carry also read besides its update must not be updated in place.
+            (lambda x: lax.fori_loop(1, 3, lambda i, t: lax.dynamic_update_slice(
+                t, lax.dynamic_slice(t, (i - 1, 0), (1, 4)) * 2 + 1, (i, 0)), x), x),
+            # An inner trajectory is re-initialized on every outer iteration.
+            (lambda x: lax.fori_loop(0, 3, lambda i, a: a + lax.scan(
+                lambda c, _: (c * 0.5 + i, c), a[0], None, length=3)[1], x), x),
+            # Induction variables: non-unit steps and int32 wrap-around.
+            (lambda x: lax.while_loop(lambda s: s[0] < 6,
+                lambda s: (s[0] + 1, s[1] + 3, s[2] + s[1]), (0, 5, x))[1:], x),
+            (lambda x: lax.while_loop(lambda s: s[0] < 5,
+                lambda s: (s[0] + 1, s[1] + np.int32(1), s[2] + (s[1] % 7)),
+                (0, np.int32(2**31 - 2), x)), x),
             (lambda x: lax.while_loop(lambda s: s[0] < np.uint32(2**32 - 1),
                 lambda s: (s[0] + np.uint32(1), s[1] + 1),
                 (np.uint32(2**32 - 3), x)), x),
@@ -667,6 +679,36 @@ def test_raw_case_out_of_range_indices_select_last_branch():
             run(kernel,[buffers[s] for s in launch.slots],launch.grid)
             assert buffers[program.outputs[0]].item() == expected
     ''')
+
+
+def test_execution_stats_count_launches_and_gpu_time():
+    _check("""
+        import time
+        import jax, numpy as np
+        from jax import lax
+        from palladium import _pjrt
+        device = jax.devices('metal')[0]
+        x = jax.device_put(np.ones(1 << 20, np.float32), device)
+        loop = jax.jit(lambda x: lax.fori_loop(0, 5, lambda i, y: y * 2 + 1, x))
+        passthrough = jax.jit(lambda x: x)
+        jax.block_until_ready((loop(x), passthrough(x)))
+        _pjrt.stats(reset=True)
+        start = time.perf_counter()
+        for _ in range(10):
+            y = loop(x)
+        jax.block_until_ready(y)
+        wall = time.perf_counter() - start
+        # The same launches each call, at least one per replayed iteration;
+        # the blit-only call has a command buffer but no launch.
+        jax.block_until_ready(passthrough(x))
+        s = _pjrt.stats(reset=True)
+        assert s['executions'] == 11 and s['command_buffers'] == 11, s
+        assert s['launches'] >= 50 and s['launches'] % 10 == 0, s
+        assert 0 < s['gpu_busy_seconds'] <= s['gpu_sum_seconds'] + 1e-12, s
+        assert s['gpu_busy_seconds'] < wall + 0.05, (s, wall)
+        assert s['encode_seconds'] > 0 and s['throttle_seconds'] >= 0, s
+        assert _pjrt.stats()['executions'] == 0
+    """)
 
 
 def test_compiled_analysis_api():

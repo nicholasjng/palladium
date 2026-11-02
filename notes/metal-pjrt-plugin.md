@@ -124,6 +124,7 @@ almost always means jaxlib called an API slot the plugin left null. Run with
 | `examples/training_steps.py` | The SBI, LLM and SAM2-like training steps |
 | `examples/pjrt_m1_benchmark.py` | The M1 overhead, bandwidth and compile-time artifact |
 | `examples/pjrt_sbi_audit.py` | The SBI Metal/CPU numerical audit |
+| `examples/pjrt_m2_profile.py` | M2: wall, host, encode and GPU time per SBI step |
 
 ## How it was built
 
@@ -294,8 +295,16 @@ In order of what M2's SBI step needs first.
    eagerly. All branches are validated; unsupported/effectful ops still fail,
    including in an untaken branch. Out-of-range raw StableHLO indices select
    the last branch; JAX switch supplies its own clamp. Selective dispatch of
-   expensive branches remains an optimization. Trajectory updates currently copy the
-   full carried array per iteration; in-place disjoint updates are future work.
+   expensive branches remains an optimization.
+
+   Replay binds induction variables (integer scalar carries with a constant
+   start and step, including the proven counter and `fori_loop`'s index) to
+   one constant array per variable, at a byte offset per iteration, instead
+   of computing them with a kernel. A carry updated only by a
+   `dynamic_update_slice` of itself, and read nowhere else in the body, lives
+   in one buffer per execution: each iteration writes just its update, fused
+   into the body's kernel of the same element count. This covers `lax.scan`
+   outputs. Fused kernels group outputs by element count, not shape.
 5. **`dot_general` (floating slice done).** Normalize dimension numbers to
    `(batch, M, K)` and `(batch, K, N)`, preserving the specified pairing/order
    of batch and contracting axes. Canonical buffers bind directly; packing
@@ -619,6 +628,58 @@ kernels (`exp`, `log`, `tanh`, `erf`) and the 200-step simulation, whose
 trajectory already differs by 1.9e-6 (about 32 u). A rule derived from the
 floor would be near 1e-5 and would fail the moments. Locating this gap is M2
 work: rerun with SAFE elementwise math first.
+
+## M2 baseline: where an SBI step's time goes (2026-11-02, M2)
+
+M2 requires GPU time to be most of a step's wall time. The plugin now counts
+executions, command buffers and launches, host seconds inside Execute
+(encoding; waiting for the in-flight bound), and GPU time from each command
+buffer's `GPUStartTime`/`GPUEndTime`: their union (busy) and their sum.
+`palladium._pjrt.stats(reset=...)` reads them; `examples/pjrt_m2_profile.py`
+reports them per step for the SBI step and its two halves:
+
+| Workload, pipelined | Wall | Host | Encode | GPU busy | GPU/wall | Launches |
+|---|---:|---:|---:|---:|---:|---:|
+| Full SBI step | 2.145 ms | 0.844 ms | 0.738 ms | 1.133 ms | 52.8% | 657 |
+| Simulation (200 RK4 steps) | 1.805 ms | 0.652 ms | 0.623 ms | 0.927 ms | 51.4% | 603 |
+| Dense update (MDN loss, grads, AdamW) | 0.304 ms | 0.059 ms | 0.040 ms | 0.152 ms | 50.1% | 48 |
+
+Medians of five calibrated batches on the Apple M2, fixed resident inputs.
+For comparison, the same step takes 1.32 ms on XLA:CPU and 18.66 ms on
+jax-mps 0.11.1 (min of five batches of 20).
+
+The step is not host-bound. With 64 calls queued, the host spends 1.6 of its
+1.9 ms per call blocked by the 16-execution in-flight bound, so the queue is
+always full. Yet command buffers execute during only about half of the wall
+time (busy 1.05 ms of 2.12 ms per call). Their GPU intervals overlap (sum
+3.5 ms against busy 1.05 ms per call), so consecutive command buffers are
+scheduled concurrently, but some gap between them remains. A single isolated
+call takes 6.2 ms of GPU time against about 1.1 ms pipelined, which suggests
+the GPU clocks down when work is sparse. Neither effect is explained yet;
+a Metal System Trace in Instruments is the next tool.
+
+The simulation dominated: 603 of 657 launches, three per RK4 iteration, each
+over only 512×2 elements. One launch computed the loop counter, whose values
+are known when replaying; a second rewrote the whole 200×512×2 trajectory
+(204,800 threads) to append one row. Binding induction variables to constant
+arrays, updating scan outputs in place, and grouping kernels by element count
+leave one 1,024-thread launch per iteration:
+
+| SBI step on the M2, pipelined | Before | After |
+|---|---:|---:|
+| Full step wall | 2.145 ms | 0.996 ms |
+| Simulation wall | 1.805 ms | 0.657 ms |
+| Launches per step | 657 | 256 |
+| Host encoding per step | 0.738 ms | 0.297 ms |
+| GPU busy per step | 1.133 ms | 0.505 ms |
+| GPU busy / wall | 52.8% | 50.7% |
+
+The full step now beats XLA:CPU on this machine (1.32 ms) by 1.3×. GPU busy
+time is still only half the wall time, so the unexplained gaps between
+command buffers, not launch count, are now the main obstacle to M2's GPU-time
+target. The RK4 body kernel also recomputes earlier stages inside each
+concatenate branch, because value memoization is scoped per guarded branch;
+that costs GPU arithmetic, not launches.
 
 ## Success criteria for M1, against jax 0.12
 

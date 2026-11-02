@@ -12,7 +12,8 @@ extern "C" {
 const PJRT_Api* GetPjrtApi();
 void palladium_pjrt_set_compiler(int (*)(const char*, size_t, void*));
 int pp_slot(void*, int, int, const int64_t*, size_t, const void*, size_t);
-int pp_kernel(void*, const char*, const char*, int, const int*, size_t, const size_t*, const size_t*);
+int pp_kernel(void*, const char*, const char*, int, const int*, size_t, const size_t*, const size_t*,
+              const size_t*);
 void pp_output(void*, int);
 void pp_alias(void*, int, int);
 }
@@ -71,7 +72,7 @@ kernel void add1(device const float* x [[buffer(0)]], device float* y [[buffer(1
 )";
         int slots[] = {input, output};
         size_t grid[] = {size_t(n), 1, 1}, group[] = {0, 0, 0};
-        if (pp_kernel(p, source, "add1", 0, slots, 2, grid, group)) return 1;
+        if (pp_kernel(p, source, "add1", 0, slots, 2, grid, group, nullptr)) return 1;
     }
     pp_output(p, output);
     if (*code == 'd') pp_alias(p, 0, 0);

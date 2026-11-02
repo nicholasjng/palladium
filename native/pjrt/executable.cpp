@@ -5,6 +5,7 @@
 // buffer and commits without waiting.
 #include <cstring>
 #include <algorithm>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <map>
@@ -36,6 +37,7 @@ struct Kernel {
     std::shared_ptr<Library> library;
     std::shared_ptr<ComputePipeline> pipeline;
     std::vector<int> slots;  // bound at buffer indices 0..n-1
+    std::vector<size_t> offsets;  // byte offset of each binding
     Dim3 grid, threadgroup;  // an empty threadgroup lets the pipeline choose
 };
 
@@ -119,7 +121,7 @@ EXPORT int pp_slot(Program* p, int kind, int type, const int64_t* dims, size_t r
 
 EXPORT int pp_kernel(Program* p, const char* msl, const char* function, int math_mode,
                      const int* slots, size_t num_slots, const size_t* grid,
-                     const size_t* threadgroup) {
+                     const size_t* threadgroup, const size_t* offsets) {
     try {
         auto key = std::make_tuple(std::string(msl), std::string(function), math_mode);
         auto found = p->pipelines.find(key);
@@ -129,8 +131,10 @@ EXPORT int pp_kernel(Program* p, const char* msl, const char* function, int math
             found = p->pipelines.emplace(std::move(key), std::make_pair(library, pipeline)).first;
         }
         const auto& [library, pipeline] = found->second;
+        std::vector<size_t> bound_offsets(num_slots, 0);
+        if (offsets) bound_offsets.assign(offsets, offsets + num_slots);
         p->kernels.push_back({library, pipeline, {slots, slots + num_slots},
-                              {grid[0], grid[1], grid[2]},
+                              std::move(bound_offsets), {grid[0], grid[1], grid[2]},
                               {threadgroup[0], threadgroup[1], threadgroup[2]}});
         return 0;
     } catch (const MetalError& e) {
@@ -188,6 +192,32 @@ constexpr size_t kMaxInFlight = 16;
 std::mutex in_flight_mutex;
 std::deque<std::shared_ptr<Completion>> in_flight;
 
+// Execution counters for profiling, read through palladium_pjrt_stats. GPU
+// intervals come from completion handlers; on one serial queue they arrive
+// in start order, so `gpu_busy` merges overlapping intervals incrementally.
+struct Stats {
+    std::mutex mutex;
+    uint64_t executions = 0, command_buffers = 0, launches = 0;
+    double encode = 0, throttle = 0, gpu_sum = 0, gpu_busy = 0, gpu_last_end = 0;
+};
+Stats& stats() {
+    static Stats* s = new Stats;  // leaked: completion handlers may outlive statics
+    return *s;
+}
+
+double since(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+void record_gpu(double start, double end) {
+    if (!(end > start)) return;
+    Stats& s = stats();
+    std::lock_guard lock(s.mutex);
+    s.gpu_sum += end - start;
+    s.gpu_busy += std::max(0.0, end - std::max(start, s.gpu_last_end));
+    s.gpu_last_end = std::max(s.gpu_last_end, end);
+}
+
 void throttle() {
     std::unique_lock lock(in_flight_mutex);
     while (!in_flight.empty() && (in_flight.front()->ready() || in_flight.size() >= kMaxInFlight)) {
@@ -210,7 +240,12 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
                      "metal: the program takes " + std::to_string(p.num_parameters) +
                          " arguments, got " + std::to_string(num_args));
     }
+    auto throttle_start = std::chrono::steady_clock::now();
     throttle();
+    auto encode_start = std::chrono::steady_clock::now();
+    double throttled = std::chrono::duration<double>(encode_start - throttle_start).count();
+    size_t launches = 0;
+    bool committed = false;
     std::vector<Buffer*> bound(p.slots.size());
     std::vector<std::shared_ptr<Buffer>> retained;
     std::vector<std::unique_ptr<PJRT_Buffer>> fresh(p.slots.size());
@@ -264,7 +299,9 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
     }
     // Independent owners avoid a shared last-use marker, whose update can race
     // or occur in a different order from command-buffer submission.
-    auto finish = [program, completion, retained = std::move(retained)](const char* failure) {
+    auto finish = [program, completion, retained = std::move(retained)](
+                      const char* failure, double gpu_start, double gpu_end) {
+        record_gpu(gpu_start, gpu_end);
         if (failure) return completion->set(PJRT_Error_Code_INTERNAL, failure);
         completion->set();
     };
@@ -275,12 +312,15 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
             if (!k.grid.volume()) continue;
             Launch launch;
             launch.pipeline = k.pipeline.get();
-            for (int s : k.slots) launch.buffers.push_back({bound[s], 0});
+            for (size_t j = 0; j < k.slots.size(); ++j) {
+                launch.buffers.push_back({bound[k.slots[j]], k.offsets[j]});
+            }
             launch.grid = k.grid;
             launch.threadgroup =
                 k.threadgroup.volume() ? k.threadgroup : k.pipeline->default_threadgroup(k.grid);
             batch.add(launch);
             encoded = true;
+            ++launches;
         }
         // A host memcpy in the completion handler can lag the next command
         // buffer. GPU copies make passthrough/repeated outputs safe to chain.
@@ -290,11 +330,12 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
         }
         if (encoded) {
             batch.commit(finish);
+            committed = true;
             std::lock_guard lock(in_flight_mutex);
             in_flight.push_back(completion);
         } else {
             // Empty work still joins its input readiness below, asynchronously.
-            finish(nullptr);
+            finish(nullptr, 0, 0);
         }
     } catch (const std::exception& e) {
         return error(PJRT_Error_Code_INTERNAL, std::string("metal: ") + e.what());
@@ -306,10 +347,45 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
         results[i]->ready = completion;
         outputs[i] = results[i].release();
     }
+    {
+        Stats& s = stats();
+        std::lock_guard lock(s.mutex);
+        ++s.executions;
+        s.command_buffers += committed;
+        s.launches += launches;
+        s.throttle += throttled;
+        s.encode += since(encode_start);
+    }
     return nullptr;
 }
 
 }  // namespace
+
+extern "C" {
+
+// Counters since the last reset. Host seconds are spent inside Execute:
+// `throttle_seconds` waiting for the in-flight bound, `encode_seconds` binding,
+// encoding and committing. `gpu_busy_seconds` is the union of command-buffer
+// GPU intervals, `gpu_sum_seconds` their sum. Completion handlers still in
+// flight are not counted yet: synchronize before reading.
+struct PalladiumPjrtStats {
+    uint64_t executions, command_buffers, launches;
+    double encode_seconds, throttle_seconds, gpu_busy_seconds, gpu_sum_seconds;
+};
+
+EXPORT void palladium_pjrt_stats(PalladiumPjrtStats* out, int reset) {
+    Stats& s = stats();
+    std::lock_guard lock(s.mutex);
+    *out = {s.executions, s.command_buffers, s.launches, s.encode,
+            s.throttle,   s.gpu_busy,        s.gpu_sum};
+    if (reset) {
+        s.executions = s.command_buffers = s.launches = 0;
+        s.encode = s.throttle = s.gpu_sum = s.gpu_busy = 0;
+        // Keep gpu_last_end: a later interval must not re-count overlap.
+    }
+}
+
+}  // extern "C"
 
 void add_executable_api(PJRT_Api& api) {
     api.PJRT_Client_Compile = compile;

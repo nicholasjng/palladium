@@ -45,6 +45,19 @@ _PJRT_TYPES = {
 _SLOT_KINDS = {"parameter": 0, "fresh": 1, "constant": 2}
 _UNIMPLEMENTED, _INTERNAL = 12, 13
 
+
+class _Stats(ctypes.Structure):
+    _fields_ = [
+        ("executions", ctypes.c_uint64),
+        ("command_buffers", ctypes.c_uint64),
+        ("launches", ctypes.c_uint64),
+        ("encode_seconds", ctypes.c_double),
+        ("throttle_seconds", ctypes.c_double),
+        ("gpu_busy_seconds", ctypes.c_double),
+        ("gpu_sum_seconds", ctypes.c_double),
+    ]
+
+
 _COMPILER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
 _INT64S = ctypes.POINTER(ctypes.c_int64)
 _SIGNATURES = {
@@ -73,10 +86,12 @@ _SIGNATURES = {
             ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_size_t),
             ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(ctypes.c_size_t),
         ],
     ),
     "pp_output": (None, [ctypes.c_void_p, ctypes.c_int]),
     "pp_alias": (None, [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]),
+    "palladium_pjrt_stats": (None, [ctypes.POINTER(_Stats), ctypes.c_int]),
 }
 
 
@@ -98,6 +113,28 @@ def library() -> ctypes.CDLL:
         function.restype = restype
         function.argtypes = argtypes
     return lib
+
+
+def stats(reset: bool = False) -> dict[str, float]:
+    """Execution counters of the plugin since the last reset.
+
+    Parameters
+    ----------
+    reset : bool
+        Zero the counters after reading them.
+
+    Returns
+    -------
+    dict
+        ``executions``, ``command_buffers`` and ``launches`` encoded;
+        ``encode_seconds`` and ``throttle_seconds`` of host time inside
+        Execute; ``gpu_busy_seconds`` (union of command-buffer GPU intervals)
+        and ``gpu_sum_seconds``. GPU time is recorded by completion handlers,
+        so synchronize on the last outputs before reading.
+    """
+    out = _Stats()
+    library().palladium_pjrt_stats(ctypes.byref(out), int(reset))
+    return {field[0]: getattr(out, field[0]) for field in _Stats._fields_}
 
 
 class _Recorded(Exception):
@@ -139,6 +176,7 @@ def _describe(lib: ctypes.CDLL, builder: int, code: bytes) -> None:
             (ctypes.c_size_t * 3)(launch.threadgroup, 1, 1)
             if launch.threadgroup
             else (ctypes.c_size_t * 3)(),
+            (ctypes.c_size_t * len(launch.offsets))(*launch.offsets) if launch.offsets else None,
         )
         if status < 0:
             raise _Recorded

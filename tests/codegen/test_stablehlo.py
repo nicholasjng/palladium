@@ -19,13 +19,14 @@ def _compile(fn, *shapes, dtype=np.float32, version="1.0.0"):
     return compile_program(stablehlo.serialize_portable_artifact_str(text, version))
 
 
-def test_one_kernel_per_output_shape():
-    program = _compile(lambda x: (x + 1, x * 2, x.T), (3, 4))
-    assert [s.kind for s in program.slots] == ["parameter", "fresh", "fresh", "fresh"]
-    assert program.outputs == [1, 2, 3]
+def test_one_kernel_per_output_element_count():
+    """Outputs of equal size share a launch, even with different shapes."""
+    program = _compile(lambda x: (x + 1, x * 2, x.T, x[:2]), (3, 4))
+    assert [s.kind for s in program.slots] == ["parameter", *["fresh"] * 4]
+    assert program.outputs == [1, 2, 3, 4]
     assert [(launch.grid, launch.slots) for launch in program.launches] == [
-        (12, (0, 1, 2)),
-        (12, (0, 3)),
+        (12, (0, 1, 2, 3)),
+        (8, (0, 4)),
     ]
 
 
@@ -120,12 +121,46 @@ def test_counted_loop_reuses_sources_and_bounded_storage():
 
     short, long = compile_scan(3), compile_scan(200)
     assert len(short.slots) == len(long.slots)
-    assert len(long.launches) > len(short.launches)
-    assert (
-        len({launch.source for launch in long.launches}) == 3
-    )  # counter init and two body kernels
+    # One launch per iteration: the counter is a constant, not a kernel.
+    assert len(short.launches) == 3 and len(long.launches) == 200
+    assert len({launch.source for launch in long.launches}) == 1
     # The result alternates output banks according to parity.
     assert short.outputs != long.outputs
+
+
+def test_loop_counter_binds_one_constant_array_at_offsets():
+    def loop(x):
+        return lax.while_loop(lambda s: s[0] < 7, lambda s: (s[0] + 1, s[1] + s[0]), (3, x))[1]
+
+    program = _compile(loop, (4,))
+    [array] = [k for k, s in enumerate(program.slots) if s.kind == "constant" and s.shape == (4,)]
+    assert np.frombuffer(program.slots[array].data, np.int32).tolist() == [3, 4, 5, 6]
+    offsets = [launch.offsets[launch.slots.index(array)] for launch in program.launches]
+    assert offsets == [0, 4, 8, 12]
+
+
+def test_scan_outputs_update_in_place_with_one_launch_per_iteration():
+    """Stacking ys writes one row per iteration, never the whole trajectory."""
+    program = _compile(
+        lambda x: lax.scan(lambda c, _: (c * 0.5 + 1, c), x, None, length=50), (3, 4)
+    )
+    trajectory = [k for k, s in enumerate(program.slots) if s.shape == (50, 3, 4)]
+    body = [launch for launch in program.launches if launch.grid == 12]
+    assert len(body) == 50, [launch.grid for launch in program.launches]
+    assert all(launch.grid <= 50 * 12 for launch in program.launches)
+    # Every iteration writes the same trajectory buffer.
+    assert len({s for launch in body for s in launch.slots if s in trajectory}) == 1
+
+
+def test_carry_read_besides_its_update_is_not_updated_in_place():
+    def body(i, t):
+        previous = lax.dynamic_slice(t, (i - 1, 0), (1, 4))
+        return lax.dynamic_update_slice(t, previous * 2 + 1, (i, 0))
+
+    program = _compile(lambda t: lax.fori_loop(1, 6, body, t), (6, 4))
+    # Each iteration rewrites the whole carry into a fresh bank. fori_loop's
+    # own index is an induction variable too: no per-iteration scalar kernel.
+    assert [launch.grid for launch in program.launches] == [24] * 5
 
 
 def test_zero_trip_loop_returns_initial_value():

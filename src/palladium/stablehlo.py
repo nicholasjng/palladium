@@ -52,7 +52,10 @@ class Slot:
 
 @dataclasses.dataclass(frozen=True)
 class Launch:
-    """One kernel over `grid` threads, its buffers bound to `slots` in order."""
+    """One kernel over `grid` threads, its buffers bound to `slots` in order.
+
+    `offsets`, when given, are the byte offsets of each binding (default 0).
+    """
 
     source: str
     function: str
@@ -60,6 +63,7 @@ class Launch:
     grid: int | tuple[int, int, int]
     threadgroup: int = 0
     math_mode: int = 2  # runtime MathMode: Safe=0, Relaxed=1, Fast=2
+    offsets: tuple[int, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -223,6 +227,8 @@ class _While:
     parameters: list[_Parameter]
     results: list[_Node]  # updated carries
     trips: int
+    counter: int  # carry index of the proven counter
+    start: int  # its initial value
 
 
 @dataclasses.dataclass(eq=False)
@@ -262,8 +268,11 @@ def _dependencies(node: _Node) -> list[_Node]:
 
 def _trip_count(
     predicate: _Node, parameters: list[_Parameter], inputs: list[_Node], results: list[_Node]
-) -> int:
-    """Prove a scalar integer counter starts at a constant and advances to a bound."""
+) -> tuple[int, int, int]:
+    """Prove a scalar integer counter starts at a constant and advances to a bound.
+
+    Returns the trip count, the counter's carry index and its start value.
+    """
     message = "metal: stablehlo.while requires a constant counter, LT bound and unit increment"
 
     def invariant(value: _Node) -> _Node:
@@ -304,7 +313,7 @@ def _trip_count(
         or bound.splat is None
     ):
         raise UnsupportedProgram(message)
-    return max(0, int(bound.splat) - int(start.splat))
+    return max(0, int(bound.splat) - int(start.splat)), index, int(start.splat)
 
 
 def _constant(op) -> _Constant:
@@ -554,8 +563,8 @@ def _graph(module: ir.Module) -> tuple[list[_Parameter], list[_Node]]:
                     if isinstance(parameter, _Parameter) and parameter in used:
                         parameters.append(parameter)
                         inputs.append(env[value])
-                trips = _trip_count(condition, parameters, inputs, body)
-                loop = _While(inputs, parameters, body, trips)
+                trips, counter, start = _trip_count(condition, parameters, inputs, body)
+                loop = _While(inputs, parameters, body, trips, counter, start)
                 for i, value in enumerate(op.results):
                     env[value] = _LoopResult(loop, i, *_tensor(value))
                 continue
@@ -634,6 +643,10 @@ class _Kernel:
         self.lines += [
             f"uint {c} = {e};" for c, e in zip(self.coords, _delinear("i", shape), strict=True)
         ]
+
+    def coords_of(self, shape: tuple[int, ...]) -> tuple[str, ...]:
+        """Coordinates in `shape` of this thread's flat index."""
+        return self.coords if shape == self.shape else _delinear("i", shape)
 
     def require(self, name: str, source: str) -> None:
         self.helpers[name] = source
@@ -1005,8 +1018,87 @@ def compile_program(code: bytes) -> Program:
     return dataclasses.replace(_compile_graph(parameters, results), aliases=tuple(aliases))
 
 
-def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Program:
+def _inductions(loop: _While) -> dict[int, tuple[int, int]]:
+    """Integer scalar carries that start at a constant and add one each iteration.
 
+    Maps carry index to (start, step); always includes the proven counter. Their
+    value in every iteration is known, so no kernel needs to compute them.
+    """
+    found = {loop.counter: (loop.start, 1)}
+    count = len(loop.results)
+
+    def invariant(value: _Node) -> _Node:
+        if isinstance(value, _Parameter) and value in loop.parameters:
+            k = loop.parameters.index(value)
+            if k >= count or loop.results[k] is value:
+                return loop.inputs[k]
+        return value
+
+    for k, (parameter, start, result) in enumerate(
+        zip(loop.parameters[:count], loop.inputs[:count], loop.results, strict=True)
+    ):
+        if (
+            k in found
+            or parameter.shape
+            or parameter.dtype.kind not in "iu"
+            or not isinstance(start, _Constant)
+            or start.splat is None
+            or not isinstance(result, _Op)
+            or result.name != "add"
+        ):
+            continue
+        a, b = result.operands
+        step = invariant(b if a is parameter else a if b is parameter else parameter)
+        if isinstance(step, _Constant) and step.splat is not None:
+            found[k] = (int(start.splat), int(step.splat))
+    return found
+
+
+def _in_place_carries(loop: _While) -> dict[int, _Op]:
+    """Carries updated only by a dynamic_update_slice of themselves.
+
+    Such a carry can live in one buffer for the whole loop: each iteration
+    writes just the update. Safe only if nothing else in the body reads the
+    old carry or the updated value, so no read can observe a partial write.
+    """
+    uses: dict[int, int] = {}
+    seen: set[int] = set()
+    pending = list(loop.results)
+    while pending:
+        node = pending.pop()
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        for dependency in _dependencies(node):
+            uses[id(dependency)] = uses.get(id(dependency), 0) + 1
+            pending.append(dependency)
+    for result in loop.results:
+        uses[id(result)] = uses.get(id(result), 0) + 1
+    carries = {}
+    for k, result in enumerate(loop.results):
+        parameter = loop.parameters[k]
+        if (
+            isinstance(result, _Op)
+            and result.name == "dynamic_update_slice"
+            and result.operands[0] is parameter
+            and uses.get(id(result)) == 1
+            and uses.get(id(parameter)) == 1
+            and math.prod(result.operands[1].shape)
+        ):
+            carries[k] = result
+    return carries
+
+
+def _compile_graph(
+    parameters: list[_Parameter],
+    results: list[_Node],
+    updates: Sequence[tuple[_Op, _Parameter]] = (),
+) -> Program:
+    """Slots and launches computing `results` from `parameters`.
+
+    Each of `updates` is a dynamic_update_slice whose operand is the paired
+    parameter: its update is written into that parameter's buffer in place.
+    """
     slots = [Slot("parameter", p.dtype, p.shape) for p in parameters]
     slot_of: dict[int, int] = {id(p): k for k, p in enumerate(parameters)}
 
@@ -1023,13 +1115,19 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
     launches = []
 
     def launch(
-        kernel: _Kernel, source: str, name: str, nodes: list[_Node], threads: int = 0
+        kernel: _Kernel,
+        source: str,
+        name: str,
+        nodes: list[_Node],
+        threads: int = 0,
+        size: int | None = None,
     ) -> None:
         for operand in kernel.buffers:
             if id(operand) not in slot_of:
                 add_constant(operand)
         bound = [slot_of[id(n)] for n in kernel.buffers] + [slot_of[id(n)] for n in nodes]
-        grid = math.prod(nodes[0].shape) * (threads or 1)
+        size = math.prod(nodes[0].shape) if size is None else size
+        grid = size * (threads or 1)
         launches.append(Launch(source, name, tuple(bound), grid, threads, 0 if threads else 2))
 
     visited: set[int] = set()
@@ -1098,24 +1196,45 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
                 launch(kernel, kernel.source([node], name), name, [node])
         return slot_of[id(node)]
 
+    def constant_slot(array: np.ndarray) -> int:
+        slots.append(Slot("constant", array.dtype, array.shape, array.tobytes()))
+        return len(slots) - 1
+
     def schedule_loop(loop: _While) -> list[int]:
         if loop in loop_slots:
             return loop_slots[loop]
-        current = [materialize(n) for n in loop.inputs]
         count = len(loop.results)
         if not loop.trips:
-            loop_slots[loop] = current[:count]
+            loop_slots[loop] = [materialize(n) for n in loop.inputs[:count]]
             return loop_slots[loop]
-        # Force every changing carry into its own output slot, even swaps and
-        # constants. Only true invariants may alias a body parameter. This makes
-        # two output banks safe for permutations with any cycle length.
+        inductions = _inductions(loop)
+        in_place = _in_place_carries(loop)
+        current = []
+        for k, node in enumerate(loop.inputs):
+            if k in inductions:
+                current.append(-1)  # bound per iteration below
+            elif k in in_place:
+                # One buffer per execution, initialized once, updated in place.
+                copy = _Op("reshape", [node], node.dtype, node.shape, {})
+                temporaries.append(copy)
+                current.append(materialize(copy))
+            else:
+                current.append(materialize(node))
+        # Force every other changing carry into its own output slot, even swaps
+        # and constants. Only true invariants, in-place carries and induction
+        # variables alias a body parameter. This makes two output banks safe for
+        # permutations with any cycle length.
         body_results: list[_Node] = [
-            result
-            if result is loop.parameters[k]
+            loop.parameters[k]
+            if result is loop.parameters[k] or k in inductions or k in in_place
             else _Op("reshape", [result], result.dtype, result.shape, {})
             for k, result in enumerate(loop.results)
         ]
-        body = _compile_graph(loop.parameters, body_results)
+        body = _compile_graph(
+            loop.parameters,
+            body_results,
+            [(update, loop.parameters[k]) for k, update in in_place.items()],
+        )
         if len(launches) + loop.trips * len(body.launches) > 100_000:
             raise UnsupportedProgram(
                 "metal: stablehlo.while exceeds the 100000-launch replay limit"
@@ -1132,13 +1251,36 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
                 banks[0][k] = fixed[k]
                 banks[1][k] = len(slots)
                 slots.append(slot)
+
+        # Induction values are known: iteration k binds element k of one
+        # constant array per variable instead of computing it with a kernel.
+        # Values wrap like the integer arithmetic they replace.
+        def values(k: int, first: int, length: int) -> np.ndarray:
+            start, step = inductions[k]
+            steps = np.arange(first, first + length, dtype=np.int64)
+            # int64 arithmetic and narrowing casts wrap like the kernels would.
+            return (start + step * steps).astype(loop.parameters[k].dtype)
+
+        arrays = {k: constant_slot(values(k, 0, loop.trips)) for k in inductions}
         for iteration in range(loop.trips):
+            for k, array in arrays.items():
+                current[k] = array
             bindings = fixed | dict(enumerate(current)) | banks[iteration % 2]
+            offset = {k: iteration * loop.parameters[k].dtype.itemsize for k in arrays}
             launches.extend(
-                dataclasses.replace(item, slots=tuple(bindings[s] for s in item.slots))
+                dataclasses.replace(
+                    item,
+                    slots=tuple(bindings[s] for s in item.slots),
+                    offsets=tuple(
+                        (item.offsets[j] if item.offsets else 0) + offset.get(s, 0)
+                        for j, s in enumerate(item.slots)
+                    ),
+                )
                 for item in body.launches
             )
             current = [bindings[s] for s in body.outputs] + current[count:]
+        for k in inductions:
+            current[k] = constant_slot(values(k, loop.trips, 1).reshape(()))
         loop_slots[loop] = current[:count]
         return loop_slots[loop]
 
@@ -1340,8 +1482,13 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
 
     for node in results:
         schedule(node)
+    for update, _ in updates:
+        for operand in update.operands[1:]:
+            schedule(operand)
 
-    computed: dict[tuple[int, ...], list[_Node]] = {}
+    # One kernel per element count: outputs of different shapes but equal size
+    # share a launch, each read at the coordinates of the flat index.
+    computed: dict[int, list[_Node]] = {}
     for node in results:
         if id(node) in slot_of:
             continue
@@ -1349,11 +1496,30 @@ def _compile_graph(parameters: list[_Parameter], results: list[_Node]) -> Progra
             add_constant(node)
             continue
         fresh(node)
-        computed.setdefault(node.shape, []).append(node)
+        computed.setdefault(math.prod(node.shape), []).append(node)
+    in_place: dict[int, list[tuple[_Op, _Parameter]]] = {}
+    for update, target in updates:
+        in_place.setdefault(math.prod(update.operands[1].shape), []).append((update, target))
 
-    for shape, nodes in computed.items():
+    for size in [*computed, *(s for s in in_place if s not in computed)]:
+        nodes = computed.get(size, [])
+        shape = nodes[0].shape if nodes else in_place[size][0][0].operands[1].shape
         kernel = _Kernel(shape)
         name = f"fused_{len(launches)}"
-        source = kernel.source(nodes, name)
-        launch(kernel, source, name, nodes)
+        stores = [
+            f"o{k}[i] = {kernel.value(node, kernel.coords_of(node.shape))};"
+            for k, node in enumerate(nodes)
+        ]
+        targets: list[_Node] = list(nodes)
+        for update, target in in_place.get(size, []):
+            x, value, *starts = update.operands
+            limits = tuple(n - s for n, s in zip(x.shape, value.shape, strict=True))
+            offsets = kernel.offsets(starts, limits)
+            coords = kernel.coords_of(value.shape)
+            flat = _linear(
+                tuple(f"({c} + {s})" for c, s in zip(coords, offsets, strict=True)), x.shape
+            )
+            stores.append(f"o{len(targets)}[{flat}] = {kernel.value(value, coords)};")
+            targets.append(target)
+        launch(kernel, kernel.render(targets, name, stores), name, targets, size=size)
     return Program(slots, launches, [slot_of[id(n)] for n in results])

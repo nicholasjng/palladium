@@ -106,8 +106,10 @@ class CommandBatch {
     void commit();
 
     // Submits without blocking; `on_completed` runs on a Metal thread once the
-    // GPU is done, with the failure message of a faulted command buffer or null.
-    void commit(std::function<void(const char* error)> on_completed);
+    // GPU is done, with the failure message of a faulted command buffer or null,
+    // and the command buffer's GPU start and end times (host-clock seconds).
+    void commit(
+        std::function<void(const char* error, double gpu_start, double gpu_end)> on_completed);
 
     // Commits if needed, then blocks until done. Throws DispatchError on a
     // faulted command buffer. Every caller blocks, however many times.
