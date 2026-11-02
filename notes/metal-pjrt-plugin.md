@@ -1,4 +1,4 @@
-# The `metal` PJRT plugin (M1 in progress)
+# The `metal` PJRT plugin (M1 complete)
 
 Implementation record and handoff for milestone M1 of
 `notes/metal-compute-stack.md`: a PJRT plugin that runs `jax.jit` programs
@@ -444,19 +444,16 @@ The remaining acceptance gates, against the criteria below, are:
 |---|---|---|
 | Operation groups | All listed groups have differential tests, now including argmax/argmin and JAX gather/scatter-add in f32/f16/bf16 | Scoped coverage, not every StableHLO dtype/body; partially out-of-bounds low-level scatter windows differ from CPU as described below |
 | Ten SBI updates | Full program runs with new keys; every parameter, optimizer-state array and loss within normwise rtol 1e-4 (worst 3.6e-5 on M2) | Resolved 2026-11-02: the criterion is now normwise per array (see "Agreement rule") |
-| Compile time | First completed SBI step 0.256 s on M1 Pro and 2.51 s on M2, persistent JAX cache disabled, driver cache unchanged | Repeat on the M4 Pro |
+| Compile time | First completed SBI step 0.256 s on M1 Pro, 2.51 s on M2, 1.64 s on M4 Pro; persistent JAX cache disabled, driver cache unchanged | Met on both target machines |
 | Common API/lifetimes | `lower().compile()`, analysis APIs, donation/storage reuse, deletion after dispatch, and four-thread shared-input dispatch have tests; shared last-use mutation removed | Further stress/profiling on target machines; no known remaining implementation gap in the listed common API cases |
 | Memory analysis contract | PJRT returns UNIMPLEMENTED; JAX 0.12 returns `None`, covered by the API test | Resolved: the criterion now describes the public JAX behavior |
-| Dispatch overhead/bandwidth | M1 Pro: 23.1 µs small-call median, elementwise at 89.7% of copy. M2: 26.2 µs versus 175.7 µs for jax-mps 0.11.1, 96.4% of copy: **M2 gate met** | Both measurements on the M4 Pro |
+| Dispatch overhead/bandwidth | M1 Pro: 23.1 µs small-call median, 89.7% of copy. M2: 26.2 µs versus 175.7 µs for jax-mps, 96.4% of copy. M4 Pro: 10.2 µs versus 126.4 µs for jax-mps, 94.0% of copy | Met on both target machines |
 
-The recommended implementation sequence is now covered. The M2 Metal and
-jax-mps artifacts exist (below). Next: both artifacts on the M4 Pro with
-`examples/pjrt_m1_benchmark.py`, then tuning of any failed performance gates. Resolve
-the SBI tolerance contract below before declaring M1 complete.
-
-Call M1 complete only when these gates have reproducible evidence. The SBI tolerance contract was resolved on 2026-11-02. There is no defensible calendar completion date before
-the target-machine comparisons expose the remaining performance work. The
-current full-SBI slowdown is a warning for M2, **not an additional M1 gate**:
+**M1 is complete as of 2026-11-02.** Every gate has evidence: the operation,
+SBI and API tests pass on the M1 Pro, the M2 and the M4 Pro under the normwise agreement
+rule (resolved 2026-11-02, see "Agreement rule"), and the performance and
+compile-time artifacts for both target machines are below. The
+current full-SBI slowdown is a warning for M2, **not an M1 gate**:
 M1's performance requirements are the stated dispatch and bandwidth targets.
 Dynamic while, convolution, LLM/SAM training, and Pallas custom-call integration
 are not reasons to hold M1 open beyond its listed criteria.
@@ -479,11 +476,15 @@ A scalar reference tests this behavior separately. The common `x[idx]` and
 `x.at[idx].add` cases in the M1 census match CPU; do not describe arbitrary
 out-of-bounds window scatter as CPU-compatible.
 
-### Reproducing the remaining performance gates
+### Reproducing the performance gates
 
 Run in fresh processes on **each** target machine, using separate environments
-for current JAX and jax-mps (which pins JAX 0.11). Do not run other GPU workloads
-concurrently:
+for current JAX and jax-mps (which pins JAX 0.11). Never install jax-mps into
+the project's `.venv`: its plugin registers in every jax process, with priority
+500 over CPU's 0, and becomes the default backend. Palladium registers
+`metal_call` for CPU only, so most of the suite then fails inside jax-mps
+("Output count mismatch"). `uv sync` removes it again. Do not run other GPU
+workloads concurrently:
 
 ```sh
 JAX_PLATFORMS=metal,cpu uv run python examples/pjrt_m1_benchmark.py --platform metal --output metal.json
@@ -536,6 +537,24 @@ this repository (with uncommitted note edits), not jax-mps.
 
 On the M2, all three performance gates hold: overhead below jax-mps,
 elementwise bandwidth at 96.4% of copy, and SBI compile time under 5 s.
+
+[M4 Pro artifact](metal-m4-pro-2026-11-02.json) and
+[jax-mps M4 Pro artifact](mps-m4-pro-2026-11-02.json), 2026-11-02, macOS 27.2:
+the Metal plugin's small call costs 10.2 µs median versus 126.4 µs for
+jax-mps (12×). Elementwise reaches 218.6 GB/s against a 232.4 GB/s copy
+(94.0%); jax-mps also reaches 218.6 GB/s, so both are at the memory ceiling.
+SBI compile plus first execution takes 1.64 s on Metal and 2.54 s on
+jax-mps; both report the same first loss. All three M4 Pro gates hold.
+
+Provenance differs from the M2 comparison. Both M4 Pro runs used the
+project's main virtual environment with jax/jaxlib 0.12.0.1, so jax-mps ran
+outside its declared `jax<0.12` range, and the artifact does not record
+which jax-mps build was installed. The working copy was dirty with a
+`uv.lock` refresh and a uv pre-commit hook bump, at revision `abe1975`
+(the normwise-agreement change). Neither touches the measured code. With a
+12× margin, the jax-mps configuration cannot change the overhead verdict.
+The full test suite passes on the M4 Pro once jax-mps is removed from the
+main environment (see the warning under "Reproducing the performance gates").
 Validation after these changes: 504 tests passed, 2 skipped, 4 fuzz tests
 deselected; lint and type checks on the changed Python files passed.
 
