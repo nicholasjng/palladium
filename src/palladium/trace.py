@@ -124,7 +124,7 @@ class KernelSpec:
     -----
     Prefer ``trace`` to constructing this record directly: the dataclass itself does not
     validate layouts, aliases, or write safety. Alias validation requires identical layouts
-    and input reads before output writes; the mps dispatch path rejects aliases.
+    and input reads before output writes.
     """
 
     name: str
@@ -402,7 +402,7 @@ def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
 
     Notes
     -----
-    This is the common adapter for offline tracing and mps lowering. It consumes JAX
+    This is the common adapter for offline tracing and the `metal` lowering. It consumes JAX
     internal metadata rather than user-facing Pallas keyword arguments; it does not perform
     MSL primitive validation.
     """

@@ -17,12 +17,11 @@ from cnf_density import (
     parameter_count,
     reference_flow,
 )
-from jax.experimental import pallas as pl
 
 import palladium
 
-# The kernels run on Metal: through pallas_call on mps, metal_call elsewhere.
-CALL = pl.pallas_call if jax.default_backend() == "mps" else palladium.metal_call
+# The kernels run on Metal through metal_call from the CPU platform.
+CALL = palladium.metal_call
 make_flow = functools.partial(make_flow, call=CALL)
 make_log_prob = functools.partial(make_log_prob, call=CALL)
 make_training_step = functools.partial(make_training_step, call=CALL)

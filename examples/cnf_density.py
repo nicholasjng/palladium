@@ -7,8 +7,8 @@ segment and differentiates the discrete scheme, which JAX traces from the
 same scalar step code. The base is a standard normal; density evaluation
 integrates from t=1 to 0. The CNF benchmark and tests import from here.
 
-    JAX_PLATFORMS=mps,cpu uv run python examples/cnf_density.py
-    uv run python examples/cnf_density.py --device cpu   # metal_call, no jax-mps
+    JAX_PLATFORMS=metal,cpu uv run python examples/cnf_density.py
+    uv run python examples/cnf_density.py --device cpu   # metal_call, no PJRT plugin
 """
 
 import argparse
@@ -510,7 +510,7 @@ def main():
     parser.add_argument("--interval", type=int, default=4)
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument("--learning-rate", type=float, default=0.01)
-    parser.add_argument("--device", choices=("mps", "cpu"), default="mps")
+    parser.add_argument("--device", choices=("metal", "cpu"), default="metal")
     parser.add_argument("--variant", choices=("reverse", "reference", "jax"), default="reverse")
     args = parser.parse_args()
     with jax.default_device(jax.devices(args.device)[0]):

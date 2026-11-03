@@ -11,7 +11,7 @@ license = "Apache-2.0"
 authors = [{ name = "Nicholas Junge", email = "nicho.junge@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = [
-    "jax>=0.11",
+    "jax>=0.12",
 ]
 
 [project.entry-points.jax_plugins]
@@ -34,18 +34,10 @@ dev = [
     "ruff>=0.6",
     "ty>=0.0.66",
 ]
-mps = ["jax-mps>=0.11.1"]
-# jax-mps requires jax<0.12. Without the mps group, take the newest jax;
-# sync the plugin with `uv sync --group mps --no-group latest-jax`.
-latest-jax = ["jax>=0.12", "jaxlib>=0.12"]
 
 [tool.uv]
 no-build-isolation-package = ["palladium"]
-default-groups = ["build", "dev", "latest-jax"]
-conflicts = [[{ group = "mps" }, { group = "latest-jax" }]]
-
-[tool.uv.sources]
-jax-mps = { path = "../jax-mps" }
+default-groups = ["build", "dev"]
 
 [tool.uv.extra-build-dependencies]
 palladium = ["jax"]

@@ -220,3 +220,9 @@ def initialize() -> None:
         library().palladium_pjrt_set_compiler(_compile)
         if "metal" not in mlir._platforms_with_donation:
             mlir._platforms_with_donation.append("metal")
+        # Only now is `metal` a platform JAX accepts lowering rules for.
+        from jax.experimental import pallas as pl
+
+        from palladium.ffi import pallas_lowering
+
+        mlir.register_lowering(pl.pallas_call_p, pallas_lowering, platform="metal")

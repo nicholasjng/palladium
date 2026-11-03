@@ -1,4 +1,4 @@
-"""Launch options and geometry shared by `metal_call` and `pallas_call` on mps."""
+"""Launch options and geometry shared by `metal_call` and `pallas_call` on `metal`."""
 
 from __future__ import annotations
 
@@ -60,8 +60,7 @@ class CompilerParams(pl.CompilerParams):
         One to three positive dimensions, or None for runtime selection. Cooperative
         kernels fix their own size and reject mismatches.
     math_mode : MathMode, optional
-        FAST by default; RELAXED and SAFE are available through CPU FFI. The mps path
-        accepts FAST only.
+        FAST by default; RELAXED and SAFE are available on both entry points.
     BACKEND : str
         Pallas backend identifier, "palladium"; leave this at its default.
 

@@ -169,36 +169,6 @@ def test_simdgroup_policy_keeps_matmul2d_for_transposed_operands(metal_device, r
     np.testing.assert_allclose(call(a, b), a @ b.T, rtol=1e-5, atol=1e-4)
 
 
-def test_simdgroup_kernel_splits_for_the_mps_descriptor():
-    """The mps path keeps the helper in the header and rebinds the new builtins."""
-    from palladium.mps import kernel_prologue, split_kernel_source
-
-    shape = jax.ShapeDtypeStruct((64, 64), jnp.float32)
-    source = palladium.debug_msl(
-        _dot,
-        shape,
-        shape,
-        grid=(2, 2),
-        in_specs=(
-            pl.BlockSpec((32, 64), lambda i, j: (i, 0)),
-            pl.BlockSpec((64, 32), lambda i, j: (0, j)),
-        ),
-        out_specs=pl.BlockSpec((32, 32), lambda i, j: (i, j)),
-        out_shape=shape,
-        compiler_params=SIMDGROUP,
-    )
-    header, params, body = split_kernel_source(source)
-    prologue = kernel_prologue(params)
-    assert "METAL_FUNC void simdgroup_mma" in header
-    assert "simdgroup_mma(" in body
-    for builtin in (
-        "simdgroup_index_in_threadgroup",
-        "thread_index_in_simdgroup",
-        "thread_index_in_threadgroup",
-    ):
-        assert f"({builtin});" in prologue
-
-
 def test_simdgroup_policy_keeps_matmul2d_for_float16(metal_device, rng):
     """Half precision stays on `matmul2d`, which is faster for it."""
     a, b = _operands(rng, 64, 64, 32, np.float16)

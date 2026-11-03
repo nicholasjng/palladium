@@ -1,9 +1,9 @@
 """palladium: Pallas kernels on Apple GPUs.
 
 trace (Pallas -> KernelSpec) and emit (KernelSpec -> MSL), dispatched two
-ways: a plain `pl.pallas_call` on the jax-mps `mps` platform, or
-`metal_call` from the CPU platform through a jax.ffi target. `debug_msl`
-returns the intermediate MSL.
+ways: a plain `pl.pallas_call` under `jax.jit` on the `metal` PJRT plugin
+(`JAX_PLATFORMS=metal,cpu`), or `metal_call` from the CPU platform through a
+jax.ffi target. `debug_msl` returns the intermediate MSL.
 """
 
 from __future__ import annotations
@@ -11,7 +11,6 @@ from __future__ import annotations
 import importlib.metadata as _metadata
 from collections.abc import Callable
 
-import palladium.mps  # registers palladium as the Pallas backend for mps
 from palladium.diagnostics import KernelDiagnostics
 from palladium.emit import emit_msl
 from palladium.errors import (

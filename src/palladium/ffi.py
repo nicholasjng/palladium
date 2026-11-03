@@ -354,8 +354,14 @@ def pallas_lowering(ctx, *in_nodes, interpret: Any = False, **params):
 
     Emits the same `palladium_dispatch` custom call as `metal_call`; the
     plugin's compiler turns it into a launch inside the program's command
-    buffers. Unlike the jax-mps path, every math mode and aliasing work.
+    buffers. With `interpret=True`, JAX's own rule lowers the interpreter.
     """
+    if interpret:
+        from jax._src.interpreters import mlir  # JAX's default rule has no public name
+        from jax.experimental import pallas as pl
+
+        default = mlir._lowerings[pl.pallas_call_p].rule
+        return default(ctx, *in_nodes, interpret=interpret, **params)
     from palladium.trace import spec_from_params
 
     options = lowering_options(params, "metal")
@@ -402,7 +408,7 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> FfiCallable:
     Notes
     -----
     Tracing, dtype validation, and Metal compilation are deferred until use. This path
-    requires the native FFI library and a Metal device, but does not require jax-mps. One
+    requires the native FFI library and a Metal device, but not the PJRT plugin. One
     vmap level batches dispatches in one native call; outer levels run sequentially.
     Gradients require an explicit backward implementation via ``with_vjp``. FAST math is the
     default; use SAFE for compensated arithmetic and strict NaN or signed-zero behavior.
