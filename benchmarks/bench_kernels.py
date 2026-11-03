@@ -11,7 +11,8 @@ Rows have the same names on every backend, so ``mew compare`` lines them up
 CPU is skipped: it is not what these kernels compete with. Every row checks its
 result against NumPy before timing, and every call waits for its result, so
 rows include each backend's dispatch. Counters: ``flops`` per second for
-matmuls and attention.
+matmuls and attention; on ``metal``, ``gpu_us``, ``launches`` and
+``pool_misses`` per call.
 
 - ``bench_matmul``: square ``a @ b`` in float32, float16 and bfloat16.
 - ``bench_attention``: 32 heads of 64 over 2,048 tokens, float32, forward and
@@ -58,13 +59,28 @@ def _backend() -> str:
 
 
 def _timed(state: mew.State, call, flops: float | None = None) -> None:
-    """Time `call`, which must wait for its own result."""
+    """Time `call`, which must wait for its own result.
+
+    On ``metal``, also report per call the GPU's busy time (``gpu_us``), the
+    kernels launched, and the buffer pool's misses (new MTLBuffers): wall
+    time well above ``gpu_us`` is host or allocation cost, not kernel time.
+    """
     for _ in range(3):
         call()
+    metal = _backend() == "metal"
+    if metal:
+        from palladium import _pjrt
+
+        _pjrt.stats(reset=True)
     for _ in state:
         call()
     if flops:
         state.set_counter("flops", flops, mew.CounterFlags.kIsIterationInvariantRate)
+    if metal and state.iterations:
+        s, n = _pjrt.stats(reset=True), state.iterations
+        state.set_counter("gpu_us", s["gpu_busy_seconds"] / n * 1e6)
+        state.set_counter("launches", s["launches"] / n)
+        state.set_counter("pool_misses", s["pool_misses"] / n)
 
 
 def _close(actual, expected, rtol: float) -> None:
@@ -213,7 +229,10 @@ VOCAB, WIDTH, ROWS = 32000, 1024, 8192
 
 
 @mew.parametrize(
-    [{"op": "gather"}, {"op": "scatter_add"}], ids=["gather", "scatter_add"], unit="us"
+    [{"op": "gather"}, {"op": "scatter_add"}],
+    ids=["gather", "scatter_add"],
+    use_real_time=True,
+    unit="us",
 )
 def bench_embedding(state: mew.State, op: str) -> None:
     backend = _backend()

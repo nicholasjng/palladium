@@ -655,6 +655,32 @@ def test_execution_stats_count_launches_and_gpu_time():
     """)
 
 
+def test_pool_evicts_stale_sizes_for_new_ones():
+    # Buffers of sizes no longer requested must not keep new sizes out.
+    _check("""
+        import os
+        os.environ['PALLADIUM_POOL_BYTES'] = str(64 << 20)
+        import jax, numpy as np
+        from palladium import _pjrt
+        device = jax.devices('metal')[0]
+        double = jax.jit(lambda x: x * 2)
+        _pjrt.stats(reset=True)
+        for n in range(8):  # 256 MiB of 16 MiB inputs and outputs, a new size each
+            jax.block_until_ready(double(jax.device_put(np.ones((4 << 20) + n, np.float32), device)))
+        assert _pjrt.stats()['pool_dropped'] > 0  # stale sizes were evicted
+        x = jax.device_put(np.ones(3 << 22, np.float32), device)  # 12 MiB
+        jax.block_until_ready(double(x))
+        _pjrt.stats(reset=True)
+        for _ in range(4):
+            jax.block_until_ready(double(x))
+        s = _pjrt.stats(reset=True)
+        assert s['pool_misses'] == 0 and s['pool_hits'] == 4, s
+        big = jax.device_put(np.ones(80 << 18, np.float32), device)  # larger than the pool
+        del big
+        assert _pjrt.stats()['pool_dropped'] == 1
+    """)
+
+
 def test_compiled_analysis_api():
     _check("""
         import jax,numpy as np

@@ -86,8 +86,8 @@ struct PJRT_Client {
 };
 
 // Pool counters since the last reset: requests served from the pool, new
-// MTLBuffers created (and their bytes and seconds), and releases the pool
-// dropped because it was full.
+// MTLBuffers created (and their bytes and seconds), and buffers the pool
+// freed: evicted to make room, or larger than the whole pool.
 struct PoolCounters {
     uint64_t hits, misses, miss_bytes, dropped;
     std::chrono::duration<double> miss_seconds;

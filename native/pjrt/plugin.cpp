@@ -5,10 +5,14 @@
 // Compilation and execution are in executable.cpp.
 #include "plugin.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <chrono>
+#include <deque>
+#include <list>
 #include <unordered_map>
+#include <vector>
 
 #include "errors.h"
 #include "metal.h"
@@ -201,19 +205,53 @@ void Completion::then(std::function<void()> f) {
 
 namespace {
 
-// Free buffers by requested size, up to kPoolLimit bytes in all. Leaked, so
-// buffers destroyed during static destruction can still return to it.
-constexpr size_t kPoolLimit = size_t(1) << 30;
-
+// Free buffers by requested size, up to a quarter of the device's recommended
+// working set (PALLADIUM_POOL_BYTES overrides it, and 0 disables the pool). A
+// release that does not fit evicts the oldest free buffers, so sizes a
+// program stopped using do not keep new sizes out. Leaked, so buffers
+// destroyed during static destruction can still return to it.
 struct Pool {
+    using Free = std::list<std::unique_ptr<Buffer>>;
     std::mutex mutex;
-    std::unordered_map<size_t, std::vector<std::unique_ptr<Buffer>>> free;
-    size_t bytes = 0;
+    Free lru;  // oldest release first
+    std::unordered_map<size_t, std::deque<Free::iterator>> by_size;  // oldest first
+    size_t bytes = 0, limit = 0;
     PoolCounters counters{};
+
+    // The newest free buffer of `size` bytes, or null.
+    std::unique_ptr<Buffer> take(size_t size) {
+        auto bucket = by_size.find(size);
+        if (bucket == by_size.end()) return nullptr;
+        Free::iterator node = bucket->second.back();
+        bucket->second.pop_back();
+        if (bucket->second.empty()) by_size.erase(bucket);
+        std::unique_ptr<Buffer> buffer = std::move(*node);
+        lru.erase(node);
+        bytes -= size;
+        return buffer;
+    }
+
+    void clear() {
+        lru.clear();
+        by_size.clear();
+        bytes = 0;
+    }
 };
 
+size_t pool_limit() {
+    const char* env = std::getenv("PALLADIUM_POOL_BYTES");
+    char* end = nullptr;
+    unsigned long long bytes = env && *env ? std::strtoull(env, &end, 10) : 0;
+    return env && *env && !*end ? (size_t)bytes
+                                : runtime().recommended_max_working_set_size() / 4;
+}
+
 Pool& pool() {
-    static Pool* p = new Pool;
+    static Pool* p = [] {
+        auto* p = new Pool;
+        p->limit = pool_limit();
+        return p;
+    }();
     return *p;
 }
 
@@ -224,11 +262,7 @@ std::unique_ptr<Buffer> acquire(size_t size_bytes) {
     Pool& p = pool();
     {
         std::lock_guard lock(p.mutex);
-        auto it = p.free.find(size_bytes);
-        if (it != p.free.end() && !it->second.empty()) {
-            auto buffer = std::move(it->second.back());
-            it->second.pop_back();
-            p.bytes -= size_bytes;
+        if (auto buffer = p.take(size_bytes)) {
             ++p.counters.hits;
             return buffer;
         }
@@ -239,8 +273,7 @@ std::unique_ptr<Buffer> acquire(size_t size_bytes) {
         buffer = std::make_unique<Buffer>(runtime().device(), size_bytes);
     } catch (const AllocationError&) {
         std::lock_guard lock(p.mutex);  // retry with the pool given back
-        p.free.clear();
-        p.bytes = 0;
+        p.clear();
     }
     if (!buffer) buffer = std::make_unique<Buffer>(runtime().device(), size_bytes);
     std::lock_guard lock(p.mutex);
@@ -248,6 +281,32 @@ std::unique_ptr<Buffer> acquire(size_t size_bytes) {
     p.counters.miss_bytes += size_bytes;
     p.counters.miss_seconds += std::chrono::steady_clock::now() - start;
     return buffer;
+}
+
+// Return `owned` to the pool, evicting the oldest free buffers to make room.
+void release(std::unique_ptr<Buffer> owned) {
+    std::vector<std::unique_ptr<Buffer>> evicted;  // freed after the lock is released
+    Pool& p = pool();
+    std::lock_guard lock(p.mutex);
+    size_t size = owned->size();
+    if (size > p.limit) {
+        ++p.counters.dropped;
+        return;
+    }
+    while (p.bytes + size > p.limit) {
+        // The globally oldest buffer is also the oldest of its size.
+        size_t oldest = p.lru.front()->size();
+        auto bucket = p.by_size.find(oldest);
+        bucket->second.pop_front();
+        if (bucket->second.empty()) p.by_size.erase(bucket);
+        evicted.push_back(std::move(p.lru.front()));
+        p.lru.pop_front();
+        p.bytes -= oldest;
+        ++p.counters.dropped;
+    }
+    p.bytes += size;
+    p.lru.push_back(std::move(owned));
+    p.by_size[size].push_back(std::prev(p.lru.end()));
 }
 
 }  // namespace
@@ -273,19 +332,10 @@ PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_
     buffer->dims.assign(dims, dims + num_dims);
     for (size_t i = num_dims; i-- > 0;) buffer->minor_to_major.push_back((int64_t)i);
     try {
-        // The last owner returns the storage to the pool, unless the pool is full.
-        buffer->storage = std::shared_ptr<Buffer>(
-            acquire(byte_size(buffer.get())).release(), [](Buffer* storage) {
-                std::unique_ptr<Buffer> owned(storage);
-                Pool& p = pool();
-                std::lock_guard lock(p.mutex);
-                if (p.bytes + owned->size() > kPoolLimit) {
-                    ++p.counters.dropped;
-                    return;
-                }
-                p.bytes += owned->size();
-                p.free[owned->size()].push_back(std::move(owned));
-            });
+        // The last owner returns the storage to the pool.
+        buffer->storage =
+            std::shared_ptr<Buffer>(acquire(byte_size(buffer.get())).release(),
+                                    [](Buffer* storage) { release(std::unique_ptr<Buffer>(storage)); });
     } catch (const AllocationError& e) {
         return error(PJRT_Error_Code_RESOURCE_EXHAUSTED, e.what());
     }

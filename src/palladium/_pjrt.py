@@ -137,8 +137,9 @@ def stats(reset: bool = False) -> dict[str, float]:
         Execute; ``gpu_busy_seconds`` (union of command-buffer GPU intervals)
         and ``gpu_sum_seconds``; the buffer pool's ``pool_hits``, new
         MTLBuffers (``pool_misses``, ``allocated_bytes``,
-        ``allocation_seconds``) and releases it dropped when full
-        (``pool_dropped``). GPU time is recorded by completion handlers, so
+        ``allocation_seconds``) and buffers it freed (``pool_dropped``):
+        the oldest are evicted to make room, within a quarter of the
+        device's recommended working set or ``PALLADIUM_POOL_BYTES``. GPU time is recorded by completion handlers, so
         synchronize on the last outputs before reading.
     """
     out = _Stats()
