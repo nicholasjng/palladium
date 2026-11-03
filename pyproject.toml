@@ -52,6 +52,7 @@ allowed-unresolved-imports = ["torch", "sbi.**", "matplotlib.**"]
 
 [tool.mew]
 benchpaths = ["benchmarks"]
+setup = "benchmarks/conf.py"
 
 [tool.pytest.ini_options]
 markers = [

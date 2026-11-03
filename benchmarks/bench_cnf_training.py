@@ -1,6 +1,6 @@
 """Benchmark complete CNF training updates with Mew.
 
-Run with ``JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/``.
+Run with ``JAX_PLATFORMS=metal,cpu uv run mew run benchmarks/bench_cnf_training.py``.
 The ``cpu-reverse-k4-ffi`` case runs the same two kernels through the CPU
 FFI bridge, so the rest of the update is XLA on CPU; it needs no plugin.
 """
@@ -23,10 +23,12 @@ N, WIDTH, STEPS = 256, 4, 16
 INTERVALS = (1, 4, 8)
 CASES = [
     {"platform": "cpu", "variant": "jax", "interval": 1},
-    {"platform": "mps", "variant": "jax", "interval": 1},
-    {"platform": "mps", "variant": "reference", "interval": 1},
+    {"platform": "metal", "variant": "jax", "interval": 1},
+    {"platform": "metal", "variant": "reference", "interval": 1},
 ]
-CASES += [{"platform": "mps", "variant": "reverse", "interval": interval} for interval in INTERVALS]
+CASES += [
+    {"platform": "metal", "variant": "reverse", "interval": interval} for interval in INTERVALS
+]
 CASES = [{**case, "ffi": False} for case in CASES]
 CASES.append({"platform": "cpu", "variant": "reverse", "interval": 4, "ffi": True})
 IDS = [
@@ -46,7 +48,7 @@ def bench_cnf_training(
     state : mew.State
         Benchmark iteration controller and destination for timing counters or skip
         reasons.
-    platform : {"cpu", "mps"}
+    platform : {"cpu", "metal"}
         JAX device platform.
     variant : {"jax", "reference", "reverse"}
         Forward/backward implementation strategy.

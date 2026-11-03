@@ -1,7 +1,7 @@
 """Measure the Apple GPU roofline and where Pallas matmuls and attention land on it.
 
-Run with ``uv run mew run --random-interleaving benchmarks/bench_roofline.py``;
-add ``JAX_PLATFORMS=mps,cpu`` with jax-mps installed for the vendor rows.
+Run with ``uv run mew run --random-interleaving benchmarks/bench_roofline.py``.
+MLX's kernels for the same products are in ``bench_kernels.py``.
 
 - ``bench_copy_bandwidth``: device memory bandwidth, one read and one write
   of 256 MiB.
@@ -13,8 +13,6 @@ add ``JAX_PLATFORMS=mps,cpu`` with jax-mps installed for the vendor rows.
   ``dot_general="simdgroup"``, checked against NumPy before timing.
 - ``bench_plmtl_matmul``: the same float32 matmul written by hand in Pallas
   on a ``plmtl.Mesh``, staging tiles in threadgroup memory over the K loop.
-- ``bench_vendor_matmul``: ``jnp.dot`` on the mps platform, which jax-mps
-  runs on MLX's kernels. Wall time per call, so it includes dispatch.
 - ``bench_pallas_attention``: the example flash attention at 4096 tokens and
   32 heads of 64, float32, through ``matmul2d`` and ``simdgroup_matrix``, each
   at its fastest tiling on an M2, checked on one head against NumPy. FLOPs
@@ -29,7 +27,6 @@ from __future__ import annotations
 import os
 import statistics
 import sys
-import time
 
 import jax
 import jax.numpy as jnp
@@ -65,8 +62,6 @@ PLMTL_CASES = [
 PLMTL_IDS = [
     f"float32-n{c['size']}-tm{c['tile_m']}-tn{c['tile_n']}-tk{c['tile_k']}" for c in PLMTL_CASES
 ]
-VENDOR_CASES = [{"size": size, "dtype": dtype} for size in SIZES for dtype in DTYPES]
-VENDOR_IDS = [f"{c['dtype']}-n{c['size']}" for c in VENDOR_CASES]
 
 ATTENTION_SHAPE = (1, 4096, 32, 64)
 ATTENTION_CASES = [
@@ -259,26 +254,6 @@ def bench_plmtl_matmul(state: mew.State, size: int, tile_m: int, tile_n: int, ti
         counter="tflops",
         scale=1e12,
     )
-
-
-@mew.parametrize(VENDOR_CASES, ids=VENDOR_IDS, tags="roofline", use_manual_time=True, unit="ms")
-def bench_vendor_matmul(state: mew.State, size: int, dtype: str) -> None:
-    try:
-        device = jax.devices("mps")[0]
-    except RuntimeError:
-        state.skip_with_error("no mps platform: install jax-mps and set JAX_PLATFORMS=mps,cpu")
-        return
-    with jax.default_device(device):
-        x = jax.random.normal(jax.random.key(0), (size, size), dtype)
-        y = jax.random.normal(jax.random.key(1), (size, size), dtype)
-        matmul = jax.jit(jnp.dot)
-
-        def run() -> float:
-            start = time.perf_counter()
-            jax.block_until_ready(matmul(x, y))
-            return time.perf_counter() - start
-
-        _run_timed(state, run, work=2 * size**3, counter="tflops", scale=1e12)
 
 
 @mew.parametrize(

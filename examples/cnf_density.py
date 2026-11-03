@@ -22,8 +22,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 
-import palladium
-
 
 def parameter_count(width):
     """Return the flattened parameter count of the time-dependent two-output MLP.
@@ -348,6 +346,8 @@ def make_flow(n, *, width=4, steps=16, interval=4, variant="reverse", call=pl.pa
         out_specs=(state_spec, params_spec),
         out_shape=(shape, jax.ShapeDtypeStruct((n, count), jnp.float32)),
     )
+    import palladium  # only the kernel variants need it; plain JAX runs anywhere
+
     return palladium.with_vjp(forward, backward, residuals=1)
 
 
@@ -503,6 +503,8 @@ def main():
     """Train the example CNF from command-line options and print held-out and refinement
     diagnostics.
     """
+    from palladium import metal_call
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--n", type=int, default=256)
     parser.add_argument("--width", type=int, default=4)
@@ -523,7 +525,7 @@ def main():
             steps=args.steps,
             interval=args.interval,
             variant=args.variant,
-            call=palladium.metal_call if args.device == "cpu" else pl.pallas_call,
+            call=metal_call if args.device == "cpu" else pl.pallas_call,
             learning_rate=args.learning_rate,
         )
         start = time.perf_counter()

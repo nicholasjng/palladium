@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import jaxlib
 import numpy as np
-from pjrt_m1_benchmark import _revision, _write_json
+from records import revision, write_json
 from training_steps import adamw, sbi_loss, sbi_trajectory, workload
 
 
@@ -94,7 +94,7 @@ def audit(count: int = 10, seed: int = 0, rtol: float = 1e-4, atol: float = 2e-6
         keys = [jax.random.fold_in(key, i) for i in range(count)]
     report: dict = {
         "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat(),
-        "revision": _revision(),
+        "revision": revision(),
         "device": metal.device_kind,
         "os": platform.platform(),
         "jax": jax.__version__,
@@ -163,7 +163,7 @@ def main() -> None:
         parser.error("steps must be positive")
     report = audit(args.steps, args.seed)
     if args.output:
-        _write_json(args.output, report)
+        write_json(args.output, report)
     else:
         print(json.dumps(report, indent=2, allow_nan=False))
 

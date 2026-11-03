@@ -35,8 +35,8 @@ import cnf_density
 import jax
 import jaxlib
 import numpy as np
-from pjrt_m1_benchmark import _revision, _write_json
 from pjrt_sbi_audit import features
+from records import revision, write_json
 from training_steps import sbi_loss, sbi_step, workload
 
 
@@ -219,7 +219,7 @@ def main() -> None:
         "os": platform.platform(),
         "jax": jax.__version__,
         "jaxlib": jaxlib.__version__,
-        "revision": _revision(),
+        "revision": revision(),
         **long_run(
             args.workload,
             args.steps,
@@ -245,7 +245,7 @@ def main() -> None:
             for step, row in table.items():
                 print(f"{step:6d} " + " ".join(f"{row[run][metric]:12.3e}" for run in columns))
     if args.output:
-        _write_json(args.output, json.loads(json.dumps(result)))
+        write_json(args.output, json.loads(json.dumps(result)))
 
 
 if __name__ == "__main__":

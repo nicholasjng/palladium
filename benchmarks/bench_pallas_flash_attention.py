@@ -1,7 +1,7 @@
 """Check and benchmark Palladium's Pallas TensorOps attention lowering.
 
 Run on Apple Silicon with MSL 4 support using
-``JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/``.
+``uv run mew run benchmarks/bench_pallas_flash_attention.py``.
 Each case checks the generated kernel against a NumPy reference before timing
 resident Metal buffers. Cases cover causal modes and 16-, 32-, 48-, or
 64-wide heads. A focused noncausal sequence-length-4096 sweep compares query

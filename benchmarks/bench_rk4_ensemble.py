@@ -1,9 +1,9 @@
 """A fixed-step RK4 Lotka-Volterra ensemble: one Palladium dispatch against JAX.
 
-Run with ``JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/``.
+Run with ``JAX_PLATFORMS=metal,cpu uv run mew run benchmarks/bench_rk4_ensemble.py``.
 
-``palladium`` is a plain ``pl.pallas_call`` on mps, ``palladium-ffi`` the
-same kernel through ``metal_call`` from the CPU platform, and ``jax-mps``
+``palladium`` is a plain ``pl.pallas_call`` on the metal plugin, ``palladium-ffi`` the
+same kernel through ``metal_call`` from the CPU platform, and ``jax-metal``
 and ``jax-cpu`` the idiomatic ``jit(vmap(scan(...)))``. Every path ends in
 a downstream JAX reduction, so the kernel is timed inside the XLA graph.
 """
@@ -23,7 +23,7 @@ import palladium
 
 DT, STEPS = 0.01, 500
 SIZES = (10_000, 100_000)
-PATHS = {"palladium": "mps", "palladium-ffi": "cpu", "jax-mps": "mps", "jax-cpu": "cpu"}
+PATHS = {"palladium": "metal", "palladium-ffi": "cpu", "jax-metal": "metal", "jax-cpu": "cpu"}
 CASES = [{"path": path, "n": n} for n in SIZES for path in PATHS]
 IDS = [f"{case['path']}-n{case['n']}" for case in CASES]
 
@@ -107,7 +107,7 @@ def make_solver(path: str, n: int):
 
     Parameters
     ----------
-    path : {"palladium", "palladium-ffi", "jax-mps", "jax-cpu"}
+    path : {"palladium", "palladium-ffi", "jax-metal", "jax-cpu"}
         Benchmark implementation; the caller selects the corresponding default device.
     n : int
         Number of ensemble members or examples.
@@ -167,7 +167,7 @@ def bench_rk4_ensemble(state: mew.State, path: str, n: int) -> None:
     try:
         device = jax.devices(platform)[0]
     except RuntimeError:
-        state.skip_with_error(f"No {platform} device; set JAX_PLATFORMS=mps,cpu for jax-mps")
+        state.skip_with_error(f"No {platform} device; set JAX_PLATFORMS=metal,cpu")
         return
 
     with jax.default_device(device):
