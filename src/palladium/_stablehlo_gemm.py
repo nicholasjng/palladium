@@ -28,19 +28,35 @@ def gemm_source(
     def kernel(a, b, out):
         out[...] = jnp.matmul(a[...], b[...])
 
-    grid = (batch, pl.cdiv(m, tm), pl.cdiv(n, tn))
+    # An unbatched product is a rank-2 call, its tiles on x and y. With a
+    # leading batch axis of 1, x holds one threadgroup and the tiles go on y
+    # and z, which ran a 4096^3 float32 product 1.5-1.8x slower on the M2.
+    # The emitter requires the batch first in batched calls.
+    if batch == 1:
+        grid = (pl.cdiv(m, tm), pl.cdiv(n, tn))
+        in_specs = [
+            pl.BlockSpec((tm, k), lambda i, j: (i, 0)),
+            pl.BlockSpec((k, tn), lambda i, j: (0, j)),
+        ]
+        out_spec = pl.BlockSpec((tm, tn), lambda i, j: (i, j))
+        shapes = (m, k), (k, n), (m, n)
+        threads = (grid[0] * 128, grid[1], 1)
+    else:
+        grid = (batch, pl.cdiv(m, tm), pl.cdiv(n, tn))
+        in_specs = [
+            pl.BlockSpec((1, tm, k), lambda b, i, j: (b, i, 0)),
+            pl.BlockSpec((1, k, tn), lambda b, i, j: (b, 0, j)),
+        ]
+        out_spec = pl.BlockSpec((1, tm, tn), lambda b, i, j: (b, i, j))
+        shapes = (batch, m, k), (batch, k, n), (batch, m, n)
+        threads = (batch * 128, grid[1], grid[2])
     call = pl.pallas_call(
         kernel,
         grid=grid,
-        in_specs=[
-            pl.BlockSpec((1, tm, k), lambda b, i, j: (b, i, 0)),
-            pl.BlockSpec((1, k, tn), lambda b, i, j: (b, 0, j)),
-        ],
-        out_specs=pl.BlockSpec((1, tm, tn), lambda b, i, j: (b, i, j)),
-        out_shape=jax.ShapeDtypeStruct((batch, m, n), dtype),
+        in_specs=in_specs,
+        out_specs=out_spec,
+        out_shape=jax.ShapeDtypeStruct(shapes[2], dtype),
     )
-    spec = trace(
-        call, jax.ShapeDtypeStruct((batch, m, k), dtype), jax.ShapeDtypeStruct((batch, k, n), dtype)
-    )
+    spec = trace(call, *(jax.ShapeDtypeStruct(shape, dtype) for shape in shapes[:2]))
     source, _ = compile_kernel(spec, "gemm", prefer_simdgroup=True)
-    return source, (batch * 128, grid[1], grid[2])
+    return source, threads

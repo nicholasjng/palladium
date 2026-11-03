@@ -195,7 +195,7 @@ def test_aligned_dot_reuses_simdgroup_emitter_without_input_copies():
     [launch] = program.launches
     assert launch.slots == (0, 1, program.outputs[0])
     assert "simdgroup_multiply_accumulate" in launch.source
-    assert launch.grid == (128, 1, 3) and launch.threadgroup == 128
+    assert launch.grid == (128, 3, 1) and launch.threadgroup == 128
 
 
 def test_dot_tail_uses_existing_tensorops_emitter():
