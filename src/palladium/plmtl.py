@@ -39,7 +39,7 @@ from collections.abc import Callable, Generator, Sequence
 from typing import Any
 
 import jax.numpy as jnp
-from jax._src.pallas import core as pallas_core
+from jax._src.pallas import core as pallas_core  # tracing_grid_env has no public name
 from jax.core import ShapedArray
 from jax.experimental import pallas as pl
 
@@ -58,8 +58,8 @@ class MemorySpace(enum.Enum):
     def __str__(self) -> str:
         return self.value
 
-    def __call__(self, shape: Sequence[int], dtype: Any) -> pallas_core.MemoryRef:
-        return pallas_core.MemoryRef(ShapedArray(tuple(shape), jnp.dtype(dtype)), self)
+    def __call__(self, shape: Sequence[int], dtype: Any) -> pl.MemoryRef:
+        return pl.MemoryRef(ShapedArray(tuple(shape), jnp.dtype(dtype)), self)
 
 
 THREADGROUP = MemorySpace.THREADGROUP
@@ -87,8 +87,8 @@ class Mesh:
         return collections.OrderedDict(zip(("x", "y", "z"), self.grid, strict=False))
 
     @property
-    def default_memory_space(self) -> pallas_core.MemorySpace:
-        return pallas_core.MemorySpace.ANY
+    def default_memory_space(self) -> pl.MemorySpace:
+        return pl.MemorySpace.ANY
 
     @property
     def core_type(self) -> str:
@@ -103,7 +103,7 @@ class Mesh:
 
     @property
     def supported_memory_spaces(self) -> Sequence[Any]:
-        return [pallas_core.MemorySpace.ANY, *MemorySpace]
+        return [pl.MemorySpace.ANY, *MemorySpace]
 
     @contextlib.contextmanager
     def tracing_context(self) -> Generator[None]:

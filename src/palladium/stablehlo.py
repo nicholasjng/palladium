@@ -32,7 +32,7 @@ from typing import Literal
 
 import ml_dtypes
 import numpy as np
-from jax._src.interpreters import mlir
+from jax.interpreters import mlir
 from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import stablehlo
 

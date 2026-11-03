@@ -9,7 +9,7 @@ import operator
 from collections.abc import Mapping
 from typing import Any
 
-from jax._src.pallas import core as pallas_core
+from jax.experimental import pallas as pl
 
 from palladium.device import device_limits
 from palladium.emit.kernel import DOT_GENERAL_POLICIES, PROGRAM_SCOPES
@@ -39,7 +39,7 @@ class MathMode(enum.StrEnum):
 
 
 @dataclasses.dataclass(frozen=True)
-class CompilerParams(pallas_core.CompilerParams):
+class CompilerParams(pl.CompilerParams):
     """Configure Metal emission and launch options for either Palladium entry point.
 
     Attributes

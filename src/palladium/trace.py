@@ -12,7 +12,7 @@ from typing import Any
 import jax
 import jax.experimental.pallas as pl
 import numpy as np
-from jax._src.pallas import core as pallas_core
+from jax._src.pallas import core as pallas_core  # get_grid_mapping has no public name
 from jax.extend.core import (
     ClosedJaxpr,
     Jaxpr,
@@ -351,12 +351,12 @@ def _mesh_spec(eqn: JaxprEqn) -> KernelSpec:
     n_in, n_out = len(eqn.invars), len(out_avals)
     refs = [v.aval.inner_aval for v in jaxpr.invars[: n_in + n_out]]
     scratch = [v.aval for v in jaxpr.invars[n_in + n_out :]]
-    any_space = pallas_core.MemorySpace.ANY
-    grid_spec = pallas_core.GridSpec(
+    any_space = pl.MemorySpace.ANY
+    grid_spec = pl.GridSpec(
         grid=tuple(mesh.grid),
         in_specs=tuple(pl.BlockSpec(memory_space=any_space) for _ in range(n_in)),
         out_specs=tuple(pl.BlockSpec(memory_space=any_space) for _ in range(n_out)),
-        scratch_shapes=tuple(pallas_core.MemoryRef(a.inner_aval, a.memory_space) for a in scratch),
+        scratch_shapes=tuple(pl.MemoryRef(a.inner_aval, a.memory_space) for a in scratch),
     )
     _, grid_mapping = pallas_core.get_grid_mapping(
         grid_spec,

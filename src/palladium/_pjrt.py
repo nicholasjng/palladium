@@ -19,9 +19,10 @@ import importlib.resources
 import traceback
 from pathlib import Path
 
+import jax
 import ml_dtypes
 import numpy as np
-from jax._src import config, xla_bridge
+from jax._src import xla_bridge  # register_plugin has no public name
 from jax._src.interpreters import mlir
 
 _LIBRARY_NAME = "libpalladium_pjrt.dylib"
@@ -214,7 +215,7 @@ def _compile(code: int, size: int, builder: int) -> int:
 
 
 def initialize() -> None:
-    if "metal" in (config.jax_platforms.value or "").split(","):
+    if "metal" in (jax.config.jax_platforms or "").split(","):
         xla_bridge.register_plugin("metal", library_path=str(library_path()))
         library().palladium_pjrt_set_compiler(_compile)
         if "metal" not in mlir._platforms_with_donation:

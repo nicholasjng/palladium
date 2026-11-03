@@ -7,9 +7,8 @@ body surfaces in the outer equation's effects.
 
 from __future__ import annotations
 
-from jax._src.effects import Effect
-from jax._src.state.types import AccumEffect, RefEffect, WriteEffect
-from jax.extend.core import Jaxpr, JaxprEqn, Var
+from jax._src.state.types import AccumEffect, RefEffect, WriteEffect  # no public names
+from jax.extend.core import Effect, Jaxpr, JaxprEqn, Var
 
 __all__ = ["eqn_reads_ref", "eqn_writes_ref", "foreign_effects"]
 
