@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import jaxlib
 import numpy as np
 from pjrt_m1_benchmark import _revision, _write_json
-from training_steps import adamw, sbi_loss, sbi_trajectory, steps
+from training_steps import adamw, sbi_loss, sbi_trajectory, workload
 
 
 def errors(actual, reference, rtol: float, atol: float) -> dict:
@@ -90,7 +90,7 @@ def features(key):
 def audit(count: int = 10, seed: int = 0, rtol: float = 1e-4, atol: float = 2e-6) -> dict:
     cpu, metal = jax.devices("cpu")[0], jax.devices("metal")[0]
     with jax.default_device(cpu):
-        fn, params, opt, key = steps(jax.random.key(seed))["sbi"]
+        fn, params, opt, key = workload("sbi", jax.random.key(seed))
         keys = [jax.random.fold_in(key, i) for i in range(count)]
     report: dict = {
         "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat(),

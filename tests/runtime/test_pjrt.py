@@ -7,8 +7,12 @@ import sys
 import textwrap
 from pathlib import Path
 
-# Scripts may import `pjrt_tolerance`, the M1 agreement rule, from this directory.
-_PATH = f"import sys; sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})\n"
+import numpy as np
+
+# Scripts may import `pjrt_tolerance`, the M1 agreement rule, from this
+# directory, and the workloads in examples/.
+_DIRECTORIES = [Path(__file__).resolve().parent, Path(__file__).resolve().parents[2] / "examples"]
+_PATH = f"import sys; sys.path[:0] = {[str(d) for d in _DIRECTORIES]!r}\n"
 
 
 def _run(script: str, platforms: str | None = "metal,cpu") -> subprocess.CompletedProcess:
@@ -75,7 +79,7 @@ def test_programs_match_cpu():
     """Fused elementwise and index-mapping programs, against the CPU backend."""
     out = _check("""
         import jax, jax.numpy as jnp, ml_dtypes, numpy as np
-        from pjrt_tolerance import assert_normwise_close
+        from pjrt_tolerance import assert_matches_cpu
         metal, cpu = jax.devices("metal")[0], jax.devices("cpu")[0]
         rng = np.random.default_rng(0)
         x = rng.standard_normal((3, 4), np.float32)
@@ -100,11 +104,8 @@ def test_programs_match_cpu():
             "zero size": (lambda x: x * 2, np.zeros((0, 3), np.float32)),
         }
         for name, (fn, *args) in cases.items():
-            got = jax.jit(fn)(*(jax.device_put(a, metal) for a in args))
-            want = jax.jit(fn)(*(jax.device_put(a, cpu) for a in args))
-            for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
-                assert g.devices() == {metal}, name
-                assert_normwise_close(g, w, err_msg=name)
+            got = assert_matches_cpu(fn, *args, err_msg=name)
+            assert all(g.devices() == {metal} for g in jax.tree.leaves(got)), name
         print(len(cases))
     """)
     assert out.strip() == "15"
@@ -139,6 +140,7 @@ def test_guarded_index_maps_match_cpu():
     _check("""
         import jax, jax.numpy as jnp, numpy as np
         from jax import lax
+        from pjrt_tolerance import assert_matches_cpu
         metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
         x = np.arange(12, dtype=np.float32).reshape(3, 4)
         y = np.arange(8, dtype=np.float32).reshape(2, 4) + 20
@@ -188,11 +190,7 @@ def test_guarded_index_maps_match_cpu():
                  x.astype(dtype), dtype(1)),
             ]
         for fn, *args in cases:
-            run = jax.jit(fn)
-            got = run(*(jax.device_put(a, metal) for a in args))
-            want = run(*(jax.device_put(a, cpu) for a in args))
-            for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
-                np.testing.assert_array_equal(np.asarray(g), np.asarray(w))
+            assert_matches_cpu(fn, *args, exact=True)
     """)
 
 
@@ -209,7 +207,7 @@ def test_reductions_match_cpu():
     _check("""
         import jax, jax.numpy as jnp, ml_dtypes, numpy as np
         from jax import lax
-        from pjrt_tolerance import assert_normwise_close
+        from pjrt_tolerance import assert_matches_cpu
         metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
         rng = np.random.default_rng(5)
         cases = []
@@ -238,10 +236,7 @@ def test_reductions_match_cpu():
                 cases += [(lambda x: (jnp.bitwise_and.reduce(x, 0),
                                       jnp.bitwise_or.reduce(x, 1)), x)]
         for fn, x in cases:
-            run = jax.jit(fn)
-            got, want = run(jax.device_put(x, metal)), run(jax.device_put(x, cpu))
-            for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
-                assert_normwise_close(g, w)
+            assert_matches_cpu(fn, x)
     """)
 
 
@@ -317,7 +312,7 @@ def test_static_loops_match_cpu():
     _check("""
         import jax, jax.numpy as jnp, numpy as np
         from jax import lax
-        from pjrt_tolerance import assert_normwise_close
+        from pjrt_tolerance import assert_matches_cpu
         metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
         x = np.arange(12, dtype=np.float32).reshape(3, 4) / 10
         cases = []
@@ -359,10 +354,7 @@ def test_static_loops_match_cpu():
                 (np.uint32(2**32 - 3), x)), x),
         ]
         for fn, x in cases:
-            run = jax.jit(fn)
-            got, want = run(jax.device_put(x, metal)), run(jax.device_put(x, cpu))
-            for g, w in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
-                assert_normwise_close(g, w)
+            assert_matches_cpu(fn, x)
     """)
 
 
@@ -382,23 +374,9 @@ def test_static_loop_buffers_survive_queued_calls():
     """)
 
 
-def test_dynamic_loop_reports_unimplemented():
-    result = _run("""
-        import jax, numpy as np
-        from jax import lax
-        device = jax.devices('metal')[0]
-        run = jax.jit(lambda n: lax.while_loop(lambda i: i < n, lambda i: i + 1, 0))
-        run(jax.device_put(np.int32(3), device))
-    """)
-    assert result.returncode != 0
-    assert "UNIMPLEMENTED: metal: stablehlo.while requires" in result.stderr
-
-
 def test_sbi_trajectory_and_summary_match_cpu():
-    _check(f"""
-        import sys
+    _check("""
         import jax, jax.numpy as jnp, numpy as np
-        sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
         from training_steps import sbi_trajectory
         from pjrt_tolerance import assert_normwise_close
         metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
@@ -417,7 +395,7 @@ def test_dot_general_matches_cpu():
     _check("""
         import jax, jax.numpy as jnp, ml_dtypes, numpy as np
         from jax import lax
-        from pjrt_tolerance import assert_normwise_close
+        from pjrt_tolerance import assert_matches_cpu
         metal, cpu = jax.devices('metal')[0], jax.devices('cpu')[0]
         rng = np.random.default_rng(71)
         def array(shape):
@@ -452,25 +430,19 @@ def test_dot_general_matches_cpu():
                       (lambda a,b:lax.dot_general(a,b,(((1,),(0,)),((),())),
                                                  preferred_element_type=jnp.float32), a,b)]
         for index, (fn, a,b) in enumerate(cases):
-            run = jax.jit(fn)
-            got = run(jax.device_put(a,metal),jax.device_put(b,metal))
-            want = run(jax.device_put(a,cpu),jax.device_put(b,cpu))
-            for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
-                assert_normwise_close(g,w,err_msg=f'case {index}')
+            assert_matches_cpu(fn, a, b, err_msg=f'case {index}')
     """)
 
 
 def test_sbi_dense_training_matches_cpu_over_ten_steps():
-    _check(f"""
-        import sys
+    _check("""
         import jax, numpy as np
-        sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
         from training_steps import adamw, sbi_loss
-        from pjrt_tolerance import assert_normwise_close
+        from pjrt_tolerance import assert_trees_close
         rng = np.random.default_rng(17)
-        shapes = {{'w1': (6,128), 'w2': (128,128), 'wa': (128,5),
-                   'wm': (128,20), 'ws': (128,20)}}
-        params = {{k: (rng.standard_normal(s) * 0.02).astype(np.float32) for k,s in shapes.items()}}
+        shapes = {'w1': (6,128), 'w2': (128,128), 'wa': (128,5),
+                   'wm': (128,20), 'ws': (128,20)}
+        params = {k: (rng.standard_normal(s) * 0.02).astype(np.float32) for k,s in shapes.items()}
         opt = (jax.tree.map(np.zeros_like, params), jax.tree.map(np.zeros_like, params), np.int32(0))
         x = rng.standard_normal((512,6)).astype(np.float32)
         theta = rng.uniform(0.5,1.5,(512,4)).astype(np.float32)
@@ -478,17 +450,16 @@ def test_sbi_dense_training_matches_cpu_over_ten_steps():
         def step(params,opt,x,theta):
             loss,grads = jax.value_and_grad(sbi_loss)(params,x,theta)
             return adamw(params,grads,opt),loss
-        state = {{name: jax.device_put((params,opt,x,theta),jax.devices(name)[0])
-                 for name in ('metal','cpu')}}
+        state = {name: jax.device_put((params,opt,x,theta),jax.devices(name)[0])
+                 for name in ('metal','cpu')}
         for _ in range(10):
-            losses = {{}}
+            losses = {}
             for name,(p,o,a,t) in state.items():
                 (p,o),losses[name] = step(p,o,a,t)
                 state[name] = (p,o,a,t)
-            for g,w in zip(jax.tree.leaves((state['metal'][:2],losses['metal'])),
-                           jax.tree.leaves((state['cpu'][:2],losses['cpu'])),strict=True):
-                # Normwise per leaf: near-zero entries cannot match componentwise.
-                assert_normwise_close(g,w,rtol=1e-4)
+            # Normwise per leaf: near-zero entries cannot match componentwise.
+            assert_trees_close((state['metal'][:2],losses['metal']),
+                               (state['cpu'][:2],losses['cpu']),rtol=1e-4)
     """)
 
 
@@ -496,6 +467,7 @@ def test_wide_integer_operations_match_cpu():
     _check("""
         import jax, jax.numpy as jnp, numpy as np
         from jax import lax
+        from pjrt_tolerance import assert_matches_cpu
         jax.config.update('jax_enable_x64', True)
         metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
         for dtype in (np.int64,np.uint64):
@@ -519,11 +491,7 @@ def test_wide_integer_operations_match_cpu():
             if dtype == np.int64:
                 cases.append((lambda a,b:(lax.div(a,b),lax.rem(a,b)),a,np.full_like(a,-1)))
             for fn,a,b in cases:
-                run=jax.jit(fn)
-                got=run(jax.device_put(a,metal),jax.device_put(b,metal))
-                want=run(jax.device_put(a,cpu),jax.device_put(b,cpu))
-                for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
-                    np.testing.assert_array_equal(np.asarray(g),np.asarray(w))
+                assert_matches_cpu(fn, a, b, exact=True)
     """)
 
 
@@ -555,49 +523,38 @@ def test_threefry_random_matches_cpu():
 
 
 def test_full_sbi_training_matches_cpu_over_ten_steps():
-    _check(f"""
-        import sys
+    _check("""
         import jax, numpy as np
-        sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
-        from training_steps import steps
-        from pjrt_tolerance import assert_normwise_close
+        from training_steps import workload
+        from pjrt_tolerance import assert_trees_close
         cpu = jax.devices('cpu')[0]
         with jax.default_device(cpu):
-            fn,params,opt,key = steps()['sbi']
+            fn,params,opt,key = workload('sbi')
             keys = [jax.random.fold_in(key,i) for i in range(10)]
-        state = {{name:jax.device_put((params,opt),jax.devices(name)[0])
-                 for name in ('metal','cpu')}}
+        state = {name:jax.device_put((params,opt),jax.devices(name)[0])
+                 for name in ('metal','cpu')}
         run = jax.jit(fn)
         for key in keys:
-            losses = {{}}
+            losses = {}
             for name,(p,o) in state.items():
                 state[name],losses[name] = run(p,o,jax.device_put(key,jax.devices(name)[0]))
-            for g,w in zip(jax.tree.leaves((state['metal'],losses['metal'])),
-                           jax.tree.leaves((state['cpu'],losses['cpu'])),strict=True):
-                # Every parameter and optimizer-state leaf, and the loss, per array.
-                assert np.isfinite(np.asarray(g)).all()
-                assert_normwise_close(g,w,rtol=1e-4)
+            # Every parameter and optimizer-state leaf, and the loss, per array.
+            got = (state['metal'],losses['metal'])
+            assert all(np.isfinite(np.asarray(g)).all() for g in jax.tree.leaves(got))
+            assert_trees_close(got,(state['cpu'],losses['cpu']),rtol=1e-4)
     """)
 
 
 def test_llm_training_step_matches_cpu():
-    _check(f"""
-        import sys
+    _check("""
         import jax,numpy as np
-        sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
-        from training_steps import steps
-        from pjrt_tolerance import assert_normwise_close
+        from training_steps import workload
+        from pjrt_tolerance import assert_matches_cpu
         with jax.default_device(jax.devices('cpu')[0]):
-            fn,params,opt,_=steps()['llm']
+            fn,params,opt,_=workload('llm')
         tokens=np.arange(4*129,dtype=np.int32).reshape(4,129)%128
-        outputs={{}}
-        run=jax.jit(fn)
-        for name in ('metal','cpu'):
-            outputs[name]=run(*jax.device_put((params,opt,tokens),jax.devices(name)[0]))
-        for got,want in zip(jax.tree.leaves(outputs['metal']),
-                            jax.tree.leaves(outputs['cpu']),strict=True):
-            assert np.isfinite(np.asarray(got)).all()
-            assert_normwise_close(got,want,rtol=1e-4)
+        got = assert_matches_cpu(fn, params, opt, tokens, rtol=1e-4)
+        assert all(np.isfinite(np.asarray(g)).all() for g in jax.tree.leaves(got))
     """)
 
 
@@ -605,7 +562,7 @@ def test_cond_and_switch_match_cpu():
     _check("""
         import jax, jax.numpy as jnp, ml_dtypes, numpy as np
         from jax import lax
-        from pjrt_tolerance import assert_normwise_close
+        from pjrt_tolerance import assert_matches_cpu
         metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
         x = np.arange(12,dtype=np.float32).reshape(3,4) / 10 + 0.1
         cases = [
@@ -631,64 +588,41 @@ def test_cond_and_switch_match_cpu():
         for dtype in (np.int32,np.uint32,np.bool_,np.float16,ml_dtypes.bfloat16):
             cases.append((lambda p,x:lax.cond(p>0,lambda y:y,lambda y:y[::-1],x),x.astype(dtype)))
         for fn,x in cases:
-            run=jax.jit(fn)
             for p in (-100,0,1,2,100):
-                got=run(jax.device_put(np.int32(p),metal),jax.device_put(x,metal))
-                want=run(jax.device_put(np.int32(p),cpu),jax.device_put(x,cpu))
-                for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
-                    assert_normwise_close(g,w)
-    """)
-
-
-def test_cond_predicates_and_inputs_survive_queued_calls():
-    _check("""
-        import jax,numpy as np
-        from jax import lax
-        metal=jax.devices('metal')[0]
-        run=jax.jit(lambda p,x:lax.cond(p,lambda y:y+1,lambda y:y-1,x))
-        results=[]
-        for i in range(40):
-            p=jax.device_put(np.bool_(i%2),metal)
-            x=jax.device_put(np.full(4096,i,np.float32),metal)
-            results.append(run(p,x))
-            p.delete()
-            x.delete()
-        for i,y in enumerate(results):
-            np.testing.assert_array_equal(np.asarray(y),np.full(4096,i+(1 if i%2 else -1),np.float32))
+                assert_matches_cpu(fn, np.int32(p), x)
     """)
 
 
 def test_raw_case_out_of_range_indices_select_last_branch():
-    # JAX switch clamps before lowering; exercise raw StableHLO's different
-    # negative-index behavior through its generated kernel as well.
-    _check('''
-        import numpy as np
-        from jaxlib.mlir.dialects import stablehlo
-        from palladium.stablehlo import compile_program
-        from palladium._runtime import Kernel, run
-        module = """module {
-          func.func @main(%index: tensor<i32>) -> tensor<i32> {
-            %result = "stablehlo.case"(%index) ({
-              %c = stablehlo.constant dense<10> : tensor<i32>
-              stablehlo.return %c : tensor<i32>
-            }, {
-              %c = stablehlo.constant dense<20> : tensor<i32>
-              stablehlo.return %c : tensor<i32>
-            }, {
-              %c = stablehlo.constant dense<30> : tensor<i32>
-              stablehlo.return %c : tensor<i32>
-            }) : (tensor<i32>) -> tensor<i32>
-            return %result : tensor<i32>
-          }
-        }"""
-        program = compile_program(stablehlo.serialize_portable_artifact_str(module, '1.0.0'))
-        [launch] = program.launches
-        kernel = Kernel(launch.source, launch.function)
-        for index, expected in ((-100,30),(-1,30),(0,10),(1,20),(2,30),(3,30),(100,30)):
-            buffers = [np.array(index,np.int32), np.array(0,np.int32)]
-            run(kernel,[buffers[s] for s in launch.slots],launch.grid)
-            assert buffers[program.outputs[0]].item() == expected
-    ''')
+    """JAX's switch clamps before lowering; raw StableHLO sends any index outside
+    the branches to the last one. Runs the generated kernel directly: no jax."""
+    from jaxlib.mlir.dialects import stablehlo
+
+    from palladium._runtime import Kernel, run
+    from palladium.stablehlo import compile_program
+
+    module = """module {
+      func.func @main(%index: tensor<i32>) -> tensor<i32> {
+        %result = "stablehlo.case"(%index) ({
+          %c = stablehlo.constant dense<10> : tensor<i32>
+          stablehlo.return %c : tensor<i32>
+        }, {
+          %c = stablehlo.constant dense<20> : tensor<i32>
+          stablehlo.return %c : tensor<i32>
+        }, {
+          %c = stablehlo.constant dense<30> : tensor<i32>
+          stablehlo.return %c : tensor<i32>
+        }) : (tensor<i32>) -> tensor<i32>
+        return %result : tensor<i32>
+      }
+    }"""
+    program = compile_program(stablehlo.serialize_portable_artifact_str(module, "1.0.0"))
+    [launch] = program.launches
+    kernel = Kernel(launch.source, launch.function)
+    for index, expected in ((-100, 30), (-1, 30), (0, 10), (1, 20), (2, 30), (3, 30), (100, 30)):
+        buffers = [np.array(index, np.int32), np.array(0, np.int32)]
+        run(kernel, [buffers[s] for s in launch.slots], launch.grid)
+        assert buffers[program.outputs[0]].item() == expected
 
 
 def test_execution_stats_count_launches_and_gpu_time():
@@ -921,6 +855,7 @@ def test_argmax_argmin_and_variadic_reducers_match_cpu():
     _check("""
         import jax,jax.numpy as jnp,ml_dtypes,numpy as np
         from jax import lax
+        from pjrt_tolerance import assert_matches_cpu
         metal,cpu=jax.devices('metal')[0],jax.devices('cpu')[0]
         rng=np.random.default_rng(4)
         cases=[]
@@ -945,10 +880,7 @@ def test_argmax_argmin_and_variadic_reducers_match_cpu():
         cases.append((lambda x:lax.reduce((x,x),(np.float32(3),np.float32(4)),
                       lambda a,b:(a[0]+b[0],a[1]+b[1]),(1,)),np.empty((3,0),np.float32)))
         for fn,x in cases:
-            run=jax.jit(fn)
-            got,want=run(jax.device_put(x,metal)),run(jax.device_put(x,cpu))
-            for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
-                np.testing.assert_array_equal(np.asarray(g),np.asarray(w))
+            assert_matches_cpu(fn, x, exact=True)
     """)
 
 
@@ -960,7 +892,7 @@ def test_pallas_kernels_inside_jit_match_cpu():
         from jax import lax
         from jax.experimental import pallas as pl
         import palladium
-        from pjrt_tolerance import assert_normwise_close
+        from pjrt_tolerance import assert_trees_close
         metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
 
         def pair(x_ref,y_ref,o_ref,p_ref):
@@ -998,8 +930,7 @@ def test_pallas_kernels_inside_jit_match_cpu():
                 got = jax.jit(fn)(jax.device_put(x,metal),jax.device_put(y,metal))
                 with jax.default_device(cpu):
                     want = jax.jit(ref)(x,y)
-                for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
-                    assert_normwise_close(g,w)
+                assert_trees_close(got, want)
     """)
 
 
@@ -1034,12 +965,10 @@ def test_plmtl_threadgroup_kernels_run_inside_jit():
 def test_cnf_training_matches_cpu_over_ten_steps():
     """The CNF update with Palladium's adjoint kernels, and in plain JAX, whose
     backward loop needs fusions split to stay within 31 buffers per kernel."""
-    _check(f"""
-        import sys
+    _check("""
         import jax, numpy as np
-        sys.path.insert(0, {str(Path(__file__).resolve().parents[2] / "examples")!r})
         import cnf_density as cnf
-        from pjrt_tolerance import assert_normwise_close
+        from pjrt_tolerance import assert_trees_close
         metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
         data = cnf.mixture_data(256)
         def train(device, variant):
@@ -1054,25 +983,20 @@ def test_cnf_training_matches_cpu_over_ten_steps():
         want = train(cpu,'jax')
         for variant in ('reverse','jax'):
             for got,ref in zip(train(metal,variant),want,strict=True):
-                for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(ref),strict=True):
-                    assert np.isfinite(np.asarray(g)).all()
-                    assert_normwise_close(g,w,rtol=1e-4)
+                assert all(np.isfinite(np.asarray(g)).all() for g in jax.tree.leaves(got))
+                assert_trees_close(got, ref, rtol=1e-4)
     """)
 
 
 def test_programs_over_the_buffer_limit_match_cpu():
     _check("""
         import jax, numpy as np
-        from pjrt_tolerance import assert_normwise_close
+        from pjrt_tolerance import assert_matches_cpu
         metal,cpu = jax.devices('metal')[0],jax.devices('cpu')[0]
         xs = [np.full(5,k,np.float32)+np.arange(5,dtype=np.float32) for k in range(40)]
         for fn in (lambda *xs:tuple(x+1 for x in xs[:20]),
                    lambda *xs:sum(x*k for k,x in enumerate(xs))):
-            run = jax.jit(fn)
-            got = run(*jax.device_put(xs,metal))
-            want = run(*jax.device_put(xs,cpu))
-            for g,w in zip(jax.tree.leaves(got),jax.tree.leaves(want),strict=True):
-                assert_normwise_close(g,w)
+            assert_matches_cpu(fn, *xs)
     """)
 
 

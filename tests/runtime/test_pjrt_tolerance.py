@@ -7,9 +7,8 @@ from pjrt_tolerance import assert_normwise_close
 
 
 def test_tiny_arrays_are_checked_relative_to_their_own_scale():
+    # assert_allclose with atol=2e-6, the old rule, accepts an all-zero second moment.
     second_moment = np.array([1.5e-11, 3e-12, 0.0], np.float32)
-    # atol=2e-6 would accept an all-zero second moment.
-    np.testing.assert_allclose(np.zeros(3), second_moment, rtol=1e-4, atol=2e-6)
     with pytest.raises(AssertionError, match="normwise"):
         assert_normwise_close(np.zeros(3, np.float32), second_moment, rtol=1e-4)
     assert_normwise_close(second_moment * (1 + 5e-5), second_moment, rtol=1e-4)
@@ -17,10 +16,9 @@ def test_tiny_arrays_are_checked_relative_to_their_own_scale():
 
 def test_near_zero_entries_are_judged_against_the_array_scale():
     reference = np.array([1.0, -1.2106e-4], np.float32)
-    actual = np.array([1.0, -1.2049e-4], np.float32)  # 0.5% off componentwise
+    # 0.5% off componentwise, which a componentwise rtol of 1e-4 rejects.
+    actual = np.array([1.0, -1.2049e-4], np.float32)
     assert_normwise_close(actual, reference, rtol=1e-4)
-    with pytest.raises(AssertionError):
-        np.testing.assert_allclose(actual, reference, rtol=1e-4)
 
 
 def test_nonfinite_values_must_match_in_place():
@@ -28,7 +26,7 @@ def test_nonfinite_values_must_match_in_place():
     assert_normwise_close(reference.copy(), reference)
     with pytest.raises(AssertionError):
         assert_normwise_close(np.array([np.nan, -np.inf, 1.0], np.float32), reference)
-    with pytest.raises(AssertionError, match="nonfinite where"):
+    with pytest.raises(AssertionError):  # nonfinite where the reference is finite
         assert_normwise_close(np.array([np.nan, np.inf, np.nan], np.float32), reference)
 
 

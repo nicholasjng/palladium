@@ -123,10 +123,10 @@ kernel void copy4(device const float4* a [[buffer(0)]], device float4* b [[buffe
 
 def _sbi(device) -> dict:
     # Initialize on CPU so unsupported setup operations cannot obscure the step.
-    from training_steps import steps
+    from training_steps import workload
 
     with jax.default_device(jax.devices("cpu")[0]):
-        fn, *args = steps()["sbi"]
+        fn, *args = workload("sbi")
     args = jax.device_put(args, device)
     jax.block_until_ready(args)
     start = time.perf_counter()

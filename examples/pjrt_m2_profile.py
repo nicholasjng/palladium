@@ -34,14 +34,14 @@ import jax
 import jaxlib
 import numpy as np
 from pjrt_m1_benchmark import _revision, _write_json
-from training_steps import adamw, sbi_loss, sbi_trajectory, steps
+from training_steps import adamw, sbi_loss, sbi_trajectory, workload
 
 from palladium import _pjrt
 
 
 def _workloads(device) -> dict:
     with jax.default_device(jax.devices("cpu")[0]):
-        fn, params, opt, key = steps()["sbi"]
+        fn, params, opt, key = workload("sbi")
     rng = np.random.default_rng(17)
     theta = rng.uniform(0.5, 1.5, (512, 4)).astype(np.float32)
     x = rng.standard_normal((512, 6)).astype(np.float32)
