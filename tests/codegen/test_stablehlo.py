@@ -370,7 +370,7 @@ def test_palladium_dispatch_binds_inputs_then_results():
     assert fused.slots == (0, 2)  # x + 1, materialized for the kernel
     assert dispatch.slots == (2, 1, *program.outputs)
     assert dispatch.function == "palladium_kernel" and "kernel void" in dispatch.source
-    assert dispatch.grid == (2, 1, 1) and dispatch.threadgroup == 0
+    assert dispatch.grid == (2, 1, 1) and dispatch.threadgroup == (0, 0, 0)
     assert dispatch.math_mode == 0 and dispatch.offsets == ()
 
 

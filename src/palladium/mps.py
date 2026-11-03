@@ -27,7 +27,7 @@ from jax._src.pallas.pallas_call import pallas_call_p
 from palladium.emit import emit_msl
 from palladium.emit.core import shaped
 from palladium.ffi import pallas_lowering
-from palladium.launch import CompilerParams, MathMode, check_threadgroup, launch_geometry
+from palladium.launch import MathMode, check_threadgroup, launch_geometry, lowering_options
 from palladium.trace import KernelSpec, spec_from_params
 
 __all__ = ["MpsDispatchDescriptor"]
@@ -240,14 +240,7 @@ _FAST_ORDINAL = 2
 
 def _palladium_lowering(ctx: mlir.LoweringRuleContext, *in_nodes, interpret: Any, **params):
     """Lower one pallas_call as a Palladium Metal kernel for jax-mps."""
-    options = params.get("compiler_params")
-    if options is None:
-        options = CompilerParams()
-    elif not isinstance(options, CompilerParams):
-        raise TypeError(
-            f"pallas_call on mps lowers through Palladium, which takes "
-            f"palladium.CompilerParams, not {type(options).__name__}"
-        )
+    options = lowering_options(params, "mps")
     if options.math_mode != MathMode.FAST:
         raise ValueError(
             "mps lowering supports math_mode=FAST only; jax-mps's metal_kernel "

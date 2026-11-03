@@ -22,7 +22,12 @@ from palladium.diagnostics import KernelDiagnostics, explain_spec, log_compile
 from palladium.emit import emit_msl
 from palladium.emit.core import CTYPES
 from palladium.errors import DispatchError
-from palladium.launch import CompilerParams, check_threadgroup, launch_geometry
+from palladium.launch import (
+    CompilerParams,
+    check_threadgroup,
+    launch_geometry,
+    lowering_options,
+)
 from palladium.trace import KernelSpec, trace
 
 __all__ = ["FfiCallable", "metal_call"]
@@ -353,19 +358,11 @@ def pallas_lowering(ctx, *in_nodes, interpret: Any = False, **params):
     """
     from palladium.trace import spec_from_params
 
-    options = params.get("compiler_params")
-    if options is None:
-        options = CompilerParams()
-    elif not isinstance(options, CompilerParams):
-        raise TypeError(
-            f"pallas_call on metal lowers through Palladium, which takes "
-            f"palladium.CompilerParams, not {type(options).__name__}"
-        )
+    options = lowering_options(params, "metal")
     spec = spec_from_params(params)
     check_dtypes(tuple(ctx.avals_in))
     check_threadgroup(spec, options.threadgroup_dims)
     msl_source = emit_msl(spec, dot_general=options.dot_general, program=options.program)
-    count = len(ctx.avals_in) + len(ctx.avals_out)
     rule = jax.ffi.ffi_lowering(
         _TARGET_NAME,
         operand_output_aliases=dict(spec.aliases) or None,
@@ -375,7 +372,7 @@ def pallas_lowering(ctx, *in_nodes, interpret: Any = False, **params):
         *in_nodes,
         **launch_attributes(spec, msl_source, options),
         batch_size=1,
-        elem_strides=np.zeros(count, dtype=np.int64),
+        elem_strides=np.zeros(len(ctx.avals_in) + len(ctx.avals_out), dtype=np.int64),
     )
 
 

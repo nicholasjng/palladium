@@ -6,6 +6,8 @@ import dataclasses
 import enum
 import math
 import operator
+from collections.abc import Mapping
+from typing import Any
 
 from jax._src.pallas import core as pallas_core
 
@@ -20,6 +22,7 @@ __all__ = [
     "MathMode",
     "check_threadgroup",
     "launch_geometry",
+    "lowering_options",
     "normalize_threadgroup",
 ]
 
@@ -99,6 +102,25 @@ class CompilerParams(pallas_core.CompilerParams):
             the runtime.
         """
         return normalize_threadgroup(self.threadgroup)
+
+
+def lowering_options(params: Mapping[str, Any], platform: str) -> CompilerParams:
+    """A `pallas_call`'s Palladium options, or the defaults, when lowering for `platform`.
+
+    Raises
+    ------
+    TypeError
+        The call carries another backend's compiler parameters.
+    """
+    options = params.get("compiler_params")
+    if options is None:
+        return CompilerParams()
+    if not isinstance(options, CompilerParams):
+        raise TypeError(
+            f"pallas_call on {platform} lowers through Palladium, which takes "
+            f"palladium.CompilerParams, not {type(options).__name__}"
+        )
+    return options
 
 
 def normalize_threadgroup(threadgroup: int | tuple[int, ...] | None) -> tuple[int, ...] | None:

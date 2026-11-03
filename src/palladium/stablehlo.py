@@ -21,11 +21,13 @@ coordinate tuple, so index-mapping ops cost index arithmetic, not memory.
 from __future__ import annotations
 
 import ast
+import collections
 import dataclasses
 import itertools
 import math
+import operator
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from typing import Literal
 
 import ml_dtypes
@@ -170,6 +172,13 @@ def _literal(value: float, ctype: str) -> str:
 _ATOM = re.compile(r"-?[\w.]+(\(-?[\w.]+\))?")
 
 
+_OPERATORS: dict[type[ast.operator], Callable[[int, int], int]] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+}
+
+
 def _index(expr: str) -> int | None:
     """The value of a constant unsigned index expression (+, -, * only), else None."""
     try:
@@ -180,15 +189,8 @@ def _index(expr: str) -> int | None:
     def evaluate(node: ast.AST) -> int:
         if isinstance(node, ast.Constant) and type(node.value) is int:
             return node.value
-        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
-            a, b = evaluate(node.left), evaluate(node.right)
-            return (
-                a + b
-                if isinstance(node.op, ast.Add)
-                else a - b
-                if isinstance(node.op, ast.Sub)
-                else a * b
-            )
+        if isinstance(node, ast.BinOp) and type(node.op) in _OPERATORS:
+            return _OPERATORS[type(node.op)](evaluate(node.left), evaluate(node.right))
         raise ValueError
 
     try:
@@ -205,11 +207,7 @@ def _fold(expr: str) -> str:
 
 
 def _strides(shape: Sequence[int]) -> list[int]:
-    strides, step = [], 1
-    for n in reversed(shape):
-        strides.append(step)
-        step *= n
-    return strides[::-1]
+    return [math.prod(shape[k + 1 :]) for k in range(len(shape))]
 
 
 def _linear(coords: Sequence[str], shape: Sequence[int]) -> str:
@@ -291,8 +289,8 @@ class _While:
     parameters: list[_Parameter]
     results: list[_Node]  # updated carries
     trips: int
-    counter: int  # carry index of the proven counter
-    start: int  # its initial value
+    # Integer scalar carries with known values: carry index to (start, step).
+    inductions: dict[int, tuple[int, int]]
 
 
 @dataclasses.dataclass(eq=False)
@@ -350,6 +348,11 @@ class _DispatchResult(_Node):
     shape: tuple[int, ...]
 
 
+def _copy(node: _Node) -> _Op:
+    """A distinct node with the values of `node`, for a buffer of its own."""
+    return _Op("reshape", [node], node.dtype, node.shape, {})
+
+
 def _dependencies(node: _Node) -> list[_Node]:
     if isinstance(node, _Op):
         return node.operands
@@ -362,54 +365,88 @@ def _dependencies(node: _Node) -> list[_Node]:
     return []
 
 
-def _trip_count(
-    predicate: _Node, parameters: list[_Parameter], inputs: list[_Node], results: list[_Node]
-) -> tuple[int, int, int]:
-    """Prove a scalar integer counter starts at a constant and advances to a bound.
+_COUNTED = "metal: stablehlo.while requires a constant counter, LT bound and unit increment"
 
-    Returns the trip count, the counter's carry index and its start value.
+
+def _reachable(roots: Iterable[_Node]) -> Iterator[_Node]:
+    """Each node `roots` depend on, the roots included, once."""
+    seen: set[int] = set()
+    pending = list(roots)
+    while pending:
+        node = pending.pop()
+        if id(node) not in seen:
+            seen.add(id(node))
+            yield node
+            pending.extend(_dependencies(node))
+
+
+def _invariant(
+    value: _Node, parameters: list[_Parameter], inputs: list[_Node], results: list[_Node]
+) -> _Node:
+    """A loop parameter that every iteration passes on unchanged, as its input."""
+    if isinstance(value, _Parameter) and value in parameters:
+        k = parameters.index(value)
+        if k >= len(results) or results[k] is value:
+            return inputs[k]
+    return value
+
+
+def _inductions(
+    parameters: list[_Parameter], inputs: list[_Node], results: list[_Node]
+) -> dict[int, tuple[int, int]]:
+    """Integer scalar carries that start at a constant and add a constant each iteration.
+
+    Maps carry index to (start, step). Their value in every iteration is
+    known, so no kernel needs to compute them.
     """
-    message = "metal: stablehlo.while requires a constant counter, LT bound and unit increment"
+    found = {}
+    for k, (parameter, start, result) in enumerate(
+        zip(parameters[: len(results)], inputs, results, strict=False)
+    ):
+        if (
+            parameter.shape
+            or parameter.dtype.kind not in "iu"
+            or not isinstance(start, _Constant)
+            or start.splat is None
+            or not isinstance(result, _Op)
+            or result.name != "add"
+        ):
+            continue
+        a, b = result.operands
+        step = b if a is parameter else a if b is parameter else parameter
+        step = _invariant(step, parameters, inputs, results)
+        if isinstance(step, _Constant) and step.splat is not None:
+            found[k] = (int(start.splat), int(step.splat))
+    return found
 
-    def invariant(value: _Node) -> _Node:
-        if isinstance(value, _Parameter) and value in parameters:
-            k = parameters.index(value)
-            if k >= len(results) or results[k] is value:
-                return inputs[k]
-        return value
 
+def _trip_count(
+    predicate: _Node,
+    parameters: list[_Parameter],
+    inputs: list[_Node],
+    results: list[_Node],
+    inductions: dict[int, tuple[int, int]],
+) -> int:
+    """Prove the loop runs a counter from a constant start, by one, up to a constant bound."""
     if (
         not isinstance(predicate, _Op)
         or predicate.name != "compare"
         or predicate.attributes["direction"] != "lt"
     ):
-        raise UnsupportedProgram(message)
+        raise UnsupportedProgram(_COUNTED)
     counter, bound = predicate.operands
-    if not isinstance(counter, _Parameter) or counter not in parameters[: len(results)]:
-        raise UnsupportedProgram(message)
-    index = parameters.index(counter)
-    if counter.shape or counter.dtype not in (np.int32, np.uint32):
-        raise UnsupportedProgram(message)
-    increment = results[index]
-    if not isinstance(increment, _Op) or increment.name != "add":
-        raise UnsupportedProgram(message)
-    a, b = increment.operands
-    one = b if a is counter else a if b is counter else None
-    if one is not None:
-        one = invariant(one)
-    if not isinstance(one, _Constant) or one.splat != 1:
-        raise UnsupportedProgram(message)
     # An invariant carry or lexical capture can supply a constant loop bound.
-    bound = invariant(bound)
-    start = inputs[index]
+    bound = _invariant(bound, parameters, inputs, results)
+    in_loop = isinstance(counter, _Parameter) and counter in parameters
+    k = parameters.index(counter) if in_loop else -1
     if (
-        not isinstance(start, _Constant)
-        or start.splat is None
+        counter.dtype not in (np.int32, np.uint32)
+        or inductions.get(k, (0, 0))[1] != 1
         or not isinstance(bound, _Constant)
         or bound.splat is None
     ):
-        raise UnsupportedProgram(message)
-    return max(0, int(bound.splat) - int(start.splat)), index, int(start.splat)
+        raise UnsupportedProgram(_COUNTED)
+    return max(0, int(bound.splat) - inductions[k][0])
 
 
 def _constant(op) -> _Constant:
@@ -614,13 +651,11 @@ _EXTRA = {
     "not": {"bool": "!{a}", "int": "~{a}", "uint": "~{a}"},
 }
 
+# Ops computing each element from the same element of their operands.
+_SCALAR = {*_ELEMENTWISE, *_EXTRA, "compare", "select", "convert", "bitcast_convert"}
+
 _SUPPORTED = {
-    *_ELEMENTWISE,
-    *_EXTRA,
-    "compare",
-    "select",
-    "convert",
-    "bitcast_convert",
+    *_SCALAR,
     "broadcast_in_dim",
     "reshape",
     "transpose",
@@ -726,19 +761,14 @@ def _graph(module: ir.Module) -> tuple[list[_Parameter], list[_Node]]:
                 }
                 condition = walk(op.regions[0].blocks[0], list(parameters), captures)[0]
                 body = walk(op.regions[1].blocks[0], list(parameters), captures)
-                used: set[_Node] = set()
-                pending = [condition, *body]
-                while pending:
-                    node = pending.pop()
-                    if node not in used:
-                        used.add(node)
-                        pending.extend(_dependencies(node))
+                used = {id(node) for node in _reachable([condition, *body])}
                 for value, parameter in captures.items():
-                    if isinstance(parameter, _Parameter) and parameter in used:
+                    if isinstance(parameter, _Parameter) and id(parameter) in used:
                         parameters.append(parameter)
                         inputs.append(env[value])
-                trips, counter, start = _trip_count(condition, parameters, inputs, body)
-                loop = _While(inputs, parameters, body, trips, counter, start)
+                inductions = _inductions(parameters, inputs, body)
+                trips = _trip_count(condition, parameters, inputs, body, inductions)
+                loop = _While(inputs, parameters, body, trips, inductions)
                 for i, value in enumerate(op.results):
                     env[value] = _LoopResult(loop, i, *_tensor(value))
                 continue
@@ -747,32 +777,18 @@ def _graph(module: ir.Module) -> tuple[list[_Parameter], list[_Node]]:
                 block = op.regions[0].blocks[0]
                 params = [_Parameter(i, *_tensor(v)) for i, v in enumerate(block.arguments)]
                 body = walk(block, list(params), env)
-                pending, seen = list(body), set()
-                allowed = {
-                    *_ELEMENTWISE,
-                    *_EXTRA,
-                    "compare",
-                    "select",
-                    "convert",
-                    "bitcast_convert",
-                }
-                while pending:
-                    value = pending.pop()
-                    if value in seen:
-                        continue
-                    seen.add(value)
+                for value in _reachable(body):
                     if (
                         value.shape
                         or (isinstance(value, _Parameter) and value not in params)
                         or (
                             not isinstance(value, (_Constant, _Parameter))
-                            and (not isinstance(value, _Op) or value.name not in allowed)
+                            and (not isinstance(value, _Op) or value.name not in _SCALAR)
                         )
                     ):
                         raise UnsupportedProgram(
                             "metal: variadic reduce requires a scalar elementwise body"
                         )
-                    pending.extend(_dependencies(value))
                 inputs = [env[v] for v in op.operands]
                 reduction = _VariadicReduce(
                     inputs[:count],
@@ -1373,42 +1389,6 @@ def compile_program(code: bytes) -> Program:
     return dataclasses.replace(_compile_graph(parameters, results), aliases=tuple(aliases))
 
 
-def _inductions(loop: _While) -> dict[int, tuple[int, int]]:
-    """Integer scalar carries that start at a constant and add one each iteration.
-
-    Maps carry index to (start, step); always includes the proven counter. Their
-    value in every iteration is known, so no kernel needs to compute them.
-    """
-    found = {loop.counter: (loop.start, 1)}
-    count = len(loop.results)
-
-    def invariant(value: _Node) -> _Node:
-        if isinstance(value, _Parameter) and value in loop.parameters:
-            k = loop.parameters.index(value)
-            if k >= count or loop.results[k] is value:
-                return loop.inputs[k]
-        return value
-
-    for k, (parameter, start, result) in enumerate(
-        zip(loop.parameters[:count], loop.inputs[:count], loop.results, strict=True)
-    ):
-        if (
-            k in found
-            or parameter.shape
-            or parameter.dtype.kind not in "iu"
-            or not isinstance(start, _Constant)
-            or start.splat is None
-            or not isinstance(result, _Op)
-            or result.name != "add"
-        ):
-            continue
-        a, b = result.operands
-        step = invariant(b if a is parameter else a if b is parameter else parameter)
-        if isinstance(step, _Constant) and step.splat is not None:
-            found[k] = (int(start.splat), int(step.splat))
-    return found
-
-
 def _in_place_carries(loop: _While) -> dict[int, _Op]:
     """Carries updated only by a dynamic_update_slice of themselves.
 
@@ -1416,19 +1396,10 @@ def _in_place_carries(loop: _While) -> dict[int, _Op]:
     writes just the update. Safe only if nothing else in the body reads the
     old carry or the updated value, so no read can observe a partial write.
     """
-    uses: dict[int, int] = {}
-    seen: set[int] = set()
-    pending = list(loop.results)
-    while pending:
-        node = pending.pop()
-        if id(node) in seen:
-            continue
-        seen.add(id(node))
-        for dependency in _dependencies(node):
-            uses[id(dependency)] = uses.get(id(dependency), 0) + 1
-            pending.append(dependency)
-    for result in loop.results:
-        uses[id(result)] = uses.get(id(result), 0) + 1
+    uses = collections.Counter(
+        id(dependency) for node in _reachable(loop.results) for dependency in _dependencies(node)
+    )
+    uses.update(id(result) for result in loop.results)
     carries = {}
     for k, result in enumerate(loop.results):
         parameter = loop.parameters[k]
@@ -1436,8 +1407,8 @@ def _in_place_carries(loop: _While) -> dict[int, _Op]:
             isinstance(result, _Op)
             and result.name == "dynamic_update_slice"
             and result.operands[0] is parameter
-            and uses.get(id(result)) == 1
-            and uses.get(id(parameter)) == 1
+            and uses[id(result)] == 1
+            and uses[id(parameter)] == 1
             and math.prod(result.operands[1].shape)
         ):
             carries[k] = result
@@ -1484,6 +1455,8 @@ def _compile_graph(
         nodes: list[_Node],
         threads: int = 0,
         size: int | None = None,
+        grid: int | None = None,
+        math_mode: int | None = None,
     ) -> None:
         for operand in kernel.buffers:
             if id(operand) not in slot_of:
@@ -1494,10 +1467,11 @@ def _compile_graph(
                 f"metal: a kernel needs {len(bound)} buffers, over Metal's {_MAX_BUFFERS}"
             )
         size = math.prod(nodes[0].shape) if size is None else size
-        grid = size * (threads or 1)
-        # Reductions run SAFE; RELAXED keeps folded extrema's infinities and NaNs.
-        mode = 0 if threads else 1 if kernel.relaxed else 2
-        launches.append(Launch(source, name, tuple(bound), grid, threads, mode))
+        grid = size * (threads or 1) if grid is None else grid
+        if math_mode is None:
+            # Reductions run SAFE; RELAXED keeps folded extrema's infinities and NaNs.
+            math_mode = 0 if threads else 1 if kernel.relaxed else 2
+        launches.append(Launch(source, name, tuple(bound), grid, threads, math_mode))
 
     visited: set[int] = set()
     temporaries: list[_Node] = []  # keep synthetic nodes alive while slot_of uses their ids
@@ -1549,8 +1523,7 @@ def _compile_graph(
             kernel.lines.append("}")
         name = f"variadic_reduce_{len(launches)}"
         stores = [f"o{k}[i] = {v};" for k, v in enumerate(accumulators)]
-        launch(kernel, kernel.render(outputs, name, stores), name, outputs)
-        launches[-1] = dataclasses.replace(launches[-1], math_mode=0)
+        launch(kernel, kernel.render(outputs, name, stores), name, outputs, math_mode=0)
         reduction_slots[reduction] = [slot_of[id(result)] for result in outputs]
         return reduction_slots[reduction][node.index]
 
@@ -1563,14 +1536,10 @@ def _compile_graph(
         for k, result in enumerate(dispatch.results):
             if k in dispatch.aliases:
                 # The result starts as a copy of its input; the kernel updates it.
-                source = dispatch.inputs[dispatch.aliases[k]]
-                copy = _Op("reshape", [source], result.dtype, result.shape, {})
-                temporaries.append(copy)
-                slot_of[id(result)] = materialize(copy)
+                slot_of[id(result)] = materialize_copy(dispatch.inputs[dispatch.aliases[k]])
             else:
                 fresh(result)
             outputs.append(slot_of[id(result)])
-        threadgroup = dispatch.threadgroup if math.prod(dispatch.threadgroup) else 0
         for element in range(dispatch.batch):
             launches.append(
                 Launch(
@@ -1578,7 +1547,7 @@ def _compile_graph(
                     dispatch.function,
                     tuple(inputs + outputs),
                     dispatch.grid,
-                    threadgroup,
+                    dispatch.threadgroup,
                     dispatch.math_mode,
                     tuple(element * s for s in dispatch.strides) if element else (),
                 )
@@ -1635,6 +1604,12 @@ def _compile_graph(
             else:
                 shrink(largest)
 
+    def materialize_copy(node: _Node) -> int:
+        """A fresh buffer holding the values of `node`."""
+        copy = _copy(node)
+        temporaries.append(copy)
+        return materialize(copy)
+
     def constant_slot(array: np.ndarray) -> int:
         slots.append(Slot("constant", array.dtype, array.shape, array.tobytes()))
         return len(slots) - 1
@@ -1646,7 +1621,7 @@ def _compile_graph(
         if not loop.trips:
             loop_slots[loop] = [materialize(n) for n in loop.inputs[:count]]
             return loop_slots[loop]
-        inductions = _inductions(loop)
+        inductions = loop.inductions
         in_place = _in_place_carries(loop)
         current = []
         for k, node in enumerate(loop.inputs):
@@ -1654,9 +1629,7 @@ def _compile_graph(
                 current.append(-1)  # bound per iteration below
             elif k in in_place:
                 # One buffer per execution, initialized once, updated in place.
-                copy = _Op("reshape", [node], node.dtype, node.shape, {})
-                temporaries.append(copy)
-                current.append(materialize(copy))
+                current.append(materialize_copy(node))
             else:
                 current.append(materialize(node))
         # Force every other changing carry into its own output slot, even swaps
@@ -1666,7 +1639,7 @@ def _compile_graph(
         body_results: list[_Node] = [
             loop.parameters[k]
             if result is loop.parameters[k] or k in inductions or k in in_place
-            else _Op("reshape", [result], result.dtype, result.shape, {})
+            else _copy(result)
             for k, result in enumerate(loop.results)
         ]
         body = _compile_graph(
@@ -1853,8 +1826,7 @@ def _compile_graph(
         name = f"scatter_add_{len(launches)}"
         source = kernel.render([target], name, [])
         # This grid covers updates, not output elements.
-        launch(kernel, source, name, [target])
-        launches[-1] = dataclasses.replace(launches[-1], grid=math.prod(updates.shape), math_mode=0)
+        launch(kernel, source, name, [target], grid=math.prod(updates.shape), math_mode=0)
         if narrow:
             kernel = new_kernel(node.shape)
             value = kernel.value(target, kernel.coords)
@@ -1968,9 +1940,6 @@ def _compile_graph(
 
     def bins(shape: tuple[int, ...], items: list) -> list[list]:
         """Items in groups whose kernels bind at most _MAX_BUFFERS buffers."""
-        kernel, _, targets = fuse(shape, items)
-        if len(kernel.buffers) + len(targets) <= _MAX_BUFFERS:
-            return [items]
         groups: list[list] = []
         reads: set[int] = set()
         for item in items:
@@ -1986,8 +1955,11 @@ def _compile_graph(
     for size in [*computed, *(s for s in in_place if s not in computed)]:
         nodes = computed.get(size, [])
         shape = nodes[0].shape if nodes else in_place[size][0][0].operands[1].shape
-        for items in bins(shape, [*nodes, *in_place.get(size, [])]):
-            kernel, stores, targets = fuse(shape, items)
+        items = [*nodes, *in_place.get(size, [])]
+        kernels = [fuse(shape, items)]
+        if len(kernels[0][0].buffers) + len(items) > _MAX_BUFFERS:
+            kernels = [fuse(shape, group) for group in bins(shape, items)]
+        for kernel, stores, targets in kernels:
             name = f"fused_{len(launches)}"
             launch(kernel, kernel.render(targets, name, stores), name, targets, size=size)
     return Program(slots, launches, [slot_of[id(n)] for n in results])

@@ -171,10 +171,11 @@ def _describe(lib: ctypes.CDLL, builder: int, code: bytes) -> None:
             raise _Recorded
     for launch in program.launches:
         slots = (ctypes.c_int * len(launch.slots))(*launch.slots)
-        dims = (launch.grid, 1, 1) if isinstance(launch.grid, int) else launch.grid
-        grid = (ctypes.c_size_t * 3)(*dims)
-        group = launch.threadgroup
-        group = (group, 1, 1) if isinstance(group, int) else group
+        # An int is the x extent; a zero threadgroup lets the pipeline choose.
+        grid, group = (
+            (ctypes.c_size_t * 3)(*((n, 1, 1) if isinstance(n, int) else n))
+            for n in (launch.grid, launch.threadgroup)
+        )
         status = lib.pp_kernel(
             builder,
             launch.source.encode(),
@@ -183,7 +184,7 @@ def _describe(lib: ctypes.CDLL, builder: int, code: bytes) -> None:
             slots,
             len(launch.slots),
             grid,
-            (ctypes.c_size_t * 3)(*group) if group[0] else (ctypes.c_size_t * 3)(),
+            group,
             (ctypes.c_size_t * len(launch.offsets))(*launch.offsets) if launch.offsets else None,
         )
         if status < 0:
