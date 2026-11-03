@@ -63,10 +63,12 @@ def sbi_loss(p, x, theta):
 def sbi_step(params, opt, key):
     """Simulate a Lotka-Volterra ensemble with RK4, then fit an MDN posterior."""
     k1, k2 = jax.random.split(key)
-    theta = jax.random.uniform(k1, (512, 4), minval=0.5, maxval=1.5)
+    # Float32 draws in the parameters' precision: a float64 run sees the same data.
+    dtype = params["w1"].dtype
+    theta = jax.random.uniform(k1, (512, 4), jnp.float32, 0.5, 1.5).astype(dtype)
     traj = sbi_trajectory(theta)
     x = jnp.concatenate([traj.mean(0), traj.std(0), traj[-1]], -1)
-    x = x + 0.05 * jax.random.normal(k2, (512, 6))
+    x = x + 0.05 * jax.random.normal(k2, (512, 6), jnp.float32).astype(dtype)
 
     value, grads = jax.value_and_grad(sbi_loss)(params, x, theta)
     return adamw(params, grads, opt), value
