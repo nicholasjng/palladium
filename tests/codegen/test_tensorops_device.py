@@ -10,6 +10,7 @@ from flash_attention import (
     attention_call,
     attention_kernel,
     attention_specs,
+    differentiable_attention,
     reference_attention,
 )
 from jax.experimental import pallas as pl
@@ -148,3 +149,38 @@ def test_attention_with_simdgroup_matrix(
     np.testing.assert_allclose(
         call(q, k, v), reference_attention(q, k, v, causal=causal), rtol=3e-4, atol=3e-4
     )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_logsumexp(rng, causal):
+    """The forward's second output is each row's logsumexp of the scaled scores."""
+    shape = (1, 128, 2, 64)
+    call = attention_call(
+        shape, tile_q=32, tile_k=16, causal=causal, logsumexp=True, call=palladium.metal_call
+    )
+    q, k, v = (rng.standard_normal(shape, dtype=np.float32) for _ in range(3))
+    out, lse = call(q, k, v)
+    scores = np.einsum("bqhd,bkhd->bhqk", q, k).astype(np.float64) / 8.0
+    if causal:
+        scores = np.where(np.tril(np.ones((128, 128), bool)), scores, -np.inf)
+    peak = scores.max(-1, keepdims=True)
+    want = (peak + np.log(np.exp(scores - peak).sum(-1, keepdims=True)))[..., 0]
+    np.testing.assert_allclose(lse, want, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(out, reference_attention(q, k, v, causal), rtol=3e-4, atol=3e-4)
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_gradients(rng, causal):
+    """The backward kernels' dQ, dK and dV match JAX's attention VJP on CPU."""
+    shape = (1, 128, 2, 64)
+    q, k, v, d_out = (rng.standard_normal(shape, dtype=np.float32) for _ in range(4))
+    f = differentiable_attention(shape, causal=causal, tile_q=32, call=palladium.metal_call)
+    _, vjp = jax.vjp(f, q, k, v)
+    with jax.default_device(jax.devices("cpu")[0]):
+        _, reference = jax.vjp(
+            lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=causal), q, k, v
+        )
+        want = reference(d_out)
+    for got, expected in zip(vjp(d_out), want, strict=True):
+        got, expected = np.asarray(got, np.float64), np.asarray(expected, np.float64)
+        assert np.abs(got - expected).max() <= 1e-5 * np.abs(expected).max()

@@ -16,9 +16,10 @@ matmuls and attention; on ``metal``, ``gpu_us``, ``launches`` and
 
 - ``bench_matmul``: square ``a @ b`` in float32, float16 and bfloat16.
 - ``bench_attention``: 32 heads of 64 over 2,048 tokens, float32, forward and
-  the gradient of all three inputs. Forward on ``metal`` is Palladium's flash
-  attention; the backward is plain JAX through the plugin, as no attention
-  backward kernel exists yet. MLX uses ``mx.fast.scaled_dot_product_attention``.
+  the gradient of all three inputs. On ``metal`` the forward is Palladium's
+  flash attention and the gradient adds its backward kernels
+  (``examples/flash_attention.py``); elsewhere JAX's attention, which jax-mps
+  routes to MLX. MLX uses ``mx.fast.scaled_dot_product_attention``.
 - ``bench_embedding``: gathering 8,192 rows of a 32,000 by 1,024 float32 table,
   and scatter-adding them back, as an embedding's gradient does.
 """
@@ -44,7 +45,8 @@ def _optional(name: str) -> Any:
 
 
 _MLX = os.environ.get("BENCH_BACKEND") == "mlx"
-jax, jnp = (None, None) if _MLX else (_optional("jax"), _optional("jax.numpy"))
+jax: Any = None if _MLX else _optional("jax")
+jnp: Any = None if _MLX else _optional("jax.numpy")
 mx = _optional("mlx.core")
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
@@ -137,40 +139,37 @@ ATTENTION = [
 ]
 
 
-def _reference_attention(q, k, v, causal: bool):
-    """NumPy attention for one head, (tokens, dim) inputs, in float64."""
-    scores = q @ k.T / math.sqrt(q.shape[-1])
+def _attention_weights(q, k, causal: bool):
+    """NumPy attention weights for one head, (tokens, dim) inputs, in float64."""
+    scores = q.astype(np.float64) @ k.T / math.sqrt(q.shape[-1])
     if causal:
         scores = np.where(np.tril(np.ones(scores.shape, bool)), scores, -np.inf)
     weights = np.exp(scores - scores.max(-1, keepdims=True))
-    return (weights / weights.sum(-1, keepdims=True)) @ v
+    return weights / weights.sum(-1, keepdims=True)
 
 
-def _jax_attention(device, direction: str, causal: bool, q, k, v):
-    def plain(q, k, v):
-        return jax.nn.dot_product_attention(q, k, v, is_causal=causal)
+def _jax_attention(device, direction: str, causal: bool):
+    if device.platform == "metal":
+        from flash_attention import attention_call, differentiable_attention
 
-    if direction == "backward":
-        return jax.jit(jax.grad(lambda *qkv: plain(*qkv).sum(), argnums=(0, 1, 2)))
-    if device.platform != "metal":
-        return jax.jit(plain)  # jax-mps routes this to MLX's fused attention
-    from flash_attention import attention_kernel, attention_specs
-    from jax.experimental import pallas as pl
+        import palladium  # only the metal rows need Palladium
 
-    import palladium  # only the metal rows need Palladium
-
-    grid, in_specs, out_specs = attention_specs(BATCH, TOKENS, HEADS, 64, DIM)
-    shape = jax.ShapeDtypeStruct(q.shape, jnp.float32)
-    return jax.jit(
-        pl.pallas_call(
-            attention_kernel(tile_q=64, tile_k=16, head_dim=DIM, causal=causal),
-            grid=grid,
-            in_specs=in_specs,
-            out_specs=out_specs,
-            out_shape=shape,
+        make = differentiable_attention if direction == "backward" else attention_call
+        attention = make(
+            (BATCH, TOKENS, HEADS, DIM),
+            tile_q=64,
+            tile_k=16,
+            causal=causal,
             compiler_params=palladium.CompilerParams(dot_general="simdgroup"),
         )
-    )
+    else:  # jax-mps routes this to MLX's fused attention
+
+        def attention(q, k, v):
+            return jax.nn.dot_product_attention(q, k, v, is_causal=causal)
+
+    if direction == "backward":
+        return jax.jit(jax.grad(lambda *qkv: attention(*qkv).sum(), argnums=(0, 1, 2)))
+    return jax.jit(attention)
 
 
 @mew.parametrize(
@@ -208,7 +207,7 @@ def bench_attention(state: mew.State, direction: str, causal: bool) -> None:
         first = np.asarray(out if direction == "forward" else out[2])[0, 0]
     else:
         device = jax.devices()[0]
-        run = _jax_attention(device, direction, causal, q, k, v)
+        run = _jax_attention(device, direction, causal)
         args = jax.device_put((q, k, v), device)
 
         def call():
@@ -216,8 +215,11 @@ def bench_attention(state: mew.State, direction: str, causal: bool) -> None:
 
         out = call()
         first = np.asarray(out if direction == "forward" else out[2])[0, :, 0]
+    weights = _attention_weights(q[0, :, 0], k[0, :, 0], causal)
     if direction == "forward":
-        _close(first, _reference_attention(q[0, :, 0], k[0, :, 0], v[0, :, 0], causal), 1e-4)
+        _close(first, weights @ v[0, :, 0], 1e-4)
+    else:  # the gradient of a sum: each key's dV row is its total weight
+        _close(first, np.broadcast_to(weights.sum(0)[:, None], first.shape), 1e-4)
     # The forward pass does two products of tokens x tokens x dim per head,
     # the backward five; a causal mask halves the useful work.
     products = 2 if direction == "forward" else 5

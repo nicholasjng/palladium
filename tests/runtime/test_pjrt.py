@@ -681,6 +681,27 @@ def test_pool_evicts_stale_sizes_for_new_ones():
     """)
 
 
+def test_attention_gradient_inside_jit_matches_cpu():
+    # The forward kernel, rowsum(dO * O) and both backward kernels in one program.
+    _check("""
+        import jax, numpy as np
+        from flash_attention import differentiable_attention
+        shape = (1, 128, 2, 64)
+        rng = np.random.default_rng(0)
+        q, k, v = (rng.standard_normal(shape, np.float32) for _ in range(3))
+        for causal in (False, True):
+            f = differentiable_attention(shape, causal=causal, tile_q=32)
+            grad = jax.jit(jax.grad(lambda *a: (f(*a) ** 2).sum(), argnums=(0, 1, 2)))
+            got = grad(*jax.device_put((q, k, v), jax.devices('metal')[0]))
+            with jax.default_device(jax.devices('cpu')[0]):
+                attention = lambda *a: jax.nn.dot_product_attention(*a, is_causal=causal)
+                want = jax.grad(lambda *a: (attention(*a) ** 2).sum(), argnums=(0, 1, 2))(q, k, v)
+            for g, w in zip(got, want):
+                g, w = np.asarray(g, np.float64), np.asarray(w, np.float64)
+                assert np.abs(g - w).max() <= 1e-5 * np.abs(w).max(), (causal, np.abs(g - w).max())
+    """)
+
+
 def test_compiled_analysis_api():
     _check("""
         import jax,numpy as np

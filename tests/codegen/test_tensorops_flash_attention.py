@@ -6,7 +6,8 @@ import re
 import jax
 import jax.numpy as jnp
 import pytest
-from flash_attention import attention_call
+from flash_attention import _attention, attention_call, attention_specs
+from jax.experimental import pallas as pl
 from jax.extend.core import Jaxpr
 
 import palladium
@@ -207,3 +208,59 @@ def test_simdgroup_attention_keeps_the_softmax_in_registers(causal):
     assert stats.threadgroup_bytes == 2 * 16 * (64 + 4) * 4
     assert ("> q_start" in msl) == causal  # masking only blocks crossing the diagonal
     assert "matmul2d" in palladium.emit_msl(_spec(causal=causal), dot_general="simdgroup")
+
+
+def _logsumexp_spec(kernel=None):
+    """Attention storing its logsumexp, or `kernel` under the same specs."""
+    shape = (1, 64, 2, 64)
+    call = attention_call(shape, tile_q=32, tile_k=16, logsumexp=True)
+    if kernel is not None:
+        grid, in_specs, out_specs = attention_specs(1, 64, 2, 32, 64)
+        call = pl.pallas_call(
+            kernel,
+            grid=grid,
+            in_specs=in_specs,
+            out_specs=(out_specs, pl.BlockSpec((1, 1, 32), lambda b, h, qb: (b, h, qb))),
+            out_shape=(
+                jax.ShapeDtypeStruct(shape, jnp.float32),
+                jax.ShapeDtypeStruct((1, 2, 64), jnp.float32),
+            ),
+        )
+    return palladium.trace(call, *(jax.ShapeDtypeStruct(shape, jnp.float32),) * 3)
+
+
+def test_simdgroup_attention_stores_the_logsumexp():
+    """A second output of max + log(sum) per row is stored by one lane per row; the
+    `matmul2d` schedule does not support it."""
+    msl = palladium.emit_msl(_logsumexp_spec(), dot_general="simdgroup")
+    assert "device float* logsumexp [[buffer(4)]]" in msl
+    assert "_m[i] + precise::log(_l[i])" in msl
+    with pytest.raises(EmitError, match="logsumexp output needs"):
+        palladium.emit_msl(_logsumexp_spec(), dot_general="tensorops")
+
+
+def test_attention_rejects_other_second_outputs():
+    """A second output that is not running_max + log(running_sum) is not the logsumexp."""
+
+    class Shifted:
+        def __init__(self, ref):
+            self.ref = ref
+
+        def __setitem__(self, index, value):
+            self.ref[index] = value - 1.0
+
+    def kernel(q_ref, k_ref, v_ref, o_ref, lse_ref):
+        _attention(
+            q_ref,
+            k_ref,
+            v_ref,
+            o_ref,
+            Shifted(lse_ref),
+            tile_q=32,
+            tile_k=16,
+            head_dim=64,
+            causal=False,
+        )
+
+    with pytest.raises(EmitError, match="must store running_max"):
+        palladium.emit_msl(_logsumexp_spec(kernel), dot_general="simdgroup")

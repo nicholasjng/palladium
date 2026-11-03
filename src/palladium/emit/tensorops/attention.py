@@ -52,6 +52,7 @@ class _AttentionPlan:
     value_op: _TensorOpsMatmul
     online_softmax: OnlineSoftmaxPlan
     final_div: JaxprEqn
+    logsumexp: bool  # a second output stores each row's max + log(sum)
 
 
 def lower_attention(
@@ -87,7 +88,8 @@ def lower_attention(
     Notes
     -----
     Requires rank-4 float32 Q/K/V, a standard 3D grid, one forward scan, and one non-aliased
-    output. Tiles and head dimensions must be multiples of 16, or of 8 for the
+    output, optionally followed by a (batch, heads, query length) output of each row's
+    `running_max + log(running_sum)`, which the `simdgroup_matrix` schedule stores. Tiles and head dimensions must be multiples of 16, or of 8 for the
     `simdgroup_matrix` schedule, and lengths must tile evenly.
     Noncausal query and key lengths may differ; causal lengths must match. Dataflow and mask
     positions are validated, not only primitive names.
@@ -122,8 +124,10 @@ def _analyze_attention(spec: KernelSpec, scan: JaxprEqn, body: Jaxpr) -> _Attent
     """Match attention dataflow and layouts, rejecting unsupported scans, masks, tiles, or operands."""
     if scan.params.get("reverse") or scan.params.get("unroll") != 1:
         raise EmitError("tensorops attention requires a forward, single-step scan")
-    if len(spec.inputs) != 3 or len(spec.outputs) != 1 or spec.scratch or spec.aliases:
-        raise EmitError("tensorops attention requires Q, K, V, and one non-aliased output")
+    if len(spec.inputs) != 3 or len(spec.outputs) not in (1, 2) or spec.scratch or spec.aliases:
+        raise EmitError(
+            "tensorops attention requires Q, K, V, an output and optionally its logsumexp"
+        )
     if len(spec.grid) != 3:
         raise EmitError("tensorops attention requires a complete three-dimensional Pallas grid")
 
@@ -360,7 +364,39 @@ def _analyze_attention(spec: KernelSpec, scan: JaxprEqn, body: Jaxpr) -> _Attent
         value_op,
         online,
         final_div,
+        _has_logsumexp(spec, scan, body, running_max, sum_update, tile_q),
     )
+
+
+def _has_logsumexp(spec, scan, body, running_max, sum_update, tile_q) -> bool:
+    """Whether a second output stores `running_max + log(running_sum)` per query row."""
+    if len(spec.outputs) == 1:
+        return False
+    query, info = spec.inputs[0], spec.outputs[1]
+    batch, query_length, heads, _ = query.array_shape
+    block = tuple(1 if size is None else int(size) for size in info.full_block_shape)
+    if (
+        info.dtype != np.float32
+        or tuple(info.array_shape) != (batch, heads, query_length)
+        or block != (1, 1, tile_q)
+        or not _index_map_is(info, (0, 1, 2))
+    ):
+        raise EmitError(
+            "tensorops attention stores the logsumexp as (batch, heads, query length) "
+            "in (1, 1, BQ) blocks"
+        )
+    final = dict(zip(body.outvars, scan.outvars, strict=True))
+    row_max, row_sum = final.get(running_max.outvars[0]), final.get(sum_update.outvars[0])
+    producers = {v: eqn for eqn in spec.jaxpr.eqns for v in eqn.outvars if isinstance(v, Var)}
+    ref = spec.jaxpr.invars[len(spec.inputs) + 1]
+    stores = [e for e in spec.jaxpr.eqns if e.primitive.name == "swap" and e.invars[0] is ref]
+    total = producers.get(stores[0].invars[1]) if len(stores) == 1 else None
+    if total is not None and total.primitive.name == "add" and row_max in total.invars:
+        other = next(atom for atom in total.invars if atom is not row_max)
+        log = producers.get(other) if isinstance(other, Var) else None
+        if log is not None and log.primitive.name == "log" and log.invars[0] is row_sum:
+            return True
+    raise EmitError("tensorops attention's second output must store running_max + log(running_sum)")
 
 
 def _one(eqns, name, shape, predicate, role):
@@ -497,6 +533,11 @@ def _emit(plan: _AttentionPlan, spec: KernelSpec, kernel_name: str | None):
     tile_q, tile_k, causal = plan.tile_q, plan.tile_k, plan.causal
     score_op, value_op = plan.score_op, plan.value_op
     online_softmax, final_div_eqn = plan.online_softmax, plan.final_div
+    if plan.logsumexp:
+        raise EmitError(
+            'the attention logsumexp output needs dot_general="simdgroup" or "auto" on '
+            "Apple GPU families 7-9, with query tiles of 32 rows"
+        )
     name = kernel_name or spec.name
     lanes = simdgroup_width()
     if tile_q % SIMDGROUPS:
@@ -760,12 +801,17 @@ def _emit_simdgroup(plan: _AttentionPlan, spec: KernelSpec, kernel_name: str | N
             cursor.block(f"{u} for (short c = 0; c < 2; ++c)"),
         ):
             cursor.emit(f"_out[8 * d + c] = {normalized};")
+        if plan.logsumexp:  # the four lanes of a row hold the same state; one writes it
+            row = f"(group.x * {heads} + group.y) * {plan.query_length} + _row0 + 8 * i"
+            with cursor.block("if (_fn == 0)"):
+                cursor.emit(f"logsumexp[{row}] = _m[i] + precise::log(_l[i]);")
 
     params = (
         "device float* query [[buffer(0)]]",
         "device float* key [[buffer(1)]]",
         "device float* value [[buffer(2)]]",
         "device float* output [[buffer(3)]]",
+        *(("device float* logsumexp [[buffer(4)]]",) if plan.logsumexp else ()),
         "uint3 group [[threadgroup_position_in_grid]]",
         "uint tid [[thread_index_in_threadgroup]]",
         "uint lane [[thread_index_in_simdgroup]]",
