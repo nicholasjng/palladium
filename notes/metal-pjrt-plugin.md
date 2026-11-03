@@ -128,9 +128,11 @@ almost always means jaxlib called an API slot the plugin left null. Run with
 | `tests/runtime/test_pjrt_native.py` | Builds and runs `tests/native/pjrt_dependencies.cpp` |
 | `tests/codegen/test_stablehlo.py` | Generated programs, no GPU needed |
 | `examples/training_steps.py` | The SBI, LLM and SAM2-like training steps |
-| `examples/pjrt_m1_benchmark.py` | The M1 overhead, bandwidth and compile-time artifact |
+| `benchmarks/bench_dispatch.py` | M1's overhead and bandwidth gates, per backend (mew) |
+| `benchmarks/bench_training.py` | M2: pipelined training steps with GPU busy fraction, launches and host time; compile plus first call |
+| `benchmarks/bench_kernels.py` | M0/M3: GEMM, attention and embedding kernels against MLX |
 | `examples/pjrt_sbi_audit.py` | The SBI Metal/CPU numerical audit |
-| `examples/pjrt_m2_profile.py` | M2: wall, host, encode and GPU time per SBI step |
+| `examples/pjrt_long_run.py` | Long training runs against CPU's own rounding sensitivity |
 
 ## How it was built
 
@@ -365,9 +367,9 @@ In order of what M2's SBI step needs first.
 8. **Host time per call.** 29 µs pipelined against 3 µs on CPU. Profile
    the split between jax's C API dispatch and Execute (command buffer and
    encoder creation, per-launch vectors, `std::function` and `shared_ptr`
-   churn), and compare against jax-mps on the same machine in its own
-   environment (`uv sync --group mps --no-group latest-jax`, since jax-mps
-   pins jax 0.11).
+   churn), and compare against jax-mps on the same machine from a venv in
+   the jax-mps checkout (`docs/benchmarking.md`), since jax-mps pins
+   jax 0.11.
 9. **Smaller gaps.**
    - Dependency failures now propagate through output readiness and execution
      events. GPU work may already be queued, but its results cannot report
@@ -506,27 +508,26 @@ out-of-bounds window scatter as CPU-compatible.
 
 ### Reproducing the performance gates
 
-Run in fresh processes on **each** target machine, using separate environments
-for current JAX and jax-mps (which pins JAX 0.11). Never install jax-mps into
-the project's `.venv`: its plugin registers in every jax process, with priority
-500 over CPU's 0, and becomes the default backend. Palladium registers
-`metal_call` for CPU only, so most of the suite then fails inside jax-mps
-("Output count mismatch"). `uv sync` removes it again. Do not run other GPU
-workloads concurrently:
+Since 2026-11-03 the gates are mew benchmarks, run once per backend and
+compared with `mew compare` (`docs/benchmarking.md`). Never install jax-mps
+into the project's `.venv`: its plugin registers in every jax process, with
+priority 500 over CPU's 0, and becomes the default backend; it now lives in a
+venv inside the jax-mps checkout. Do not run other GPU workloads concurrently:
 
 ```sh
-JAX_PLATFORMS=metal,cpu uv run python examples/pjrt_m1_benchmark.py --platform metal --output metal.json
-# In the jax-mps environment:
-JAX_PLATFORMS=mps,cpu python examples/pjrt_m1_benchmark.py --platform mps --output mps.json
+JAX_PLATFORMS=metal,cpu uv run mew run benchmarks/bench_dispatch.py benchmarks/bench_training.py -o metal.jsonl
+JAX_PLATFORMS=mps,cpu ../jax-mps/.venv/bin/mew run benchmarks/bench_dispatch.py benchmarks/bench_training.py -o mps.jsonl
+uv run mew compare metal.jsonl mps.jsonl
 ```
 
-The JSON records versions, machine, cache policy, timing samples, SBI compile
-plus first completed call, and median small-call microseconds. Metal also
-records a 256 MiB elementwise wall-time bandwidth and the same copy kernel/GPU
-time used by `bench_copy_bandwidth`. Compare `small_median_us` across the two
-artifacts; require `elementwise_fraction_of_copy >= 0.8` and SBI first call
-under 5 seconds. The correctness suite remains a separate prerequisite.
-JAX persistent caching is disabled; the Metal driver's cache is not cleared.
+`bench_small_call` is the small-call gate; `bench_elementwise` reports
+bandwidth as a `bytes` rate, to compare with
+`bench_roofline.py::bench_copy_bandwidth` (gate: at least 80% of copy).
+`bench_first_call` measures compile plus first call after clearing JAX's
+caches in a running process, which is shorter than the gate's fresh-process
+figure: that one includes JAX's own first-use costs. The records below were
+made with the earlier `examples/pjrt_m1_benchmark.py`, which ran each section
+in a fresh process with JAX's persistent cache disabled.
 
 Schema version 2 also records Git/jj revisions and working-copy dirtiness.
 With `--output`, the artifact is atomically checkpointed before and after each
@@ -702,8 +703,8 @@ executions, command buffers and launches; host seconds inside Execute
 and their creation time; and GPU time from each command buffer's
 `GPUStartTime`/`GPUEndTime`, as the sum and the exact union (busy) of the
 intervals. `palladium._pjrt.stats(reset=...)` reads them;
-`examples/pjrt_m2_profile.py` reports them per step for the SBI step and its
-two halves. Completion handlers arrive out of start order, so the union is
+`examples/pjrt_m2_profile.py` reported them per step for the SBI step and its
+two halves (now `benchmarks/bench_training.py`). Completion handlers arrive out of start order, so the union is
 computed when read; an earlier incremental merge assumed start order and
 reported about half the true busy time.
 
@@ -764,7 +765,7 @@ interval 4, Palladium's forward and adjoint kernels, Adam). jax-mps with
 time (xla-metal-replay `notes/plan.md`, 2026-10-28, which places it on the M1
 machine; not rerun here, since PyPI jax-mps has no `palladium.dispatch`
 handler).
-`examples/pjrt_m2_profile.py` on the M2:
+`examples/pjrt_m2_profile.py` (now `benchmarks/bench_training.py`) on the M2:
 
 | Workload, pipelined | Wall | Host | Encode | GPU busy | GPU/wall | Launches |
 |---|---:|---:|---:|---:|---:|---:|

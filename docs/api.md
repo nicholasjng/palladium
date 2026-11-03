@@ -10,18 +10,19 @@ complete usage examples.
 
 | API | Purpose | Important boundary |
 |---|---|---|
-| `metal_call(kernel, **pallas_kwargs)` | Construct a CPU JAX callable dispatching a Pallas kernel to Metal | Native FFI and a Metal device are required at execution; no jax-mps plugin is needed |
-| `plmtl.kernel(body, out_type, *, mesh, scratch_types=())` | Like `pl.kernel` on a `plmtl.Mesh` of threadgroups, with `plmtl.THREADGROUP` scratch, dispatched like `metal_call` | Use `pl.program_id` for mesh coordinates; dots take threadgroup tiles; CPU FFI only so far |
-| `CompilerParams(...)` | Select dot policy, threadgroup dimensions, and math mode | MPS supports FAST only; cooperative kernels fix their group size |
+| `metal_call(kernel, **pallas_kwargs)` | Construct a CPU JAX callable dispatching a Pallas kernel to Metal | Native FFI and a Metal device are required at execution; the PJRT plugin is not |
+| `plmtl.kernel(body, out_type, *, mesh, scratch_types=())` | Like `pl.kernel` on a `plmtl.Mesh` of threadgroups, with `plmtl.THREADGROUP` scratch, dispatched like `metal_call` | Use `pl.program_id` for mesh coordinates; dots take threadgroup tiles; runs from CPU programs and inside programs on the `metal` plugin |
+| `CompilerParams(...)` | Select dot policy, threadgroup dimensions, and math mode | Cooperative kernels fix their group size |
 | `debug_msl(kernel, *example_args, **pallas_kwargs)` | Return source directly from a kernel and shape/dtype examples | Traces and emits; no Metal compilation or dispatch |
 | `trace(pallas_fn, *example_args)` | Extract a reusable `KernelSpec` | Exactly one Pallas call, including through JIT wrappers |
 | `emit_msl(spec, kernel_name=None, *, dot_general="auto")` | Generate complete source from a specification | Launch geometry must match the emitted primitive/cooperative model |
 | `with_vjp(forward, backward, *, residuals=0)` | Supply an explicit reverse-mode derivative | Backward receives primals, residuals, then public-output cotangents |
 
-For native MPS execution, use `pl.pallas_call` after importing `palladium`;
-the import registers the platform lowering. Pass `CompilerParams` through
-Pallas's `compiler_params` keyword. See [architecture](architecture.md) for
-the distinction between the MPS and CPU FFI custom-call targets.
+Inside programs on the `metal` PJRT plugin (`JAX_PLATFORMS=metal,cpu`), use a
+plain `pl.pallas_call`: the plugin registers Palladium's lowering for the
+platform when it loads. Pass `CompilerParams` through Pallas's
+`compiler_params` keyword. Both paths emit the same `palladium_dispatch`
+custom call; see [architecture](architecture.md).
 
 The `FfiCallable` returned by `metal_call` exposes:
 
@@ -67,8 +68,8 @@ defined hierarchy rather than every possible failure in the toolchain.
 ## Compiler extension interfaces
 
 Submodules expose typed building blocks for compiler work: `EmitStats`,
-`emit_msl_stats`, `CVal`, `Cursor`, `Environment`, addressing helpers, rule
-registration, and `MpsDispatchDescriptor`. Their docstrings document the
+`emit_msl_stats`, `CVal`, `Cursor`, `Environment`, addressing helpers and
+rule registration. Their docstrings document the
 required invariants. Start with the [emitter guide](emitter.md) before reusing
 them: they consume staged JAX internals and are coupled to the supported JAX
 version and emitted source format.

@@ -5,7 +5,7 @@ single pallas_call, and emits a Metal kernel. Two entry points run it:
 
 | Entry point | Execution |
 |---|---|
-| pl.pallas_call on mps | palladium is the registered Pallas backend for jax-mps; composable with jax.jit |
+| pl.pallas_call on metal | a launch inside the program on palladium's `metal` PJRT plugin (`JAX_PLATFORMS=metal,cpu`); composable with jax.jit, jax.vmap and loops |
 | metal_call | Metal dispatch through a CPU jax.ffi target backed by palladium's Metal runtime; composable with jax.jit and jax.vmap, no plugin |
 
 Both accept the same kernels. See the [README](../README.md) for the install
@@ -57,12 +57,14 @@ differ from the reference.
 MSL size without compiling or dispatching.
 palladium.debug_msl returns the generated MSL directly.
 
-## Plain Pallas on jax-mps
+## Plain Pallas on the metal plugin
 
-Importing palladium registers it as the Pallas backend for the mps platform:
-a plain `pl.pallas_call` inside `jax.jit` on a jax-mps device lowers to the
-same Metal kernel `metal_call` would build, with no wrapper call. Metal-side
-options travel as `compiler_params` on both paths:
+When `JAX_PLATFORMS` names `metal`, the plugin registers Palladium as the
+`pallas_call` lowering for the `metal` platform: a plain `pl.pallas_call`
+inside `jax.jit` on the `metal` device becomes the same Metal kernel
+`metal_call` would build, launched inside the program's command buffers with
+no wrapper call and no host round trip. Metal-side options travel as
+`compiler_params` on both paths:
 
 ~~~python
 call = pl.pallas_call(
@@ -70,7 +72,7 @@ call = pl.pallas_call(
     out_shape=...,
     compiler_params=palladium.CompilerParams(dot_general="tensorops", threadgroup=128),
 )
-jax.jit(call)(x)  # Metal on mps; JAX's own lowering elsewhere
+jax.jit(call)(x)  # a Metal kernel on metal; JAX's own lowering elsewhere
 ~~~
 
 Other platforms keep JAX's own behavior, and `interpret=True` runs the Pallas
@@ -87,7 +89,7 @@ batch axis in the Pallas grid when possible. A kernel that advances a state
 over many dispatches is an ordinary `lax.fori_loop` or `lax.scan` around the
 call under `jax.jit`.
 
-On mps, jax.vmap over a pallas_call is JAX's own batching. No path derives
+On metal, jax.vmap over a pallas_call is JAX's own batching. No path derives
 gradients from emitted MSL: pair forward and backward calls with
 palladium.with_vjp or jax.custom_vjp. See the
 [supported functionality](supported-jax.md) for details.

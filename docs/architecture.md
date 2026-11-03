@@ -3,8 +3,8 @@
 Palladium is a compiler and dispatch bridge for running a supported subset of
 JAX Pallas kernels on Apple GPUs. It reuses JAX's tracing and Pallas's grid,
 block, and Ref abstractions, translates the resulting kernel jaxpr into Metal
-Shading Language (MSL), and connects that source to either jax-mps or a CPU
-FFI handler.
+Shading Language (MSL), and runs that source either inside whole programs on
+its own PJRT plugin, `metal`, or through a CPU FFI handler.
 
 The useful starting point for an interview is the shared compiler pipeline:
 **Pallas kernel → kernel jaxpr and layouts → `KernelSpec` → MSL → dispatch.**
@@ -19,7 +19,7 @@ are separate decisions.
 | Tracing adapter | Extract the kernel body and normalize Pallas metadata; reject unsupported structure and obvious write hazards | [`trace.py`](../src/palladium/trace.py), [`effects.py`](../src/palladium/effects.py) |
 | MSL compiler | Assemble a kernel, lower primitives, or recognize a cooperative TensorOps pattern | [`emit/kernel.py`](../src/palladium/emit/kernel.py), [emitter guide](emitter.md) |
 | Launch planning | Resolve compiler options, device thread limits, and program-to-thread geometry | [`launch.py`](../src/palladium/launch.py), [`device.py`](../src/palladium/device.py) |
-| Pallas backend for MPS | Lower an ordinary Pallas call to a StableHLO custom call understood by jax-mps | [`mps.py`](../src/palladium/mps.py) |
+| PJRT plugin | Compile `jax.jit` programs (StableHLO) to Metal launches and run them; lower `pallas_call` on `metal` to Palladium's kernels | [`_pjrt.py`](../src/palladium/_pjrt.py), [`stablehlo.py`](../src/palladium/stablehlo.py), [`native/pjrt/`](../native/pjrt), [plugin notes](../notes/metal-pjrt-plugin.md) |
 | CPU-to-Metal FFI | Specialize calls and batch dispatches through JAX's CPU execution | [`ffi.py`](../src/palladium/ffi.py), [`palladium_ffi.cpp`](../native/ffi/palladium_ffi.cpp) |
 | Diagnostics | Report launch geometry, emitted source size, and declared storage | [`diagnostics.py`](../src/palladium/diagnostics.py) |
 | Explicit differentiation | Pair forward and backward callables using `jax.custom_vjp` | [`vjp.py`](../src/palladium/vjp.py) |
@@ -38,19 +38,19 @@ reads and writes, arithmetic, and nested control-flow regions.
 Palladium consumes this representation rather than parsing Python. For
 example, a static `lax.fori_loop` can arrive as a `scan`, and a `jnp.where`
 can arrive inside a JIT-wrapped sub-jaxpr. These staging details explain both
-the recursive emitter and the JAX 0.11 dependency boundary.
+the recursive emitter and the JAX 0.12 dependency boundary.
 
 ```mermaid
 flowchart TD
     A["Pallas kernel + grid + BlockSpecs"] --> B["JAX stages pallas_call"]
     B --> C["trace: make_jaxpr and extract one call"]
-    B --> D["mps lowering: receive equation parameters"]
+    B --> D["metal lowering: receive equation parameters"]
     C --> E["spec_from_params: KernelSpec"]
     D --> E
     E --> F["emit_msl: complete Metal source"]
-    F --> G["mps descriptor and StableHLO custom call"]
+    F --> G["palladium_dispatch custom call in the program"]
     F --> H["CPU jax.ffi call and native handler"]
-    G --> I["jax-mps / MLX owns execution"]
+    G --> I["metal plugin: a launch among the program's kernels"]
     H --> J["in-tree runtime C API owns dispatch"]
 ```
 
@@ -66,28 +66,26 @@ have matching layouts, with all input reads preceding writes to the shared
 output. Parallel-write validation rejects axes ignored by both the output map
 and write indices. It does **not** prove that every accepted map is injective.
 
-## Execution path 1: plain Pallas on MPS
+## Execution path 1: plain Pallas inside programs on the `metal` plugin
 
-Importing `palladium` installs a wrapper around JAX's common `pallas_call`
-lowering rule. Noninterpreted calls on `mps` take Palladium's lowering;
-other platforms and `interpret=True` delegate to JAX's original rule.
-This registration uses JAX internals because `mps` is an external platform.
+Palladium's PJRT plugin, `metal`, runs whole `jax.jit` programs: it receives
+their StableHLO, compiles it to Metal launches in Python
+([`stablehlo.py`](../src/palladium/stablehlo.py)), and executes them
+asynchronously from C++ ([`native/pjrt/`](../native/pjrt)). When the plugin
+loads (`JAX_PLATFORMS` names `metal`), it registers Palladium's
+`pallas_call` lowering for the `metal` platform through JAX's public
+`register_lowering`; `interpret=True` falls back to JAX's own rule.
 
 The lowering receives the already staged equation parameters, constructs a
-`KernelSpec`, emits MSL, and builds `MpsDispatchDescriptor`. This versioned JSON
-descriptor splits the source into header, parameter-binding prologue, and
-body, and includes the resolved launch dimensions. Buffer shapes and layouts
-are expressed by the custom call's IR types.
-
-The emitted StableHLO target is **`palladium.dispatch`**. A matching jax-mps
-handler rebuilds an MLX custom kernel, owns its buffers, and schedules it on
-its Metal stream. This path does not call the native CPU FFI library in this
-repository. The descriptor contains source and metadata rather than
-process-local pipeline handles, which makes it suitable for the compiled IR.
-
-Current limits: this integration requires the custom jax-mps handler, accepts
-FAST math only, and rejects input/output aliases because its MLX path allocates
-functional outputs. See [installation](../INSTALLATION.md) for the matching build.
+`KernelSpec`, emits MSL, and produces a typed-FFI custom call named
+**`palladium_dispatch`** whose attributes carry the source, function name,
+thread grid, threadgroup and math mode: the same call `metal_call` emits.
+The plugin's compiler turns it into a launch among the program's other
+kernels, binding inputs then results; an aliased result starts as a copy of
+its input. Every math mode and input/output alias works on this path, and
+nothing returns to the host between kernels. The plugin's design, status and
+measurements are recorded in
+[notes/metal-pjrt-plugin.md](../notes/metal-pjrt-plugin.md).
 
 ## Execution path 2: CPU JAX with Metal dispatch
 
@@ -155,7 +153,7 @@ The tests provide several kinds of evidence:
 | `tracing/` | Metadata normalization, effect rejection, aliasing and write-safety contracts |
 | `codegen/` | Source structure, numeric boundaries, cooperative recognition, and device comparisons |
 | `memory/`, `control_flow/` | Ref snapshots, edge guards, strided layouts, scratch, carry updates, and scan streaming |
-| `runtime/` | FFI/JIT/vmap composition, MPS descriptors and lowering, dtype transport, and cache concurrency |
+| `runtime/` | The PJRT plugin against XLA:CPU, FFI/JIT/vmap composition, dtype transport, and cache concurrency |
 | `workloads/` | Independent numerical references, conservation properties, and explicit gradient checks |
 | Opt-in fuzz tests | Generated expression and control-flow kernels compared with the interpreter |
 
@@ -163,8 +161,8 @@ The tests provide several kinds of evidence:
 
 1. **Problem and contract:** write a Pallas kernel once and lower a supported
    subset to Metal; explain program grids, tiles, and Refs with SAXPY.
-2. **Integration:** show `KernelSpec`, then contrast the MPS custom-call
-   descriptor with the CPU FFI handler and their buffer ownership.
+2. **Integration:** show `KernelSpec`, then contrast a launch inside a
+   plugin program with the CPU FFI handler and their buffer ownership.
 3. **Compiler:** walk through [the emitter](emitter.md), including safe views,
    control-flow carries, and the cooperative TensorOps branch.
 4. **Engineering tradeoffs:** discuss JAX internal API coupling, static shape

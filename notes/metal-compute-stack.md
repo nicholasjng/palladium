@@ -151,6 +151,15 @@ Open: CPU and jax-mps throughput on the M4 Pro. diffrax stays a CPU reference on
 2026-11-03): on `metal` it needs host callbacks and dynamic `while`, and
 adaptive solvers on the GPU come from palladium's own kernels instead.
 
+M3 baseline, preliminary (2026-11-03, M2, one run of `bench_kernels.py`
+each on the `metal` plugin and on MLX 0.32.4 directly; repeat on the M4 Pro
+as `docs/benchmarking.md` describes): Palladium's flash attention forward is
+5–12% faster than MLX's fused attention at 2,048 tokens and 32 heads of 64.
+Slower: the attention backward (plain JAX through the plugin; no kernel yet)
+by 2.3–3.3×, embedding scatter-add by 2.5×, bfloat16 GEMM by 1.6–1.9×,
+float32 GEMM at 4,096³ by 1.4×, float16 GEMM by 13%. Gather and float32 GEMM
+at 1,024³ are at parity.
+
 Work that costs time without proving anything: a JAX port of SAM2's image
 encoder and mask decoder (SAM2 is PyTorch) for M5, and a small JAX LoRA
 training stack for M4.

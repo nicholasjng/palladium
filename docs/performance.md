@@ -9,13 +9,17 @@ the grid.
 
 These are local Apple-GPU runs, workload- and machine-specific, not general
 speedup guarantees. The Lotka-Volterra result used JAX 0.11.1 and did not
-record the GPU model; the CNF row is from September 2026.
+record the GPU model; the CNF rows on mps are from September 2026. Rows marked
+"mps" ran Palladium's kernels through jax-mps, an integration removed on
+2026-11-03 when Palladium moved to jax 0.12 and its own `metal` PJRT plugin;
+they remain as records.
 
 | Workload | Palladium | Comparison |
 |---|---:|---:|
 | Lotka–Volterra, 100,000 trajectories × 500 RK4 steps, MPS custom call | 1.059 ms | 63.008 ms for `jit(vmap(scan))` on MPS |
 | 2D CNF, 256 points, width 4, 16 RK4 steps, full optimizer update (M1 Pro, JAX 0.11.2, plain `pallas_call` on mps) | 0.388 ms, reverse VJP, interval 4 | 15.023 ms for JAX on MPS; 1.061 ms for JAX on CPU |
 | The same update on the CPU platform, kernels through the FFI bridge (M2, JAX 0.11.2, no plugin) | 0.475 ms, reverse VJP, interval 4 | 0.958 ms for JAX on CPU |
+| The same update inside a `jax.jit` program on the `metal` plugin, pipelined (M2, JAX 0.12, 2026-11-03) | 0.057 ms, reverse VJP, interval 4 | 0.91 ms for JAX on CPU; 0.55 ms for plain JAX on the plugin |
 
 Training measurements are warmed, synchronized medians over 15 samples with
 rotating variant order. Updates start from identical optimizer states; input
@@ -26,20 +30,23 @@ Checkpoint interval barely matters at this size: intervals 1, 4, and 8 ran in
 0.380, 0.388, and 0.408 ms. Pairing the Palladium forward kernel with JAX's
 reference VJP instead of the adjoint kernel ran at 15.029 ms, the same as
 plain JAX, so the backward kernel carries the speedup. The FFI row calls the
-same two kernels from an XLA-on-CPU program with `metal_call`. It needs
-neither jax-mps nor Xcode and lands within 25% of the mps-platform run on a
-different machine, since XLA fuses the small optimizer glue better than MLX.
-Run the Mew benchmarks with
-`JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/`.
+same two kernels from an XLA-on-CPU program with `metal_call`; it lands within
+25% of the mps-platform run on a different machine, since XLA fuses the small
+optimizer glue better than MLX. The plugin row runs the update pipelined, as
+a training loop does, with one synchronization per batch
+(`bench_training.py`); its derivation is in
+[notes/metal-pjrt-plugin.md](../notes/metal-pjrt-plugin.md).
+[Benchmarking](benchmarking.md) describes the mew suite and how to compare
+backends.
 See the reproducible scripts for [RK4](../benchmarks/bench_rk4_ensemble.py)
 and [CNF training](../benchmarks/bench_cnf_training.py). The
 [Pallas attention benchmark](../benchmarks/bench_pallas_flash_attention.py)
 checks causal and noncausal Pallas TensorOps lowering against a NumPy reference
 and measures resident-buffer runs at sequence lengths from 1,024 to 4,096. It
-needs an MSL 4-capable runtime. The [MLX SDPA comparison](../benchmarks/bench_attention_vs_mlx_sdpa.py)
-times the same kernel as a plain `pl.pallas_call` under `jax.jit` on mps against
-`jax.nn.dot_product_attention`, which jax-mps routes to MLX's fused kernel; run it
-with the same `mew run --random-interleaving` command as the other benchmarks.
+needs an MSL 4-capable runtime. [`bench_kernels.py`](../benchmarks/bench_kernels.py)
+times the flash attention as a plain `pl.pallas_call` under `jax.jit` on the
+`metal` plugin, and MLX's fused attention from an MLX environment, under the
+same row names.
 The [SIR simulator comparison](../benchmarks/bench_sir_simulators.py) times the
 `examples/sbi_sir.py` kernel against vectorized NumPy and against torch on CPU,
 eager on MPS, and `torch.compile` with the Metal backend; it needs

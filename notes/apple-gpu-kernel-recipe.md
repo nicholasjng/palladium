@@ -33,8 +33,8 @@ Where kernels land (TFLOPS, share of the 3.38 matrix peak):
 | palladium flash attention, same, `simdgroup_matrix`, 64x16 tiles | 2.10 (62%) | not measured |
 
 The vendor rows were measured with torch 2.13 and MLX 0.32.1 directly;
-`bench_vendor_matmul` measures `jnp.dot` through jax-mps instead, when the
-mps platform is installed. Attention counts 4·heads·tokens²·64 FLOPs.
+`benchmarks/bench_kernels.py` measures MLX's matmuls and attention from an
+MLX environment under the same row names as Palladium's. Attention counts 4·heads·tokens²·64 FLOPs.
 
 Targets: float32 matmul at vendor parity (≥ 2.7 TFLOPS at 4096³), float16
 matmul ≥ 3.2, attention ≥ 2.0 at float32.
