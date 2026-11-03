@@ -29,8 +29,10 @@ mlx and palladium versions; `mew compare` prints them above its table.
 
 On `metal`, `bench_training.py` also reports the plugin's counters per step:
 `gpu_fraction` (GPU busy time over wall time), `launches`, and `encode_us`
-(host time inside Execute). `bench_kernels.py` reports `flops` per second.
-`mew compare -m flops` compares a counter instead of time.
+(host time inside Execute). `bench_kernels.py` reports `flops` per second
+and `bench_elementwise` `bytes` per second. `mew run` prints counters under
+each row and the `.jsonl` files keep them, but `mew compare` (0.3) compares
+times only.
 
 ## 1. Setup
 
