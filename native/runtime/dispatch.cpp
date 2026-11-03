@@ -207,10 +207,7 @@ CommandBatch::CommandBatch(MetalRuntime& rt)
     if (!command_buffer_) {
         throw DispatchError("could not create a Metal command buffer");
     }
-    encoder_ = NS::RetainPtr(command_buffer_->computeCommandEncoder());
-    if (!encoder_) {
-        throw DispatchError("could not create a Metal compute command encoder");
-    }
+    // add() opens the compute encoder when the first launch needs it.
 }
 
 CommandBatch::~CommandBatch() {

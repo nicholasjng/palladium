@@ -131,8 +131,8 @@ EXPORT int pp_kernel(Program* p, const char* msl, const char* function, int math
             found = p->pipelines.emplace(std::move(key), std::make_pair(library, pipeline)).first;
         }
         const auto& [library, pipeline] = found->second;
-        std::vector<size_t> bound_offsets(num_slots, 0);
-        if (offsets) bound_offsets.assign(offsets, offsets + num_slots);
+        auto bound_offsets = offsets ? std::vector<size_t>(offsets, offsets + num_slots)
+                                     : std::vector<size_t>(num_slots);
         p->kernels.push_back({library, pipeline, {slots, slots + num_slots},
                               std::move(bound_offsets), {grid[0], grid[1], grid[2]},
                               {threadgroup[0], threadgroup[1], threadgroup[2]}});
@@ -198,16 +198,12 @@ std::deque<std::shared_ptr<Completion>> in_flight;
 struct Stats {
     std::mutex mutex;
     uint64_t executions = 0, command_buffers = 0, launches = 0;
-    double encode = 0, throttle = 0;
+    std::chrono::duration<double> encode{}, throttle{};
     std::vector<std::pair<double, double>> gpu;  // command-buffer intervals
 };
 Stats& stats() {
     static Stats* s = new Stats;  // leaked: completion handlers may outlive statics
     return *s;
-}
-
-double since(std::chrono::steady_clock::time_point start) {
-    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
 void record_gpu(double start, double end) {
@@ -254,7 +250,6 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
     auto throttle_start = std::chrono::steady_clock::now();
     throttle();
     auto encode_start = std::chrono::steady_clock::now();
-    double throttled = std::chrono::duration<double>(encode_start - throttle_start).count();
     size_t launches = 0;
     bool committed = false;
     std::vector<Buffer*> bound(p.slots.size());
@@ -319,10 +314,11 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
     try {
         CommandBatch batch(runtime());
         bool encoded = false;
+        Launch launch;  // reused: add() encodes it at once, and buffers keep their capacity
         for (const Kernel& k : p.kernels) {
             if (!k.grid.volume()) continue;
-            Launch launch;
             launch.pipeline = k.pipeline.get();
+            launch.buffers.clear();
             for (size_t j = 0; j < k.slots.size(); ++j) {
                 launch.buffers.push_back({bound[k.slots[j]], k.offsets[j]});
             }
@@ -354,18 +350,16 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
     // Publish deletion only after successful submission. All original reads and
     // output snapshots precede the copybacks, including swapped/aliased outputs.
     for (int parameter : donated) args[parameter]->storage.reset();
-    for (size_t i = 0; i < results.size(); ++i) {
-        results[i]->ready = completion;
-        outputs[i] = results[i].release();
-    }
+    // The caller publishes readiness: this completion joined with the inputs'.
+    for (size_t i = 0; i < results.size(); ++i) outputs[i] = results[i].release();
     {
         Stats& s = stats();
         std::lock_guard lock(s.mutex);
         ++s.executions;
         s.command_buffers += committed;
         s.launches += launches;
-        s.throttle += throttled;
-        s.encode += since(encode_start);
+        s.throttle += encode_start - throttle_start;
+        s.encode += std::chrono::steady_clock::now() - encode_start;
     }
     return nullptr;
 }
@@ -392,12 +386,12 @@ EXPORT void palladium_pjrt_stats(PalladiumPjrtStats* out, int reset) {
     std::lock_guard lock(s.mutex);
     PoolCounters pool = pool_counters(reset);
     auto [gpu_sum, gpu_busy] = gpu_time(s.gpu);
-    *out = {s.executions, s.command_buffers, s.launches, s.encode,      s.throttle,
+    *out = {s.executions, s.command_buffers, s.launches, s.encode.count(), s.throttle.count(),
             gpu_busy,     gpu_sum,           pool.hits,  pool.misses,   pool.miss_bytes,
-            pool.dropped, pool.miss_seconds};
+            pool.dropped, pool.miss_seconds.count()};
     if (reset) {
         s.executions = s.command_buffers = s.launches = 0;
-        s.encode = s.throttle = 0;
+        s.encode = s.throttle = {};
         s.gpu.clear();
     }
 }

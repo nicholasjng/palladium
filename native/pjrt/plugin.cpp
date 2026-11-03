@@ -119,8 +119,10 @@ std::shared_ptr<Completion> Completion::done() {
 std::shared_ptr<Completion> Completion::join(
     std::vector<std::shared_ptr<Completion>> dependencies) {
     std::vector<std::shared_ptr<Completion>> unique;
+    const auto finished = done();
     for (auto& dependency : dependencies) {
-        if (dependency != done() && std::find(unique.begin(), unique.end(), dependency) == unique.end()) {
+        if (dependency != finished &&
+            std::find(unique.begin(), unique.end(), dependency) == unique.end()) {
             unique.push_back(std::move(dependency));
         }
     }
@@ -215,8 +217,9 @@ Pool& pool() {
     return *p;
 }
 
-}  // namespace
-
+// Buffers come from a pool keyed by size: GPU allocations cost tens of
+// microseconds and are zeroed. Each dispatch retains the storage it uses;
+// only the final owner returns it to the pool.
 std::unique_ptr<Buffer> acquire(size_t size_bytes) {
     Pool& p = pool();
     {
@@ -231,26 +234,23 @@ std::unique_ptr<Buffer> acquire(size_t size_bytes) {
         }
     }
     auto start = std::chrono::steady_clock::now();
-    auto count = [&] {
-        std::lock_guard lock(p.mutex);
-        ++p.counters.misses;
-        p.counters.miss_bytes += size_bytes;
-        p.counters.miss_seconds +=
-            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    };
+    std::unique_ptr<Buffer> buffer;
     try {
-        auto buffer = std::make_unique<Buffer>(runtime().device(), size_bytes);
-        count();
-        return buffer;
+        buffer = std::make_unique<Buffer>(runtime().device(), size_bytes);
     } catch (const AllocationError&) {
         std::lock_guard lock(p.mutex);  // retry with the pool given back
         p.free.clear();
         p.bytes = 0;
     }
-    auto buffer = std::make_unique<Buffer>(runtime().device(), size_bytes);
-    count();
+    if (!buffer) buffer = std::make_unique<Buffer>(runtime().device(), size_bytes);
+    std::lock_guard lock(p.mutex);
+    ++p.counters.misses;
+    p.counters.miss_bytes += size_bytes;
+    p.counters.miss_seconds += std::chrono::steady_clock::now() - start;
     return buffer;
 }
+
+}  // namespace
 
 PoolCounters pool_counters(bool reset) {
     Pool& p = pool();
@@ -258,18 +258,6 @@ PoolCounters pool_counters(bool reset) {
     PoolCounters counters = p.counters;
     if (reset) p.counters = {};
     return counters;
-}
-
-void release(std::unique_ptr<Buffer> buffer) {
-    if (!buffer) return;
-    Pool& p = pool();
-    std::lock_guard lock(p.mutex);
-    if (p.bytes + buffer->size() > kPoolLimit) {
-        ++p.counters.dropped;
-        return;
-    }
-    p.bytes += buffer->size();
-    p.free[buffer->size()].push_back(std::move(buffer));
 }
 
 PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_t* dims,
@@ -285,9 +273,19 @@ PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_
     buffer->dims.assign(dims, dims + num_dims);
     for (size_t i = num_dims; i-- > 0;) buffer->minor_to_major.push_back((int64_t)i);
     try {
+        // The last owner returns the storage to the pool, unless the pool is full.
         buffer->storage = std::shared_ptr<Buffer>(
-            acquire(byte_size(buffer.get())).release(),
-            [](Buffer* storage) { release(std::unique_ptr<Buffer>(storage)); });
+            acquire(byte_size(buffer.get())).release(), [](Buffer* storage) {
+                std::unique_ptr<Buffer> owned(storage);
+                Pool& p = pool();
+                std::lock_guard lock(p.mutex);
+                if (p.bytes + owned->size() > kPoolLimit) {
+                    ++p.counters.dropped;
+                    return;
+                }
+                p.bytes += owned->size();
+                p.free[owned->size()].push_back(std::move(owned));
+            });
     } catch (const AllocationError& e) {
         return error(PJRT_Error_Code_RESOURCE_EXHAUSTED, e.what());
     }

@@ -28,7 +28,7 @@ def gemm_source(
     def kernel(a, b, out):
         out[...] = jnp.matmul(a[...], b[...])
 
-    grid = (batch, (m + tm - 1) // tm, (n + tn - 1) // tn)
+    grid = (batch, pl.cdiv(m, tm), pl.cdiv(n, tn))
     call = pl.pallas_call(
         kernel,
         grid=grid,
