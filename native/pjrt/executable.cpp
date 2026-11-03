@@ -274,7 +274,10 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
     // A fresh slot becomes its first output; parameters, constants and repeated
     // outputs are copied into new buffers once the kernels are done.
     std::vector<std::unique_ptr<PJRT_Buffer>> results(p.outputs.size());
-    std::vector<std::pair<Buffer*, Buffer*>> copies;
+    // Two blit passes: outputs first snapshot parameters, constants and
+    // repeated slots, then results are copied back into donated storage. Each
+    // pass writes distinct buffers that no other copy in it reads.
+    std::vector<std::pair<const Buffer*, Buffer*>> snapshots, copybacks;
     for (size_t i = 0; i < p.outputs.size(); ++i) {
         int s = p.outputs[i];
         if (fresh[s]) {
@@ -284,7 +287,7 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
         PJRT_Buffer* buffer;
         if (PJRT_Error* e = new_output(device, p.slots[s], &buffer)) return e;
         results[i].reset(buffer);
-        copies.emplace_back(bound[s], buffer->storage.get());
+        snapshots.emplace_back(bound[s], buffer->storage.get());
         retained.push_back(buffer->storage);
     }
     std::vector<int> donated;
@@ -299,7 +302,7 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
         if (std::count(args, args + num_args, args[parameter]) != 1) allowed = false;
         if (!allowed) continue;
         auto storage = args[parameter]->storage;
-        copies.emplace_back(results[output]->storage.get(), storage.get());
+        copybacks.emplace_back(results[output]->storage.get(), storage.get());
         results[output]->storage = std::move(storage);
         donated.push_back(parameter);
     }
@@ -331,9 +334,9 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
         }
         // A host memcpy in the completion handler can lag the next command
         // buffer. GPU copies make passthrough/repeated outputs safe to chain.
-        for (auto [src, dst] : copies) {
-            batch.copy(*src, *dst);
-            encoded |= dst->size() != 0;
+        for (const auto* pass : {&snapshots, &copybacks}) {
+            batch.copy(*pass);
+            for (auto [src, dst] : *pass) encoded |= dst->size() != 0;
         }
         if (encoded) {
             batch.commit(finish);

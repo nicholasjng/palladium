@@ -192,7 +192,10 @@ almost always means jaxlib called an API slot the plugin left null. Run with
 7. **Execution.** `Execute` binds slots to buffers, encodes every launch
    into one command buffer, commits it with a completion handler and
    returns. Passthrough/repeated outputs and donation copybacks use blit
-   commands after the compute launches. The handler retains program and
+   commands after the compute launches, in two passes: snapshots into new
+   outputs, then copybacks into donated storage. No copy in a pass writes a
+   buffer another one uses, so each pass is one blit encoder whatever order
+   Metal runs its copies in. The handler retains program and
    storage owners, then sets the execution's `Completion`, which is each
    output's `ready`. GPU copies ensure subsequent commands cannot race a
    delayed host completion callback.

@@ -102,7 +102,7 @@ is measured against an established baseline on the same machine.
 |---|---|---|---|---|
 | M0 | Baselines | Where the ceilings and competitors sit | Roofline benchmark (bandwidth; simdgroup peak in f32/f16/bf16; `matmul2d` vs `simdgroup` GEMM); the workloads on jax-mps, XLA:CPU, MLX/mlx-lm and PyTorch MPS | A results table; settles the GEMM path for family 9 |
 | M1 | Minimal plugin | `jax.jit` on our platform: zero-copy buffers, async execution, generated elementwise and reduction kernels | jax-mps on the same programs; CPU results | Matches CPU; per-call overhead clearly below jax-mps |
-| M2 | SBI end to end | The execution-model premise: whole steps on the GPU without host glue | jax-mps, XLA:CPU, diffrax | Same losses as CPU; GPU time is most of wall time; faster than jax-mps |
+| M2 | SBI end to end | The execution-model premise: whole steps on the GPU without host glue | jax-mps, XLA:CPU, diffrax on XLA:CPU | Same losses as CPU; GPU time is most of wall time; faster than jax-mps |
 | M3 | Kernels for LLM training | Kernel parity where MLX is strongest | MLX | bf16 GEMM, gather and scatter-add, attention forward and backward at MLX speed (the backward is new) |
 | M4 | LLM LoRA fine-tune | Beating MLX at its own use case | mlx-lm LoRA, same 0.5–1B model and data | Same loss curve; tokens/s at or above mlx-lm; comparable peak memory |
 | M5 | SAM2 fine-tune | Generality: convolutions, pooling, larger graphs | PyTorch MPS (qgis-segment) and jax-mps | Same mask quality; steps/s above PyTorch MPS |
@@ -144,8 +144,10 @@ kernels stopped recomputing values in guarded branches; on the M4 Pro it
 takes 0.225 ms with the GPU busy 99.9%. The premise check holds: with
 Palladium kernels inside `jit`, the CNF update takes 57 µs on the M2, 51 µs of
 it GPU time, against 149 µs (61 µs GPU) recorded for jax-mps with async
-dispatch. Open: CPU and jax-mps throughput on the M4 Pro, a long-run loss
-comparison against CPU, and diffrax (host callbacks, dynamic `while`).
+dispatch. Open: CPU and jax-mps throughput on the M4 Pro, and a long-run loss
+comparison against CPU. diffrax stays a CPU reference only (decided
+2026-11-03): on `metal` it needs host callbacks and dynamic `while`, and
+adaptive solvers on the GPU come from palladium's own kernels instead.
 
 Work that costs time without proving anything: a JAX port of SAM2's image
 encoder and mask decoder (SAM2 is PyTorch) for M5, and a small JAX LoRA

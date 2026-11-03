@@ -4,6 +4,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "buffer.h"
@@ -99,8 +100,10 @@ class CommandBatch {
     // Validates, then encodes. Throws before touching the encoder if invalid.
     void add(const Launch& launch);
 
-    // Copies on the GPU in submission order, after preceding launches.
-    void copy(const Buffer& source, Buffer& destination);
+    // Copies each (source, destination) pair on the GPU in one blit pass,
+    // after preceding launches and passes. Copies within a pass are unordered:
+    // no copy may write a buffer that another copy in the same call uses.
+    void copy(const std::vector<std::pair<const Buffer*, Buffer*>>& copies);
 
     // Submits without blocking.
     void commit();

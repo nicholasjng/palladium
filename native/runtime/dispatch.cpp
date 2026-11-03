@@ -250,11 +250,15 @@ void CommandBatch::add(const Launch& launch) {
     }
 }
 
-void CommandBatch::copy(const Buffer& source, Buffer& destination) {
+void CommandBatch::copy(const std::vector<std::pair<const Buffer*, Buffer*>>& copies) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (committed_) throw DispatchError("cannot copy in a batch that has already been committed");
-    if (source.size() != destination.size()) throw DispatchError("copy buffer sizes must match");
-    if (!source.size()) return;
+    for (auto [source, destination] : copies) {
+        if (source->size() != destination->size()) {
+            throw DispatchError("copy buffer sizes must match");
+        }
+    }
+    if (std::none_of(copies.begin(), copies.end(), [](auto c) { return c.first->size(); })) return;
     AutoreleaseScope scope;
     if (encoder_) {
         encoder_->endEncoding();
@@ -262,7 +266,11 @@ void CommandBatch::copy(const Buffer& source, Buffer& destination) {
     }
     auto blit = command_buffer_->blitCommandEncoder();
     if (!blit) throw DispatchError("could not create a Metal blit command encoder");
-    blit->copyFromBuffer(source.handle(), 0, destination.handle(), 0, source.size());
+    for (auto [source, destination] : copies) {
+        if (source->size()) {
+            blit->copyFromBuffer(source->handle(), 0, destination->handle(), 0, source->size());
+        }
+    }
     blit->endEncoding();
 }
 
