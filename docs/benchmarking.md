@@ -172,9 +172,10 @@ carry the machine, commit and versions.
   measures the older 8x8 instruction only.
 - **Against MLX.** `bench_kernels.py` shows where the plugin stands on
   M3's kernels: GEMM per dtype, attention forward and backward, and
-  scatter-add. On the M2 (2026-11-03), Palladium's attention forward was
-  5–12% faster than MLX's, while the plain-JAX attention backward was
-  2.3–3.3× slower, scatter-add 2.5×, and bfloat16 GEMM 1.6–1.9×.
+  scatter-add. `gpu_us` near the wall time means the kernel, not dispatch
+  or allocation, sets a `metal` row. On the M2 (2026-11-03), with the
+  backward kernels, Palladium's attention gradient was 4% (full) and 27%
+  (causal) faster than MLX's, and its forward 4–8% faster.
 - **Bandwidth.** `bench_copy_bandwidth` and the row programs set the ceiling
   for memory-bound work; `bench_elementwise` should come close to it.
 

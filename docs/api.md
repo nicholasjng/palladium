@@ -11,7 +11,7 @@ complete usage examples.
 | API | Purpose | Important boundary |
 |---|---|---|
 | `metal_call(kernel, **pallas_kwargs)` | Construct a CPU JAX callable dispatching a Pallas kernel to Metal | Native FFI and a Metal device are required at execution; the PJRT plugin is not |
-| `plmtl.kernel(body, out_type, *, mesh, scratch_types=())` | Like `pl.kernel` on a `plmtl.Mesh` of threadgroups, with `plmtl.THREADGROUP` scratch, dispatched like `metal_call` | Use `pl.program_id` for mesh coordinates; dots take threadgroup tiles; runs from CPU programs and inside programs on the `metal` plugin |
+| `plmtl.kernel(body, out_type, *, mesh, scratch_types=())` | Like `pl.kernel` on a `plmtl.Mesh` of threadgroups, with `plmtl.THREADGROUP` scratch, dispatched like `metal_call` | Use `pl.program_id` for mesh coordinates; dots take threadgroup tiles, `a @ b.T` included; vectors broadcast along rows or columns; runs from CPU programs and inside programs on the `metal` plugin |
 | `CompilerParams(...)` | Select dot policy, threadgroup dimensions, and math mode | Cooperative kernels fix their group size |
 | `debug_msl(kernel, *example_args, **pallas_kwargs)` | Return source directly from a kernel and shape/dtype examples | Traces and emits; no Metal compilation or dispatch |
 | `trace(pallas_fn, *example_args)` | Extract a reusable `KernelSpec` | Exactly one Pallas call, including through JIT wrappers |

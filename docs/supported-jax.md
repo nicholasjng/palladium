@@ -75,15 +75,21 @@ refs (`tile[...] = x_ref[pl.ds(...), pl.ds(...)]`) are spread over the
 threadgroup's threads; `jnp.dot` of two float32 threadgroup tiles runs on
 SIMD-group matrix fragments, with output tiles a multiple of 16 in each
 dimension and K a multiple of 8, and `acc + jnp.dot(...)` accumulates in
-place; elementwise operations on a dot's result, including comparisons, run
-per fragment element, and it can be stored to a device slice. Scalars,
-`fori_loop` with scalar and fragment carries, and broadcasts of scalars are
-supported; palladium places the barriers between threadgroup writes and
-reads. Use `pl.program_id` for the mesh coordinates, since the Pallas
+place; `lax.dot_general` of `a` and `b` contracting both on their last axis
+(`a @ b.T`) reads `b` transposed. Elementwise operations on a dot's result,
+including comparisons, run per fragment element, and a result can be stored
+to a device slice or a threadgroup tile, to feed the next dot. Vectors,
+`jnp.arange` and one-dimensional slices of device arrays, combine
+elementwise with scalars and broadcast along rows or columns of a block, as
+masks and per-row statistics do. Scalars, broadcasts of scalars, and
+`fori_loop` with scalar and fragment carries are supported, with static
+bounds or bounds computed from `pl.program_id`; palladium places the
+barriers between threadgroup writes and reads. Use `pl.program_id` for the mesh coordinates, since the Pallas
 interpreter does not bind mesh axis names. A hand-written float32 matmul in
 this form ran at the speed of the emitted `simdgroup` kernel on an M2 (2.69
-TFLOPS at 4096³). Dots of device reads, other tile shapes, aliases and other
-primitives raise `EmitError`.
+TFLOPS at 4096³), and the attention backward of `examples/flash_attention.py`
+is two such kernels. Dots of device reads, other tile shapes, vectors read
+from threadgroup tiles, aliases and other primitives raise `EmitError`.
 
 On both paths, tiled matmuls on a 2D or 3D grid lower through Metal 4
 TensorOps by default (`CompilerParams(dot_general="auto")`), taking the

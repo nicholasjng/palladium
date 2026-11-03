@@ -160,6 +160,26 @@ by 2.3–3.3×, embedding scatter-add by 2.5×, bfloat16 GEMM by 1.6–1.9×,
 float32 GEMM at 4,096³ by 1.4×, float16 GEMM by 13%. Gather and float32 GEMM
 at 1,024³ are at parity.
 
+M3 progress (2026-11-03, M2 unless noted):
+
+- The buffer pool kept stale sizes once full, so every new size allocated
+  afresh: in one process after other benchmarks, elementwise ran at 35
+  instead of 86 GB/s on the M2 (75 against 226 GB/s copy on the M4 Pro),
+  and scatter-add and the attention backward spent 3.5 and 40–80 ms per call
+  outside the GPU. It now evicts its oldest buffers.
+- Unbatched products ran with one threadgroup along x; as rank-2 GEMMs, a
+  4,096³ float32 product takes 52 instead of 99.5 ms of GPU time, the
+  roofline kernel's speed.
+- The attention backward is two plmtl kernels (FlashAttention-2), with the
+  forward storing its logsumexp. Gradient including the forward, 2,048
+  tokens of 32 heads of 64: 94.7 ms full and 49.8 ms causal, against MLX's
+  98.9 and 68.3 ms; plain JAX through the plugin took 126 and 127 ms.
+- Remaining for M3: the same comparison on the M4 Pro, the causal forward
+  there (16% behind MLX before these changes), embeddings once the pool fix
+  is measured there, and batched products (the batch axis still comes
+  first) and contractions with one-element outputs, which go through the
+  GEMM path padded to 16×16 tiles.
+
 Work that costs time without proving anything: a JAX port of SAM2's image
 encoder and mask decoder (SAM2 is PyTorch) for M5, and a small JAX LoRA
 training stack for M4.
