@@ -96,14 +96,18 @@ Palladium's kernels, which needs palladium; that row is skipped.
 
 ## 4. MLX directly
 
-`bench_kernels.py` runs on MLX itself in a venv that has `mlx` and no jax:
+`bench_kernels.py` runs on MLX itself. MLX does not depend on jax, so it
+can run from palladium's venv: `uv run --with mlx` adds it for one command
+without changing the lock, and `BENCH_BACKEND=mlx` makes the file use MLX
+even though jax is installed:
 
 ```sh
-uv venv ~/venvs/mlx --python 3.13
-uv pip install --python ~/venvs/mlx mlx mew-bench numpy
-~/venvs/mlx/bin/mew run benchmarks/bench_kernels.py -o $R/mlx.jsonl
+BENCH_BACKEND=mlx uv run --with mlx mew run benchmarks/bench_kernels.py -o $R/mlx.jsonl
 uv run mew compare -k bench_kernels $R/metal.jsonl $R/mps.jsonl $R/mlx.jsonl
 ```
+
+In that mode the file does not import jax, so the plugin is not loaded. A
+venv with `mlx` and no jax needs no `BENCH_BACKEND`.
 
 The `metal` side of `bench_kernels.py` comes from the run in section 2 if it
 included the file; otherwise add it to that command. Matmuls on `metal` go

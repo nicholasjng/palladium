@@ -11,6 +11,7 @@ import mew
 
 mew.update_context(mew.vcs_context())
 mew.set_context("jax_platforms", os.environ.get("JAX_PLATFORMS"))
+mew.set_context("bench_backend", os.environ.get("BENCH_BACKEND"))
 for package in ("jax", "jaxlib", "jax-mps", "mlx", "palladium"):
     try:
         mew.set_context(f"versions.{package}", importlib.metadata.version(package))

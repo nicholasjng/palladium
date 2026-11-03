@@ -5,7 +5,8 @@ Rows have the same names on every backend, so ``mew compare`` lines them up
 
 - JAX's default device: ``metal`` runs Palladium's kernels and the plugin's
   compiler; ``mps`` (from a jax-mps venv) runs MLX's kernels through jax-mps.
-- MLX directly, in a venv with ``mlx`` and no jax.
+- MLX directly, with ``BENCH_BACKEND=mlx`` where jax is installed too
+  (``uv run --with mlx``), or in a venv with ``mlx`` and no jax.
 
 CPU is skipped: it is not what these kernels compete with. Every row checks its
 result against NumPy before timing, and every call waits for its result, so
@@ -34,14 +35,16 @@ import numpy as np
 
 
 def _optional(name: str) -> Any:
-    """`name` if this environment has it: an MLX venv has no jax, ours no mlx."""
+    """`name` if this environment has it: an MLX venv has no jax."""
     try:
         return importlib.import_module(name)
     except ImportError:
         return None
 
 
-jax, jnp, mx = _optional("jax"), _optional("jax.numpy"), _optional("mlx.core")
+_MLX = os.environ.get("BENCH_BACKEND") == "mlx"
+jax, jnp = (None, None) if _MLX else (_optional("jax"), _optional("jax.numpy"))
+mx = _optional("mlx.core")
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
 
@@ -51,7 +54,7 @@ def _backend() -> str:
         return jax.devices()[0].platform
     if mx is not None:
         return "mlx"
-    raise RuntimeError("neither jax nor mlx is installed")
+    raise RuntimeError("mlx is not installed" if _MLX else "neither jax nor mlx is installed")
 
 
 def _timed(state: mew.State, call, flops: float | None = None) -> None:
