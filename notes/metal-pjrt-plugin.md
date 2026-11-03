@@ -648,6 +648,52 @@ trajectory already differs by 1.9e-6 (about 32 u). A rule derived from the
 floor would be near 1e-5 and would fail the moments. Locating this gap is M2
 work: rerun with SAFE elementwise math first.
 
+Resolved by the long-run comparison below: against a float64 run on the
+same data, Metal is closer than CPU's float32 run, so the gap measures how
+far apart the two roundings are, not an error on Metal's side.
+
+### Long-run agreement, 2026-11-03 (M2)
+
+M2's first target, "same losses as CPU", over a real training run:
+`examples/pjrt_long_run.py` trains 5,000 steps on CPU, on CPU from
+parameters moved by one float32 ulp (up, down, and random signs), and on
+Metal, all from the same data, and compares them at every 500 steps. Two
+float32 runs drift apart under training even on one backend, so the
+perturbed CPU runs show how far rounding-sized differences grow; for SBI, a
+float64 run on CPU with the same data (`sbi_step` draws in float32 and casts)
+shows which float32 run is more accurate. Losses are means over the last
+100 steps; parameter distances are relative L2 over all leaves; held-out
+losses are evaluated on CPU for every run. Records:
+[SBI](metal-long-run-sbi-m2-2026-11-03.json),
+[CNF](metal-long-run-cnf-m2-2026-11-03.json).
+
+| SBI, step 5,000, relative to float64 | CPU float32 | Metal | CPU, 1 ulp perturbed |
+|---|---:|---:|---:|
+| Training loss | 2.4e-5 | 9.8e-7 | 2.3e-5 – 2.8e-5 |
+| Parameters | 1.65e-3 | 2.42e-4 | 1.62e-3 – 1.90e-3 |
+| Held-out loss | 2.0e-4 | 1.9e-7 | 2.0e-4 – 2.3e-4 |
+
+SBI (loss −5.73 at step 500, −6.42 at 5,000): Metal stays 4–8× further
+from CPU than the perturbed CPU runs at every checkpoint (parameters 1.6e-3
+against at most 3.2e-4 at step 5,000). The float64 run explains why: CPU's
+own float32 error is that large, and Metal's is 3–8× smaller at every
+checkpoint. Metal's training loss differs from CPU's by 2.5e-5 relative,
+its held-out loss by 2.0e-4. Why XLA:CPU's float32 run is less accurate
+was not investigated.
+
+CNF (Palladium's adjoint kernels on Metal, plain JAX on CPU; loss 2.25 at
+step 5,000): Metal's parameter distance from CPU is 2–20× the furthest
+perturbed run's up to step 2,000, and 0.7–1.5× from step 2,500 on, when
+all runs have drifted apart (5.3e-4 against 1.2e-4 to 4.9e-4 at step
+5,000; held-out loss 5.5e-5 against 1.7e-4 to 3.5e-4). The training losses
+agree to 2.6e-6.
+
+**M2's "same losses as CPU" holds** for both workloads: Metal's losses
+match CPU's to within the spread of CPU's own rounding sensitivity (CNF) or
+are closer to float64 than CPU itself (SBI). 5,000 SBI steps take 4.4 s on
+Metal against 7.0 s on CPU, 5,000 CNF updates 0.59 s against 4.9 s
+(including per-step Python dispatch).
+
 ## M2 baseline: where an SBI step's time goes (2026-11-02, M2)
 
 M2 requires GPU time to be most of a step's wall time. The plugin counts

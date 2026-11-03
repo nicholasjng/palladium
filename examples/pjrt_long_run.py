@@ -29,6 +29,7 @@ import json
 import platform
 import time
 from pathlib import Path
+from typing import Any
 
 import cnf_density
 import jax
@@ -211,7 +212,7 @@ def main() -> None:
     args = parser.parse_args()
     if min(args.steps, args.every, args.window, args.perturbations) < 1:
         parser.error("steps, every, window and perturbations must be positive")
-    result = {
+    result: dict[str, Any] = {
         "schema_version": 1,
         "timestamp_utc": datetime.datetime.now(datetime.UTC).isoformat(),
         "device": jax.devices("metal")[0].device_kind,

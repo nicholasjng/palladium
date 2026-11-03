@@ -144,8 +144,10 @@ kernels stopped recomputing values in guarded branches; on the M4 Pro it
 takes 0.225 ms with the GPU busy 99.9%. The premise check holds: with
 Palladium kernels inside `jit`, the CNF update takes 57 µs on the M2, 51 µs of
 it GPU time, against 149 µs (61 µs GPU) recorded for jax-mps with async
-dispatch. Open: CPU and jax-mps throughput on the M4 Pro, and a long-run loss
-comparison against CPU. diffrax stays a CPU reference only (decided
+dispatch. Over 5,000 training steps, Metal's losses agree with CPU's within
+CPU's own rounding sensitivity (CNF), or are closer to a float64 run than
+CPU's float32 run is (SBI; 2026-11-03). All three M2 targets hold on the M2.
+Open: CPU and jax-mps throughput on the M4 Pro. diffrax stays a CPU reference only (decided
 2026-11-03): on `metal` it needs host callbacks and dynamic `while`, and
 adaptive solvers on the GPU come from palladium's own kernels instead.
 
