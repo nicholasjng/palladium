@@ -40,7 +40,7 @@ from palladium.emit.tensorops import declared_threadgroup_width
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
 from flash_attention import attention_kernel, attention_specs, reference_attention
 
-DTYPES = ("float32", "float16")
+DTYPES = ("float32", "float16", "bfloat16")
 SIZES = (2048, 4096)
 TILES = ((32, 32), (64, 32), (64, 64), (128, 64))
 MATMUL_CASES = [
@@ -48,7 +48,7 @@ MATMUL_CASES = [
     for size in SIZES
     for dtype in DTYPES
     for tm, tn in TILES
-    # The simdgroup kernel covers float32 only; float16 keeps matmul2d.
+    # The simdgroup kernel covers float32 only; half types keep matmul2d.
     for policy in (("tensorops", "simdgroup") if dtype == "float32" else ("tensorops",))
 ]
 MATMUL_IDS = [
@@ -192,7 +192,7 @@ def bench_pallas_matmul(
     grid = ((size // tile_m) * threadgroup, size // tile_n, 1)
     _runtime.run(kernel, buffers, grid, threadgroup)
     corner = x[:64].astype(np.float32) @ y[:, :64].astype(np.float32)
-    tolerance = 1e-5 if dtype == "float32" else 1e-3
+    tolerance = {"float32": 1e-5, "float16": 1e-3, "bfloat16": 8e-3}[dtype]  # about one ulp
     np.testing.assert_allclose(
         output[:64, :64].astype(np.float32) / np.abs(corner).max(),
         corner / np.abs(corner).max(),

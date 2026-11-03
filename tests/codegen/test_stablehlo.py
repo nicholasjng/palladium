@@ -10,6 +10,7 @@ import pytest
 from jax import lax
 from jaxlib.mlir.dialects import stablehlo
 
+from palladium.device import prefers_simdgroup_matrix
 from palladium.stablehlo import UnsupportedProgram, compile_program
 
 
@@ -190,11 +191,13 @@ def test_loop_replay_budget_is_checked():
         _compile(lambda x: lax.fori_loop(0, 100001, lambda i, y: y + 1, x), (4,))
 
 
-def test_aligned_dot_reuses_simdgroup_emitter_without_input_copies():
+def test_aligned_dot_reuses_the_pallas_gemm_without_input_copies():
+    """SIMD-group matrices on M1-M4 GPUs, `matmul2d` on GPUs with matrix accelerators."""
     program = _compile(lambda a, b: a @ b, (32, 64), (64, 48))
     [launch] = program.launches
     assert launch.slots == (0, 1, program.outputs[0])
-    assert "simdgroup_multiply_accumulate" in launch.source
+    kernel = "simdgroup_multiply_accumulate" if prefers_simdgroup_matrix() else "matmul2d"
+    assert kernel in launch.source
     assert launch.grid == (128, 3, 1) and launch.threadgroup == 128
 
 

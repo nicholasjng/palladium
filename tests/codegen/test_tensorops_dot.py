@@ -270,11 +270,10 @@ def test_auto_selects_tensorops_for_tiled_dots_and_default_forces_the_primitive_
 ):
     """Check that auto selects cooperative tiled dots, with `simdgroup_matrix` up to
     Apple family 9 (M4), while default selects primitive emission."""
-    import palladium.emit.kernel
+    import palladium.device
 
-    monkeypatch.setattr(
-        palladium.emit.kernel, "device_limits", lambda: {"apple_gpu_family": family}
-    )
+    limits = {**palladium.device.device_limits(), "apple_gpu_family": family}
+    monkeypatch.setattr(palladium.device, "device_limits", lambda: limits)
     auto = palladium.emit_msl(_blocked_dot())
     assert auto == palladium.emit_msl(_blocked_dot(), dot_general=policy)
     ordinary = palladium.emit_msl(_blocked_dot(), dot_general="default")

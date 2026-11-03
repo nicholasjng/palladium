@@ -183,7 +183,10 @@ def attention_call(
         Key/value sequence length; None uses the query length.
     logsumexp : bool, optional
         Also return each query row's logsumexp of the scaled scores, shape
-        (batch, heads, query_length), as the backward pass needs.
+        (batch, heads, query_length), as the backward pass needs. Only the
+        `simdgroup_matrix` schedule stores it, so `compiler_params` then
+        defaults to `dot_general="simdgroup"`, also where "auto" would pick
+        `matmul2d` (M5); query tiles must be a multiple of 32.
     call : callable, optional
         Kernel factory, default pl.pallas_call; use palladium.metal_call for CPU FFI
         dispatch.
@@ -209,6 +212,9 @@ def attention_call(
     )
     out_shape = jax.ShapeDtypeStruct(shape, jnp.float32)
     if logsumexp:
+        import palladium
+
+        kwargs.setdefault("compiler_params", palladium.CompilerParams(dot_general="simdgroup"))
         rows = pl.BlockSpec((1, 1, tile_q), lambda b, h, qb: (b, h, qb))
         out_specs = (out_specs, rows)
         out_shape = (out_shape, jax.ShapeDtypeStruct((batch, heads, query_length), jnp.float32))

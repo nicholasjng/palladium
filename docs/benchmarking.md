@@ -159,7 +159,48 @@ baselines (`notes/metal-compute-stack.md`):
 Send the `.jsonl` files and the two long-run records back; the context lines
 carry the machine, commit and versions.
 
-## 7. What to look at
+## 7. Checklist for an M5 (matrix accelerators)
+
+Apple GPU family 10 has matrix accelerators that Metal 4's `matmul2d` can
+use. There, `dot_general="auto"` and the plugin's GEMM take `matmul2d`
+instead of `simdgroup_matrix` (`palladium.device.prefers_simdgroup_matrix`).
+This path passes the test suite on an M2, where `matmul2d` runs without
+accelerators, but has not run on an M5. In order, each step depending on
+the one before:
+
+1. Check the family and run the tests, which exercise `matmul2d` wherever
+   M1–M4 GPUs take `simdgroup_matrix`:
+   ```sh
+   M=m5pro; R=~/bench/$M && mkdir -p $R
+   uv sync --reinstall-package palladium
+   uv run python -c "from palladium.device import device_limits; print(device_limits())"
+   uv run pytest -q
+   ```
+   `apple_gpu_family` should be 10. Send failures as they are; they are the
+   first data.
+2. The roofline: `matmul2d` against `simdgroup_matrix` per dtype and tile,
+   and attention through both:
+   ```sh
+   uv run mew run --random-interleaving benchmarks/bench_roofline.py -o $R/roofline.jsonl
+   ```
+3. Against MLX, which may use the accelerators itself:
+   ```sh
+   JAX_PLATFORMS=metal,cpu uv run mew run benchmarks/bench_kernels.py -o $R/metal.jsonl
+   BENCH_BACKEND=mlx uv run --with mlx mew run benchmarks/bench_kernels.py -o $R/mlx.jsonl
+   ```
+4. If time allows, sections 2 and 6 as on the M4 Pro.
+
+What the M5 data decides: whether `matmul2d` leads in each dtype (it
+should, for float16 and bfloat16 at least), which tile the plugin's GEMM
+should use (it takes 64x64, and on the M4 Pro `matmul2d` ran 4,096³
+float32 2.5× faster at 128x64), and whether attention should move to
+`matmul2d`. Two parts stay on `simdgroup_matrix` on any GPU for now: the
+attention forward when it stores the logsumexp, and the backward kernels
+(plmtl lowers dots to SIMD-group matrices only), so `bench_kernels.py`'s
+attention rows measure that path, and the roofline's `tensorops-*`
+attention rows the `matmul2d` one.
+
+## 8. What to look at
 
 - **Overhead and pipelining.** `bench_dispatch.py::bench_small_call` is the
   per-call floor; `gpu_fraction` in `bench_training.py` near 1 means the GPU,

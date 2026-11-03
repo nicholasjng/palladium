@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 
+from palladium.device import prefers_simdgroup_matrix
 from palladium.emit.tensorops import compile_kernel
 from palladium.trace import trace
 
@@ -19,8 +20,10 @@ def gemm_source(
 ) -> tuple[str, tuple[int, int, int]]:
     """Return source and thread grid; a program is a group of 128 threads.
 
-    Aligned float32 products use SIMD-group matrices. The existing Metal 4
-    TensorOps path handles edge tiles, K tails, and half/bfloat storage.
+    Aligned float32 products use SIMD-group matrices where they are faster
+    (`prefers_simdgroup_matrix`); Metal 4 TensorOps (`matmul2d`) handles the
+    rest: edge tiles, K tails, half/bfloat storage, and GPUs with matrix
+    accelerators.
     """
     tm = 64 if m % 64 == 0 else 32 if m % 32 == 0 else 16
     tn = 64 if n % 64 == 0 else 32 if n % 32 == 0 else 16
@@ -58,5 +61,5 @@ def gemm_source(
         out_shape=jax.ShapeDtypeStruct(shapes[2], dtype),
     )
     spec = trace(call, *(jax.ShapeDtypeStruct(shape, dtype) for shape in shapes[:2]))
-    source, _ = compile_kernel(spec, "gemm", prefer_simdgroup=True)
+    source, _ = compile_kernel(spec, "gemm", prefer_simdgroup=prefers_simdgroup_matrix())
     return source, threads

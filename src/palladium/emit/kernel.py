@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 
-from palladium.device import device_limits
+from palladium.device import prefers_simdgroup_matrix
 from palladium.emit import rules as _rules  # noqa: F401 - registers the rules
 from palladium.emit.addressing import (
     BlockLayout,
@@ -99,10 +99,8 @@ def emit_msl_stats(
         source, threadgroup_bytes = lower_row_program(spec, kernel_name)
         return source, EmitStats(thread_bytes=0, threadgroup_bytes=threadgroup_bytes)
     if dot_general != "default" and uses_tensorops(spec, dot_general):
-        # Measured on an M2 and an M4 Pro. Family 10 GPUs have matrix
-        # accelerators, which matmul2d can use, so they keep it.
         prefer_simdgroup = dot_general == "simdgroup" or (
-            dot_general == "auto" and device_limits().get("apple_gpu_family") in (7, 8, 9)
+            dot_general == "auto" and prefers_simdgroup_matrix()
         )
         try:
             source, threadgroup_bytes = compile_kernel(
