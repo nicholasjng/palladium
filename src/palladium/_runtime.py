@@ -103,33 +103,47 @@ _SIGNATURES = {
 }
 
 
+def installed_library(name: str, description: str) -> Path:
+    """A native library of the installed package; reject a missing build."""
+    # An editable install spans two roots (source tree and CMake build
+    # dir); joinpath resolves to whichever root has the file.
+    candidate = importlib.resources.files("palladium").joinpath(name)
+    if not candidate.is_file():
+        raise FileNotFoundError(
+            f"palladium's {description} ({name}) isn't built or installed. "
+            "`uv sync`/`pip install` builds it automatically via CMakeLists.txt; "
+            "if this is a from-source checkout, re-run that."
+        )
+    return Path(str(candidate))
+
+
+def load_library(path: Path, signatures: dict[str, tuple]) -> ctypes.CDLL:
+    """Load `path` and declare (restype, argtypes) for each named function."""
+    lib = ctypes.CDLL(str(path))
+    for name, (restype, argtypes) in signatures.items():
+        function = getattr(lib, name)
+        function.restype = restype
+        function.argtypes = argtypes
+    return lib
+
+
 def library_path() -> Path:
     """Resolve the native library or its environment override; reject a missing build."""
     override = os.environ.get("PALLADIUM_FFI_LIBRARY")
     if override:
         return Path(override)
-    # An editable install spans two roots (source tree and CMake build
-    # dir); joinpath resolves to whichever root has the file.
-    candidate = importlib.resources.files("palladium").joinpath(_LIBRARY_NAME)
-    if not candidate.is_file():
+    try:
+        return installed_library(_LIBRARY_NAME, "native library")
+    except FileNotFoundError as e:
         raise FileNotFoundError(
-            f"palladium's native library ({_LIBRARY_NAME}) isn't built or "
-            "installed. `uv sync`/`pip install` builds it automatically via "
-            "CMakeLists.txt; if this is a from-source checkout, re-run that. "
-            "Otherwise set PALLADIUM_FFI_LIBRARY to point at an existing build."
-        )
-    return Path(str(candidate))
+            f"{e} Otherwise set PALLADIUM_FFI_LIBRARY to point at an existing build."
+        ) from None
 
 
 @functools.cache
 def library() -> ctypes.CDLL:
     """Load the native library once, with the C API's signatures declared."""
-    lib = ctypes.CDLL(str(library_path()))
-    for name, (restype, argtypes) in _SIGNATURES.items():
-        function = getattr(lib, name)
-        function.restype = restype
-        function.argtypes = argtypes
-    return lib
+    return load_library(library_path(), _SIGNATURES)
 
 
 class MetalError(RuntimeError):

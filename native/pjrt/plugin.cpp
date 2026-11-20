@@ -6,7 +6,12 @@
 #include "plugin.h"
 
 #include <cstring>
+#include <algorithm>
+#include <chrono>
+#include <deque>
+#include <list>
 #include <unordered_map>
+#include <vector>
 
 #include "errors.h"
 #include "metal.h"
@@ -114,6 +119,50 @@ std::shared_ptr<Completion> Completion::done() {
     return completed;
 }
 
+std::shared_ptr<Completion> Completion::join(
+    std::vector<std::shared_ptr<Completion>> dependencies) {
+    std::vector<std::shared_ptr<Completion>> unique;
+    const auto finished = done();
+    for (auto& dependency : dependencies) {
+        if (dependency != finished &&
+            std::find(unique.begin(), unique.end(), dependency) == unique.end()) {
+            unique.push_back(std::move(dependency));
+        }
+    }
+    if (unique.empty()) return done();
+    if (unique.size() == 1) return unique.front();
+    struct Pending {
+        std::mutex mutex;
+        size_t remaining;
+        std::vector<std::shared_ptr<Completion>> dependencies;
+        std::shared_ptr<Completion> result = std::make_shared<Completion>();
+    };
+    auto pending = std::make_shared<Pending>();
+    pending->remaining = unique.size();
+    pending->dependencies = std::move(unique);
+    for (const auto& dependency : pending->dependencies) {
+        dependency->then([pending] {
+            {
+                std::lock_guard lock(pending->mutex);
+                if (--pending->remaining) return;
+            }
+            // Every dependency is now ready, even if its callback ran later
+            // than a consumer's GPU completion handler. Never block a Metal
+            // callback thread waiting for another callback to run.
+            for (const auto& dependency : pending->dependencies) {
+                if (auto* e = dependency->error()) {
+                    const auto* failure = static_cast<Error*>(e);
+                    pending->result->set(failure->code, failure->message);
+                    delete failure;
+                    return;
+                }
+            }
+            pending->result->set();
+        });
+    }
+    return pending->result;
+}
+
 void Completion::set(PJRT_Error_Code code, std::string message) {
     std::vector<std::function<void()>> callbacks;
     {
@@ -155,60 +204,120 @@ void Completion::then(std::function<void()> f) {
 
 namespace {
 
-// Free buffers by requested size, up to kPoolLimit bytes in all. Leaked, so
-// buffers destroyed during static destruction can still return to it.
-constexpr size_t kPoolLimit = size_t(1) << 30;
-
+// Free buffers by requested size, up to a quarter of the device's recommended
+// working set (PALLADIUM_POOL_BYTES overrides it, and 0 disables the pool). A
+// release that does not fit evicts the oldest free buffers, so sizes a
+// program stopped using do not keep new sizes out. Leaked, so buffers
+// destroyed during static destruction can still return to it.
 struct Pool {
+    using Free = std::list<std::unique_ptr<Buffer>>;
     std::mutex mutex;
-    std::unordered_map<size_t, std::vector<std::unique_ptr<Buffer>>> free;
-    size_t bytes = 0;
+    Free lru;  // oldest release first
+    std::unordered_map<size_t, std::deque<Free::iterator>> by_size;  // oldest first
+    size_t bytes = 0, limit = 0;
+    PoolCounters counters{};
+
+    // The newest free buffer of `size` bytes, or null.
+    std::unique_ptr<Buffer> take(size_t size) {
+        auto bucket = by_size.find(size);
+        if (bucket == by_size.end()) return nullptr;
+        Free::iterator node = bucket->second.back();
+        bucket->second.pop_back();
+        if (bucket->second.empty()) by_size.erase(bucket);
+        std::unique_ptr<Buffer> buffer = std::move(*node);
+        lru.erase(node);
+        bytes -= size;
+        return buffer;
+    }
+
+    void clear() {
+        lru.clear();
+        by_size.clear();
+        bytes = 0;
+    }
 };
 
 Pool& pool() {
-    static Pool* p = new Pool;
+    static Pool* p = [] {
+        auto* p = new Pool;
+        p->limit = env_bytes("PALLADIUM_POOL_BYTES",
+                             runtime().recommended_max_working_set_size() / 4);
+        return p;
+    }();
     return *p;
 }
 
-}  // namespace
-
+// Buffers come from a pool keyed by size: GPU allocations cost tens of
+// microseconds and are zeroed. Each dispatch retains the storage it uses;
+// only the final owner returns it to the pool.
 std::unique_ptr<Buffer> acquire(size_t size_bytes) {
     Pool& p = pool();
     {
         std::lock_guard lock(p.mutex);
-        auto it = p.free.find(size_bytes);
-        if (it != p.free.end() && !it->second.empty()) {
-            auto buffer = std::move(it->second.back());
-            it->second.pop_back();
-            p.bytes -= size_bytes;
+        if (auto buffer = p.take(size_bytes)) {
+            ++p.counters.hits;
             return buffer;
         }
     }
+    auto start = std::chrono::steady_clock::now();
+    std::unique_ptr<Buffer> buffer;
     try {
-        return std::make_unique<Buffer>(runtime().device(), size_bytes);
+        buffer = std::make_unique<Buffer>(runtime().device(), size_bytes);
     } catch (const AllocationError&) {
         std::lock_guard lock(p.mutex);  // retry with the pool given back
-        p.free.clear();
-        p.bytes = 0;
+        p.clear();
     }
-    return std::make_unique<Buffer>(runtime().device(), size_bytes);
+    if (!buffer) buffer = std::make_unique<Buffer>(runtime().device(), size_bytes);
+    std::lock_guard lock(p.mutex);
+    ++p.counters.misses;
+    p.counters.miss_bytes += size_bytes;
+    p.counters.miss_seconds += std::chrono::steady_clock::now() - start;
+    return buffer;
 }
 
-void release(std::unique_ptr<Buffer> buffer, std::shared_ptr<Completion> last_use) {
-    if (!buffer) return;
-    // std::function needs a copyable callable, so the buffer travels as a shared_ptr.
-    std::shared_ptr<Buffer> held(std::move(buffer));
-    last_use->then([held]() mutable {
-        Pool& p = pool();
-        std::lock_guard lock(p.mutex);
-        if (p.bytes + held->size() > kPoolLimit) return;
-        p.bytes += held->size();
-        p.free[held->size()].push_back(std::make_unique<Buffer>(std::move(*held)));
-    });
+// Return `owned` to the pool, evicting the oldest free buffers to make room.
+void release(std::unique_ptr<Buffer> owned) {
+    std::vector<std::unique_ptr<Buffer>> evicted;  // freed after the lock is released
+    Pool& p = pool();
+    std::lock_guard lock(p.mutex);
+    size_t size = owned->size();
+    if (size > p.limit) {
+        ++p.counters.dropped;
+        return;
+    }
+    while (p.bytes + size > p.limit) {
+        // The globally oldest buffer is also the oldest of its size.
+        size_t oldest = p.lru.front()->size();
+        auto bucket = p.by_size.find(oldest);
+        bucket->second.pop_front();
+        if (bucket->second.empty()) p.by_size.erase(bucket);
+        evicted.push_back(std::move(p.lru.front()));
+        p.lru.pop_front();
+        p.bytes -= oldest;
+        ++p.counters.dropped;
+    }
+    p.bytes += size;
+    p.lru.push_back(std::move(owned));
+    p.by_size[size].push_back(std::prev(p.lru.end()));
+}
+
+}  // namespace
+
+PoolCounters pool_counters(bool reset) {
+    Pool& p = pool();
+    std::lock_guard lock(p.mutex);
+    PoolCounters counters = p.counters;
+    if (reset) p.counters = {};
+    return counters;
+}
+
+std::shared_ptr<Buffer> make_storage(size_t size_bytes) {
+    return {acquire(size_bytes).release(),
+            [](Buffer* storage) { release(std::unique_ptr<Buffer>(storage)); }};
 }
 
 PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_t* dims,
-                        size_t num_dims, PJRT_Buffer** out) {
+                        size_t num_dims, PJRT_Buffer** out, std::shared_ptr<Buffer> storage) {
     if (!element_size(type)) {
         return error(PJRT_Error_Code_UNIMPLEMENTED,
                      "metal: buffers of PJRT element type " + std::to_string(type) +
@@ -220,7 +329,7 @@ PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_
     buffer->dims.assign(dims, dims + num_dims);
     for (size_t i = num_dims; i-- > 0;) buffer->minor_to_major.push_back((int64_t)i);
     try {
-        buffer->storage = acquire(byte_size(buffer.get()));
+        buffer->storage = storage ? std::move(storage) : make_storage(byte_size(buffer.get()));
     } catch (const AllocationError& e) {
         return error(PJRT_Error_Code_RESOURCE_EXHAUSTED, e.what());
     }
@@ -646,7 +755,7 @@ PJRT_Api make_api() {
         return nullptr;
     };
     api.PJRT_Buffer_Delete = [](PJRT_Buffer_Delete_Args* args) -> PJRT_Error* {
-        release(std::move(args->buffer->storage), args->buffer->last_use);
+        args->buffer->storage.reset();
         return nullptr;
     };
     api.PJRT_Buffer_IsDeleted = [](PJRT_Buffer_IsDeleted_Args* args) -> PJRT_Error* {

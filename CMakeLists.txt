@@ -43,6 +43,7 @@ include(FetchContent)
 FetchContent_Declare(
   metalcpp
   URL https://developer.apple.com/metal/cpp/files/metal-cpp_26.4.zip
+  URL_HASH SHA256=4e7587c0f351d782f1f3e7c67c649b40d0ba780c051b2f6729f00ddc61ada28c
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(metalcpp)
 if(EXISTS "${metalcpp_SOURCE_DIR}/Metal/Metal.hpp")
@@ -91,6 +92,16 @@ add_library(palladium_pjrt SHARED native/pjrt/plugin.cpp native/pjrt/executable.
 target_include_directories(palladium_pjrt PRIVATE "${PJRT_INCLUDE_DIR}")
 target_link_libraries(palladium_pjrt PRIVATE palladium::runtime)
 set_target_properties(palladium_pjrt PROPERTIES CXX_VISIBILITY_PRESET hidden)
+
+# Explicit native integration test: inject failed readiness events without
+# faulting the GPU or exposing test-only entry points in the shipped plugin.
+add_executable(palladium_pjrt_dependencies_test EXCLUDE_FROM_ALL
+  tests/native/pjrt_dependencies.cpp native/pjrt/plugin.cpp native/pjrt/executable.cpp)
+target_include_directories(palladium_pjrt_dependencies_test PRIVATE native/pjrt "${PJRT_INCLUDE_DIR}")
+target_link_libraries(palladium_pjrt_dependencies_test PRIVATE palladium::runtime)
+enable_testing()
+add_test(NAME pjrt_dependencies COMMAND palladium_pjrt_dependencies_test)
+set_tests_properties(pjrt_dependencies PROPERTIES TIMEOUT 30)
 
 # Found at runtime through importlib.resources (ffi._library_path).
 install(TARGETS palladium_ffi palladium_pjrt LIBRARY DESTINATION palladium)

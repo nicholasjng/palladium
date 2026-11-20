@@ -207,10 +207,7 @@ CommandBatch::CommandBatch(MetalRuntime& rt)
     if (!command_buffer_) {
         throw DispatchError("could not create a Metal command buffer");
     }
-    encoder_ = NS::RetainPtr(command_buffer_->computeCommandEncoder());
-    if (!encoder_) {
-        throw DispatchError("could not create a Metal compute command encoder");
-    }
+    // add() opens the compute encoder when the first launch needs it.
 }
 
 CommandBatch::~CommandBatch() {
@@ -222,6 +219,12 @@ void CommandBatch::add(const Launch& launch) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (committed_) throw DispatchError("cannot add to a batch that has already been committed");
     validate(launch, non_uniform_, max_threadgroup_memory_);
+
+    if (!encoder_) {
+        AutoreleaseScope scope;
+        encoder_ = NS::RetainPtr(command_buffer_->computeCommandEncoder());
+        if (!encoder_) throw DispatchError("could not create a Metal compute command encoder");
+    }
 
     encoder_->setComputePipelineState(launch.pipeline->handle());
     NS::UInteger index = 0;
@@ -247,23 +250,49 @@ void CommandBatch::add(const Launch& launch) {
     }
 }
 
+void CommandBatch::copy(const std::vector<std::pair<const Buffer*, Buffer*>>& copies) {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    if (committed_) throw DispatchError("cannot copy in a batch that has already been committed");
+    for (auto [source, destination] : copies) {
+        if (source->size() != destination->size()) {
+            throw DispatchError("copy buffer sizes must match");
+        }
+    }
+    if (std::none_of(copies.begin(), copies.end(), [](auto c) { return c.first->size(); })) return;
+    AutoreleaseScope scope;
+    if (encoder_) {
+        encoder_->endEncoding();
+        encoder_.reset();
+    }
+    auto blit = command_buffer_->blitCommandEncoder();
+    if (!blit) throw DispatchError("could not create a Metal blit command encoder");
+    for (auto [source, destination] : copies) {
+        if (source->size()) {
+            blit->copyFromBuffer(source->handle(), 0, destination->handle(), 0, source->size());
+        }
+    }
+    blit->endEncoding();
+}
+
 void CommandBatch::commit() {
     std::lock_guard<std::mutex> lock(state_mutex_);
     commit_locked();
 }
 
-void CommandBatch::commit(std::function<void(const char* error)> on_completed) {
+void CommandBatch::commit(
+    std::function<void(const char* error, double gpu_start, double gpu_end)> on_completed) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     if (committed_) throw DispatchError("cannot add a completion handler after commit");
     command_buffer_->addCompletedHandler(
         [on_completed = std::move(on_completed)](MTL::CommandBuffer* command_buffer) {
             AutoreleaseScope scope;
+            double start = command_buffer->GPUStartTime(), end = command_buffer->GPUEndTime();
             if (command_buffer->status() == MTL::CommandBufferStatusError) {
                 std::string message =
                     "kernel execution failed: " + describe(command_buffer->error());
-                on_completed(message.c_str());
+                on_completed(message.c_str(), start, end);
             } else {
-                on_completed(nullptr);
+                on_completed(nullptr, start, end);
             }
         });
     commit_locked();
@@ -274,7 +303,7 @@ void CommandBatch::commit_locked() {
     committed_ = true;
 
     AutoreleaseScope scope;
-    encoder_->endEncoding();
+    if (encoder_) encoder_->endEncoding();
     command_buffer_->commit();
 }
 
