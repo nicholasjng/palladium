@@ -9,6 +9,7 @@ from palladium.emit.addressing import element_strides, flat_index
 from palladium.emit.core import RULES, Cursor, CVal, Environment, declare, msl_type, shaped
 from palladium.emit.numeric import (
     ELEMENTWISE,
+    FMOD,
     HELPERS,
     PRIMITIVE_INVARS,
     enclosed,
@@ -101,7 +102,8 @@ def _template(cursor: Cursor, eqn: JaxprEqn, opname: str, ops: list[CVal], ctype
         template = f"(({{a}} > 0) ? {ctype}(1) : (({{a}} < 0) ? {ctype}(-1) : {{a}}))"
     elif opname == "rem":
         if ops[0].ctype in ("float", "half", "bfloat"):
-            template = f"{ctype}(fmod(float({{a}}), float({{b}})))"
+            cursor.require(*FMOD)
+            template = f"{ctype}(pd_fmod(float({{a}}), float({{b}})))"
         elif ops[0].ctype == "uint":
             template = "({b} == 0 ? {a} : ({a} % {b}))"
         else:

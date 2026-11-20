@@ -1814,3 +1814,35 @@ def test_recognized_attention_and_normalizations_match_cpu():
         assert_matches_cpu(lambda x: x.astype(jnp.bfloat16).sum(-1), x, rtol=1e-2)
         assert_matches_cpu(lambda x: (x * 100).astype(jnp.int32).sum(-1), x)
     """)
+
+
+def test_floating_remainder_is_exact():
+    """Metal's fmod rounds the quotient: fmod(x, x) can return x, and a large
+    quotient loses every digit. The remainder is exact, as on the CPU, also
+    in a Pallas kernel."""
+    _check("""
+        import jax, jax.numpy as jnp, ml_dtypes, numpy as np
+        from jax import lax
+        from jax.experimental import pallas as pl
+        from pjrt_tolerance import assert_matches_cpu
+        rng = np.random.default_rng(0)
+        a = (rng.standard_normal(2048) * 10.0 ** rng.integers(-6, 12, 2048)).astype(np.float32)
+        b = (rng.standard_normal(2048) * 10.0 ** rng.integers(-6, 6, 2048)).astype(np.float32)
+        a[:6] = [7.5, -7.5, 1e10, 5.0, -0.0, np.inf]
+        b[:6] = [2.5, 2.5, 3.0, 0.1, 1.0, 2.0]
+        assert_matches_cpu(lax.rem, a, b, exact=True)
+        assert_matches_cpu(lambda a: lax.rem(a, a), a, exact=True)
+        assert_matches_cpu(jnp.mod, a, b, exact=True)
+        assert_matches_cpu(lambda a, b: lax.rem(a, jnp.zeros_like(b)), a, b, exact=True)
+        for dtype in (np.float16, ml_dtypes.bfloat16):
+            assert_matches_cpu(lax.rem, a.astype(dtype), (jnp.abs(b) + 1).astype(dtype), exact=True)
+
+        def kernel(a_ref, b_ref, out_ref):
+            out_ref[...] = lax.rem(a_ref[...], b_ref[...])
+
+        block = pl.BlockSpec((16, 64), lambda i: (i, 0))
+        call = pl.pallas_call(kernel, grid=(2,), in_specs=[block, block], out_specs=block,
+                              out_shape=jax.ShapeDtypeStruct((32, 64), jnp.float32))
+        got = jax.jit(call)(a.reshape(32, 64), b.reshape(32, 64))
+        np.testing.assert_array_equal(got, np.fmod(a, b).reshape(32, 64))
+    """)
