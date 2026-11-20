@@ -1,28 +1,55 @@
-# Benchmarking on a new Mac
+# Benchmarking
 
-How to measure palladium on a new machine and compare it with MLX: the
-roofline, the row programs and attention with palladium alone, and the
-vendor rows and MLX's fused attention through jax-mps. Written for the M5
-Max (Apple GPU family 10, the first with matrix accelerators in the GPU),
-where the open question is the Metal 4 `matmul2d` ("TensorOps") path.
+How to measure palladium on a Mac and compare it with XLA:CPU, jax-mps and
+MLX. Every benchmark is a [mew](https://github.com/nicholasjng/mew) suite
+under `benchmarks/`: runs write `.jsonl` result files, and `mew compare`
+lines rows up across files. The cross-backend benchmarks measure whatever
+backend their process has and keep it out of their row names, so the same
+file runs once per backend and the comparison is one command.
 
-| Benchmark | Measures | Needs jax-mps |
+## The suite
+
+| File | Measures | Backends |
 |---|---|---|
-| `bench_roofline.py` | copy bandwidth, simdgroup_matrix peak, Pallas matmul through `matmul2d` and `simdgroup_matrix`, attention at 4096 tokens and 32 heads of 64 | only for the `bench_vendor_matmul` rows (MLX's `jnp.dot`) |
-| `bench_row_programs.py` | softmax, layer norm and cumsum as row programs, in GB/s | no |
-| `bench_pallas_flash_attention.py` | the `matmul2d` attention schedule across sequence lengths, head sizes and tiles | no |
-| `bench_attention_vs_mlx_sdpa.py` | palladium attention under `jax.jit` on `mps` against MLX's fused SDPA | yes, built from the `palladium-dispatch` branch |
+| `bench_training.py` | whole training steps, pipelined: the SBI step and its two halves, the census LLM and SAM2-like steps, the CNF update in plain JAX and with Palladium's adjoint kernels; compile plus first call | default JAX device: `metal`, `cpu`, `mps` |
+| `bench_dispatch.py` | per-call overhead (1,024 floats, pipelined) and elementwise bandwidth (256 MiB) | default JAX device |
+| `bench_ops.py` | single lowerings: products with few output tiles, tails and a transposed operand; row, column and full reductions; a loop carrying a product; a convolution and its kernel gradient; uint8 conversion | default JAX device |
+| `bench_kernels.py` | GEMM in float32, float16 and bfloat16; attention forward and backward; embedding gather and scatter-add | `metal`, `mps`, or MLX directly; skips `cpu` |
+| `bench_roofline.py` | copy bandwidth, `simdgroup_matrix` peak, Pallas matmuls through `matmul2d` and `simdgroup_matrix`, `plmtl` matmuls, an elementwise kernel in tiles and rows, flash attention; GPU time from the command buffer | Palladium's runtime |
+| `bench_row_programs.py` | softmax, layer norm and cumsum as row programs, in GB/s | Palladium's runtime |
+| `bench_pallas_flash_attention.py` | the `matmul2d` attention schedule across lengths, head sizes and tiles | Palladium's runtime |
+| `bench_cnf_training.py` | CNF updates per variant and checkpoint interval, on `metal` and `cpu`, waiting for each update | `metal,cpu` |
+| `bench_rk4_ensemble.py` | the Lotka–Volterra RK4 ensemble as a Pallas kernel, through `metal_call`, and in plain JAX | `metal,cpu` |
+| `bench_sir_simulators.py` | the SIR simulator of `examples/sbi_sir.py` in NumPy and PyTorch (eager on CPU and MPS, `torch.compile`) | `uv run --with torch` |
 
-Palladium's own rows report GPU time from the command buffer. The vendor
-rows report wall time per call, which includes dispatch; that is negligible
-for the 4096³ matmuls (around 20 ms per call) but not for small problems.
+Every benchmark checks its result against NumPy or a JAX reference before
+timing, so a failure is a correctness bug, not a slow run.
+`benchmarks/conf.py` stamps each run's context with the commit (jj change
+and dirty state), `JAX_PLATFORMS`, the installed jax, jaxlib, jax-mps, mlx
+and palladium versions, the macOS version, the power source and low-power
+mode, and the Metal device's limits; `mew compare` prints them above its
+table.
 
-## 1. Palladium
+A workload that a platform does not support is skipped with its reason. On
+`metal`, only UNIMPLEMENTED counts as unsupported: any other failure shows
+its traceback in the row, and is a defect to fix before reading the rest.
 
-Requirements: macOS 26 on Apple silicon, [uv](https://docs.astral.sh/uv/),
-CMake and Ninja (`brew install cmake ninja`), and network access on the
-first build, which fetches Apple's metal-cpp headers. Xcode is not needed:
-palladium compiles MSL at runtime.
+On `metal`, rows that go through the plugin (`bench_training.py`,
+`bench_dispatch.py::bench_small_call`, `bench_kernels.py`, `bench_ops.py`)
+report its counters per call, from `benchmarks/plugin_stats.py`: `gpu_us`
+(GPU busy time), `launches`, `encode_us` and `throttle_us` (host time inside
+Execute: encoding, and waiting for the in-flight bound), `pool_misses` (new
+MTLBuffers), and for pipelined rows `gpu_fraction` (GPU busy time over wall
+time). `bench_kernels.py` reports `flops` per second
+and `bench_elementwise` `bytes` per second. `mew run` prints counters under
+each row and the `.jsonl` files keep them, but `mew compare` (0.3) compares
+times only.
+
+## 1. Setup
+
+Requirements: macOS 26 or later on Apple silicon, [uv](https://docs.astral.sh/uv/),
+CMake and Ninja (`brew install cmake ninja`), and network access on the first
+build. Xcode is not needed for palladium.
 
 ```sh
 git clone https://github.com/nicholasjng/palladium.git
@@ -32,109 +59,189 @@ uv run pytest -q
 uv run python -c "from palladium.device import device_limits; print(device_limits())"
 ```
 
-The last line prints the device name and `apple_gpu_family`; an M5 should
-report 10. On family 10, `dot_general="auto"` keeps `matmul2d` for float32
-matmuls and attention; families 7 to 9 prefer `simdgroup_matrix`.
-
-## 2. Palladium-only benchmarks
-
-Keep results outside the checkout, or add `/*.jsonl` to
-`.git/info/exclude`, so they are not picked up by `jj` or `git`. Name them
-after the machine:
+Keep results outside the checkout so `jj` and `git` ignore them:
 
 ```sh
-M=m5max
-uv run mew run --random-interleaving benchmarks/bench_roofline.py -o ~/bench/roofline-$M.jsonl
-uv run mew run --random-interleaving benchmarks/bench_row_programs.py -o ~/bench/rows-$M.jsonl
-uv run mew run --random-interleaving benchmarks/bench_pallas_flash_attention.py -o ~/bench/attention-$M.jsonl
+M=m4pro                 # name the files after the machine
+R=~/bench/$M && mkdir -p $R
 ```
 
-Without jax-mps, the roofline's `bench_vendor_matmul` rows are skipped with
-"no mps platform"; that is expected. `-k <regex>` selects cases, for
-example `-k "float32-n4096|attention"`. Each benchmark checks its results
-against NumPy before timing, so a failure there is a correctness bug, not a
-slow run.
+## 2. Palladium against XLA:CPU
 
-## 3. jax-mps, for the MLX comparisons
-
-jax-mps runs JAX programs on MLX. The comparisons need the
-`palladium-dispatch` branch, which carries the `palladium.dispatch` handler
-that lets `pl.pallas_call` reach palladium on the `mps` platform; a stock
-jax-mps wheel cannot run `bench_attention_vs_mlx_sdpa.py`. Building it
-needs Xcode with its Metal toolchain (MLX compiles its kernels with the
-Metal compiler):
+`JAX_PLATFORMS` decides the backend; `metal,cpu` makes `metal` the default
+device and keeps CPU available for setup.
 
 ```sh
-xcrun --find metal      # must print a path; otherwise install Xcode's Metal Toolchain
+JAX_PLATFORMS=metal,cpu uv run mew run benchmarks/bench_training.py benchmarks/bench_dispatch.py benchmarks/bench_ops.py -o $R/metal.jsonl
+JAX_PLATFORMS=cpu       uv run mew run benchmarks/bench_training.py benchmarks/bench_dispatch.py benchmarks/bench_ops.py -o $R/cpu.jsonl
+uv run mew compare $R/metal.jsonl $R/cpu.jsonl
+```
 
-cd ..                   # jax-mps must sit next to palladium
-git clone --branch palladium-dispatch https://github.com/nicholasjng/jax-mps.git
-cd jax-mps
-./scripts/setup_deps.sh # builds LLVM/MLIR, StableHLO and MLX once; long
+`mew compare` measures every file against the last one, so put the baseline
+last. Rows a backend cannot run (Palladium's CNF kernels on CPU) are
+skipped and reported as missing.
+
+## 3. jax-mps, from a venv in its own checkout
+
+jax-mps pins `jax<0.12` while palladium needs 0.12, so they do not share an
+environment, and the jax-mps rows need no palladium: they are plain JAX
+programs. Create the venv inside the jax-mps checkout, add mew to it, and run
+palladium's benchmark files with that venv's mew, from palladium's directory:
+
+```sh
+cd ../jax-mps
+./scripts/setup_deps.sh                   # once: builds LLVM/MLIR, StableHLO and MLX; long
+uv sync                                   # builds jax-mps into ../jax-mps/.venv
+uv pip install mew-bench numpy
 cd ../palladium
-uv sync --group mps --no-group latest-jax
+JAX_PLATFORMS=mps,cpu ../jax-mps/.venv/bin/mew run \
+    benchmarks/bench_training.py benchmarks/bench_dispatch.py benchmarks/bench_kernels.py \
+    -o $R/mps.jsonl
+uv run mew compare $R/metal.jsonl $R/mps.jsonl
 ```
 
-jax-mps pins `jax<0.12`, so the `mps` group conflicts with the default
-`latest-jax` group and the sync above moves the environment to jax 0.11.
-A plain `uv sync` or `uv run` afterwards would move it back and remove
-jax-mps, so pass the same groups to every command:
+Building jax-mps from source needs Xcode with its Metal toolchain (`xcrun
+--find metal` must print a path). Without it, a released wheel works the
+same way: `uv venv ../jax-mps/.venv && uv pip install --python
+../jax-mps/.venv jax-mps mew-bench numpy`. The context line shows which
+jax-mps and jax each run used. jax-mps cannot run the CNF update with
+Palladium's kernels, which needs palladium; that row is skipped.
+
+## 4. MLX directly
+
+`bench_kernels.py` runs on MLX itself. MLX does not depend on jax, so it
+can run from palladium's venv: `uv run --with mlx` adds it for one command
+without changing the lock, and `BENCH_BACKEND=mlx` makes the file use MLX
+even though jax is installed:
 
 ```sh
-export JAX_PLATFORMS=mps,cpu
-uv run --group mps --no-group latest-jax python -c "import jax; print(jax.devices('mps'))"
+BENCH_BACKEND=mlx uv run --with mlx mew run benchmarks/bench_kernels.py -o $R/mlx.jsonl
+uv run mew compare -k bench_kernels $R/metal.jsonl $R/mps.jsonl $R/mlx.jsonl
 ```
 
-[INSTALLATION.md](../INSTALLATION.md) has a smoke test that checks the
-`palladium.dispatch` path end to end, and troubleshooting for the jax-mps
-build.
+In that mode the file does not import jax, so the plugin is not loaded. A
+venv with `mlx` and no jax needs no `BENCH_BACKEND`.
 
-Then the comparisons:
+The `metal` side of `bench_kernels.py` comes from the run in section 2 if it
+included the file; otherwise add it to that command. Matmuls on `metal` go
+through the plugin's GEMM (Palladium's Pallas emitter), the attention
+forward through Palladium's flash attention, and its backward and the
+embedding rows through the plugin's compiler. MLX uses `mx.matmul`,
+`mx.fast.scaled_dot_product_attention` and its gradient, indexing and
+`.at[].add`. Record `mlx` from the context line: on GPUs with matrix
+accelerators (M5 and later), newer MLX releases may use them.
+
+## 5. Interleave and repeat
+
+Thermal and load drift bias a run that does all of one backend first. For
+numbers to keep, alternate the backends and append the repetitions:
 
 ```sh
-uv run --group mps --no-group latest-jax mew run --random-interleaving \
-    benchmarks/bench_roofline.py -o ~/bench/roofline-mps-$M.jsonl
-uv run --group mps --no-group latest-jax mew run --random-interleaving \
-    benchmarks/bench_attention_vs_mlx_sdpa.py -o ~/bench/sdpa-$M.jsonl
+for i in 1 2 3; do
+  JAX_PLATFORMS=metal,cpu uv run mew run benchmarks/bench_training.py --append -o $R/metal.jsonl
+  JAX_PLATFORMS=cpu       uv run mew run benchmarks/bench_training.py --append -o $R/cpu.jsonl
+done
+uv run mew compare $R/metal.jsonl $R/cpu.jsonl
 ```
 
-Record the MLX version jax-mps was built with
-(`third_party/mlx/version.txt` in the jax-mps checkout):
-on an M5, newer MLX releases may use the GPU's matrix accelerators, and
-that decides which baseline the numbers are compared with.
+`mew compare` reduces repetitions to their median (`--statistic` picks
+another). Within one file, `--random-interleaving` shuffles the cases.
 
-Return to the default environment with `unset JAX_PLATFORMS` and `uv sync`
-when done.
+## 6. Checklist for the M4 Pro (M2 close-out and M0)
 
-## 4. What to look at on an M5
+M2 needs its throughput numbers on the milestone machine, and M0 its
+baselines (`notes/metal-compute-stack.md`):
 
-- **`matmul2d` against `simdgroup_matrix`.** Compare `tensorops-*` and
-  `simdgroup-*` rows of `bench_pallas_matmul`, float32 and float16. On the
-  M2 and the M4 Pro, `simdgroup` won for float32 (6.66 against 5.82 TFLOPS
-  on the M4 Pro). If `matmul2d` reaches the matrix accelerators, it should
-  now lead clearly, and float16 `matmul2d` should pass the
-  `bench_simdgroup_matrix_peak` row, which measures the older 8x8
-  instruction only. If `simdgroup` still wins, family 10 belongs in the
-  `"auto"` policy in `emit/kernel.py` like 7 to 9.
-- **Attention.** Compare `bench_pallas_attention[tensorops-*]` with
-  `[simdgroup-*]`; on the M4 Pro the two were within 4%. On an M5 the
-  `matmul2d` schedule may pull ahead, and `bench_pallas_flash_attention.py`
-  shows which tiles it prefers.
-- **Against MLX.** `bench_vendor_matmul` and `bench_attention_vs_mlx_sdpa.py`
-  give MLX's numbers on the same machine.
+1. Sections 2, 3 and 4 above, including `bench_kernels.py` on all three
+   backends.
+2. The roofline and the row programs:
+   ```sh
+   uv run mew run --random-interleaving benchmarks/bench_roofline.py -o $R/roofline.jsonl
+   uv run mew run --random-interleaving benchmarks/bench_row_programs.py -o $R/rows.jsonl
+   ```
+3. The long-run agreement (not a timing benchmark; writes a JSON record):
+   ```sh
+   for w in sbi cnf; do
+     JAX_PLATFORMS=metal,cpu uv run python examples/pjrt_long_run.py --workload $w \
+         --output notes/metal-long-run-$w-$M-$(date +%F).json
+   done
+   ```
+
+Send the `.jsonl` files and the two long-run records back; the context lines
+carry the machine, commit and versions.
+
+## 7. Checklist for an M5 (matrix accelerators)
+
+Apple GPU family 10 has matrix accelerators that Metal 4's `matmul2d` can
+use. There, `dot_general="auto"` and the plugin's GEMM take `matmul2d`
+instead of `simdgroup_matrix` (`palladium.device.prefers_simdgroup_matrix`).
+This path passes the test suite on an M2, where `matmul2d` runs without
+accelerators, but has not run on an M5. In order, each step depending on
+the one before:
+
+1. Check the family and run the tests, which exercise `matmul2d` wherever
+   M1–M4 GPUs take `simdgroup_matrix`:
+   ```sh
+   M=m5pro; R=~/bench/$M && mkdir -p $R
+   uv sync --reinstall-package palladium
+   uv run python -c "from palladium.device import device_limits; print(device_limits())"
+   uv run pytest -q
+   ```
+   `apple_gpu_family` should be 10. Send failures as they are; they are the
+   first data.
+2. The roofline: `matmul2d` against `simdgroup_matrix` per dtype and tile,
+   and attention through both:
+   ```sh
+   uv run mew run --random-interleaving benchmarks/bench_roofline.py -o $R/roofline.jsonl
+   ```
+3. Against MLX, which may use the accelerators itself:
+   ```sh
+   JAX_PLATFORMS=metal,cpu uv run mew run benchmarks/bench_kernels.py -o $R/metal.jsonl
+   BENCH_BACKEND=mlx uv run --with mlx mew run benchmarks/bench_kernels.py -o $R/mlx.jsonl
+   ```
+4. If time allows, sections 2 and 6 as on the M4 Pro.
+
+What the M5 data decides: whether `matmul2d` leads in each dtype (it
+should, for float16 and bfloat16 at least), which tile the plugin's GEMM
+should use (it takes 64x64, and on the M4 Pro `matmul2d` ran 4,096³
+float32 2.5× faster at 128x64), and whether attention should move to
+`matmul2d`. Two parts stay on `simdgroup_matrix` on any GPU for now: the
+attention forward when it stores the logsumexp, and the backward kernels
+(plmtl lowers dots to SIMD-group matrices only), so `bench_kernels.py`'s
+attention rows measure that path, and the roofline's `tensorops-*`
+attention rows the `matmul2d` one.
+
+## 8. What to look at
+
+- **Overhead and pipelining.** `bench_dispatch.py::bench_small_call` is the
+  per-call floor, and its `encode_us`, `throttle_us` and `gpu_us` say where
+  it goes; `gpu_fraction` in `bench_training.py` near 1 means the GPU, not
+  the host, limits a step.
+- **Single lowerings.** `bench_ops.py` against the same file on `cpu`: a row
+  far from its neighbours (tails against aligned products, columns against
+  rows) points at one lowering rather than at a whole step.
+- **`matmul2d` against `simdgroup_matrix`.** The `tensorops-*` and
+  `simdgroup-*` rows of `bench_roofline.py::bench_pallas_matmul`. On the M2
+  and the M4 Pro, `simdgroup` won for float32 (6.66 against 5.82 TFLOPS on
+  the M4 Pro). On a GPU with matrix accelerators, `matmul2d` should lead,
+  and float16 `matmul2d` should pass `bench_simdgroup_matrix_peak`, which
+  measures the older 8x8 instruction only.
+- **Against MLX.** `bench_kernels.py` shows where the plugin stands on
+  M3's kernels: GEMM per dtype, attention forward and backward, and
+  scatter-add. `gpu_us` near the wall time means the kernel, not dispatch
+  or allocation, sets a `metal` row. On the M2 (2026-11-03), with the
+  backward kernels, Palladium's attention gradient was 4% (full) and 27%
+  (causal) faster than MLX's, and its forward 4–8% faster.
 - **Bandwidth.** `bench_copy_bandwidth` and the row programs set the ceiling
-  for everything memory-bound; the row programs ran at the copy
-  benchmark's bandwidth on the M2 and the M4 Pro.
+  for memory-bound work; `bench_elementwise` should come close to it.
 
-## 5. Run hygiene
+## Run hygiene
 
 - Keep the machine on power, close other GPU users, and let it idle a
-  minute before starting; `--random-interleaving` spreads thermal drift
-  across cases rather than removing it.
-- For numbers to publish, add `--repetitions 5` and compare medians.
-- Share the `.jsonl` files together with the `device_limits()` line, the
-  macOS version (`sw_vers`), and for the jax-mps runs the jax-mps commit and
-  MLX version.
+  minute before starting.
+- For numbers to publish, repeat as in section 5 and compare medians.
+- Share the `.jsonl` files; their context lines carry the machine, macOS
+  version, power state, commit and versions.
 
 Reference numbers from earlier machines are in
 [notes/apple-gpu-kernel-recipe.md](../notes/apple-gpu-kernel-recipe.md) and

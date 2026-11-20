@@ -1,7 +1,7 @@
 """Check and benchmark Palladium's Pallas TensorOps attention lowering.
 
 Run on Apple Silicon with MSL 4 support using
-``JAX_PLATFORMS=mps,cpu uv run mew run --random-interleaving benchmarks/``.
+``uv run mew run benchmarks/bench_pallas_flash_attention.py``.
 Each case checks the generated kernel against a NumPy reference before timing
 resident Metal buffers. Cases cover causal modes and 16-, 32-, 48-, or
 64-wide heads. A focused noncausal sequence-length-4096 sweep compares query
@@ -11,21 +11,17 @@ and key tile sizes for 16-, 32-, and 64-wide heads.
 from __future__ import annotations
 
 import functools
-import os
-import sys
 import time
 
 import jax
 import jax.numpy as jnp
 import mew
 import numpy as np
+from flash_attention import attention_kernel, attention_specs, reference_attention
 
 from palladium import _runtime
 from palladium.device import device_limits
 from palladium.emit.tensorops import declared_threadgroup_width
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
-from flash_attention import attention_kernel, attention_specs, reference_attention
 
 HEAD_DIM, TILE_Q, TILE_K = 64, 32, 64
 
@@ -137,6 +133,7 @@ def bench_pallas_flash_attention(
     output = np.empty(q.shape, np.float32)
     buffers = [q, k, v, output]
     threadgroup = declared_threadgroup_width(source)
+    assert threadgroup is not None, "cooperative kernels declare their threadgroup width"
     metal_grid = (BATCH * threadgroup, HEADS, sequence_length // tile_q)
 
     def execute() -> None:

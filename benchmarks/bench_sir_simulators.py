@@ -16,14 +16,10 @@ torch is not a project dependency:
 from __future__ import annotations
 
 import functools
-import os
-import sys
 import time
 
 import mew
 import numpy as np
-
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
 from sbi_sir import (
     DT,
     INITIAL_INFECTED,
