@@ -47,3 +47,7 @@ class MetalRuntime {
 };
 
 MetalRuntime& runtime();
+
+// A byte count from the environment variable `name`, or `fallback` when it
+// is unset, empty or not a plain decimal number.
+size_t env_bytes(const char* name, size_t fallback);

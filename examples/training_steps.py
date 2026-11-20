@@ -29,10 +29,8 @@ def adamw(params, grads, state, lr=1e-3, b1=0.9, b2=0.999, wd=0.01):
     return jax.tree.map(update, params, m, v), (m, v, t)
 
 
-def sbi_step(params, opt, key):
-    """Simulate a Lotka-Volterra ensemble with RK4, then fit an MDN posterior."""
-    k1, k2 = jax.random.split(key)
-    theta = jax.random.uniform(k1, (512, 4), minval=0.5, maxval=1.5)
+def sbi_trajectory(theta):
+    """The SBI workload's 200-step RK4 ensemble, independently testable from its MLP."""
 
     def rhs(y):
         x, z = y[..., 0], y[..., 1]
@@ -49,18 +47,30 @@ def sbi_step(params, opt, key):
         y = y + h / 6 * (a + 2 * b + 2 * c + d)
         return y, y
 
-    _, traj = lax.scan(rk4, jnp.ones((512, 2)), None, length=200)
+    _, traj = lax.scan(rk4, jnp.ones((theta.shape[0], 2)), None, length=200)
+    return traj
+
+
+def sbi_loss(p, x, theta):
+    """Mixture-density loss, isolated so dense training can be tested without RNG."""
+    h = jax.nn.gelu(jax.nn.gelu(x @ p["w1"]) @ p["w2"])
+    logits = h @ p["wa"]
+    mu, log_s = (h @ p["wm"]).reshape(512, 5, 4), (h @ p["ws"]).reshape(512, 5, 4)
+    lp = -0.5 * jnp.sum(((theta[:, None] - mu) / jnp.exp(log_s)) ** 2 + 2 * log_s, -1)
+    return -jnp.mean(jax.nn.logsumexp(jax.nn.log_softmax(logits) + lp, -1))
+
+
+def sbi_step(params, opt, key):
+    """Simulate a Lotka-Volterra ensemble with RK4, then fit an MDN posterior."""
+    k1, k2 = jax.random.split(key)
+    # Float32 draws in the parameters' precision: a float64 run sees the same data.
+    dtype = params["w1"].dtype
+    theta = jax.random.uniform(k1, (512, 4), jnp.float32, 0.5, 1.5).astype(dtype)
+    traj = sbi_trajectory(theta)
     x = jnp.concatenate([traj.mean(0), traj.std(0), traj[-1]], -1)
-    x = x + 0.05 * jax.random.normal(k2, (512, 6))
+    x = x + 0.05 * jax.random.normal(k2, (512, 6), jnp.float32).astype(dtype)
 
-    def loss(p):
-        h = jax.nn.gelu(jax.nn.gelu(x @ p["w1"]) @ p["w2"])
-        logits = h @ p["wa"]
-        mu, log_s = (h @ p["wm"]).reshape(512, 5, 4), (h @ p["ws"]).reshape(512, 5, 4)
-        lp = -0.5 * jnp.sum(((theta[:, None] - mu) / jnp.exp(log_s)) ** 2 + 2 * log_s, -1)
-        return -jnp.mean(jax.nn.logsumexp(jax.nn.log_softmax(logits) + lp, -1))
-
-    value, grads = jax.value_and_grad(loss)(params)
+    value, grads = jax.value_and_grad(sbi_loss)(params, x, theta)
     return adamw(params, grads, opt), value
 
 
@@ -140,58 +150,60 @@ def _opt_state(params):
     return jax.tree.map(jnp.zeros_like, params), jax.tree.map(jnp.zeros_like, params), 0
 
 
-def steps(key=None):
-    """Each step with arguments: name -> (function, *args)."""
+def workload(name, key=None):
+    """One training step with its arguments, (function, *args), built on demand."""
     key = jax.random.key(0) if key is None else key
-    sbi = _init(
-        key, {"w1": (6, 128), "w2": (128, 128), "wa": (128, 5), "wm": (128, 20), "ws": (128, 20)}
-    )
-    llm = _init(
-        key,
-        {
-            "emb": (4096, 256),
-            "n1": (256,),
-            "n2": (256,),
-            "nf": (256,),
-            "wq": (256, 256),
-            "wk": (256, 256),
-            "wv": (256, 256),
-            "wo": (256, 256),
-            "wg": (256, 512),
-            "wu": (256, 512),
-            "wd": (512, 256),
-        },
-    )
-    sam = _init(
-        key,
-        {
-            "patch": (4, 4, 3, 64),
-            "n1": (64,),
-            "n2": (64,),
-            "wq": (64, 64),
-            "wk": (64, 64),
-            "wv": (64, 64),
-            "w1": (64, 128),
-            "w2": (128, 64),
-            "up": (4, 4, 64, 1),
-        },
-    )
-    return {
-        "sbi": (sbi_step, sbi, _opt_state(sbi), key),
-        "llm": (llm_step, llm, _opt_state(llm), jnp.zeros((4, 129), jnp.int32)),
-        "sam": (
-            sam_step,
-            sam,
-            _opt_state(sam),
-            jnp.zeros((2, 256, 256, 3)),
-            jnp.zeros((2, 256, 256)),
-        ),
-    }
+    if name == "sbi":
+        sbi = _init(
+            key,
+            {"w1": (6, 128), "w2": (128, 128), "wa": (128, 5), "wm": (128, 20), "ws": (128, 20)},
+        )
+        return sbi_step, sbi, _opt_state(sbi), key
+    if name == "llm":
+        llm = _init(
+            key,
+            {
+                "emb": (4096, 256),
+                "n1": (256,),
+                "n2": (256,),
+                "nf": (256,),
+                "wq": (256, 256),
+                "wk": (256, 256),
+                "wv": (256, 256),
+                "wo": (256, 256),
+                "wg": (256, 512),
+                "wu": (256, 512),
+                "wd": (512, 256),
+            },
+        )
+        return llm_step, llm, _opt_state(llm), jnp.zeros((4, 129), jnp.int32)
+    if name == "sam":
+        sam = _init(
+            key,
+            {
+                "patch": (4, 4, 3, 64),
+                "n1": (64,),
+                "n2": (64,),
+                "wq": (64, 64),
+                "wk": (64, 64),
+                "wv": (64, 64),
+                "w1": (64, 128),
+                "w2": (128, 64),
+                "up": (4, 4, 64, 1),
+            },
+        )
+        images, masks = jnp.zeros((2, 256, 256, 3)), jnp.zeros((2, 256, 256))
+        return sam_step, sam, _opt_state(sam), images, masks
+    raise ValueError(f"unknown workload {name!r}")
+
+
+STEPS = ("sbi", "llm", "sam")
 
 
 if __name__ == "__main__":
     union = collections.Counter()
-    for name, (fn, *args) in steps().items():
+    for name in STEPS:
+        fn, *args = workload(name)
         text = jax.jit(fn).lower(*args).as_text()
         ops = collections.Counter(re.findall(r"\b((?:stablehlo|chlo)\.[a-z_]+|func\.call)\b", text))
         union.update(dict.fromkeys(ops, 1))

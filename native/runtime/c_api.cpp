@@ -110,9 +110,9 @@ std::optional<std::vector<uint64_t>> region_signature(uintptr_t start, size_t le
 }
 
 // No-copy wraps kept across mr_wrap_buffer calls. A new wrap costs the GPU
-// page-table setup on its first dispatch, about 15 us per MB, so a caller that
-// wraps the same memory on every call (an XLA FFI handler) pays it every
-// call. A wrap pins the VM objects it maps, and the GPU keeps reading those
+// page-table setup on its first dispatch, in proportion to its size, so a
+// caller that wraps the same memory on every call (an XLA FFI handler) pays
+// it every call. A wrap pins the VM objects it maps, and the GPU keeps reading those
 // pages even after the range is freed and mapped again; but while the wrap
 // lives, no other object can take their ids. So a cached wrap is reused
 // exactly while its range still has the signature it was made over.
@@ -176,13 +176,9 @@ class WrapCache {
     };
 
     // MR_WRAP_CACHE_BYTES overrides the budget, and 0 disables the cache.
-    WrapCache() {
-        const char* env = std::getenv("MR_WRAP_CACHE_BYTES");
-        char* end = nullptr;
-        unsigned long long bytes = env && *env ? std::strtoull(env, &end, 10) : 0;
-        capacity_ =
-            env && *env && !*end ? (size_t)bytes : runtime().recommended_max_working_set_size() / 4;
-    }
+    WrapCache()
+        : capacity_(env_bytes("MR_WRAP_CACHE_BYTES",
+                              runtime().recommended_max_working_set_size() / 4)) {}
 
     void erase(std::list<Entry>::iterator it) {
         bytes_ -= it->length;

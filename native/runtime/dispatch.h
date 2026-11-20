@@ -4,6 +4,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "buffer.h"
@@ -99,12 +100,19 @@ class CommandBatch {
     // Validates, then encodes. Throws before touching the encoder if invalid.
     void add(const Launch& launch);
 
+    // Copies each (source, destination) pair on the GPU in one blit pass,
+    // after preceding launches and passes. Copies within a pass are unordered:
+    // no copy may write a buffer that another copy in the same call uses.
+    void copy(const std::vector<std::pair<const Buffer*, Buffer*>>& copies);
+
     // Submits without blocking.
     void commit();
 
     // Submits without blocking; `on_completed` runs on a Metal thread once the
-    // GPU is done, with the failure message of a faulted command buffer or null.
-    void commit(std::function<void(const char* error)> on_completed);
+    // GPU is done, with the failure message of a faulted command buffer or null,
+    // and the command buffer's GPU start and end times (host-clock seconds).
+    void commit(
+        std::function<void(const char* error, double gpu_start, double gpu_end)> on_completed);
 
     // Commits if needed, then blocks until done. Throws DispatchError on a
     // faulted command buffer. Every caller blocks, however many times.

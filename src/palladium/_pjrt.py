@@ -7,21 +7,24 @@ describes to the plugin through its pp_* builder functions. Execution stays
 native.
 
 It registers only when JAX_PLATFORMS names `metal` (e.g.
-`JAX_PLATFORMS=metal,cpu`): most programs do not compile yet, and otherwise
-every jax process would bring it up and warn that it is experimental.
+`JAX_PLATFORMS=metal,cpu`): otherwise every jax process would bring it up
+and warn that it is experimental, and unsupported programs fail to compile.
 """
 
 from __future__ import annotations
 
 import ctypes
 import functools
-import importlib.resources
 import traceback
 from pathlib import Path
 
+import jax
 import ml_dtypes
 import numpy as np
-from jax._src import config, xla_bridge
+from jax._src import xla_bridge  # register_plugin has no public name
+from jax._src.interpreters import mlir
+
+from palladium._runtime import installed_library, load_library
 
 _LIBRARY_NAME = "libpalladium_pjrt.dylib"
 
@@ -43,7 +46,24 @@ _PJRT_TYPES = {
 }
 _SLOT_KINDS = {"parameter": 0, "fresh": 1, "constant": 2}
 _UNIMPLEMENTED, _INTERNAL = 12, 13
-_MATH_MODE_FAST = 2
+
+
+class _Stats(ctypes.Structure):
+    _fields_ = [
+        ("executions", ctypes.c_uint64),
+        ("command_buffers", ctypes.c_uint64),
+        ("launches", ctypes.c_uint64),
+        ("encode_seconds", ctypes.c_double),
+        ("throttle_seconds", ctypes.c_double),
+        ("gpu_busy_seconds", ctypes.c_double),
+        ("gpu_sum_seconds", ctypes.c_double),
+        ("pool_hits", ctypes.c_uint64),
+        ("pool_misses", ctypes.c_uint64),
+        ("allocated_bytes", ctypes.c_uint64),
+        ("pool_dropped", ctypes.c_uint64),
+        ("allocation_seconds", ctypes.c_double),
+    ]
+
 
 _COMPILER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p)
 _INT64S = ctypes.POINTER(ctypes.c_int64)
@@ -73,30 +93,56 @@ _SIGNATURES = {
             ctypes.c_size_t,
             ctypes.POINTER(ctypes.c_size_t),
             ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(ctypes.c_size_t),
         ],
     ),
     "pp_output": (None, [ctypes.c_void_p, ctypes.c_int]),
+    "pp_alias": (None, [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]),
+    "palladium_pjrt_stats": (None, [ctypes.POINTER(_Stats), ctypes.c_int]),
 }
 
 
 def library_path() -> Path:
     """The plugin library in the installed package; reject a missing build."""
-    candidate = importlib.resources.files("palladium").joinpath(_LIBRARY_NAME)
-    if not candidate.is_file():
-        raise FileNotFoundError(f"palladium's PJRT plugin ({_LIBRARY_NAME}) isn't built")
-    return Path(str(candidate))
+    return installed_library(_LIBRARY_NAME, "PJRT plugin")
 
 
 @functools.cache
 def library() -> ctypes.CDLL:
     """The plugin, loaded once with the builder signatures declared; the same
     image jax loads, so the compiler set here is the one it calls."""
-    lib = ctypes.CDLL(str(library_path()))
-    for name, (restype, argtypes) in _SIGNATURES.items():
-        function = getattr(lib, name)
-        function.restype = restype
-        function.argtypes = argtypes
-    return lib
+    return load_library(library_path(), _SIGNATURES)
+
+
+def stats(reset: bool = False) -> dict[str, float]:
+    """Execution counters of the plugin since the last reset.
+
+    Parameters
+    ----------
+    reset : bool
+        Zero the counters after reading them.
+
+    Returns
+    -------
+    dict
+        ``executions``, ``command_buffers`` and ``launches`` encoded.
+        ``encode_seconds`` and ``throttle_seconds`` of host time inside
+        Execute. ``gpu_busy_seconds``, the union of the command buffers' GPU
+        intervals, and ``gpu_sum_seconds``, their sum. Of the buffer pool:
+        ``pool_hits``; ``pool_misses``, ``allocated_bytes`` and
+        ``allocation_seconds`` for new MTLBuffers; and ``pool_dropped``,
+        the buffers it freed.
+
+    Notes
+    -----
+    Completion handlers record GPU time, so synchronize on the last outputs
+    before reading. The pool evicts its oldest buffers to stay within a
+    quarter of the device's recommended working set, or within
+    ``PALLADIUM_POOL_BYTES``.
+    """
+    out = _Stats()
+    library().palladium_pjrt_stats(ctypes.byref(out), int(reset))
+    return {field[0]: getattr(out, field[0]) for field in _Stats._fields_}
 
 
 class _Recorded(Exception):
@@ -125,21 +171,28 @@ def _describe(lib: ctypes.CDLL, builder: int, code: bytes) -> None:
             raise _Recorded
     for launch in program.launches:
         slots = (ctypes.c_int * len(launch.slots))(*launch.slots)
-        grid = (ctypes.c_size_t * 3)(launch.grid, 1, 1)
+        # An int is the x extent; a zero threadgroup lets the pipeline choose.
+        grid, group = (
+            (ctypes.c_size_t * 3)(*((n, 1, 1) if isinstance(n, int) else n))
+            for n in (launch.grid, launch.threadgroup)
+        )
         status = lib.pp_kernel(
             builder,
             launch.source.encode(),
             launch.function.encode(),
-            _MATH_MODE_FAST,
+            launch.math_mode,
             slots,
             len(launch.slots),
             grid,
-            (ctypes.c_size_t * 3)(),
+            group,
+            (ctypes.c_size_t * len(launch.offsets))(*launch.offsets) if launch.offsets else None,
         )
         if status < 0:
             raise _Recorded
     for slot in program.outputs:
         lib.pp_output(builder, slot)
+    for parameter, output in program.aliases:
+        lib.pp_alias(builder, parameter, output)
 
 
 @_COMPILER
@@ -161,6 +214,14 @@ def _compile(code: int, size: int, builder: int) -> int:
 
 
 def initialize() -> None:
-    if "metal" in (config.jax_platforms.value or "").split(","):
+    if "metal" in (jax.config.jax_platforms or "").split(","):
         xla_bridge.register_plugin("metal", library_path=str(library_path()))
         library().palladium_pjrt_set_compiler(_compile)
+        if "metal" not in mlir._platforms_with_donation:
+            mlir._platforms_with_donation.append("metal")
+        # JAX accepts lowering rules for `metal` only after it is registered.
+        from jax.experimental import pallas as pl
+
+        from palladium.ffi import pallas_lowering
+
+        mlir.register_lowering(pl.pallas_call_p, pallas_lowering, platform="metal")

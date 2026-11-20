@@ -1,5 +1,6 @@
 // Types and helpers shared by the `metal` PJRT plugin's translation units.
 #pragma once
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <map>
@@ -25,6 +26,10 @@ class Completion {
    public:
     // An already completed one, for work done synchronously.
     static std::shared_ptr<Completion> done();
+
+    // Complete after all dependencies, preserving the first error in input
+    // order. Registration never waits; duplicate dependencies are coalesced.
+    static std::shared_ptr<Completion> join(std::vector<std::shared_ptr<Completion>> dependencies);
 
     void set(PJRT_Error_Code code = PJRT_Error_Code_OK, std::string message = {});
     bool ready();
@@ -80,21 +85,22 @@ struct PJRT_Client {
     PJRT_TopologyDescription topology{&device.description};
 };
 
-// Buffers come from a pool keyed by size: GPU allocations cost tens of
-// microseconds and are zeroed. A released buffer returns to the pool once
-// `last_use` completes, so host copies never race GPU work still using it.
-std::unique_ptr<Buffer> acquire(size_t size_bytes);
-void release(std::unique_ptr<Buffer> buffer, std::shared_ptr<Completion> last_use);
+// Pool counters since the last reset: requests served from the pool, new
+// MTLBuffers created (and their bytes and seconds), and buffers the pool
+// freed: evicted to make room, or larger than the whole pool.
+struct PoolCounters {
+    uint64_t hits, misses, miss_bytes, dropped;
+    std::chrono::duration<double> miss_seconds;
+};
+PoolCounters pool_counters(bool reset);
 
 struct PJRT_Buffer {
     PJRT_Device* device;
     PJRT_Buffer_Type type;
     std::vector<int64_t> dims, minor_to_major;
-    std::unique_ptr<Buffer> storage;  // null once deleted
-    // Its contents are defined, and GPU work reading or writing it has finished.
-    std::shared_ptr<Completion> ready = Completion::done(), last_use = Completion::done();
-
-    ~PJRT_Buffer() { release(std::move(storage), last_use); }
+    std::shared_ptr<Buffer> storage;  // null once deleted; dispatches retain their own copy
+    // Its contents are defined. Published once, before returning the buffer.
+    std::shared_ptr<Completion> ready = Completion::done();
 };
 
 PJRT_Error* error(PJRT_Error_Code code, std::string message);
@@ -103,9 +109,15 @@ PJRT_Error* error(PJRT_Error_Code code, std::string message);
 size_t element_size(PJRT_Buffer_Type type);
 size_t byte_size(const PJRT_Buffer* buffer);
 
-// Allocates a dense row-major buffer; the caller fills it.
+// Pooled storage of `size_bytes`, which its last owner returns to the pool.
+// Throws AllocationError.
+std::shared_ptr<Buffer> make_storage(size_t size_bytes);
+
+// A dense row-major buffer over `storage`, or over new storage that the
+// caller fills.
 PJRT_Error* make_buffer(PJRT_Device* device, PJRT_Buffer_Type type, const int64_t* dims,
-                        size_t num_dims, PJRT_Buffer** out);
+                        size_t num_dims, PJRT_Buffer** out,
+                        std::shared_ptr<Buffer> storage = nullptr);
 
 // An error if the buffer has been deleted.
 PJRT_Error* deleted(const PJRT_Buffer* buffer);

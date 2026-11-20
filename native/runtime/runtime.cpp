@@ -1,5 +1,6 @@
 #include "runtime.h"
 
+#include <cstdlib>
 #include <string>
 
 #include "errors.h"
@@ -43,6 +44,14 @@ size_t MetalRuntime::max_threads_per_threadgroup() const {
 }
 
 size_t MetalRuntime::max_buffer_length() const { return (size_t)(device_->maxBufferLength()); }
+
+size_t env_bytes(const char* name, size_t fallback) {
+    const char* env = std::getenv(name);
+    if (!env || !*env) return fallback;
+    char* end = nullptr;
+    unsigned long long bytes = std::strtoull(env, &end, 10);
+    return *end ? fallback : (size_t)bytes;
+}
 
 MetalRuntime& runtime() {
     static MetalRuntime rt;

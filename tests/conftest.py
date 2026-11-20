@@ -13,14 +13,16 @@ _NO_GPU_MODULES = {
     "test_kernel_spec",
     "test_effects",
     "test_write_safety",
-    "test_regressions",
+    "test_edge_lowerings",
     "test_structural_lowerings",
     "test_typed_arithmetic",
     "test_tensorops_dot",
+    "test_tensorops_attention_variants",
     "test_tensorops_flash_attention",
     "test_cursor",
     "test_views",
     "test_stablehlo",
+    "test_pjrt_tolerance",
 }
 
 

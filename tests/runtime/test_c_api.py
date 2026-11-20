@@ -417,8 +417,8 @@ def test_dispatch_rejects_offsets_outside_logical_wrapping(lib, async_dispatch, 
         data = np.frombuffer(region, dtype=np.float32)
         data[:] = 10
         try:
-            # The logical allocation starts inside the page. The huge offset
-            # used to wrap back to the page's beginning when 64 was added.
+            # The logical allocation starts inside the page, so a huge offset
+            # plus 64 would wrap back to the page's beginning.
             status = lib.mr_wrap_buffer(
                 data.ctypes.data + 64, 4, ctypes.byref(buffer), ctypes.byref(err)
             )
@@ -617,7 +617,7 @@ def test_cached_wrap_is_not_reused_after_its_range_is_remapped(lib, add_one):
     address = _map(size)
     view = (ctypes.c_float * (size // 4)).from_address
     np.ctypeslib.as_array(view(address))[:] = 1.0
-    _add_one_in_place(lib, add_one, address, size // 4)  # now cached
+    _add_one_in_place(lib, add_one, address, size // 4)  # caches the wrap
     _libc.munmap(address, size)
     assert _map(size, at=address) == address
     try:
