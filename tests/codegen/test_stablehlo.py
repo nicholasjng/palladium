@@ -864,3 +864,73 @@ def test_host_calls_in_a_conditional_branch_run_only_if_taken():
     assert isinstance(flag, Launch)
     assert isinstance(branch, Branch) and (branch.slot, branch.skip) == (flag.slots[-1], 1)
     assert isinstance(call, HostCall) and call.name == "print"
+
+
+def _attention(q, k, v, scale=None):
+    scores = q @ jnp.swapaxes(k, -1, -2)
+    return jax.nn.softmax(scores if scale is None else scores * scale, axis=-1) @ v
+
+
+def _weights_and_output(q, k, v):
+    weights = jax.nn.softmax(q @ jnp.swapaxes(k, -1, -2), axis=-1)
+    return weights @ v, weights.sum()
+
+
+def test_plain_attention_is_one_kernel_without_a_score_buffer():
+    """A product, a row softmax and a second product run as one attention
+    kernel, each head a batch of it, and no slot holds the scores."""
+    shape = (2, 4, 256, 32)
+    program = _compile(_attention, shape, shape, shape)
+    launch = program.launches[-1]
+    assert launch.function == "attention" and launch.slots[-1] == program.outputs[0]
+    # Eight heads along x, each a batch of the kernel, and four tiles of 64 queries.
+    assert launch.grid[0] % 8 == 0 and launch.grid[1:] == (1, 4)
+    assert not [s for s in program.launches if s.function.startswith(("gemm", "reduce"))]
+    assert max(math.prod(slot.shape) for slot in program.slots) == math.prod(shape)
+    # A scale on the scores is the kernel's, on the queries a fused operand.
+    launch = _compile(lambda q, k, v: _attention(q, k, v, 0.25), shape, shape, shape).launches[-1]
+    assert launch.function == "attention"
+    program = _compile(lambda q, k, v: _attention(q * 0.25, k, v), shape, shape, shape)
+    assert [step.function for step in program.launches][-1] == "attention"
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        # The probabilities have a second reader, as in a gradient.
+        lambda q, k, v: _weights_and_output(q, k, v),
+        # Not a softmax over the keys.
+        lambda q, k, v: jax.nn.softmax(q @ jnp.swapaxes(k, -1, -2), axis=-2) @ v,
+        lambda q, k, v: jnp.tanh(q @ jnp.swapaxes(k, -1, -2)) @ v,
+        lambda q, k, v: jax.grad(lambda q: _attention(q, k, v).sum())(q),
+    ],
+)
+def test_other_graphs_are_scheduled_as_written(fn):
+    shape = (2, 4, 256, 32)
+    program = _compile(fn, shape, shape, shape)
+    assert "attention" not in [step.function for step in program.launches]
+
+
+def test_attention_too_small_or_ragged_for_the_kernel_stays_plain():
+    for shape in [(4, 48, 32), (4, 250, 32), (4, 256, 24)]:
+        program = _compile(_attention, shape, shape, shape)
+        assert "attention" not in [step.function for step in program.launches], shape
+
+
+def test_reductions_store_an_operand_other_values_read():
+    """A normalization reads what it took the mean of twice more: an operand
+    that binds several buffers is computed once, not by each reader."""
+
+    def layer_norm(x, y, z):
+        h = x * y + z
+        mean = h.mean(-1, keepdims=True)
+        return (h - mean) * lax.rsqrt(((h - mean) ** 2).mean(-1, keepdims=True) + 1e-5)
+
+    program = _compile(layer_norm, (64, 64, 96), (64, 64, 96), (64, 64, 96))
+    stored, mean, variance, normalized = program.launches
+    assert stored.slots[:3] == (0, 1, 2) and stored.function.startswith("init")
+    for reader in (mean, variance, normalized):
+        assert stored.slots[-1] in reader.slots and not set(reader.slots) & {0, 1, 2}
+    # An operand only the reduction reads stays fused into it.
+    [launch] = _compile(lambda x, y, z: (x * y + z).sum(-1), *[(64, 64, 96)] * 3).launches
+    assert launch.slots[:3] == (0, 1, 2)

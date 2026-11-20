@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import math
 from collections.abc import Sequence
@@ -10,6 +11,7 @@ import ml_dtypes
 import numpy as np
 
 from palladium.errors import EmitError
+from palladium.stablehlo.attention import Attention, attention_source, match
 from palladium.stablehlo.gemm import gemm_source
 from palladium.stablehlo.graph import (
     SHORT_REDUCTION,
@@ -35,6 +37,7 @@ from palladium.stablehlo.graph import (
     is_short,
     is_stored,
     owns_slot,
+    reachable,
 )
 from palladium.stablehlo.kernel import (
     Kernel,
@@ -61,6 +64,12 @@ from palladium.stablehlo.scalar import ctype_of
 
 # Buffer arguments one Metal kernel can bind.
 MAX_BUFFERS = 31
+
+
+# A reduction stores an operand that other nodes read too, if computing it
+# reads more buffers than this: a normalization reads what it took the mean
+# of twice more, and a fused residual sum can bind dozens of buffers.
+STORE_READS = 2
 
 
 # Split K when a product's output has fewer GEMM tiles than this: one
@@ -254,6 +263,10 @@ class Scheduler:
         self.reduction_slots: dict[VariadicReduce, list[int]] = {}
         self.dispatch_slots: dict[Dispatch, list[int]] = {}
         self.host_slots: dict[Host, list[int]] = {}
+        # Products recognized as attention, or None for those that are not.
+        self.attentions: dict[Op, Attention | None] = {}
+        # How many nodes read each node, among those `compile` schedules.
+        self.uses: collections.Counter[Node] = collections.Counter()
         self.sort_slots: dict[Sort, list[int]] = {}
         # Buffers read by node, for one size of `stored`.
         self.read_sets: dict[Node, tuple[int, set[Node]]] = {}
@@ -661,7 +674,10 @@ class Scheduler:
             elif node not in self.visited:
                 self.visited.add(node)
                 pending.append((node, True))
-                pending.extend((n, False) for n in reversed(dependencies(node)))
+                # Attention needs its operands only, not the scores between.
+                found = self.attention(node)
+                needed = [found.q, found.k, found.v] if found else dependencies(node)
+                pending.extend((n, False) for n in reversed(needed))
 
     def launch_node(self, node: Node) -> None:
         """The launches of `node` itself; its dependencies are scheduled."""
@@ -680,6 +696,8 @@ class Scheduler:
         elif isinstance(node, Op):
             if node.name == "scatter":
                 self.schedule_scatter(node)
+            elif node.name == "dot_general" and self.attention(node):
+                self.schedule_attention(node)
             elif node.name == "dot_general":
                 self.schedule_dot(node)
             elif node.name == "reduce" and not is_short(node):
@@ -690,6 +708,15 @@ class Scheduler:
         """128 threads per output element; a long reduction to few outputs
         first reduces 4096-element chunks, so it occupies the GPU."""
         x, init = node.operands
+        if (
+            isinstance(x, Op)
+            and x not in self.stored
+            and self.uses[x] > 1
+            and len(self.reads(x)) > STORE_READS
+        ):
+            # Something else reads the operand too, as a normalization reads
+            # what it took the mean of: compute it once, not per reader.
+            self.store(x)
         self.bound([x, init])
         size = math.prod(x.shape[d] for d in node.attributes["dims"])
         chunks = math.ceil(size / 4096) if size > 4096 and math.prod(node.shape) < 128 else 1
@@ -796,6 +823,40 @@ class Scheduler:
         self.sort_slots[sort] = banks[0]
         return banks[0]
 
+    def attention(self, node: Node) -> Attention | None:
+        """`node` as attention, if it is one the kernel can run."""
+        if not isinstance(node, Op) or node.name != "dot_general":
+            return None
+        if node not in self.attentions:
+            found = match(node, self.uses)
+            if found:
+                try:
+                    attention_source(
+                        found.heads, found.queries, found.keys, found.head_dim, found.scale
+                    )
+                except EmitError:
+                    found = None
+            self.attentions[node] = found
+        return self.attentions[node]
+
+    def schedule_attention(self, node: Op) -> None:
+        """Attention as one kernel: a threadgroup per tile of queries, with
+        each head a batch, so operands bind in the layout they are stored."""
+        found = self.attentions[node]
+        assert found is not None
+        heads, queries, keys, head_dim = found.heads, found.queries, found.keys, found.head_dim
+        source, name, grid, threadgroup = attention_source(
+            heads, queries, keys, head_dim, found.scale
+        )
+        self.fresh(node)
+        slots = (
+            self.packed(found.q, (heads, queries, 1, head_dim)),
+            self.packed(found.k, (heads, keys, 1, head_dim)),
+            self.packed(found.v, (heads, keys, 1, head_dim)),
+            self.slot_of[node],
+        )
+        self.launches.append(Launch(source, name, slots, grid, threadgroup))
+
     def schedule_dot(self, node: Op) -> None:
         """A product on the GEMM kernel, its operands packed to (batch, M, K)
         and (batch, K, N) where they are not stored that way already."""
@@ -864,6 +925,8 @@ class Scheduler:
         parameter: only the update is written, into that parameter's buffer.
         `effects` run first, in order, whether or not a result depends on them.
         """
+        roots = [*results, *(x for effect in effects for x in effect.inputs)]
+        self.uses = collections.Counter(d for n in reachable(roots) for d in dependencies(n))
         for effect in effects:
             for node in effect.inputs:
                 self.schedule(node)
