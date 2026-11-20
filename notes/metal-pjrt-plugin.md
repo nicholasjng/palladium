@@ -40,9 +40,10 @@ Works:
   `jax.debug.print` and `jax.debug.callback`, and `checkify` checks, also
   inside loops.
 - Dense linear algebra on LAPACK, between launches: Cholesky, triangular
-  solves, LU, QR, `eigh` and SVD, and what JAX builds on them (`solve`, `inv`,
-  `det`, `slogdet`, `pinv`, `lstsq`, Gaussian log densities), with gradients
-  and under `vmap`.
+  solves, LU, QR and its Householder form (`geqrf`, `householder_product`),
+  `eigh`, SVD, and the Hessenberg, tridiagonal and real Schur forms, and what
+  JAX builds on them (`solve`, `inv`, `det`, `slogdet`, `pinv`, `lstsq`,
+  Gaussian log densities), with gradients and under `vmap`.
 - `sort` along any dimension with any comparator and several operands
   (`jnp.sort`, `argsort`, `lax.sort` by keys, `top_k`, `median`,
   `searchsorted`, `unique` with a size, `random.permutation`), stable.
@@ -72,7 +73,8 @@ Works:
 Fails with UNIMPLEMENTED, naming the op (`palladium.stablehlo` raises
 `UnsupportedProgram`):
 
-- complex numbers, and with them `fft` and `eig`;
+- complex numbers, and with them `fft`, `eig` and what needs them (`roots`,
+  `sqrtm`, the spectral functions of `jax.scipy.signal`);
 - reducer, scatter and comparator bodies that are not scalar elementwise
   code, and `reduce_window` or `scatter` of several operands;
 - scatter that combines 64-bit elements, or takes 64-bit indices;
@@ -347,8 +349,9 @@ in-place carries are optimizations of counted loops only.
 emit a `palladium_host` custom call naming a Python function by index: for
 `pure_callback`, `io_callback`, `debug_callback`, `debug_print` and
 `checkify`'s check, and for `cholesky`, `triangular_solve`, `lu`, `qr`,
-`eigh` and `svd`, which run on LAPACK through NumPy and SciPy (MLX runs them
-on the CPU too). The compiler schedules the inputs into buffers, then the
+`geqrf`, `householder_product`, `eigh`, `svd`, `hessenberg`, `tridiagonal`
+and `schur`, which run on LAPACK through NumPy and SciPy (MLX runs them on
+the CPU too). The compiler schedules the inputs into buffers, then the
 step, then reads the results as buffers. Calls with effects run in program
 order whether or not anything reads them, and a loop holding one runs for
 it; the token of an ordered effect is an empty buffer. Kernels compute every
@@ -475,6 +478,10 @@ Two float32 training runs drift apart even on one backend, so over long
 runs the yardstick is CPU against itself from parameters moved by one ulp,
 and a float64 run on the same data (`examples/pjrt_long_run.py`).
 
+The floating remainder is an exact helper, in the plugin and in Pallas
+kernels: Metal defines `fmod(x, y)` as `x - y * trunc(x / y)`, which returns
+`x` for some `fmod(x, x)` and loses every digit of a large quotient.
+
 Known differences from XLA:CPU:
 
 - Duplicate floating scatter updates apply in an implementation-dependent
@@ -485,6 +492,8 @@ Known differences from XLA:CPU:
   says. The `x[idx]` and `x.at[idx].add` forms match CPU.
 - Float-to-narrow-integer conversion of out-of-range values is undefined on
   both backends.
+- Subnormal numbers flush to zero on the GPU, so a remainder by one is NaN
+  where CPU's is a subnormal.
 - `rng_bit_generator` draws different bits than XLA:CPU: StableHLO leaves
   the generator to the backend. The default Threefry PRNG matches.
 - Linear algebra runs LAPACK through NumPy and SciPy, which may pick other
