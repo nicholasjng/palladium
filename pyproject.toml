@@ -88,4 +88,10 @@ exclude = [
     "benchmarks/bench_sir_simulators.py",
     "examples/sbi_sir.py",
     "examples/sbi_sir_npe.py",
+    # These two run in the qgis-segment environment, with torch and mlx.
+    "examples/sam2/convert.py",
+    "examples/sam2/mlx_reference.py",
+    # And these two with mlx-lm.
+    "examples/lora/convert.py",
+    "examples/lora/mlx_reference.py",
 ]

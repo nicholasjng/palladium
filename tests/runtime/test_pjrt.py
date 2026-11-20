@@ -1695,3 +1695,79 @@ def test_diffrax_solves_match_cpu():
         assert_matches_cpu(lambda y: solve(y, diffrax.ConstantStepSize()), y0, rtol=1e-4)
         assert_matches_cpu(lambda y: solve(y, diffrax.PIDController(rtol=1e-5, atol=1e-6)), y0, rtol=1e-4)
     """)
+
+
+def test_llm_lora_step_matches_cpu():
+    """The Qwen2.5 port of examples/lora (grouped-query attention with RoPE,
+    SwiGLU, tied head) in a tiny configuration with random weights: three
+    LoRA training steps agree with the CPU backend, in float32 and with
+    bfloat16 weights."""
+    _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from pjrt_tolerance import assert_trees_close
+        from lora.model import QwenConfig, init_lora, init_params
+        from lora.train import adam_init, make_train_step
+        config = QwenConfig(
+            vocab_size=97, hidden_size=32, num_hidden_layers=3, num_attention_heads=4,
+            num_key_value_heads=2, intermediate_size=64, lora_num_layers=2, lora_rank=2)
+        rng = np.random.default_rng(0)
+        tokens = rng.integers(1, config.vocab_size, size=(2, 17)).astype(np.int32)
+        tokens[1, 9:] = 0
+        lengths = np.array([[0, 17], [0, 9]], np.int32)
+        for dtype, rtol in ((jnp.float32, 1e-4), (jnp.bfloat16, 2e-2)):
+            lora = init_lora(config)
+            results = {}
+            for name in ("metal", "cpu"):
+                with jax.default_device(jax.devices(name)[0]):
+                    params = init_params(config, seed=0, dtype=dtype)
+                    step = jax.jit(make_train_step(config, learning_rate=1e-3))
+                    state, losses = (lora, adam_init(lora)), []
+                    for _ in range(3):
+                        *state, loss = step(params, *state, tokens, lengths)
+                        losses.append(loss)
+                    results[name] = losses
+            assert_trees_close(results["metal"], results["cpu"], rtol=rtol)
+            assert float(results["cpu"][2]) < float(results["cpu"][0])
+    """)
+
+
+def test_sam2_lora_steps_match_cpu():
+    """The SAM2 port of examples/sam2 (Hiera trunk, neck, prompt encoder and
+    mask decoder) with random weights: the logits and three LoRA training
+    steps agree with the CPU backend, as written and with its global
+    attention on the flash-attention kernels, forward and backward."""
+    _check("""
+        import dataclasses
+        import jax, numpy as np
+        from pjrt_tolerance import assert_trees_close
+        from sam2.model import Sam2Config, block_specs, forward, init_lora, init_params
+        from sam2.train import adamw_init, make_train_step
+        plain = Sam2Config(image_size=128)
+        fused = dataclasses.replace(plain, fused_attention=True)
+        assert sum(spec.fused for spec in block_specs(fused)) == 3
+        rng = np.random.default_rng(0)
+        images = rng.normal(size=(1, 128, 128, 3)).astype(np.float32)
+        boxes = np.array([[16, 20, 100, 88]], np.float32)
+        masks = np.zeros((1, 128, 128), np.float32)
+        masks[0, 20:88, 16:100] = 1.0
+        lora = init_lora(plain, rank=4)
+
+        def run(device, config):
+            with jax.default_device(jax.devices(device)[0]):
+                params = init_params(config, seed=0)
+                logits = jax.jit(lambda i, b: forward(params, config, i, b))(images, boxes)
+                step = jax.jit(make_train_step(params, config, (128, 128)))
+                state, losses = (lora, adamw_init(lora)), []
+                for _ in range(3):
+                    *state, loss = step(*state, images, boxes, masks)
+                    losses.append(loss)
+                return logits, losses
+
+        # The adapters are not compared: this Adam has no bias correction, so
+        # an element whose gradient is at rounding level still moves by the
+        # learning rate, in either direction.
+        want = run("cpu", plain)
+        assert float(want[1][2]) < float(want[1][0])
+        for config in (plain, fused):
+            assert_trees_close(run("metal", config), want, rtol=1e-4)
+    """)
