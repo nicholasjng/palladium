@@ -5,7 +5,7 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "palladium"
 version = "0.1.0"
-description = "Pallas kernels on Apple GPU: trace Pallas, emit MSL, dispatch on Metal."
+description = "JAX on Apple GPUs: a Metal backend for jit-compiled programs, and Pallas kernels compiled to Metal Shading Language."
 readme = "README.md"
 license = "Apache-2.0"
 authors = [{ name = "Nicholas Junge", email = "nicho.junge@gmail.com" }]
