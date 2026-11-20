@@ -28,10 +28,26 @@ from jaxlib.mlir import ir
 from jaxlib.mlir.dialects import stablehlo
 
 from palladium.stablehlo.graph import import_graph
-from palladium.stablehlo.program import Launch, Program, Slot, UnsupportedProgram
+from palladium.stablehlo.program import (
+    Branch,
+    HostCall,
+    Launch,
+    Program,
+    Slot,
+    UnsupportedProgram,
+    share_storage,
+)
 from palladium.stablehlo.schedule import compile_graph
 
-__all__ = ["Launch", "Program", "Slot", "UnsupportedProgram", "compile_program"]
+__all__ = [
+    "Branch",
+    "HostCall",
+    "Launch",
+    "Program",
+    "Slot",
+    "UnsupportedProgram",
+    "compile_program",
+]
 
 
 # Python frames code generation may nest per StableHLO op: a convolution is
@@ -59,7 +75,7 @@ def compile_program(code: bytes) -> Program:
     """
     with mlir.make_ir_context() as ctx:
         module = stablehlo.deserialize_portable_artifact(ctx, code)
-        main, parameters, results, ops = import_graph(module)
+        main, parameters, results, effects, ops = import_graph(module)
         aliases = []
         if "arg_attrs" in main.attributes:
             for i, attrs in enumerate(ir.ArrayAttr(main.attributes["arg_attrs"])):
@@ -82,4 +98,5 @@ def compile_program(code: bytes) -> Program:
     depth = FRAMES_PER_OP * ops + 1000
     if sys.getrecursionlimit() < depth:
         sys.setrecursionlimit(depth)
-    return dataclasses.replace(compile_graph(parameters, results), aliases=tuple(aliases))
+    program = share_storage(compile_graph(parameters, results, effects=effects))
+    return dataclasses.replace(program, aliases=tuple(aliases))

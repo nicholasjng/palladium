@@ -5,7 +5,7 @@ from __future__ import annotations
 import collections
 import dataclasses
 import math
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 
 import ml_dtypes
 import numpy as np
@@ -32,7 +32,14 @@ _DTYPES = {
 }
 
 
+_BOOL = np.dtype(np.bool_)
+
+
 def tensor_type(value: ir.Value) -> tuple[np.dtype, tuple[int, ...]]:
+    if str(value.type) == "!stablehlo.token":
+        # The token of an ordered effect carries no data: an empty buffer.
+        # Host steps run in program order without it.
+        return np.dtype(np.bool_), (0,)
     t = ir.RankedTensorType(value.type)
     name = str(t.element_type)
     if name not in _DTYPES:
@@ -76,14 +83,50 @@ class Op(Node):
     attributes: dict
 
 
+# A `case` branch something lies in: the selector, the branch, and the number
+# of branches. Kernels compute every branch and select; what runs on the host
+# may raise, print or never end, so it runs only in the branch taken.
+Guard = tuple[Node, int, int]
+
+
+def guard_flag(guards: Sequence[Guard]) -> Node:
+    """A boolean scalar: whether every branch of `guards` is the one taken."""
+
+    def compare(index: Node, direction: str, value: int) -> Op:
+        operands = [index, Constant(index.dtype, (), value)]
+        return Op("compare", operands, _BOOL, (), {"direction": direction, "total": False})
+
+    taken: Node | None = None
+    for index, branch, count in guards:
+        if branch < count - 1:
+            here = compare(index, "eq", branch)
+        else:
+            # An index out of range selects the last branch.
+            out_of_range: list[Node] = [
+                compare(index, "lt", 0),
+                compare(index, "ge", count - 1),
+            ]
+            here = Op("or", out_of_range, _BOOL, (), {})
+        taken = here if taken is None else Op("and", [taken, here], _BOOL, (), {})
+    assert taken is not None
+    return taken
+
+
 @dataclasses.dataclass(eq=False)
 class While:
     inputs: list[Node]  # carries followed by lexical captures
     parameters: list[Parameter]
     results: list[Node]  # updated carries
-    trips: int
+    # Iterations, when the loop provably counts to a constant bound. None:
+    # the host reads `condition` before every iteration.
+    trips: int | None
     # Integer scalar carries with known values: carry index to (start, step).
     inductions: dict[int, tuple[int, int]]
+    condition: Node
+    # Host calls and loops in the body that run for their effect, in order.
+    effects: list[Host | While] = dataclasses.field(default_factory=list)
+    # Set for a loop the host drives or that calls it: it runs only if taken.
+    guards: tuple[Guard, ...] = ()
 
 
 @dataclasses.dataclass(eq=False)
@@ -92,6 +135,15 @@ class LoopResult(Node):
     index: int
     dtype: np.dtype
     shape: tuple[int, ...]
+
+
+@dataclasses.dataclass(eq=False)
+class Reducer:
+    """A reducer or scatter body that is not one known binary op: the node
+    combining its two scalar parameters, the accumulated value first."""
+
+    parameters: list[Parameter]
+    body: Node
 
 
 @dataclasses.dataclass(eq=False)
@@ -106,6 +158,26 @@ class VariadicReduce:
 @dataclasses.dataclass(eq=False)
 class ReductionResult(Node):
     reduction: VariadicReduce
+    index: int
+    dtype: np.dtype
+    shape: tuple[int, ...]
+
+
+@dataclasses.dataclass(eq=False)
+class Sort:
+    """A sort of `inputs` together along `dim`. `body` says whether the
+    element in the first of each input's two `parameters` comes before the
+    one in the second."""
+
+    inputs: list[Node]
+    parameters: list[Parameter]
+    body: Node
+    dim: int
+
+
+@dataclasses.dataclass(eq=False)
+class SortResult(Node):
+    sort: Sort
     index: int
     dtype: np.dtype
     shape: tuple[int, ...]
@@ -141,6 +213,40 @@ class DispatchResult(Node):
     shape: tuple[int, ...]
 
 
+@dataclasses.dataclass(eq=False)
+class Host:
+    """A function the host runs on arrays: a Python callback, or an op without
+    a kernel. With `effect`, it runs even if nothing reads its results."""
+
+    inputs: list[Node]
+    results: list[HostResult]
+    function: Callable[..., Sequence[np.ndarray]]
+    name: str
+    effect: bool = False
+    guards: tuple[Guard, ...] = ()
+
+
+@dataclasses.dataclass(eq=False)
+class HostResult(Node):
+    host: Host
+    index: int
+    dtype: np.dtype
+    shape: tuple[int, ...]
+
+
+def host_call(
+    name: str,
+    function: Callable[..., Sequence[np.ndarray]],
+    inputs: list[Node],
+    types: Sequence[tuple[np.dtype, tuple[int, ...]]],
+    effect: bool = False,
+) -> Host:
+    """A call of `function` on the host, its results of the given types."""
+    host = Host(inputs, [], function, name, effect)
+    host.results = [HostResult(host, k, dtype, shape) for k, (dtype, shape) in enumerate(types)]
+    return host
+
+
 def copy_of(node: Node) -> Op:
     """A distinct node with the values of `node`, for a buffer of its own."""
     return Op("reshape", [node], node.dtype, node.shape, {})
@@ -155,10 +261,11 @@ def dependencies(node: Node) -> list[Node]:
         return node.reduction.inputs + node.reduction.initial
     if isinstance(node, DispatchResult):
         return node.dispatch.inputs
+    if isinstance(node, HostResult):
+        return node.host.inputs
+    if isinstance(node, SortResult):
+        return node.sort.inputs
     return []
-
-
-_COUNTED = "metal: stablehlo.while requires a constant counter, LT bound and unit increment"
 
 
 def reachable(roots: Iterable[Node]) -> Iterator[Node]:
@@ -219,26 +326,28 @@ def _trip_count(
     inputs: list[Node],
     results: list[Node],
     inductions: dict[int, tuple[int, int]],
-) -> int:
-    """Prove the loop runs a counter from a constant start, by one, up to a constant bound."""
+) -> int | None:
+    """The iterations of a loop that provably runs a counter from a constant
+    start, by one, up to a constant bound; None for any other loop."""
     if (
         not isinstance(predicate, Op)
         or predicate.name != "compare"
         or predicate.attributes["direction"] != "lt"
+        or predicate.attributes["total"]
     ):
-        raise UnsupportedProgram(_COUNTED)
+        return None
     counter, bound = predicate.operands
     # An invariant carry or lexical capture can supply a constant loop bound.
     bound = _invariant(bound, parameters, inputs, results)
     in_loop = isinstance(counter, Parameter) and counter in parameters
     k = parameters.index(counter) if in_loop else -1
     if (
-        counter.dtype not in (np.int32, np.uint32)
+        counter.dtype.kind not in "iu"
         or inductions.get(k, (0, 0))[1] != 1
         or not isinstance(bound, Constant)
         or bound.splat is None
     ):
-        raise UnsupportedProgram(_COUNTED)
+        return None
     return max(0, int(bound.splat) - inductions[k][0])
 
 
@@ -274,40 +383,92 @@ def _pairs(a, name: str, rank: int) -> list[tuple[int, int]]:
     return [(values[2 * d], values[2 * d + 1]) for d in range(rank)]
 
 
-def _reducer(op) -> str:
-    """The binary op of a single-result reduce or reduce_window body."""
-    name = op.operation.name
-    block = op.regions[0].blocks[0]
+REDUCERS = ("add", "multiply", "maximum", "minimum", "and", "or", "xor")
+
+
+def _reducer(op, region: int = 0) -> str | None:
+    """The op of a body that applies one known binary op to its two
+    arguments, or None for any other body."""
+    block = op.regions[region].blocks[0]
     body = list(block.operations)
     if len(op.results) != 1 or len(body) != 2:
-        raise UnsupportedProgram(f"metal: {name} requires a single binary reducer")
+        return None
     reducer, ret = body
     kind = reducer.operation.name.removeprefix("stablehlo.")
     if (
-        kind not in ("add", "maximum", "minimum", "and", "or")
+        kind not in REDUCERS
         or list(reducer.operands) != list(block.arguments)
         or ret.operation.name != "stablehlo.return"
         or list(ret.operands) != list(reducer.results)
     ):
-        raise UnsupportedProgram(f"metal: {name} has an unsupported reducer body")
+        return None
     return kind
+
+
+def _window(op) -> dict:
+    """The geometry of a reduce_window."""
+    a = op.attributes
+    rank = len(tensor_type(op.operands[0])[1])
+    return {
+        "window": _array(a, "window_dimensions", 1, rank),
+        "strides": _array(a, "window_strides", 1, rank),
+        "base": _array(a, "base_dilations", 1, rank),
+        "dilations": _array(a, "window_dilations", 1, rank),
+        "padding": _pairs(a, "padding", rank),
+    }
+
+
+# Cumulative reductions along more elements than this run in blocks.
+CUMULATIVE_DIRECT = 128
+
+
+def _cumulative(x: Node, init: Node, a: dict, shape: tuple[int, ...]) -> Node | None:
+    """A reduce_window that is a cumulative reduction along one long axis, in
+    blocks; None for any other window.
+
+    JAX lowers `cumsum` and its relatives to a window as long as the axis,
+    padded by its length less one before (or, reversed, after). Folding each
+    window alone would read the square of the length. Instead: the total of
+    each block of the axis, then for each block the total of the blocks
+    before it, then each element from its block's start. The reducer must be
+    associative and the initial value its identity, as StableHLO asks.
+    """
+    moving = [
+        d
+        for d in range(len(x.shape))
+        if (a["window"][d], a["strides"][d], a["base"][d], *a["padding"][d]) != (1, 1, 1, 0, 0)
+    ]
+    if len(moving) != 1 or shape != x.shape:
+        return None
+    [axis] = moving
+    n = x.shape[axis]
+    padding = tuple(a["padding"][axis])
+    if (
+        n <= CUMULATIVE_DIRECT
+        or (a["window"][axis], a["strides"][axis], a["base"][axis]) != (n, 1, 1)
+        or padding not in ((n - 1, 0), (0, n - 1))
+    ):
+        return None
+    # Work per row: n * block / 2 within blocks, (n / block)^2 across them.
+    block = max(16, round((4 * n) ** (1 / 3)))
+    common = {"axis": axis, "block": block, "reducer": a["reducer"], "reverse": padding[0] == 0}
+    blocks = (*x.shape[:axis], -(-n // block), *x.shape[axis + 1 :])
+    totals = Op("fold_blocks", [x, init], x.dtype, blocks, common)
+    before = Op("fold_before", [totals, init], x.dtype, blocks, common)
+    return Op("fold_within", [x, before], x.dtype, x.shape, common)
+
+
+# Internal ops that fold with a loop per output element: computed once into a
+# buffer, never refolded by each kernel that reads them.
+STORED = ("fold_blocks", "fold_before", "fold_within")
 
 
 def _attributes(op) -> dict:
     a = op.attributes
     name = op.operation.name.removeprefix("stablehlo.")
     if name == "scatter":
-        block = op.regions[0].blocks[0]
-        body = list(block.operations)
-        if (
-            len(op.results) != 1
-            or len(body) != 2
-            or body[0].operation.name != "stablehlo.add"
-            or list(body[0].operands) != list(block.arguments)
-            or body[1].operation.name != "stablehlo.return"
-            or list(body[1].operands) != list(body[0].results)
-        ):
-            raise UnsupportedProgram("metal: stablehlo.scatter requires a single add update")
+        if len(op.results) != 1:
+            raise UnsupportedProgram("metal: stablehlo.scatter of several operands")
         d = stablehlo.ScatterDimensionNumbers(a["scatter_dimension_numbers"])
         return {
             "window": tuple(d.update_window_dims),
@@ -342,16 +503,6 @@ def _attributes(op) -> dict:
         }
     if name == "reduce":
         return {"dims": list(ir.DenseI64ArrayAttr(a["dimensions"])), "reducer": _reducer(op)}
-    if name == "reduce_window":
-        rank = len(tensor_type(op.operands[0])[1])
-        return {
-            "reducer": _reducer(op),
-            "window": _array(a, "window_dimensions", 1, rank),
-            "strides": _array(a, "window_strides", 1, rank),
-            "base": _array(a, "base_dilations", 1, rank),
-            "dilations": _array(a, "window_dilations", 1, rank),
-            "padding": _pairs(a, "padding", rank),
-        }
     if name == "select_and_scatter":
         select, scatter = (list(r.blocks[0].operations) for r in op.regions)
         arguments = list(op.regions[0].blocks[0].arguments)
@@ -400,15 +551,19 @@ def _attributes(op) -> dict:
         }
     if name == "reverse":
         return {"dims": list(ir.DenseI64ArrayAttr(a["dimensions"]))}
+    if name == "reduce_precision":
+        return {
+            "exponent": ir.IntegerAttr(a["exponent_bits"]).value,
+            "mantissa": ir.IntegerAttr(a["mantissa_bits"]).value,
+        }
     if name == "compare":
-        # Kernels compare as MSL does: a total order would rank NaNs and zeros.
-        if (
+        # A total order ranks NaNs and the two zeros, which MSL's operators do not.
+        total = (
             "compare_type" in a
             and stablehlo.ComparisonTypeAttr(a["compare_type"]).value == "TOTALORDER"
-        ):
-            raise UnsupportedProgram("metal: stablehlo.compare in total order is not supported")
+        )
         direction = stablehlo.ComparisonDirectionAttr(a["comparison_direction"]).value
-        return {"direction": direction.lower()}
+        return {"direction": direction.lower(), "total": total}
     return {}
 
 
@@ -431,9 +586,23 @@ def is_short(node: Op) -> bool:
     return node.dtype not in (np.int64, np.uint64) and size <= SHORT_REDUCTION
 
 
+def is_looped(node: Op) -> bool:
+    """Whether a reduce_window folds with a loop instead of unrolled: its
+    window is long, or its reducer a body of its own."""
+    a = node.attributes
+    return not isinstance(a["reducer"], str) or math.prod(a["window"]) > WINDOW_LIMIT
+
+
+def is_stored(node: Node) -> bool:
+    """Whether scheduling `node` computes it once into a buffer for all readers."""
+    return isinstance(node, Op) and (
+        node.name in STORED or (node.name == "reduce_window" and is_looped(node))
+    )
+
+
 def owns_slot(node: Node) -> bool:
     """Whether scheduling `node` computes it into a fresh buffer of its own."""
-    if isinstance(node, (ReductionResult, DispatchResult)):
+    if isinstance(node, (ReductionResult, DispatchResult, HostResult, SortResult)):
         return True
     return isinstance(node, Op) and (
         node.name in ("dot_general", "scatter") or (node.name == "reduce" and not is_short(node))
@@ -509,10 +678,62 @@ _SUPPORTED = {
     "reduce",
     "dot_general",
     "gather",
-    "scatter",
-    "reduce_window",
     "select_and_scatter",
+    "reduce_precision",
 }
+
+
+def _grouped_product(
+    patches: Op, kernel: Node, dtype: np.dtype, rank: int, feature_groups: int, batch_groups: int
+) -> Op:
+    """The product of a grouped convolution's patches, (batch, output
+    spatial..., window..., feature), with its kernel, (window..., input
+    feature, output feature), as (batch, output spatial..., output feature).
+
+    Each group is one product of a batch: feature groups split the patches'
+    features and batch groups their batch, and both split the kernel's output
+    features. A group contracting few elements, as in a depthwise
+    convolution, is a sum the reading kernel unrolls instead of a GEMM.
+    """
+    groups = feature_groups * batch_groups
+    batch, *outputs = patches.shape[: 1 + rank]
+    window, features = patches.shape[1 + rank : 1 + 2 * rank], patches.shape[-1]
+    *_, inputs, out_features = kernel.shape
+    per_group = out_features // groups
+    if feature_groups > 1:
+        split = (batch, *outputs, *window, groups, features // groups)
+        lhs_batch = (1 + 2 * rank,)
+        lhs_contract = (*range(1 + rank, 1 + 2 * rank), 2 + 2 * rank)
+    else:
+        split = (groups, batch // groups, *outputs, *window, features)
+        lhs_batch = (0,)
+        lhs_contract = tuple(range(2 + rank, 3 + 2 * rank))
+    lhs = Op("reshape", [patches], patches.dtype, split, {})
+    rhs = Op("reshape", [kernel], kernel.dtype, (*window, inputs, groups, per_group), {})
+    rows = batch // batch_groups
+    product = Op(
+        "dot_general",
+        [lhs, rhs],
+        dtype,
+        (groups, rows, *outputs, per_group),
+        {
+            "lhs_batch": lhs_batch,
+            "rhs_batch": (rank + 1,),
+            "lhs_contract": lhs_contract,
+            "rhs_contract": tuple(range(rank + 1)),
+        },
+    )
+    if math.prod(window) * inputs <= SHORT_REDUCTION:
+        product = _summed_products(product)
+    order = (*range(1, 2 + rank), 0, 2 + rank)
+    grouped = Op(
+        "transpose",
+        [product],
+        dtype,
+        tuple(product.shape[k] for k in order),
+        {"perm": order},
+    )
+    return Op("reshape", [grouped], dtype, (rows, *outputs, out_features), {})
 
 
 def _convolution(op, lhs: Node, rhs: Node) -> Node:
@@ -526,9 +747,9 @@ def _convolution(op, lhs: Node, rhs: Node) -> Node:
     emits, gradients included, needs only these two operations.
     """
     a = op.attributes
-    for attribute in ("feature_group_count", "batch_group_count"):
-        if ir.IntegerAttr(a[attribute]).value != 1:
-            raise UnsupportedProgram(f"metal: stablehlo.convolution with {attribute} > 1")
+    feature_groups = ir.IntegerAttr(a["feature_group_count"]).value
+    batch_groups = ir.IntegerAttr(a["batch_group_count"]).value
+    groups = feature_groups * batch_groups
     d = stablehlo.ConvDimensionNumbers(a["dimension_numbers"])
     spatial = list(d.input_spatial_dimensions)
     kernel_spatial = list(d.kernel_spatial_dimensions)
@@ -563,13 +784,26 @@ def _convolution(op, lhs: Node, rhs: Node) -> Node:
         kernel = Op(
             "transpose", [rhs], rhs.dtype, tuple(rhs.shape[p] for p in perm), {"perm": perm}
         )
-    phased = any(n > 1 for n in lhs_dilation) and all(
-        n == 1 or (s, r, rev, w % n, o % n) == (1, 1, False, 0, 0)
-        for n, s, r, rev, w, o in zip(
-            lhs_dilation, strides, rhs_dilation, reversal, window, outputs, strict=True
+    phased = (
+        groups == 1
+        and any(n > 1 for n in lhs_dilation)
+        and all(
+            n == 1 or (s, r, rev, w % n, o % n) == (1, 1, False, 0, 0)
+            for n, s, r, rev, w, o in zip(
+                lhs_dilation, strides, rhs_dilation, reversal, window, outputs, strict=True
+            )
         )
     )
-    if not phased:
+    if groups > 1:
+        product = _grouped_product(
+            Op("conv_patches", [lhs], lhs.dtype, (batch, *outputs, *window, features), attributes),
+            kernel,
+            dtype,
+            rank,
+            feature_groups,
+            batch_groups,
+        )
+    elif not phased:
         patches = Op(
             "conv_patches", [lhs], lhs.dtype, (batch, *outputs, *window, features), attributes
         )
@@ -684,19 +918,133 @@ def _convolution(op, lhs: Node, rhs: Node) -> Node:
     return Op("transpose", [product], dtype, shape, {"perm": order})
 
 
-def import_graph(module: ir.Module) -> tuple[ir.OpView, list[Parameter], list[Node], int]:
+def _summed_products(node: Op) -> Op:
+    """A dot_general as a sum over the products of its operands, broadcast
+    against each other: for integers and booleans, since the GEMM kernels are
+    floating, and for contractions too short to be worth one."""
+    lhs, rhs = node.operands
+    a = node.attributes
+    lb, rb, lc, rc = (a[key] for key in ("lhs_batch", "rhs_batch", "lhs_contract", "rhs_contract"))
+    lf = tuple(d for d in range(len(lhs.shape)) if d not in lb + lc)
+    rf = tuple(d for d in range(len(rhs.shape)) if d not in rb + rc)
+    contracted = tuple(lhs.shape[d] for d in lc)
+    full = (*node.shape, *contracted)
+    batch, left, right = len(lb), len(lf), len(rf)
+
+    def spread(x: Node, perm: tuple[int, ...], positions: list[int]) -> Op:
+        if x.dtype != node.dtype:
+            x = Op("convert", [x], node.dtype, x.shape, {})
+        shape = tuple(x.shape[d] for d in perm)
+        x = Op("transpose", [x], node.dtype, shape, {"perm": list(perm)})
+        return Op("broadcast_in_dim", [x], node.dtype, full, {"dims": positions})
+
+    last = list(range(batch + left + right, len(full)))
+    products = Op(
+        "and" if node.dtype == np.bool_ else "multiply",
+        [
+            spread(lhs, lb + lf + lc, [*range(batch + left), *last]),
+            spread(
+                rhs,
+                rb + rf + rc,
+                [*range(batch), *range(batch + left, batch + left + right), *last],
+            ),
+        ],
+        node.dtype,
+        full,
+        {},
+    )
+    return Op(
+        "reduce",
+        [products, Constant(node.dtype, (), 0)],
+        node.dtype,
+        node.shape,
+        {"dims": last, "reducer": "or" if node.dtype == np.bool_ else "add"},
+    )
+
+
+def _rng_bits(op, state: Node) -> list[Node]:
+    """rng_bit_generator: the new state and the random bits.
+
+    StableHLO leaves the generator to the implementation. This one is
+    Threefry-2x32 keyed by the state, counting output elements; the next
+    state is the state plus one in its first word.
+    """
+    if state.dtype not in (np.uint32, np.uint64) or len(state.shape) != 1:
+        raise UnsupportedProgram(
+            "metal: stablehlo.rng_bit_generator needs a uint32 or uint64 state"
+        )
+    dtype, shape = tensor_type(op.results[1])
+    if dtype.kind not in "iu" or dtype.itemsize not in (4, 8):
+        raise UnsupportedProgram(f"metal: stablehlo.rng_bit_generator of {dtype}")
+    step = np.zeros(state.shape, state.dtype)
+    step[:1] = 1
+    advanced = Op(
+        "add", [state, Constant(state.dtype, state.shape, None, step)], state.dtype, state.shape, {}
+    )
+    return [advanced, Op("rng_bits", [state], dtype, shape, {})]
+
+
+def _scalar_body(values: list[Node], parameters: list[Parameter], what: str) -> None:
+    """Reject a reducer or comparator body that is not scalar elementwise code."""
+    for value in reachable(values):
+        if (
+            value.shape
+            or (isinstance(value, Parameter) and value not in parameters)
+            or (
+                not isinstance(value, (Constant, Parameter))
+                and (not isinstance(value, Op) or value.name not in SCALAR)
+            )
+        ):
+            raise UnsupportedProgram(f"metal: {what} requires a scalar elementwise body")
+
+
+_HOST_TARGET = "palladium_host"
+
+
+def _host_callback(op, inputs: list[Node]) -> Host:
+    """A `palladium_host` custom call: the function `palladium.host` registered
+    under the call's index, run on the host."""
+    from palladium import host
+
+    a = op.attributes
+    config = ir.DictAttr(a["mhlo.backend_config"])
+    name, function = host.registered(ir.IntegerAttr(config["index"]).value)
+    types = [tensor_type(value) for value in op.results]
+    effect = "has_side_effect" in a and ir.BoolAttr(a["has_side_effect"]).value
+    return host_call(name, function, inputs, types, effect)
+
+
+def import_graph(
+    module: ir.Module,
+) -> tuple[ir.OpView, list[Parameter], list[Node], list[Host | While], int]:
     """The main function, and it as a DAG of nodes, calls and composites
-    inlined, with the number of ops that took, inlined ones counted per call."""
+    inlined: its parameters, results and the host calls that run for their
+    effect, with the number of ops that took, inlined ones counted per call."""
     functions = {
         ir.StringAttr(op.attributes["sym_name"]).value: op
         for op in module.body.operations
         if op.operation.name == "func.func"
     }
 
+    # Host calls with effects, per region being walked; calls inline into
+    # their caller's.
+    effects: list[list[Host | While]] = [[]]
+    # The `case` branches around the op being walked, and the host calls seen.
+    guards: list[Guard] = []
+    hosts = 0
+
+    def region(block, args: list[Node], outer: dict, what: str) -> list[Node]:
+        """The results of a region that may not call the host for an effect."""
+        effects.append([])
+        results = walk(block, args, outer)
+        if effects.pop():
+            raise UnsupportedProgram(f"metal: a host callback with effects inside {what}")
+        return results
+
     def walk(block, args: list[Node], outer: dict | None = None) -> list[Node]:
         env: dict[ir.Value, Node] = dict(outer or {})
         env.update(zip(block.arguments, args, strict=True))
-        nonlocal ops
+        nonlocal ops, hosts
         for op in block.operations:
             ops += 1
             name = op.operation.name
@@ -710,10 +1058,14 @@ def import_graph(module: ir.Module) -> tuple[ir.OpView, list[Parameter], list[No
                 continue
             if name == "stablehlo.case":
                 # Regions have no arguments and capture their enclosing values.
-                # Parse every branch: unsupported/effectful operations must still
-                # fail explicitly, even when a constant selector would skip them.
-                branches = [walk(region.blocks[0], [], env) for region in op.regions]
+                # Parse every branch: unsupported operations must still fail
+                # explicitly, even when a constant selector would skip them.
                 index = env[op.operands[0]]
+                branches = []
+                for k, r in enumerate(op.regions):
+                    guards.append((index, k, len(op.regions)))
+                    branches.append(walk(r.blocks[0], [], env))
+                    guards.pop()
                 for k, value in enumerate(op.results):
                     env[value] = Op(
                         "case", [index, *(b[k] for b in branches)], *tensor_type(value), {}
@@ -727,36 +1079,50 @@ def import_graph(module: ir.Module) -> tuple[ir.OpView, list[Parameter], list[No
                     v: n if isinstance(n, Constant) else Parameter(n.dtype, n.shape)
                     for v, n in env.items()
                 }
-                condition = walk(op.regions[0].blocks[0], list(parameters), captures)[0]
+                # Inside, the loop's own conditionals guard; the ones around
+                # it guard the loop as a whole.
+                around, before = guards[:], hosts
+                guards.clear()
+                [condition] = region(
+                    op.regions[0].blocks[0], list(parameters), captures, "a loop condition"
+                )
+                effects.append([])
                 body = walk(op.regions[1].blocks[0], list(parameters), captures)
-                used = set(reachable([condition, *body]))
+                body_effects = effects.pop()
+                guards[:] = around
+                roots = [condition, *body, *(x for host in body_effects for x in host.inputs)]
+                used = set(reachable(roots))
                 for value, parameter in captures.items():
                     if isinstance(parameter, Parameter) and parameter in used:
                         parameters.append(parameter)
                         inputs.append(env[value])
                 inductions = _inductions(parameters, inputs, body)
                 trips = _trip_count(condition, parameters, inputs, body, inductions)
-                loop = While(inputs, parameters, body, trips, inductions)
-                for i, value in enumerate(op.results):
-                    env[value] = LoopResult(loop, i, *tensor_type(value))
+                if trips is None:
+                    inductions = {}
+                loop = While(inputs, parameters, body, trips, inductions, condition, body_effects)
+                if trips is None or hosts > before:
+                    loop.guards = tuple(guards)
+                results: list[Node] = [
+                    LoopResult(loop, i, *tensor_type(value)) for i, value in enumerate(op.results)
+                ]
+                env.update(zip(op.results, results, strict=True))
+                if body_effects:
+                    # The loop runs for its effects even if no carry is read.
+                    effects[-1].append(loop)
                 continue
-            if name == "stablehlo.reduce" and len(op.results) > 1:
+            if name == "stablehlo.reduce" and (
+                # Any body, folded in order by one thread per output; so are
+                # 64-bit integers, which the SIMD-group collectives lack.
+                _reducer(op) is None
+                or tensor_type(op.results[0])[0].itemsize == 8
+                or (tensor_type(op.results[0])[0] == np.bool_ and _reducer(op) == "xor")
+            ):
                 count = len(op.results)
                 block = op.regions[0].blocks[0]
                 params = [Parameter(*tensor_type(v)) for v in block.arguments]
-                body = walk(block, list(params), env)
-                for value in reachable(body):
-                    if (
-                        value.shape
-                        or (isinstance(value, Parameter) and value not in params)
-                        or (
-                            not isinstance(value, (Constant, Parameter))
-                            and (not isinstance(value, Op) or value.name not in SCALAR)
-                        )
-                    ):
-                        raise UnsupportedProgram(
-                            "metal: variadic reduce requires a scalar elementwise body"
-                        )
+                body = region(block, list(params), env, "a reducer")
+                _scalar_body(body, params, "stablehlo.reduce")
                 inputs = [env[v] for v in op.operands]
                 reduction = VariadicReduce(
                     inputs[:count],
@@ -768,6 +1134,54 @@ def import_graph(module: ir.Module) -> tuple[ir.OpView, list[Parameter], list[No
                 for k, value in enumerate(op.results):
                     env[value] = ReductionResult(reduction, k, *tensor_type(value))
                 continue
+            if name in ("stablehlo.reduce_window", "stablehlo.scatter"):
+                # The body: a known binary op, or a `Reducer` of its own
+                # (scatter also assigns, when the body returns the update).
+                block = op.regions[0].blocks[0]
+                kind: str | Reducer | None = _reducer(op)
+                body_ops = list(block.operations)
+                if len(op.results) != 1:
+                    raise UnsupportedProgram(f"metal: {name} of several operands")
+                if (
+                    name == "stablehlo.scatter"
+                    and len(body_ops) == 1
+                    and list(body_ops[0].operands) == [block.arguments[1]]
+                ):
+                    kind = "set"
+                if kind is None:
+                    params = [Parameter(*tensor_type(v)) for v in block.arguments]
+                    [combined] = region(block, list(params), env, "a reducer")
+                    _scalar_body([combined], params, name)
+                    kind = Reducer(params, combined)
+                operands = [env[v] for v in op.operands]
+                dtype, shape = tensor_type(op.result)
+                if name == "stablehlo.scatter":
+                    attributes = {**_attributes(op), "update": kind}
+                    env[op.result] = Op("scatter", operands, dtype, shape, attributes)
+                else:
+                    attributes = {**_window(op), "reducer": kind}
+                    env[op.result] = _cumulative(*operands, attributes, shape) or Op(
+                        "reduce_window", operands, dtype, shape, attributes
+                    )
+                continue
+            if name == "stablehlo.sort":
+                inputs = [env[v] for v in op.operands]
+                block = op.regions[0].blocks[0]
+                params = [Parameter(*tensor_type(v)) for v in block.arguments]
+                [before] = region(block, list(params), env, "a comparator")
+                _scalar_body([before], params, name)
+                rank = len(inputs[0].shape)
+                dim = ir.IntegerAttr(op.attributes["dimension"]).value % max(rank, 1)
+                sort = Sort(inputs, params, before, dim)
+                for k, value in enumerate(op.results):
+                    env[value] = SortResult(sort, k, *tensor_type(value))
+                continue
+            if name == "stablehlo.rng_bit_generator":
+                env.update(zip(op.results, _rng_bits(op, env[op.operands[0]]), strict=True))
+                continue
+            if name == "stablehlo.create_token":
+                env[op.result] = Constant(np.dtype(np.bool_), (0,), 0)
+                continue
             if name == "stablehlo.convolution":
                 env[op.result] = _convolution(op, env[op.operands[0]], env[op.operands[1]])
                 continue
@@ -777,8 +1191,18 @@ def import_graph(module: ir.Module) -> tuple[ir.OpView, list[Parameter], list[No
                 env.update(zip(op.results, (env[v] for v in op.operands), strict=True))
                 continue
             if name == "stablehlo.custom_call":
-                dispatch = _dispatch(op, [env[v] for v in op.operands])
-                env.update(zip(op.results, dispatch.results, strict=True))
+                target = ir.StringAttr(op.attributes["call_target_name"]).value
+                operands = [env[v] for v in op.operands]
+                if target == _HOST_TARGET:
+                    host = _host_callback(op, operands)
+                    host.guards = tuple(guards)
+                    hosts += 1
+                    if host.effect:
+                        effects[-1].append(host)
+                    results = host.results
+                else:
+                    results = _dispatch(op, operands).results
+                env.update(zip(op.results, results, strict=True))
                 continue
             short = name.removeprefix("stablehlo.")
             if name == "stablehlo.constant":
@@ -787,7 +1211,10 @@ def import_graph(module: ir.Module) -> tuple[ir.OpView, list[Parameter], list[No
                 attributes = _attributes(op)
                 dtype, shape = tensor_type(op.result)
                 operands = [env[v] for v in op.operands]
-                env[op.result] = Op(short, operands, dtype, shape, attributes)
+                node = Op(short, operands, dtype, shape, attributes)
+                if short == "dot_general" and dtype.kind in "iub":
+                    node = _summed_products(node)
+                env[op.result] = node
             else:
                 raise UnsupportedProgram(f"metal: {name} is not supported yet")
         raise UnsupportedProgram("metal: function without a return")
@@ -797,7 +1224,7 @@ def import_graph(module: ir.Module) -> tuple[ir.OpView, list[Parameter], list[No
     block = main.regions[0].blocks[0]
     parameters = [Parameter(*tensor_type(v)) for v in block.arguments]
     results = walk(block, list(parameters))
-    return main, parameters, results, ops
+    return main, parameters, results, effects[0], ops
 
 
 def in_place_carries(loop: While) -> dict[int, Op]:

@@ -2,6 +2,8 @@
 the generated program and on the compiler's parts; the metal PJRT plugin runs
 programs in tests/runtime/test_pjrt.py."""
 
+import itertools
+import math
 import re
 
 import jax
@@ -12,10 +14,16 @@ from jax import lax
 from jaxlib.mlir.dialects import stablehlo
 
 from palladium.device import prefers_simdgroup_matrix
-from palladium.stablehlo import UnsupportedProgram, compile_program
-from palladium.stablehlo.graph import Op, Parameter
-from palladium.stablehlo.program import RELAXED, SAFE, Launch
-from palladium.stablehlo.schedule import Product, Scheduler, induction_values, rebound
+from palladium.stablehlo import Branch, HostCall, UnsupportedProgram, compile_program
+from palladium.stablehlo.graph import Op, Parameter, host_call
+from palladium.stablehlo.program import RELAXED, SAFE, Launch, Program, Slot, share_storage
+from palladium.stablehlo.schedule import (
+    Product,
+    Scheduler,
+    compile_graph,
+    induction_values,
+    rebound,
+)
 from palladium.stablehlo.term import Term, delinear, linear
 
 
@@ -80,16 +88,22 @@ def test_guarded_index_maps_fuse():
     assert [s.kind for s in program.slots] == ["parameter", "parameter", "fresh"]
 
 
-@pytest.mark.parametrize(
-    ("fn", "message"),
-    [
-        (lambda x: x.prod(), "stablehlo.reduce"),
-        (lambda x: x.astype(jnp.int32) @ x.astype(jnp.int32), "stablehlo.dot_general"),
-    ],
-)
-def test_rejects_unsupported_ops(fn, message):
-    with pytest.raises(UnsupportedProgram, match=message):
-        _compile(fn, (4, 4))
+def test_rejects_unsupported_ops():
+    with pytest.raises(UnsupportedProgram, match="complex"):
+        _compile(lambda x: jnp.fft.fft(x).real, (4, 4))
+
+
+def test_integer_dot_is_a_reduction_over_products():
+    """The GEMM kernels are floating: an integer product sums in a reduction."""
+    program = _compile(lambda x: x @ x.T, (4, 64), dtype=np.int32)
+    assert [launch.function.split("_")[0] for launch in program.launches] == ["reduce"]
+
+
+def test_reducer_bodies_fold_in_one_thread_per_output():
+    """A reducer that is not one known op binds its body in a sequential fold."""
+    program = _compile(lambda x: lax.reduce(x, 0.0, jnp.logaddexp, (1,)), (4, 64))
+    [launch] = program.launches
+    assert launch.function.startswith("variadic_reduce") and launch.grid == 4
 
 
 def test_reductions_materialize_once_before_consumers():
@@ -185,9 +199,31 @@ def test_zero_trip_loop_returns_initial_value():
         lambda x: lax.while_loop(lambda s: s[0] <= 3, lambda s: (s[0] + 1, s[1] + 2), (0, x))[1],
     ],
 )
-def test_unproven_loop_is_rejected(fn):
-    with pytest.raises(UnsupportedProgram, match="stablehlo.while requires"):
-        _compile(fn, (4,))
+def test_unproven_loop_reads_its_condition_on_the_host(fn):
+    """A loop that does not provably count to a constant runs 1, 1, 2 and 4
+    iterations, then 8 at a time, with a branch out after each group. An
+    iteration is the condition, the body and a copy back that the condition
+    gates, so the iterations past the last change nothing."""
+    program = _compile(fn, (4,))
+    steps = program.steps
+    branches = [k for k, step in enumerate(steps) if isinstance(step, Branch)]
+    *exits, jump = branches
+    assert [steps[k].slot is None for k in branches] == [False] * 5 + [True]
+    # Every exit lands after the loop, and the jump returns to the last group.
+    assert {k + 1 + steps[k].skip for k in exits} == {len(steps)}
+    assert jump + 1 + steps[jump].skip == exits[3] + 1
+    gated = [step for step in program.launches if step.function.startswith("copy_if_")]
+    assert len(gated) % 16 == 0 and all(step.slots[0] == steps[exits[0]].slot for step in gated)
+
+
+def test_counted_loops_stay_static_with_64_bit_counters():
+    with jax.enable_x64():
+        program = _compile(
+            lambda x: lax.fori_loop(np.int64(0), np.int64(3), lambda i, y: y * 2, x),
+            (4,),
+            dtype=np.float32,
+        )
+    assert not any(isinstance(step, Branch) for step in program.steps)
 
 
 def test_loop_replay_budget_is_checked():
@@ -250,12 +286,16 @@ def test_wide_integer_types_stay_local_to_pjrt():
     assert "9223372036854775809ul" in program.launches[0].source
 
 
-def test_unsupported_wide_operations_fail_explicitly():
+def test_wide_reductions_fold_and_bitcasts_regroup():
+    """64-bit integers have no SIMD-group collectives: one thread per output
+    folds them. A bitcast to wider elements joins the last dimension's parts."""
     with jax.enable_x64():
-        with pytest.raises(UnsupportedProgram, match="reduce on 64-bit"):
-            _compile(lambda x: x.sum(), (4,), dtype=np.int64)
-        with pytest.raises(UnsupportedProgram, match="shape-changing"):
-            _compile(lambda x: lax.bitcast_convert_type(x, jnp.int64), (2, 2), dtype=np.int32)
+        [launch] = _compile(lambda x: x.sum(), (4,), dtype=np.int64).launches
+        assert launch.function.startswith("variadic_reduce")
+        [launch] = _compile(
+            lambda x: lax.bitcast_convert_type(x, jnp.int64), (2, 2), dtype=np.int32
+        ).launches
+        assert launch.grid == 2
 
 
 def test_elementwise_cond_fuses_with_guarded_branch_reads():
@@ -273,8 +313,11 @@ def test_cond_materializes_reductions_before_selection():
 
 
 def test_unsupported_op_in_case_is_not_silently_discarded():
-    with pytest.raises(UnsupportedProgram, match="reduce has an unsupported reducer"):
-        _compile(lambda x: lax.cond(x[0] > 0, lambda y: y.sum(), lambda y: y.prod(), x), (8,))
+    with pytest.raises(UnsupportedProgram, match="complex"):
+        _compile(
+            lambda x: lax.cond(x[0] > 0, lambda y: y.sum(), lambda y: jnp.fft.fft(y).real.sum(), x),
+            (8,),
+        )
 
 
 def test_gather_fuses_producers_without_intermediate_buffers():
@@ -291,11 +334,6 @@ def test_scatter_initialization_precedes_atomic_updates():
     assert init.grid == 21 and update.grid == 12
     assert init.slots[-1] == update.slots[-1] == program.outputs[0]
     assert "atomic_fetch_add_explicit" in update.source
-
-
-def test_non_add_scatter_is_rejected():
-    with pytest.raises(UnsupportedProgram, match="single add update"):
-        _compile(lambda x, i: x.at[i.astype(jnp.int32)].set(1), (7, 3), (4,))
 
 
 def test_argmax_uses_one_variadic_reduction():
@@ -576,21 +614,6 @@ def test_cbrt_uses_functions_msl_has():
     assert "cbrt" not in launch.source
 
 
-def test_total_order_comparisons_are_rejected():
-    """A kernel comparison orders NaNs and signed zeros as MSL does, which is
-    not the total order."""
-    text = """
-    func.func public @main(%x: tensor<4xf32>, %y: tensor<4xf32>) -> tensor<4xi1> {
-      %0 = stablehlo.compare LT, %x, %y, TOTALORDER : (tensor<4xf32>, tensor<4xf32>) -> tensor<4xi1>
-      return %0 : tensor<4xi1>
-    }"""
-    with pytest.raises(UnsupportedProgram, match="total order"):
-        compile_program(stablehlo.serialize_portable_artifact_str(text, "1.0.0"))
-    compile_program(
-        stablehlo.serialize_portable_artifact_str(text.replace("TOTALORDER", "FLOAT"), "1.0.0")
-    )
-
-
 def test_reshape_chains_stay_small():
     """A reshape names its flat index, so a chain of them grows by a line
     each, not by a factor of the rank each."""
@@ -630,14 +653,17 @@ def test_loop_carries_with_their_own_buffer_are_not_copied():
 
 
 def test_narrow_integers_compute_in_32_bits_and_wrap():
-    """8- and 16-bit integers bind as their own MSL types; scatter on them
-    is not supported."""
+    """8- and 16-bit integers bind as their own MSL types; a scatter combines
+    them in 32-bit words, the unit of Metal's atomics."""
     [launch] = _compile(lambda x: x.astype(jnp.float32) / 255, (4,), dtype=np.uint8).launches
     assert "device const uchar* b0" in launch.source
     [launch] = _compile(lambda x, y: x * y, (4,), (4,), dtype=np.int8).launches
     assert "device char* o0" in launch.source
-    with pytest.raises(UnsupportedProgram, match="scatter"):
-        _compile(lambda x: x.at[jnp.array([1, 1])].add(1), (4,), dtype=np.int16)
+    pack, update, unpack = _compile(
+        lambda x: x.at[jnp.array([1, 1])].add(1), (4,), dtype=np.int16
+    ).launches
+    assert "device uint* o0" in pack.source and "device short* o0" in unpack.source
+    assert pack.slots[-1] == update.slots[-1] == unpack.slots[0]
 
 
 def test_index_terms_fold_constants_and_know_their_names():
@@ -709,6 +735,7 @@ def test_induction_values_wrap_like_the_carry_type():
 def test_rebound_launches_map_slots_and_offset_induction_arrays():
     launch = Launch("source", "name", (0, 2, 3), 4, offsets=(0, 8, 0))
     replayed = rebound(launch, {0: 10, 2: 12, 3: 13}, {0: 24})
+    assert isinstance(replayed, Launch)
     assert replayed.slots == (10, 12, 13) and replayed.offsets == (24, 8, 0)
     assert (replayed.source, replayed.function, replayed.grid) == ("source", "name", 4)
 
@@ -722,3 +749,118 @@ def test_scheduler_compiles_a_graph_built_by_hand():
     [launch] = program.launches
     assert program.outputs == [1, 2, 0] and launch.slots == (0, 1, 2) and launch.grid == 12
     assert launch.source.count("b0[") == 2  # at the thread's index and at the transposed one
+
+
+def test_host_calls_are_steps_between_the_launches_around_them():
+    """The inputs are computed into buffers before the step; its results are
+    buffers the launches after it read."""
+    x = Parameter(np.dtype(np.float32), (4,))
+    doubled = Op("add", [x, x], x.dtype, x.shape, {})
+    [result] = host_call("sine", lambda a: [np.sin(a)], [doubled], [(x.dtype, x.shape)]).results
+    program = compile_graph([x], [Op("negate", [result], x.dtype, x.shape, {})])
+    before, call, after = program.steps
+    assert isinstance(before, Launch) and isinstance(after, Launch)
+    assert isinstance(call, HostCall) and call.inputs == 1 and call.name == "sine"
+    assert call.slots == (before.slots[-1], after.slots[0])
+
+
+def test_host_calls_with_effects_run_without_readers_and_in_order():
+    x = Parameter(np.dtype(np.float32), (4,))
+    calls = [host_call(name, lambda a: (), [x], [], effect=True) for name in ("first", "second")]
+    program = compile_graph([x], [x], effects=calls)
+    names = [step.name for step in program.steps if isinstance(step, HostCall)]
+    assert names == ["first", "second"]
+
+
+def test_intermediates_with_disjoint_lifetimes_share_storage():
+    f32 = np.dtype(np.float32)
+    slots = [
+        Slot("parameter", f32, (8,)),
+        *[Slot("fresh", f32, (8,))] * 4,
+        Slot("fresh", f32, (4,)),
+    ]
+    steps: list = [
+        Launch("", "k", (0, 1), 8),
+        Launch("", "k", (1, 2), 8),
+        Launch("", "k", (2, 3), 8),
+    ]
+    steps += [Launch("", "k", (3, 5), 4), Launch("", "k", (5, 4), 8)]
+    program = share_storage(Program(slots, steps, [4]))
+    # Slot 3 reuses slot 1, which nothing reads after the second step; the
+    # output and the slot of another size keep their own.
+    assert [step.slots for step in program.launches] == [(0, 1), (1, 2), (2, 1), (1, 4), (4, 3)]
+    assert len(program.slots) == 5 and program.outputs == [3]
+
+
+def test_slots_of_a_host_driven_loop_live_for_all_of_it():
+    f32 = np.dtype(np.float32)
+    slots = [Slot("parameter", f32, (8,)), *[Slot("fresh", f32, (8,))] * 3]
+    steps: list = [
+        Launch("", "k", (0, 1), 8),
+        Launch("", "k", (1, 2), 8),
+        Launch("", "k", (2, 3), 8),
+    ]
+    looped = Program(slots, [*steps, Branch(None, -3), Launch("", "k", (3, 1), 8)], [1])
+    assert share_storage(looped) is looped
+    assert len(share_storage(Program(slots, [*steps, Launch("", "k", (3, 0), 8)], [])).slots) == 3
+
+
+def test_long_cumulative_reductions_run_in_blocks():
+    """Block totals, the totals before each block, then each element from its
+    block's start; a short axis folds its windows in one kernel."""
+    program = _compile(lambda x: jnp.cumsum(x, axis=1), (3, 1000))
+    assert len(program.launches) == 3
+    assert [math.prod(program.slots[launch.slots[-1]].shape) for launch in program.launches] == [
+        3 * 63,
+        3 * 63,
+        3000,
+    ]
+    assert len(_compile(lambda x: jnp.cumsum(x, axis=1), (3, 16)).launches) == 1
+
+
+def test_sort_merges_runs_in_one_launch_per_doubling():
+    program = _compile(lambda x: jnp.sort(x, axis=1), (3, 100))
+    passes = [launch for launch in program.launches if launch.function.startswith("sort_pass")]
+    assert len(passes) == 7 and len({launch.source for launch in passes}) == 1
+    # Each pass reads its run width at its own offset and writes the other bank.
+    assert [launch.offsets[1] for launch in passes] == [4 * k for k in range(7)]
+    assert all(a.slots[-1] == b.slots[0] for a, b in itertools.pairwise(passes))
+    assert passes[-1].slots[-1] == program.outputs[0]
+    assert _compile(lambda x: jnp.sort(x, axis=1), (3, 1)).outputs == [0]
+
+
+def test_depthwise_convolution_fuses_into_one_kernel():
+    """A group contracting few elements unrolls its sum; a larger one is a
+    GEMM batched over the groups."""
+
+    def conv(x, w, groups):
+        return lax.conv_general_dilated(x, w, (1, 1), "SAME", feature_group_count=groups)
+
+    [launch] = _compile(lambda x, w: conv(x, w, 4), (1, 4, 8, 8), (4, 1, 3, 3)).launches
+    assert launch.function.startswith("fused")
+    program = _compile(lambda x, w: conv(x, w, 2), (1, 8, 8, 8), (8, 4, 3, 3))
+    assert [launch.function for launch in program.launches].count("gemm") == 1
+
+
+def test_host_calls_in_a_conditional_branch_run_only_if_taken():
+    """Kernels compute both branches of a `case` and select; a callback may
+    raise or print, so a branch step skips it unless its branch is taken."""
+    text = """
+    func.func public @main(%p: tensor<i32>, %x: tensor<4xf32>) -> tensor<4xf32> {
+      %0 = "stablehlo.case"(%p) ({
+        stablehlo.custom_call @palladium_host(%x) {has_side_effect = true, mhlo.backend_config = {index = 0 : ui64}} : (tensor<4xf32>) -> ()
+        stablehlo.return %x : tensor<4xf32>
+      }, {
+        stablehlo.return %x : tensor<4xf32>
+      }) : (tensor<i32>) -> tensor<4xf32>
+      return %0 : tensor<4xf32>
+    }"""
+    from palladium import host
+
+    entry = host._Function("print", lambda a: ())
+    host._functions[0] = entry
+    program = compile_program(stablehlo.serialize_portable_artifact_str(text, "1.0.0"))
+    flag, branch, call = program.steps[:3]
+    assert isinstance(flag, Launch)
+    assert isinstance(branch, Branch) and (branch.slot, branch.skip) == (flag.slots[-1], 1)
+    assert isinstance(call, HostCall) and call.name == "print"

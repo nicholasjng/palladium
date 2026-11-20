@@ -1080,10 +1080,10 @@ def test_unsupported_ops_report_unimplemented():
     result = _run("""
         import jax, jax.numpy as jnp, numpy as np
         assert float(jax.device_put(np.ones(3, np.float32), jax.devices("cpu")[0]).sum()) == 3
-        jax.jit(lambda x: x.prod())(jnp.ones(3, device=jax.devices("metal")[0]))
+        jax.jit(lambda x: jnp.fft.fft(x).real)(jnp.ones(3, device=jax.devices("metal")[0]))
     """)
     assert result.returncode != 0
-    assert "UNIMPLEMENTED: metal: stablehlo.reduce has an unsupported reducer body" in result.stderr
+    assert "UNIMPLEMENTED: metal: element type complex<f32> is not supported" in result.stderr
 
 
 def test_registers_only_when_jax_platforms_names_metal():
@@ -1334,4 +1334,364 @@ def test_narrow_integer_operations_match_cpu():
             for name, (fn, *args) in cases.items():
                 assert_matches_cpu(fn, *args, exact=name != "image",
                                    err_msg=f"{dt.__name__} {name}")
+    """)
+
+
+def test_dynamic_loops_match_cpu():
+    """Loops whose condition the host reads: data-dependent trip counts, zero
+    trips, permuted carries, a GEMM in the body, nesting in counted loops and
+    conditionals, and batched loops."""
+    out = _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        from pjrt_tolerance import assert_matches_cpu
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((6, 5), np.float32)
+        a = rng.standard_normal((4, 4), np.float32)
+        a = a @ a.T + 4 * np.eye(4, dtype=np.float32)
+
+        def newton(x):
+            def cond(s): return jnp.any(jnp.abs(s[0] * s[0] - jnp.abs(x)) > 1e-5) & (s[1] < 50)
+            def body(s): return (0.5 * (s[0] + jnp.abs(x) / s[0]), s[1] + 1)
+            return lax.while_loop(cond, body, (jnp.ones_like(x), 0))
+
+        def swap(x):
+            def body(s): return (s[1], s[0] + 1, s[2] + 1)
+            return lax.while_loop(lambda s: s[2] < 5, body, (x, x * 2, 0.0))
+
+        cases = {
+            "newton": (newton, x),
+            "traced bound": (lambda x, n: lax.fori_loop(0, n, lambda j, y: y * 1.01 + j, x), x, np.int32(7)),
+            "zero trips": (lambda x: lax.while_loop(lambda s: s[1] < 0, lambda s: (s[0] + 1, s[1] + 1), (x, 0)), x),
+            "odd and even trips": (lambda x, n: lax.while_loop(lambda s: s[1] < n, lambda s: (s[0] * 2, s[1] + 1), (x, 0)), x, np.int32(4)),
+            "permuted carries": (swap, x),
+            "gemm": (lambda a: lax.while_loop(lambda s: jnp.abs(s).max() < 1e6, lambda s: s @ a, a), a),
+            "in a counted loop": (lambda x: lax.fori_loop(0, 3, lambda j, y: newton(y)[0] + 1.0, x), x),
+            "in a conditional": (lambda x: lax.cond(x[0, 0] > 100, lambda: x, lambda: newton(x)[0]), x),
+            "batched": (lambda x: jax.vmap(lambda r: lax.while_loop(
+                lambda s: s[1] < jnp.int32(3) + (r[0] > 0), lambda s: (s[0] * 2, s[1] + 1), (r, 0))[0])(x), x),
+            "scalar": (lambda x: lax.while_loop(lambda s: s < 100.0, lambda s: s * 2 + 1, x[0, 0] ** 2 + 1), x),
+            "many trips": (lambda x, n: lax.while_loop(lambda s: s[1] < n, lambda s: (s[0] * 1.001 + 1e-3, s[1] + 1), (x, 0)), x, np.int32(1003)),
+        }
+        # Every trip count around the groups of iterations between two reads.
+        counted = jax.jit(lambda x, n: lax.while_loop(lambda s: s[1] < n, lambda s: (s[0] + 1, s[1] + 1), (x, 0)))
+        for n in range(20):
+            total, trips = counted(jax.device_put(x, jax.devices("metal")[0]), np.int32(n))
+            np.testing.assert_allclose(total, x + n, rtol=1e-6)
+            assert int(trips) == n
+        for name, (fn, *args) in cases.items():
+            assert_matches_cpu(fn, *args, err_msg=name)
+        assert_matches_cpu(lambda x, n: lax.while_loop(lambda s: s[1] < n, lambda s: (s[0] * 2, s[1] + 1), (x, 0)), x, np.int32(5))
+        print(len(cases))
+    """)
+    assert out.strip() == "11"
+
+
+def test_host_callbacks_run_between_launches():
+    out = _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        from jax.experimental import checkify, io_callback
+        from pjrt_tolerance import assert_matches_cpu
+        x = np.arange(6, dtype=np.float32).reshape(2, 3)
+        spec = jax.ShapeDtypeStruct(x.shape, x.dtype)
+        assert_matches_cpu(lambda x: jax.pure_callback(np.sin, spec, x * 2) + 1, x)
+        assert_matches_cpu(lambda x: lax.fori_loop(0, 3, lambda j, y: jax.pure_callback(np.cos, spec, y), x), x)
+        # A loop that calls the host reads its condition once per iteration.
+        assert_matches_cpu(lambda x: lax.while_loop(
+            lambda s: s[0].sum() < 2.5, lambda s: (jax.pure_callback(np.cos, spec, s[0]), s[1] + 1), (x, 0)), x)
+
+        metal = jax.devices("metal")[0]
+        x = jax.device_put(x, metal)
+        seen = []
+        def record(a):
+            seen.append(float(a))
+            return np.float32(len(seen))
+        fn = jax.jit(lambda x: io_callback(record, jax.ShapeDtypeStruct((), jnp.float32), x.sum(), ordered=True)
+                     + io_callback(record, jax.ShapeDtypeStruct((), jnp.float32), x.max(), ordered=True))
+        assert float(fn(x)) == 3.0 and seen == [15.0, 5.0], seen
+
+        @jax.jit
+        def printing(x):
+            jax.debug.print("sum {}", x.sum())
+            return lax.fori_loop(0, 3, lambda j, y: (jax.debug.print("step {} {}", j, y[0, 0]), y + 1)[1], x)
+        np.testing.assert_array_equal(printing(x), np.asarray(x) + 3)
+
+        checked = jax.jit(checkify.checkify(lambda y: (checkify.check(y.sum() > 0, "negative"), y * 2)[1]))
+        error, _ = checked(x)
+        error.throw()
+        error, _ = checked(-x)
+        assert "negative" in str(error.get())
+
+        def fails(a):
+            raise ValueError("no luck")
+        # A callback in a conditional branch runs only if the branch is taken,
+        # as does a loop the host drives.
+        guarded = jax.jit(lambda p, x: lax.cond(
+            p, lambda: jax.pure_callback(fails, spec, x),
+            lambda: lax.while_loop(lambda y: y.sum() < 100, lambda y: y * 2 + 1, x)))
+        assert float(guarded(False, x).sum()) >= 100
+        switched = jax.jit(lambda k, x: lax.switch(k, [
+            lambda: x, lambda: jax.pure_callback(fails, spec, x), lambda: jax.pure_callback(np.sin, spec, x)]))
+        np.testing.assert_array_equal(switched(0, x), x)
+        np.testing.assert_allclose(switched(2, x), np.sin(np.asarray(x)), rtol=1e-6)
+        try:
+            np.asarray(jax.jit(lambda x: jax.pure_callback(fails, spec, x))(x))
+        except Exception as e:
+            assert "no luck" in str(e), e
+        else:
+            raise AssertionError("the callback's error was lost")
+        # A wrong result shape is an error, not memory written out of bounds.
+        try:
+            np.asarray(jax.jit(lambda x: jax.pure_callback(lambda a: a[0], spec, x))(x))
+        except Exception as e:
+            assert "returned float32[3]" in str(e), e
+        else:
+            raise AssertionError("a result of the wrong shape was accepted")
+    """)
+    assert out.splitlines() == ["sum 15.0", "step 0 0.0", "step 1 1.0", "step 2 2.0"]
+
+
+def test_linear_algebra_matches_cpu():
+    """Cholesky, triangular solves, LU, QR, eigh and SVD run on LAPACK between
+    launches; solve, inv, determinants and their gradients build on them."""
+    out = _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        from pjrt_tolerance import assert_matches_cpu
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((6, 5), np.float32)
+        a = rng.standard_normal((4, 4), np.float32)
+        a = a @ a.T + 4 * np.eye(4, dtype=np.float32)
+        batch = np.stack([a, 2 * a, a + np.eye(4, dtype=np.float32)])
+        solve = lax.linalg.triangular_solve
+        cases = {
+            "cholesky": (jnp.linalg.cholesky, a),
+            "cholesky batch": (jnp.linalg.cholesky, batch),
+            "cholesky indefinite": (jnp.linalg.cholesky, np.stack([a, -a])),
+            "left lower": (lambda a, b: solve(jnp.tril(a), b[:4], left_side=True, lower=True), a, x),
+            "left upper transposed": (lambda a, b: solve(jnp.triu(a), b[:4], left_side=True, lower=False, transpose_a=True), a, x),
+            "right upper": (lambda a, b: solve(jnp.triu(a), b[:, :4], left_side=False, lower=False), a, x),
+            "right lower transposed": (lambda a, b: solve(jnp.tril(a), b[:, :4], left_side=False, lower=True, transpose_a=True), a, x),
+            "unit diagonal": (lambda a, b: solve(jnp.tril(a), b[:4], left_side=True, lower=True, unit_diagonal=True), a, x),
+            "solve": (lambda a, b: jnp.linalg.solve(a, b[:4]), a, x),
+            "solve batch": (lambda a, b: jax.vmap(lambda m: jnp.linalg.solve(m, b[:4, 0]))(a), batch, x),
+            "inv": (jnp.linalg.inv, a),
+            "slogdet": (jnp.linalg.slogdet, a),
+            "lu rectangular": (jax.scipy.linalg.lu, x),
+            "qr": (jnp.linalg.qr, x),
+            "qr complete": (lambda x: jnp.linalg.qr(x, mode="complete"), x),
+            "eigh": (jnp.linalg.eigh, a),
+            "svd": (lambda x: jnp.linalg.svd(x, full_matrices=False), x),
+            "singular values": (lambda x: jnp.linalg.svd(x, compute_uv=False), x),
+            "pinv": (jnp.linalg.pinv, x),
+            "normal log density": (lambda a, x: jax.scipy.stats.multivariate_normal.logpdf(x[:, :4], jnp.zeros(4), a), a, x),
+            "cholesky gradient": (jax.grad(lambda m: jnp.linalg.cholesky(m).sum()), a),
+            "eigh gradient": (jax.grad(lambda m: jnp.linalg.eigh(m)[0].sum()), a),
+        }
+        for name, (fn, *args) in cases.items():
+            assert_matches_cpu(fn, *args, rtol=2e-4, err_msg=name)
+        print(len(cases))
+    """)
+    assert out.strip() == "22"
+
+
+def test_sorts_match_cpu():
+    out = _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        from pjrt_tolerance import assert_matches_cpu
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((6, 5), np.float32)
+        v = rng.standard_normal(3000, np.float32)
+        i = rng.integers(-50, 50, (6, 5), np.int32)
+        special = np.array([np.nan, 1, -0.0, 0.0, -np.inf, np.inf, -1, np.nan, 2], np.float32)
+        cases = {
+            "long": (jnp.sort, v),
+            "each axis": (lambda x: (jnp.sort(x, axis=0), jnp.sort(x, axis=1)), x),
+            "descending": (lambda v: jnp.sort(v, descending=True), v),
+            "nonfinite and zeros": (jnp.sort, special),
+            "argsort is stable": (lambda i: jnp.argsort(jnp.tile(i.ravel() % 4, 9), stable=True), i),
+            "integers": (lambda i: jnp.sort(i, axis=1), i),
+            "by key": (lambda i, x: lax.sort((i % 3, x), dimension=1, num_keys=1), i, x),
+            "two keys": (lambda i, x: lax.sort((i % 3, i % 2, x), dimension=0, num_keys=2), i, x),
+            "one element": (lambda x: jnp.sort(x[:, :1], axis=1), x),
+            "half": (jnp.sort, v.astype(np.float16)),
+            "top k": (lambda v: lax.top_k(v, 5), v),
+            "median": (lambda x: jnp.median(x, axis=1), x),
+            "searchsorted": (lambda v, x: jnp.searchsorted(jnp.sort(v), x.ravel()), v, x),
+            "unique": (lambda i: jnp.unique(i, size=20, fill_value=0), i),
+            "permutation": (lambda: jax.random.permutation(jax.random.key(0), 50),),
+            "gradient": (jax.grad(lambda y: jnp.sort(y)[:10].sum()), v),
+        }
+        for name, (fn, *args) in cases.items():
+            assert_matches_cpu(fn, *args, exact=name != "median", err_msg=name)
+        print(len(cases))
+    """)
+    assert out.strip() == "16"
+
+
+def test_cumulative_and_window_reductions_match_cpu():
+    """Cumulative reductions in blocks along a long axis, both directions and
+    with reducer bodies; long windows; and the reducers beyond sum and extrema."""
+    out = _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        from pjrt_tolerance import assert_matches_cpu
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((6, 5), np.float32)
+        big = rng.standard_normal((3, 1000), np.float32)
+        i = rng.integers(-50, 50, (6, 5), np.int32)
+        cases = {
+            "cumsum": (lambda b: jnp.cumsum(b, axis=1), big),
+            "cumsum leading axis": (lambda b: jnp.cumsum(b.T, axis=0), big),
+            "cumsum reversed": (lambda b: lax.cumsum(b, axis=1, reverse=True), big),
+            "cumsum of a fused value": (lambda b: jnp.cumsum(jnp.exp(b * 0.1) + 1, axis=1), big),
+            "cumsum int": (lambda i: jnp.cumsum(jnp.tile(i.ravel(), 20)), i),
+            "cumsum half": (lambda b: jnp.cumsum(b[0, :200].astype(jnp.float16)), big),
+            "cumprod": (lambda b: jnp.cumprod(1 + 0.01 * b, axis=1), big),
+            "cummax": (lambda b: lax.cummax(b, axis=1), big),
+            "cummin reversed": (lambda b: lax.cummin(b, axis=1, reverse=True), big),
+            "cumlogsumexp": (lambda b: lax.cumlogsumexp(b, axis=1), big),
+            "cumsum gradient": (jax.grad(lambda y: (jnp.cumsum(y) ** 2).sum()), big[0]),
+            "long window": (lambda b: lax.reduce_window(b, 0.0, lax.add, (1, 100), (1, 10), "VALID"), big),
+            "long padded window": (lambda b: lax.reduce_window(b, -np.inf, lax.max, (1, 70), (1, 7), "SAME"), big),
+            "product": (lambda x: (jnp.prod(x, axis=1), jnp.prod(x)), x),
+            "long product": (lambda b: jnp.prod(1 + 0.001 * b), big),
+            "product int": (lambda i: jnp.prod(i % 3 + 1, axis=0), i),
+            "product half": (lambda x: jnp.prod(x.astype(jnp.float16), axis=0), x),
+            "reducer body": (lambda b: lax.reduce(b, -np.inf, jnp.logaddexp, (1,)), big),
+        }
+        for name, (fn, *args) in cases.items():
+            assert_matches_cpu(fn, *args, rtol=1e-4 if "half" not in name else None, err_msg=name)
+        print(len(cases))
+    """)
+    assert out.strip() == "18"
+
+
+def test_scatters_integer_dots_and_bitcasts_match_cpu():
+    out = _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        from pjrt_tolerance import assert_matches_cpu
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((6, 5), np.float32)
+        v = rng.standard_normal(300, np.float32)
+        i = rng.integers(-50, 50, (6, 5), np.int32)
+        rows = jnp.array([1, 3, 1])
+        cases = {
+            "set": (lambda x: x.at[jnp.array([1, 3]), 2].set(7.0), x),
+            "set slice": (lambda x: x.at[1:3].set(0.0), x),
+            "set half": (lambda x: x.astype(jnp.float16).at[jnp.array([1, 3])].set(2.0), x),
+            "set bool": (lambda x: (x > 0).at[jnp.array([0, 1])].set(True), x),
+            "multiply": (lambda x: x.at[rows].multiply(2.0), x),
+            "multiply int8": (lambda i: i.astype(jnp.int8).at[rows].multiply(2), i),
+            "max": (lambda x: x.at[rows, 0].max(0.5), x),
+            "min": (lambda x: x.at[rows, 0].min(0.5), x),
+            "max half": (lambda x: x.astype(jnp.float16).at[rows, 0].max(0.5), x),
+            "add int16": (lambda i: i.astype(jnp.int16).at[rows].add(3), i),
+            "segment max": (lambda v: jax.ops.segment_max(v, jnp.arange(300) % 7, 7), v),
+            "integer matmul": (lambda i: i @ i.T, i),
+            "integer matvec": (lambda i: jnp.dot(i, i[0]), i),
+            "boolean matmul": (lambda x: (x > 0) @ (x.T > 0), x),
+            "narrowing bitcast": (lambda v: lax.bitcast_convert_type(v, jnp.int16), v),
+            "widening bitcast": (lambda v: lax.bitcast_convert_type(
+                lax.bitcast_convert_type(v, jnp.uint8), jnp.float32), v),
+        }
+        for name, (fn, *args) in cases.items():
+            assert_matches_cpu(fn, *args, err_msg=name)
+        print(len(cases))
+    """)
+    assert out.strip() == "16"
+
+
+def test_grouped_convolutions_and_their_gradients_match_cpu():
+    _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from jax import lax
+        from pjrt_tolerance import assert_matches_cpu
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((2, 8, 7, 6), np.float32)
+
+        def conv(x, w, groups, strides=(1, 1), padding="SAME"):
+            return lax.conv_general_dilated(x, w, strides, padding, feature_group_count=groups)
+
+        # Depthwise (one input feature per group), a channel multiplier, and
+        # groups large enough for the GEMM, each with both gradients.
+        for groups, per_group, multiplier in [(8, 1, 1), (8, 1, 3), (2, 4, 2), (4, 2, 1)]:
+            w = rng.standard_normal((groups * multiplier, per_group, 3, 3), np.float32)
+            for strides, padding in [((1, 1), "SAME"), ((2, 1), "VALID")]:
+                name = f"{groups} groups of {per_group}, x{multiplier}, {padding}"
+                assert_matches_cpu(lambda x, w: conv(x, w, groups, strides, padding), x, w, err_msg=name)
+                loss = lambda x, w: (conv(x, w, groups, strides, padding) ** 2).sum()
+                assert_matches_cpu(jax.grad(loss, (0, 1)), x, w, rtol=1e-4, err_msg=name)
+        w = rng.standard_normal((5, 1, 6), np.float32)
+        nwc = lambda x, w: lax.conv_general_dilated(
+            x, w, (2,), "SAME", dimension_numbers=("NWC", "WIO", "NWC"), feature_group_count=6)
+        assert_matches_cpu(nwc, x[0], w)
+    """)
+
+
+def test_newer_stablehlo_ops_and_the_bit_generator():
+    """The plugin reports jaxlib's StableHLO version, so jax may emit `fma`,
+    which the special functions and samplers use."""
+    _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from pjrt_tolerance import assert_matches_cpu
+        rng = np.random.default_rng(0)
+        v = rng.standard_normal(300, np.float32)
+        key = np.asarray(jax.random.key_data(jax.random.key(0)))
+        wrap = jax.random.wrap_key_data
+        special = jax.scipy.special
+        cases = {
+            "erfinv": (lambda v: special.erfinv(jnp.tanh(v)), v),
+            "gammaln": (lambda v: special.gammaln(jnp.abs(v) + 0.5), v),
+            "digamma": (lambda v: special.digamma(jnp.abs(v) + 0.5), v),
+            "gammainc": (lambda v: special.gammainc(2.0, jnp.abs(v)), v),
+            "betainc": (lambda v: special.betainc(2.0, 3.0, jax.nn.sigmoid(v)), v),
+            "i0e": (special.i0e, v),
+            "expm": (lambda v: jax.scipy.linalg.expm(v[:16].reshape(4, 4) * 0.1), v),
+            "histogram": (lambda v: jnp.histogram(v, bins=10, range=(-3, 3))[0], v),
+            "gamma": (lambda k: jax.random.gamma(wrap(k), 2.0, (50,)), key),
+            "poisson": (lambda k: jax.random.poisson(wrap(k), 3.0, (50,)), key),
+            "beta": (lambda k: jax.random.beta(wrap(k), 2.0, 3.0, (20,)), key),
+            "truncated normal": (lambda k: jax.random.truncated_normal(wrap(k), -1.0, 1.0, (20,)), key),
+        }
+        for name, (fn, *args) in cases.items():
+            assert_matches_cpu(fn, *args, rtol=2e-4, err_msg=name)
+
+        # StableHLO leaves the generator to the backend: check its statistics.
+        metal = jax.devices("metal")[0]
+        with jax.default_device(metal):
+            sample = jax.jit(lambda seed: jax.random.split(jax.random.key(seed, impl="rbg")))
+            keys = sample(0)
+            a = np.asarray(jax.jit(lambda k: jax.random.normal(k, (1 << 16,)))(keys[0]))
+            b = np.asarray(jax.jit(lambda k: jax.random.normal(k, (1 << 16,)))(keys[1]))
+        assert abs(a.mean()) < 0.02 and abs(a.std() - 1) < 0.02, (a.mean(), a.std())
+        assert abs(np.corrcoef(a, b)[0, 1]) < 0.02 and abs(np.corrcoef(a[1:], a[:-1])[0, 1]) < 0.02
+        assert len(np.unique(a)) > 60000
+    """)
+
+
+def test_diffrax_solves_match_cpu():
+    """diffrax drives its steps with a `while_loop` and reports errors through
+    callbacks in conditional branches."""
+    _check("""
+        import diffrax, jax, jax.numpy as jnp, numpy as np
+        from pjrt_tolerance import assert_matches_cpu
+
+        def field(t, y, a):
+            x, z = y[..., 0], y[..., 1]
+            return jnp.stack([a[0] * x - a[1] * x * z, a[2] * x * z - a[3] * z], -1)
+
+        def solve(y0, controller):
+            solution = diffrax.diffeqsolve(
+                diffrax.ODETerm(field), diffrax.Tsit5(), 0.0, 0.5, 0.01, y0,
+                args=jnp.array([1.5, 1.0, 1.0, 3.0]), stepsize_controller=controller,
+                saveat=diffrax.SaveAt(t1=True), max_steps=200)
+            return solution.ys
+
+        y0 = np.ones((16, 2), np.float32)
+        assert_matches_cpu(lambda y: solve(y, diffrax.ConstantStepSize()), y0, rtol=1e-4)
+        assert_matches_cpu(lambda y: solve(y, diffrax.PIDController(rtol=1e-5, atol=1e-6)), y0, rtol=1e-4)
     """)

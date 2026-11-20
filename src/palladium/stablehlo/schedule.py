@@ -17,34 +17,44 @@ from palladium.stablehlo.graph import (
     Constant,
     Dispatch,
     DispatchResult,
+    Host,
+    HostResult,
     LoopResult,
     Node,
     Op,
     Parameter,
     ReductionResult,
+    Sort,
+    SortResult,
     VariadicReduce,
     While,
     copy_of,
     dependencies,
+    guard_flag,
     in_place_carries,
     is_short,
+    is_stored,
     owns_slot,
 )
 from palladium.stablehlo.kernel import (
     Kernel,
     fused_stores,
-    half_words_source,
-    halves_source,
     reduction_source,
-    scatter_add_source,
+    scatter_source,
+    sort_pass_source,
+    unpacked_source,
     variadic_reduction_source,
+    words_source,
 )
 from palladium.stablehlo.program import (
     RELAXED,
     SAFE,
+    Branch,
+    HostCall,
     Launch,
     Program,
     Slot,
+    Step,
     UnsupportedProgram,
 )
 from palladium.stablehlo.scalar import ctype_of
@@ -147,16 +157,18 @@ def loop_body(loop: While, in_place: dict[int, Op]) -> Program:
     alias a parameter. A carry computed by launches of its own already has
     such a slot and needs no copy into another.
     """
-    results: list[Node] = [
-        loop.parameters[k]
-        if result is loop.parameters[k] or k in loop.inductions or k in in_place
-        else result
-        if owns_slot(result)
-        else copy_of(result)
-        for k, result in enumerate(loop.results)
-    ]
+    results: list[Node] = []
+    for k, result in enumerate(loop.results):
+        if result is loop.parameters[k] or k in loop.inductions or k in in_place:
+            results.append(loop.parameters[k])
+        elif owns_slot(result) and (loop.trips is not None or result not in results):
+            results.append(result)
+        else:
+            # A dynamic loop writes each carry back to one place, so there
+            # two carries with one value need a slot each.
+            results.append(copy_of(result))
     updates = [(update, loop.parameters[k]) for k, update in in_place.items()]
-    return compile_graph(loop.parameters, results, updates)
+    return compile_graph(loop.parameters, results, updates, loop.effects)
 
 
 def induction_values(start: int, step: int, steps: np.ndarray, dtype: np.dtype) -> np.ndarray:
@@ -168,9 +180,13 @@ def induction_values(start: int, step: int, steps: np.ndarray, dtype: np.dtype) 
     return (start + step * steps.astype(np.int64)).astype(dtype)
 
 
-def rebound(launch: Launch, bindings: dict[int, int], offsets: dict[int, int]) -> Launch:
-    """A loop body's launch for one iteration: its slots as `bindings` map
-    them, and the slots in `offsets` read at that byte offset."""
+def rebound(launch: Step, bindings: dict[int, int], offsets: dict[int, int]) -> Step:
+    """A loop body's step for one iteration: its slots as `bindings` map
+    them, and the slots in `offsets` read at that byte offset. Branches skip
+    relative to themselves, so they hold wherever the body is replayed."""
+    if isinstance(launch, Branch):
+        slot = None if launch.slot is None else bindings[launch.slot]
+        return dataclasses.replace(launch, slot=slot)
     return dataclasses.replace(
         launch,
         slots=tuple(bindings[s] for s in launch.slots),
@@ -185,13 +201,38 @@ def compile_graph(
     parameters: list[Parameter],
     results: list[Node],
     updates: Sequence[tuple[Op, Parameter]] = (),
+    effects: Sequence[Host | While] = (),
 ) -> Program:
-    """Slots and launches computing `results` from `parameters`.
+    """Slots and steps computing `results` from `parameters`.
 
     Each of `updates` is a dynamic_update_slice whose operand is the paired
     parameter: its update is written into that parameter's buffer in place.
+    `effects` are the host calls, and the loops holding some, that run even
+    if no result depends on them, in order.
     """
-    return Scheduler(parameters).compile(results, updates)
+    return Scheduler(parameters).compile(results, updates, effects)
+
+
+def copy_source(dtype: np.dtype, gated: bool = False) -> tuple[str, str]:
+    """A kernel copying one buffer to another, and its name. Gated, it binds
+    a boolean scalar first and copies only if that is true."""
+    ctype = ctype_of(dtype)
+    name = f"copy_{'if_' if gated else ''}{ctype}"
+    flag = "    device const bool* flag [[buffer(0)]],\n" if gated else ""
+    first = int(gated)
+    return (
+        "#include <metal_stdlib>\nusing namespace metal;\n\n"
+        f"kernel void {name}(\n{flag}    device const {ctype}* b0 [[buffer({first})]],\n"
+        f"    device {ctype}* o0 [[buffer({first + 1})]],\n"
+        "    uint i [[thread_position_in_grid]]) {\n"
+        f"    {'if (flag[0]) ' if gated else ''}o0[i] = b0[i];\n}}\n"
+    ), name
+
+
+# A loop the host drives runs this many iterations between two reads of its
+# condition, after 1, 1, 2 and 4: a short loop wastes little, and a long one
+# waits for the GPU once in eight iterations.
+SPECULATED = (1, 1, 2, 4, 8)
 
 
 class Scheduler:
@@ -205,13 +246,15 @@ class Scheduler:
     def __init__(self, parameters: list[Parameter]):
         self.slots = [Slot("parameter", p.dtype, p.shape) for p in parameters]
         self.slot_of: dict[Node, int] = {p: k for k, p in enumerate(parameters)}
-        self.launches: list[Launch] = []
+        self.launches: list[Step] = []
         # Ops materialized for the buffer limit or for branches.
         self.stored: set[Node] = set()
         self.visited: set[Node] = set()
         self.loop_slots: dict[While, list[int]] = {}
         self.reduction_slots: dict[VariadicReduce, list[int]] = {}
         self.dispatch_slots: dict[Dispatch, list[int]] = {}
+        self.host_slots: dict[Host, list[int]] = {}
+        self.sort_slots: dict[Sort, list[int]] = {}
         # Buffers read by node, for one size of `stored`.
         self.read_sets: dict[Node, tuple[int, set[Node]]] = {}
 
@@ -286,6 +329,7 @@ class Scheduler:
         ]
         for result in outputs:
             self.fresh(result)
+        self.bound([*reduction.inputs, *reduction.initial], len(outputs))
         kernel = self.new_kernel(node.shape)
         name = f"variadic_reduce_{len(self.launches)}"
         source = variadic_reduction_source(kernel, reduction, outputs, name)
@@ -323,6 +367,24 @@ class Scheduler:
             )
         self.dispatch_slots[dispatch] = outputs
         return outputs[node.index]
+
+    def schedule_host(self, host: Host) -> list[int]:
+        """The slots of a host call's results, after the step that runs it."""
+        if host in self.host_slots:
+            return self.host_slots[host]
+        inputs = [self.materialize(x) for x in host.inputs]
+        if host.guards:
+            # In a conditional branch: skip the call unless the branch is taken.
+            self.launches.append(Branch(self.materialize(guard_flag(host.guards)), 1))
+        for result in host.results:
+            self.fresh(result)
+        outputs = [self.slot_of[result] for result in host.results]
+        types = tuple((n.dtype, n.shape) for n in (*host.inputs, *host.results))
+        self.launches.append(
+            HostCall(host.function, tuple(inputs + outputs), len(inputs), types, host.name)
+        )
+        self.host_slots[host] = outputs
+        return outputs
 
     def materialize(self, node: Node) -> int:
         """The slot holding `node`, computed by a kernel of its own if nothing holds it."""
@@ -380,11 +442,42 @@ class Scheduler:
             else:
                 self.shrink(largest)
 
+    def bound(self, nodes: Sequence[Node], outputs: int = 1) -> None:
+        """Store the values among `nodes` that read the most buffers, until
+        one kernel can read all of `nodes` and write `outputs` buffers."""
+        while sum(len(self.reads(n)) for n in nodes) > MAX_BUFFERS - outputs:
+            fused = [n for n in nodes if isinstance(n, Op) and n not in self.stored]
+            if not fused:
+                raise UnsupportedProgram(f"metal: a kernel reads over {MAX_BUFFERS} buffers")
+            self.store(max(fused, key=lambda n: len(self.reads(n))))
+
     def schedule_loop(self, loop: While) -> list[int]:
-        """The slots of the loop's results, after replaying its body `trips` times."""
+        """The slots of the loop's results, after the steps that run it.
+
+        A loop in a conditional branch that the host drives, or that calls
+        the host, runs only if the branch is taken: a branch step skips it.
+        Its inputs are computed before, since values outside the loop may
+        read them too.
+        """
         if loop in self.loop_slots:
             return self.loop_slots[loop]
+        if not loop.guards:
+            return self.replay_loop(loop)
+        flag = self.materialize(guard_flag(loop.guards))
+        for node in loop.inputs:
+            self.materialize(node)
+        start = len(self.launches)
+        self.launches.append(Branch(flag, 0))
+        slots = self.replay_loop(loop)
+        self.launches[start] = Branch(flag, len(self.launches) - start - 1)
+        return slots
+
+    def replay_loop(self, loop: While) -> list[int]:
+        """The slots of the loop's results, after replaying its body `trips` times."""
         count = len(loop.results)
+        if loop.trips is None:
+            self.loop_slots[loop] = self.schedule_dynamic_loop(loop)
+            return self.loop_slots[loop]
         if not loop.trips:
             self.loop_slots[loop] = [self.materialize(n) for n in loop.inputs[:count]]
             return self.loop_slots[loop]
@@ -400,7 +493,7 @@ class Scheduler:
             else:
                 current.append(self.materialize(node))
         body = loop_body(loop, in_place)
-        if len(self.launches) + loop.trips * len(body.launches) > 100_000:
+        if len(self.launches) + loop.trips * len(body.steps) > 100_000:
             raise UnsupportedProgram(
                 "metal: stablehlo.while exceeds the 100000-launch replay limit"
             )
@@ -419,19 +512,126 @@ class Scheduler:
                 current[k] = array
             bindings = fixed | dict(enumerate(current)) | banks[iteration % 2]
             offsets = {k: iteration * loop.parameters[k].dtype.itemsize for k in arrays}
-            self.launches.extend(rebound(item, bindings, offsets) for item in body.launches)
+            self.launches.extend(rebound(item, bindings, offsets) for item in body.steps)
             current = [bindings[s] for s in body.outputs] + current[count:]
         for k in inductions:
             current[k] = induction(k, np.array(loop.trips))
         self.loop_slots[loop] = current[:count]
         return self.loop_slots[loop]
 
-    def adopt(self, body: Program) -> tuple[dict[int, int], list[dict[int, int]]]:
+    def schedule_dynamic_loop(self, loop: While) -> list[int]:
+        """The slots of the results of a loop whose condition the host reads.
+
+        The carries start as copies in slots of their own, which hold the
+        results in the end. Reading the condition costs a wait for the GPU,
+        so a body made of launches alone runs several iterations between two
+        reads: `speculate`. A body with host steps of its own takes one read
+        per iteration: `alternate`.
+        """
+        count = len(loop.results)
+        body = loop_body(loop, {})
+        condition = compile_graph(loop.parameters, [loop.condition])
+        changing = [k for k in range(count) if body.outputs[k] != k]
+        home = {
+            k: self.materialize(copy_of(node) if k in changing else node)
+            for k, node in enumerate(loop.inputs)
+        }
+        fixed, _ = self.adopt(body, second_bank=False)
+        away = {k: fixed[body.outputs[k]] for k in changing}
+        condition_slots, _ = self.adopt(condition, second_bank=False)
+
+        def steps(program: Program, extra: dict[int, int], carries: dict[int, int]) -> list[Step]:
+            bindings = extra | home | carries
+            return [rebound(step, bindings, {}) for step in program.steps]
+
+        def flag(carries: dict[int, int]) -> int:
+            return (condition_slots | home | carries)[condition.outputs[0]]
+
+        def copies(gate: int | None) -> list[Step]:
+            """The second bank copied into the carries' slots, if `gate` holds."""
+            launches: list[Step] = []
+            for k in changing:
+                slot = self.slots[home[k]]
+                if size := math.prod(slot.shape):
+                    source, name = copy_source(slot.dtype, gate is not None)
+                    slots = (away[k], home[k]) if gate is None else (gate, away[k], home[k])
+                    launches.append(Launch(source, name, slots, size, 0, RELAXED))
+            return launches
+
+        there = fixed | {body.outputs[k]: away[k] for k in changing}
+        test_home = steps(condition, condition_slots, {})
+        first = steps(body, there, {})
+        if all(isinstance(step, Launch) for step in body.steps):
+            self.speculate([*test_home, *first, *copies(flag({}))], flag({}))
+        else:
+            back = fixed | {body.outputs[k]: home[k] for k in changing}
+            second = steps(body, back, away)
+            test_away = steps(condition, condition_slots, away)
+            self.alternate(test_home, flag({}), first, test_away, flag(away), second, copies(None))
+        return [home[k] for k in range(count)]
+
+    def speculate(self, iteration: list[Step], flag: int) -> None:
+        """Lay out a loop whose `iteration` is the condition, the body into a
+        second bank, and copies back that only run if the condition held.
+
+        Once the condition is false the carries stop changing, so it stays
+        false and further iterations change nothing: they may run without
+        the host having looked. Groups of `SPECULATED` iterations end in a
+        branch out of the loop; the last group repeats.
+        """
+        if len(self.launches) + sum(SPECULATED) * len(iteration) > 100_000:
+            raise UnsupportedProgram(
+                "metal: stablehlo.while exceeds the 100000-launch replay limit"
+            )
+        *leading, repeated = SPECULATED
+        tail: list[Step] = [*iteration * repeated, Branch(flag, 1)]
+        tail.append(Branch(None, -(len(tail) + 1)))
+        groups = [[*iteration * n, Branch(flag, 0)] for n in leading]
+        remaining = len(tail) + sum(len(group) for group in groups)
+        for group in groups:
+            remaining -= len(group)
+            group[-1] = Branch(flag, remaining)
+            self.launches += group
+        self.launches += tail
+
+    def alternate(
+        self,
+        test_home: list[Step],
+        flag_home: int,
+        first: list[Step],
+        test_away: list[Step],
+        flag_away: int,
+        second: list[Step],
+        copies: list[Step],
+    ) -> None:
+        """Lay out a loop with one read of the condition per iteration.
+
+        The body is laid out twice, from the carries' slots to a second bank
+        and back, each behind the condition on the carries it reads; leaving
+        after the first copy moves the second bank into the carries' slots:
+
+            L:  condition(A); if false go to END
+                body(A to B)
+                condition(B); if false go to E
+                body(B to A); go to L
+            E:  copy B to A
+            END:
+        """
+        tail = [*second, Branch(None, 0)]
+        rest = [*first, *test_away, Branch(flag_away, len(tail)), *tail]
+        # Back to the first condition: over everything laid out before the jump.
+        tail[-1] = Branch(None, -(len(test_home) + 1 + len(rest)))
+        rest = [*first, *test_away, Branch(flag_away, len(tail)), *tail]
+        self.launches += [*test_home, Branch(flag_home, len(rest) + len(copies)), *rest, *copies]
+
+    def adopt(
+        self, body: Program, second_bank: bool = True
+    ) -> tuple[dict[int, int], list[dict[int, int]]]:
         """Slots here for the slots a loop body adds to its parameters.
 
         Returns the slot of each, and two banks of slots for the body's
         outputs: iterations alternate between them, so none writes a carry it
-        still reads.
+        still reads. Without `second_bank`, the caller places the outputs.
         """
         fixed: dict[int, int] = {}
         banks: list[dict[int, int]] = [{}, {}]
@@ -441,7 +641,7 @@ class Scheduler:
                 continue
             fixed[k] = len(self.slots)
             self.slots.append(slot)
-            if k in outputs and slot.kind == "fresh":
+            if second_bank and k in outputs and slot.kind == "fresh":
                 banks[0][k] = fixed[k]
                 banks[1][k] = len(self.slots)
                 self.slots.append(slot)
@@ -471,6 +671,12 @@ class Scheduler:
             self.slot_of[node] = self.schedule_loop(node.loop)[node.index]
         elif isinstance(node, DispatchResult):
             self.slot_of[node] = self.schedule_dispatch(node)
+        elif isinstance(node, HostResult):
+            self.slot_of[node] = self.schedule_host(node.host)[node.index]
+        elif isinstance(node, SortResult):
+            self.slot_of[node] = self.schedule_sort(node.sort)[node.index]
+        elif is_stored(node):
+            self.store(node)
         elif isinstance(node, Op):
             if node.name == "scatter":
                 self.schedule_scatter(node)
@@ -484,6 +690,7 @@ class Scheduler:
         """128 threads per output element; a long reduction to few outputs
         first reduces 4096-element chunks, so it occupies the GPU."""
         x, init = node.operands
+        self.bound([x, init])
         size = math.prod(x.shape[d] for d in node.attributes["dims"])
         chunks = math.ceil(size / 4096) if size > 4096 and math.prod(node.shape) < 128 else 1
         reduction = node
@@ -511,18 +718,18 @@ class Scheduler:
         self.launch(kernel, reduction_source(kernel, reduction, node, name), name, [node], 128)
 
     def schedule_scatter(self, node: Op) -> None:
-        """A scatter-add: a copy of the operand, then atomic adds of the updates."""
+        """A scatter: a copy of the operand, then one thread per update
+        element combining it in. Elements narrower than the 32-bit words of
+        Metal's atomics get a word each while they are updated."""
         x, indices, updates = node.operands
-        narrow = node.dtype in (np.float16, ml_dtypes.bfloat16)
-        if (
-            not narrow and node.dtype not in (np.float32, np.int32, np.uint32)
-        ) or indices.dtype not in (
-            np.int32,
-            np.uint32,
-        ):
-            raise UnsupportedProgram(
-                "metal: stablehlo.scatter requires floating or int32/uint32 data and 32-bit indices"
-            )
+        update = node.attributes["update"]
+        if indices.dtype not in (np.int32, np.uint32):
+            raise UnsupportedProgram("metal: stablehlo.scatter requires 32-bit indices")
+        if update != "set" and node.dtype.itemsize == 8:
+            raise UnsupportedProgram("metal: stablehlo.scatter combining 64-bit elements")
+        words = update != "set" and node.dtype.itemsize < 4
+        self.bound([x])
+        self.bound([indices, updates])
         self.fresh(node)
         kernel = self.new_kernel(node.shape)
         name = f"scatter_init_{len(self.launches)}"
@@ -530,29 +737,64 @@ class Scheduler:
             self.launch(kernel, kernel.source([x], name), name, [node])
             return
         target: Node = node
-        if narrow:
-            # One 32-bit atomic word per element, including odd-sized outputs.
-            # Packing adjacent halves would require aligned/padded allocations.
+        if words:
             target = self.buffer(np.dtype(np.uint32), node.shape)
-            source = half_words_source(kernel, x, target, name)
+            source = words_source(kernel, x, target, name)
         else:
             source = kernel.source([x], name)
         self.launch(kernel, source, name, [target])
         kernel = self.new_kernel(updates.shape)
-        name = f"scatter_add_{len(self.launches)}"
+        name = f"scatter_{len(self.launches)}"
         # This grid covers updates, not output elements.
         self.launch(
             kernel,
-            scatter_add_source(kernel, node, target, name),
+            scatter_source(kernel, node, target, name),
             name,
             [target],
             grid=math.prod(updates.shape),
             math_mode=SAFE,
         )
-        if narrow:
+        if words:
             kernel = self.new_kernel(node.shape)
             name = f"scatter_unpack_{len(self.launches)}"
-            self.launch(kernel, halves_source(kernel, target, node, name), name, [node])
+            self.launch(kernel, unpacked_source(kernel, target, node, name), name, [node])
+
+    def schedule_sort(self, sort: Sort) -> list[int]:
+        """The slots of a sort's results: a merge sort along the dimension,
+        one launch per doubling of the sorted runs, between two banks of
+        buffers so the last pass writes the results."""
+        if sort in self.sort_slots:
+            return self.sort_slots[sort]
+        inputs = [self.materialize(x) for x in sort.inputs]
+        shape = sort.inputs[0].shape
+        n = shape[sort.dim] if shape else 1
+        passes = (n - 1).bit_length() if math.prod(shape) else 0
+        if not passes:
+            self.sort_slots[sort] = inputs
+            return inputs
+        results = [self.buffer(x.dtype, x.shape) for x in sort.inputs]
+        spare = [self.buffer(x.dtype, x.shape) for x in sort.inputs] if passes > 1 else []
+        banks = [[self.slot_of[b] for b in bank] for bank in (results, spare)]
+        widths = Constant(
+            np.dtype(np.uint32), (passes,), None, 1 << np.arange(passes, dtype=np.uint32)
+        )
+        self.add_constant(widths)
+        kernel = self.new_kernel(shape)
+        name = f"sort_pass_{len(self.launches)}"
+        source = sort_pass_source(kernel, sort, list(sort.inputs), widths, results, name)
+        # The sources bind first, in order, then the widths.
+        assert list(kernel.buffers) == [*dict.fromkeys(sort.inputs), widths]
+        reads = inputs
+        for k in range(passes):
+            writes = banks[(passes - 1 - k) % 2]
+            bound = {**dict(zip(sort.inputs, reads, strict=True)), widths: self.slot_of[widths]}
+            slots = (*(bound[node] for node in kernel.buffers), *writes)
+            offsets = tuple(4 * k if node is widths else 0 for node in kernel.buffers)
+            offsets += (0,) * len(writes)
+            self.launches.append(Launch(source, name, slots, math.prod(shape), 0, SAFE, offsets))
+            reads = writes
+        self.sort_slots[sort] = banks[0]
+        return banks[0]
 
     def schedule_dot(self, node: Op) -> None:
         """A product on the GEMM kernel, its operands packed to (batch, M, K)
@@ -610,12 +852,25 @@ class Scheduler:
             return self.slot_of[value]
         return self.materialize(Op("reshape", [value], value.dtype, shape, {}))
 
-    def compile(self, results: list[Node], updates: Sequence[tuple[Op, Parameter]] = ()) -> Program:
+    def compile(
+        self,
+        results: list[Node],
+        updates: Sequence[tuple[Op, Parameter]] = (),
+        effects: Sequence[Host | While] = (),
+    ) -> Program:
         """The program computing `results`, with each update written in place.
 
         Each of `updates` is a dynamic_update_slice whose operand is the paired
         parameter: only the update is written, into that parameter's buffer.
+        `effects` run first, in order, whether or not a result depends on them.
         """
+        for effect in effects:
+            for node in effect.inputs:
+                self.schedule(node)
+            if isinstance(effect, Host):
+                self.schedule_host(effect)
+            else:
+                self.schedule_loop(effect)
         for node in results:
             self.schedule(node)
         for update, _ in updates:

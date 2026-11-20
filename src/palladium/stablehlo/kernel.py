@@ -16,19 +16,28 @@ from palladium.stablehlo.graph import (
     Buffer,
     Constant,
     DispatchResult,
+    HostResult,
     LoopResult,
     Node,
     Op,
     Parameter,
+    Reducer,
     ReductionResult,
+    Sort,
+    SortResult,
     VariadicReduce,
+    is_looped,
     is_short,
+    reachable,
 )
 from palladium.stablehlo.program import UnsupportedProgram
 from palladium.stablehlo.scalar import (
+    COMPARISONS,
     ELEMENTWISE,
     EXTRA,
     NARROW,
+    THREEFRY,
+    TOTAL_ORDER,
     accumulator,
     ctype_of,
     literal,
@@ -170,7 +179,12 @@ class Kernel:
         if not isinstance(result, Term):
             # An expression gets a variable; a term stands for itself.
             name = self.temporary()
-            self.lines.append(f"{ctype_of(node.dtype)} {name} = {result};")
+            ctype = ctype_of(node.dtype)
+            if ctype == "bfloat":
+                # MSL's math functions return float for bfloat operands, and
+                # bfloat has no implicit conversion from float.
+                result = f"bfloat({result})"
+            self.lines.append(f"{ctype} {name} = {result};")
             result = name
         scope.values[key] = result
         return result
@@ -280,7 +294,16 @@ class Kernel:
         """`node` at `coords`: an expression, or the term it is already spelled as."""
         ctype = ctype_of(node.dtype)
         if node in self.stored or isinstance(
-            node, (Parameter, Buffer, LoopResult, ReductionResult, DispatchResult)
+            node,
+            (
+                Parameter,
+                Buffer,
+                LoopResult,
+                ReductionResult,
+                DispatchResult,
+                HostResult,
+                SortResult,
+            ),
         ):
             return self._read(node, coords)
         if isinstance(node, Constant):
@@ -460,10 +483,12 @@ class Kernel:
                 )
             case "iota":
                 return f"{ctype}({coords[a['dim']].text})"
+            case "fold_blocks" | "fold_before" | "fold_within":
+                return self._block_fold(node, coords)
+            case "rng_bits":
+                return self._rng_bits(node, coords)
         if node.name == "bitcast_convert" and node.dtype.itemsize != operands[0].dtype.itemsize:
-            raise UnsupportedProgram(
-                "metal: shape-changing stablehlo.bitcast_convert is not supported"
-            )
+            return self._regrouped_bits(node, coords)
         # A scalar operand of a tensor op (select's predicate, clamp's bounds)
         # applies to every element.
         values = [str(self.value(x, coords if x.shape else ())) for x in operands]
@@ -472,6 +497,18 @@ class Kernel:
                 return f"{ctype}({values[0]})"
             case "bitcast_convert":
                 return f"as_type<{ctype}>({values[0]})"
+            case "reduce_precision":
+                # A round trip through the narrower format; same-format is a no-op.
+                formats = {(5, 10): "half", (8, 7): "bfloat", (8, 23): "float"}
+                narrow = formats.get((a["exponent"], a["mantissa"]))
+                if narrow is None or ctype not in formats.values():
+                    raise UnsupportedProgram("metal: stablehlo.reduce_precision to this format")
+                wider = ctype == "float" and narrow != "float"
+                return f"{ctype}({narrow}({values[0]}))" if wider else values[0]
+            case "compare" if a["total"] and operands[0].dtype.kind == "f":
+                self.require(*TOTAL_ORDER)
+                ranks = [f"total_order(float({v}))" for v in values]
+                return f"({ranks[0]} {COMPARISONS[a['direction']]} {ranks[1]})"
             case "compare":
                 # JAX spells isnan as x != x, which RELAXED and FAST math fold
                 # to false; isnan survives every math mode.
@@ -494,7 +531,7 @@ class Kernel:
             kind = "float" if operand_ctype in ("float", "half", "bfloat") else operand_ctype
             if kind not in EXTRA[node.name]:
                 raise UnsupportedProgram(f"metal: stablehlo.{node.name} on {operand_ctype}")
-            expr = EXTRA[node.name][kind].format(**dict(zip("ab", values, strict=False)))
+            expr = EXTRA[node.name][kind].format(**dict(zip("abc", values, strict=False)))
             # Templates that compute in float narrow explicitly: bfloat has no
             # implicit conversion from float.
             return expr if operand_ctype in ("float", kind) else f"{operand_ctype}({expr})"
@@ -620,16 +657,141 @@ class Kernel:
         condition, value = self._guarded(x, coords, positions, dilations)
         return f"({condition} ? {value} : {literal(0, ctype_of(node.dtype))})"
 
+    def _loop_fold(
+        self,
+        dtype: np.dtype,
+        reducer: str | Reducer,
+        seed: str,
+        start: str,
+        end: str,
+        element: Callable[[Term], str | Term],
+    ) -> str:
+        """`seed` combined, in a loop over [start, end), with `element` of the
+        loop variable. A `Reducer` binds its body to the two values."""
+        ctype = ctype_of(dtype)
+        general = isinstance(reducer, Reducer)
+        acc_type = ctype if general else accumulator(ctype)
+        acc = self.temporary()
+        self.lines.append(f"{acc_type} {acc} = {acc_type}({seed});")
+        # A body's values are scalars without coordinates, which would look
+        # loop-invariant: nothing leaves a loop that binds one.
+        scope = Scope(self.lines, len(self.lines), hoist=not general)
+        r = self._variable("r", scope)
+        self.lines.append(f"for (uint {r} = {start}; {r} < {end}; ++{r}) {{")
+        self.scopes.append(scope)
+        self.branches.append(scope)
+        try:
+            value = element(r)
+            if isinstance(reducer, Reducer):
+                bound = self.temporary()
+                self.lines.append(f"{ctype} {bound} = {value};")
+                scope.values[(reducer.parameters[0], ())] = acc
+                scope.values[(reducer.parameters[1], ())] = bound
+                combined = str(self.value(reducer.body, ()))
+            else:
+                operands = (str(acc), f"{acc_type}({value})")
+                combined = format_scalar(ELEMENTWISE[reducer], acc_type, operands)
+            self.lines.append(f"{acc} = {combined};")
+        finally:
+            self.scopes.pop()
+            self.branches.pop()
+        self.lines.append("}")
+        return f"{ctype}({acc})"
+
+    def _stored_operand(self, x: Node) -> None:
+        """Compute `x` into a buffer before a fold that reads each of its
+        elements many times, where the kernel can."""
+        if self.store is not None and isinstance(x, Op) and x not in self.stored:
+            self.store(x)
+
+    def _block_fold(self, node: Op, coords: Coords) -> str:
+        """One element of a step of a cumulative reduction in blocks; see
+        `graph._cumulative`."""
+        a = node.attributes
+        axis, block, reverse = a["axis"], a["block"], a["reverse"]
+        x, other = node.operands
+        n, c = x.shape[axis], coords[axis]
+        self._stored_operand(x)
+
+        def at(position: Term) -> Coords:
+            return (*coords[:axis], position, *coords[axis + 1 :])
+
+        if node.name == "fold_blocks":
+            # The total of block c.
+            seed, start, end = self.value(other, ()), c * block, f"min({(c + 1) * block}, {n}u)"
+        elif node.name == "fold_before":
+            # The total of the blocks before block c, or after it in reverse.
+            seed = self.value(other, ())
+            start, end = (c + 1, f"{n}u") if reverse else (ZERO, c)
+        else:
+            # Element c: what precedes its block, then its block up to it.
+            first = c // block
+            seed = self.value(other, at(first))
+            start, end = (
+                (c, f"min({(first + 1) * block}, {n}u)") if reverse else (first * block, c + 1)
+            )
+        return self._loop_fold(
+            node.dtype,
+            a["reducer"],
+            str(seed),
+            str(start),
+            str(end),
+            lambda r: self.value(x, at(r)),
+        )
+
+    def _rng_bits(self, node: Op, coords: Coords) -> str:
+        """Random bits for one element: Threefry keyed by the state's words,
+        on the element's flat index."""
+        [state] = node.operands
+        self.require(*THREEFRY)
+        words = []
+        for k in range(state.shape[0]):
+            value = self.value(state, (Term.constant(k),))
+            if state.dtype.itemsize == 8:
+                words += [f"uint({value})", f"uint({value} >> 32)"]
+            else:
+                words.append(str(value))
+        words += ["0u"] * (len(words) % 2)
+        key = self.temporary()
+        self.lines.append(f"uint2 {key} = uint2({words[0]}, {words[1]});")
+        for k in range(2, len(words), 2):
+            self.lines.append(f"{key} = threefry2x32({key}, uint2({words[k]}, {words[k + 1]}));")
+        bits = self.temporary()
+        flat = self._flat(coords, node.shape)
+        self.lines.append(f"uint2 {bits} = threefry2x32({key}, uint2({flat.text}, 0u));")
+        ctype = ctype_of(node.dtype)
+        if node.dtype.itemsize == 8:
+            return f"as_type<{ctype}>((ulong({bits}.y) << 32) | ulong({bits}.x))"
+        return f"as_type<{ctype}>({bits}.x)"
+
+    def _regrouped_bits(self, node: Op, coords: Coords) -> str:
+        """A bitcast between element widths: the last dimension of the
+        narrower side holds the parts of each wider element, lowest first."""
+        [x] = node.operands
+        unsigned = {1: "uchar", 2: "ushort", 4: "uint", 8: "ulong"}
+        if np.bool_ in (node.dtype, x.dtype):
+            raise UnsupportedProgram("metal: shape-changing stablehlo.bitcast_convert of booleans")
+        ctype, wide, narrow = ctype_of(node.dtype), node.dtype.itemsize, x.dtype.itemsize
+        if narrow > wide:
+            whole = unsigned[narrow]
+            bits = f"as_type<{whole}>({self.value(x, coords[:-1])})"
+            part = f"{unsigned[wide]}({bits} >> {whole}({coords[-1]} * {8 * wide}u))"
+            return f"as_type<{ctype}>({part})"
+        whole = unsigned[wide]
+        parts = [
+            f"({whole}(as_type<{unsigned[narrow]}>({self.value(x, (*coords, Term.constant(k)))}))"
+            f" << {8 * narrow * k}u)"
+            for k in range(wide // narrow)
+        ]
+        return f"as_type<{ctype}>({' | '.join(parts)})"
+
     def _reduce_window(self, node: Op, coords: Coords) -> str:
         """A window of the base-dilated, padded input folded from the initial
         value; positions on padding or dilation holes contribute the initial
-        value, as StableHLO pads with it."""
+        value, as StableHLO pads with it. A window of at most `WINDOW_LIMIT`
+        elements unrolls; a longer one, or a reducer body, folds in a loop."""
         x, init = node.operands
         a = node.attributes
-        if math.prod(a["window"]) > WINDOW_LIMIT:
-            raise UnsupportedProgram(
-                f"metal: stablehlo.reduce_window over more than {WINDOW_LIMIT} elements"
-            )
         ctype = ctype_of(node.dtype)
         acc_type = accumulator(ctype)
         start = self.value(init, ())
@@ -640,6 +802,22 @@ class Kernel:
             for d in range(len(x.shape))
             if (a["window"][d], a["strides"][d], a["base"][d], *a["padding"][d]) != (1, 1, 1, 0, 0)
         ]
+        if is_looped(node):
+            self._stored_operand(x)
+            sizes = [a["window"][d] for d in moving]
+
+            def element(r: Term) -> str | Term:
+                positions = {
+                    d: f"int({coords[d]}) * {a['strides'][d]} + int({e}) * {a['dilations'][d]}"
+                    f" - {a['padding'][d][0]}"
+                    for d, e in zip(moving, delinear(r, sizes), strict=True)
+                }
+                condition, value = self._guarded(x, coords, positions, a["base"])
+                return value if condition == "true" else f"({condition} ? {value} : {start})"
+
+            return self._loop_fold(
+                node.dtype, a["reducer"], str(start), "0u", f"{math.prod(sizes)}u", element
+            )
         for offsets in itertools.product(*(range(a["window"][d]) for d in moving)):
             positions = {
                 d: f"int({coords[d]}) * {a['strides'][d]} + {e * a['dilations'][d]}"
@@ -750,15 +928,25 @@ def reduction_source(kernel: Kernel, node: Op, output: Node, name: str, chunks: 
     kind = node.attributes["reducer"]
     ctype = ctype_of(node.dtype)
     acc_type = accumulator(ctype)
-    if kind in ("add", "or"):
+    if kind in ("add", "or", "xor"):
         identity = f"{acc_type}(0)"
+    elif kind == "multiply":
+        identity = "true" if acc_type == "bool" else f"{acc_type}(1)"
     elif kind == "and":
         identity = "true" if acc_type == "bool" else f"{acc_type}(~0u)"
     else:
         identity = extremum_identity(ELEMENTWISE[kind], acc_type)
-    intrinsic = {"add": "sum", "maximum": "max", "minimum": "min", "and": "and", "or": "or"}[kind]
+    intrinsic = {
+        "add": "sum",
+        "multiply": "product",
+        "maximum": "max",
+        "minimum": "min",
+        "and": "and",
+        "or": "or",
+        "xor": "xor",
+    }[kind]
     if ctype == "bool":
-        intrinsic = "all" if kind in ("and", "minimum") else "any"
+        intrinsic = "all" if kind in ("and", "minimum", "multiply") else "any"
 
     def combine(a: str, b: str) -> str:
         return format_scalar(ELEMENTWISE[kind], acc_type, (a, b))
@@ -846,25 +1034,48 @@ def variadic_reduction_source(
     return kernel.render(outputs, name, stores)
 
 
-def half_words_source(kernel: Kernel, x: Node, words: Node, name: str) -> str:
-    """Each half-precision element of `x` as the low bits of a 32-bit word,
-    the unit Metal's atomics work on."""
+def pack_word(ctype: str, value: str) -> str:
+    """`value` as a 32-bit word, the unit Metal's atomics work on."""
+    if ctype in ("half", "bfloat"):
+        return f"uint(as_type<ushort>({value}))"
+    return f"as_type<uint>({value})" if ctype in ("float", "int") else f"uint({value})"
+
+
+def unpack_word(ctype: str, word: str) -> str:
+    """The element of `ctype` that `pack_word` put in `word`."""
+    if ctype in ("half", "bfloat"):
+        return f"as_type<{ctype}>(ushort({word}))"
+    if ctype == "bool":
+        return f"({word} != 0u)"
+    return f"as_type<{ctype}>({word})" if ctype in ("float", "int") else f"{ctype}({word})"
+
+
+def words_source(kernel: Kernel, x: Node, words: Node, name: str) -> str:
+    """Each element of `x` in a 32-bit word of its own."""
     value = kernel.value(x, kernel.coords)
-    return kernel.render([words], name, [f"o0[i] = uint(as_type<ushort>({value}));"])
+    return kernel.render([words], name, [f"o0[i] = {pack_word(ctype_of(x.dtype), str(value))};"])
 
 
-def halves_source(kernel: Kernel, words: Node, output: Node, name: str) -> str:
-    """The half-precision elements held in the 32-bit `words`."""
+def unpacked_source(kernel: Kernel, words: Node, output: Node, name: str) -> str:
+    """The elements held in the 32-bit `words`."""
     value = kernel.value(words, kernel.coords)
-    ctype = ctype_of(output.dtype)
-    return kernel.render([output], name, [f"o0[i] = as_type<{ctype}>(ushort({value}));"])
+    return kernel.render(
+        [output], name, [f"o0[i] = {unpack_word(ctype_of(output.dtype), str(value))};"]
+    )
 
 
-def scatter_add_source(kernel: Kernel, node: Op, target: Node, name: str) -> str:
-    """One thread per update element adds it to `target` atomically, where its
-    index lies inside the operand; `target` holds 32-bit words for half types."""
+def scatter_source(kernel: Kernel, node: Op, target: Node, name: str) -> str:
+    """One thread per update element combines it into `target`, where its
+    index lies inside the operand.
+
+    An assignment stores. An addition of 32-bit elements is an atomic add.
+    Any other update is a compare-and-exchange loop on the element's 32-bit
+    word; `target` then holds one word per element for narrower types.
+    Updates of one element apply in no particular order.
+    """
     _, indices, updates = node.operands
-    narrow = target is not node
+    words = target is not node
+    update = node.attributes["update"]
     a = node.attributes
     index_coords, components = index_positions(
         kernel.coords, a["window"], a["vector"], len(indices.shape), len(a["map"])
@@ -885,23 +1096,95 @@ def scatter_add_source(kernel: Kernel, node: Op, target: Node, name: str) -> str
     value = kernel.value(updates, kernel.coords)
     flat = linear(tuple(Term(f"uint({c})") for c in inner), node.shape).text
     ctype = ctype_of(node.dtype)
-    if narrow:
-        # Round after every successful update, as a narrow scalar add does.
+    if update == "set":
+        kernel.lines.append(f"o0[{flat}] = {value};")
+    elif update == "add" and not words:
+        kernel.lines.append(
+            f"atomic_fetch_add_explicit(reinterpret_cast<device atomic_{ctype}*>(o0) + ({flat}), {value}, memory_order_relaxed);"
+        )
+    else:
         kernel.lines += [
             f"device atomic_uint* address = reinterpret_cast<device atomic_uint*>(o0) + ({flat});",
             "uint expected = atomic_load_explicit(address, memory_order_relaxed);",
             "uint desired;",
             "do {",
-            f"{ctype} next = {ctype}(float(as_type<{ctype}>(ushort(expected))) + float({value}));",
-            "desired = uint(as_type<ushort>(next));",
+            f"{ctype} current = {unpack_word(ctype, 'expected')};",
+        ]
+        if isinstance(update, Reducer):
+            kernel.body.values[(update.parameters[0], ())] = Term("current")
+            kernel.body.values[(update.parameters[1], ())] = value
+            combined = str(kernel.value(update.body, ()))
+        else:
+            # Round after every update, as a scalar of the element type does.
+            wide = accumulator(ctype)
+            operands = (f"{wide}(current)", f"{wide}({value})")
+            combined = f"{ctype}({format_scalar(ELEMENTWISE[update], wide, operands)})"
+        kernel.lines += [
+            f"{ctype} next = {combined};",
+            f"desired = {pack_word(ctype, 'next')};",
             "} while (!atomic_compare_exchange_weak_explicit(address, &expected, desired, memory_order_relaxed, memory_order_relaxed));",
         ]
-    else:
-        kernel.lines.append(
-            f"atomic_fetch_add_explicit(reinterpret_cast<device atomic_{ctype}*>(o0) + ({flat}), {value}, memory_order_relaxed);"
-        )
     kernel.lines.append("}")
     return kernel.render([target], name, [])
+
+
+def sort_pass_source(
+    kernel: Kernel,
+    sort: Sort,
+    sources: Sequence[Node],
+    width: Node,
+    outputs: Sequence[Node],
+    name: str,
+) -> str:
+    """One pass of a merge sort along `sort.dim`: sorted runs of the width in
+    `width` merge in pairs.
+
+    One thread per element finds its rank in the merged pair: its position in
+    its own run plus the elements of the other run that go before it, found
+    by binary search with the comparator. An element of the left run goes
+    before equal elements of the right, so the sort is stable. Every thread
+    writes a different position.
+    """
+    shape = sort.inputs[0].shape
+    n, stride = shape[sort.dim], math.prod(shape[sort.dim + 1 :])
+    buffers = [kernel.buffer(source) for source in sources]
+    kernel.lines += [
+        f"uint w = {kernel.buffer(width)}[0];",
+        f"uint j = {kernel.coords[sort.dim].text};",
+        "uint base = j / (2u * w) * (2u * w);",
+        "bool right = j - base >= w;",
+        # The other run of the pair: where it starts and how many it holds.
+        "uint other = right ? base : base + w;",
+        f"uint count = right ? w : (base + w < {n}u ? min(w, {n}u - (base + w)) : 0u);",
+        f"uint row = i - j * {stride}u;",
+    ]
+    for k, (source, buffer) in enumerate(zip(sources, buffers, strict=True)):
+        kernel.lines.append(f"{ctype_of(source.dtype)} m{k} = {buffer}[i];")
+    kernel.lines += [
+        "uint lo = 0u, hi = count;",
+        "while (lo < hi) {",
+        "uint mid = (lo + hi) / 2u;",
+        f"uint at = row + (other + mid) * {stride}u;",
+    ]
+    # The comparator on (other, this) for an element of the left run and on
+    # (this, other) for one of the right: one evaluation serves both.
+    used = set(reachable([sort.body]))
+    for k, (source, buffer) in enumerate(zip(sources, buffers, strict=True)):
+        ctype = ctype_of(source.dtype)
+        for side, parameter in enumerate(sort.parameters[2 * k : 2 * k + 2]):
+            if parameter in used:
+                mine = "right" if side == 0 else "!right"
+                kernel.lines.append(f"{ctype} p{k}_{side} = {mine} ? m{k} : {buffer}[at];")
+                kernel.body.values[(parameter, ())] = Term(f"p{k}_{side}")
+    before = kernel.value(sort.body, ())
+    kernel.lines += [
+        # From `lo` on, the other run's elements go after this one.
+        f"if (right ? {before} : !{before}) hi = mid; else lo = mid + 1u;",
+        "}",
+        f"uint to = row + (base + (right ? j - base - w : j - base) + lo) * {stride}u;",
+    ]
+    stores = [f"o{k}[to] = m{k};" for k in range(len(sources))]
+    return kernel.render(list(outputs), name, stores)
 
 
 def fused_stores(kernel: Kernel, items: Sequence[Node | tuple[Op, Node]]) -> list[str]:

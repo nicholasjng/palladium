@@ -33,7 +33,9 @@ ELEMENTWISE = {
     "abs": "abs",
     "exponential": "exp",
     "exponential_minus_one": "expm1",
+    "exp2": "exp2",
     "log": "log",
+    "log2": "log2",
     "log_plus_one": "log1p",
     "sine": "sin",
     "cosine": "cos",
@@ -132,11 +134,54 @@ EXTRA = {
     "popcnt": {"int": "popcount({a})", "uint": "popcount({a})"},
     "count_leading_zeros": {"int": "clz({a})", "uint": "clz({a})"},
     "not": {"bool": "!{a}", "int": "~{a}", "uint": "~{a}"},
+    "fma": {"float": "fma(float({a}), float({b}), float({c}))"},
 }
 
 
+# The MSL function ranking floats in IEEE total order: as integers, negative
+# NaNs come first, then -inf up to -0, +0 up to +inf, and positive NaNs.
+TOTAL_ORDER = (
+    "total_order",
+    """inline int total_order(float x) {
+    int bits = as_type<int>(x);
+    return bits < 0 ? (bits ^ 0x7fffffff) : bits;
+}""",
+)
+
+COMPARISONS = {"eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">="}
+
+
 # Ops computing each element from the same element of their operands.
-SCALAR = {*ELEMENTWISE, *EXTRA, "compare", "select", "convert", "bitcast_convert"}
+SCALAR = {
+    *ELEMENTWISE,
+    *EXTRA,
+    "compare",
+    "select",
+    "convert",
+    "bitcast_convert",
+    "reduce_precision",
+}
+
+
+# Threefry-2x32 with 20 rounds, the generator behind `rng_bits`.
+THREEFRY = (
+    "threefry2x32",
+    """inline uint2 threefry2x32(uint2 key, uint2 counter) {
+    uint ks[3] = {key.x, key.y, 0x1BD11BDAu ^ key.x ^ key.y};
+    uint x0 = counter.x + ks[0], x1 = counter.y + ks[1];
+    const uint rotations[8] = {13u, 15u, 26u, 6u, 17u, 29u, 16u, 24u};
+    for (uint group = 0u; group < 5u; ++group) {
+        for (uint k = 0u; k < 4u; ++k) {
+            uint r = rotations[(group % 2u) * 4u + k];
+            x0 += x1;
+            x1 = ((x1 << r) | (x1 >> (32u - r))) ^ x0;
+        }
+        x0 += ks[(group + 1u) % 3u];
+        x1 += ks[(group + 2u) % 3u] + group + 1u;
+    }
+    return uint2(x0, x1);
+}""",
+)
 
 
 def wide_scalar(name: str, ctype: str, values: list[str]) -> str:
