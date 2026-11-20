@@ -1165,23 +1165,30 @@ def test_pooling_and_its_gradient_match_cpu():
 
 
 def test_sam_training_step_matches_cpu_over_three_steps():
+    """Each of three steps, taken on both backends from the CPU's state.
+
+    The states are not left to run apart: max-pooling picks a winner, so two
+    trajectories a few 1e-6 apart can disagree on one and then differ by
+    1e-3 in a gradient, with either backend stepping correctly. From one
+    state the backends agree to rounding at every step. Drift over long runs
+    is what examples/pjrt_long_run.py measures, against the CPU's own spread.
+    """
     _check("""
         import jax, numpy as np
         from training_steps import workload
         from pjrt_tolerance import assert_trees_close
-        cpu = jax.devices('cpu')[0]
+        cpu, metal = jax.devices('cpu')[0], jax.devices('metal')[0]
         with jax.default_device(cpu):
             fn, params, opt, images, masks = workload('sam')
             images = jax.random.uniform(jax.random.key(1), images.shape)
             masks = (jax.random.uniform(jax.random.key(2), masks.shape) > 0.5).astype(np.float32)
-        state = {d: jax.device_put((params, opt, images, masks), jax.devices(d)[0]) for d in ('metal', 'cpu')}
         run = jax.jit(fn)
+        state = (params, opt, images, masks)
         for _ in range(3):
-            losses = {}
-            for d, (p, o, x, m) in state.items():
-                (p, o), losses[d] = run(p, o, x, m)
-                state[d] = (p, o, x, m)
-            assert_trees_close((state['metal'][:2], losses['metal']), (state['cpu'][:2], losses['cpu']), rtol=1e-4)
+            (p, o), loss = run(*state)
+            got = run(*jax.device_put(state, metal))
+            assert_trees_close(got, ((p, o), loss), rtol=1e-4)
+            state = (p, o, images, masks)
     """)
 
 
