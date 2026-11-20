@@ -1,4 +1,4 @@
-"""Launch options and geometry shared by `metal_call` and `pallas_call` on mps."""
+"""Launch options and geometry shared by `metal_call` and `pallas_call` on `metal`."""
 
 from __future__ import annotations
 
@@ -6,8 +6,11 @@ import dataclasses
 import enum
 import math
 import operator
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any, SupportsIndex
 
-from jax._src.pallas import core as pallas_core
+import numpy as np
+from jax.experimental import pallas as pl
 
 from palladium.device import device_limits
 from palladium.emit.kernel import DOT_GENERAL_POLICIES, PROGRAM_SCOPES
@@ -20,6 +23,7 @@ __all__ = [
     "MathMode",
     "check_threadgroup",
     "launch_geometry",
+    "lowering_options",
     "normalize_threadgroup",
 ]
 
@@ -36,7 +40,7 @@ class MathMode(enum.StrEnum):
 
 
 @dataclasses.dataclass(frozen=True)
-class CompilerParams(pallas_core.CompilerParams):
+class CompilerParams(pl.CompilerParams):
     """Configure Metal emission and launch options for either Palladium entry point.
 
     Attributes
@@ -45,9 +49,9 @@ class CompilerParams(pallas_core.CompilerParams):
         Default "auto" attempts cooperative lowering for dots on a 2D or 3D grid and
         falls back if recognition fails. "default" forces primitive emission.
         "tensorops" requires cooperative lowering for kernels containing dots.
-        "simdgroup" also requires it, and emits float32 tiled matmuls with
-        `simdgroup_matrix` instead of Metal 4 `matmul2d` where the tile shape allows;
-        that measured about 20% faster on an M2.
+        "simdgroup" also requires it, and emits tiled matmuls and attention with
+        `simdgroup_matrix` instead of Metal 4 `matmul2d` where the tile shape allows.
+        "auto" makes that choice by GPU family.
     program : {"thread", "threadgroup"}, optional
         "thread" (default) runs each Pallas program as one Metal thread, or
         one threadgroup when a dot lowers cooperatively. "threadgroup" runs
@@ -56,17 +60,17 @@ class CompilerParams(pallas_core.CompilerParams):
     threadgroup : int, tuple of int, or None, optional
         One to three positive dimensions, or None for runtime selection. Cooperative
         kernels fix their own size and reject mismatches.
-    math_mode : MathMode, optional
-        FAST by default; RELAXED and SAFE are available through CPU FFI. The mps path
-        accepts FAST only.
+    math_mode : MathMode or str, optional
+        FAST by default; RELAXED and SAFE are available on both entry points. A
+        mode's value, such as "safe", is converted.
     BACKEND : str
         Pallas backend identifier, "palladium"; leave this at its default.
 
     Raises
     ------
     ValueError
-        The dot policy is unknown or threadgroup dimensions are not one to three
-        positive integers.
+        The dot policy, program scope or math mode is unknown, or threadgroup
+        dimensions are not one to three positive integers.
 
     Notes
     -----
@@ -78,7 +82,7 @@ class CompilerParams(pallas_core.CompilerParams):
     BACKEND: str = "palladium"
     dot_general: str = "auto"
     program: str = "thread"
-    threadgroup: int | tuple[int, ...] | None = None
+    threadgroup: SupportsIndex | Sequence[SupportsIndex] | None = None
     math_mode: MathMode = MathMode.FAST
 
     def __post_init__(self) -> None:
@@ -87,21 +91,38 @@ class CompilerParams(pallas_core.CompilerParams):
         if self.program not in PROGRAM_SCOPES:
             raise ValueError("program must be 'thread' or 'threadgroup'")
         normalize_threadgroup(self.threadgroup)
+        # Accepts the mode's value too ("safe"); anything else fails here
+        # rather than at the first dispatch.
+        object.__setattr__(self, "math_mode", MathMode(self.math_mode))
 
     @property
     def threadgroup_dims(self) -> tuple[int, ...] | None:
-        """Return the normalized threadgroup dimensions without changing the stored option.
-
-        Returns
-        -------
-        tuple of int or None
-            An integer option becomes a one-element tuple; None leaves launch selection to
-            the runtime.
-        """
+        """The threadgroup option as a tuple of dimensions, or None for runtime selection."""
         return normalize_threadgroup(self.threadgroup)
 
 
-def normalize_threadgroup(threadgroup: int | tuple[int, ...] | None) -> tuple[int, ...] | None:
+def lowering_options(params: Mapping[str, Any], platform: str) -> CompilerParams:
+    """A `pallas_call`'s Palladium options, or the defaults, when lowering for `platform`.
+
+    Raises
+    ------
+    TypeError
+        The call carries another backend's compiler parameters.
+    """
+    options = params.get("compiler_params")
+    if options is None:
+        return CompilerParams()
+    if not isinstance(options, CompilerParams):
+        raise TypeError(
+            f"pallas_call on {platform} lowers through Palladium, which takes "
+            f"palladium.CompilerParams, not {type(options).__name__}"
+        )
+    return options
+
+
+def normalize_threadgroup(
+    threadgroup: SupportsIndex | Sequence[SupportsIndex] | None,
+) -> tuple[int, ...] | None:
     """Normalize an explicit Metal threadgroup size and validate its dimensions.
 
     Parameters
@@ -128,7 +149,9 @@ def normalize_threadgroup(threadgroup: int | tuple[int, ...] | None) -> tuple[in
     if threadgroup is None:
         return None
     try:
-        values = (threadgroup,) if isinstance(threadgroup, int) else tuple(threadgroup)
+        values = tuple(threadgroup) if isinstance(threadgroup, Iterable) else (threadgroup,)
+        if any(isinstance(t, bool | np.bool_) for t in values):
+            raise TypeError("bool is not a threadgroup dimension")
         result = tuple(operator.index(t) for t in values)
     except TypeError as exc:
         raise ValueError("threadgroup dimensions must be integers") from exc
@@ -137,16 +160,13 @@ def normalize_threadgroup(threadgroup: int | tuple[int, ...] | None) -> tuple[in
     return result
 
 
-def check_threadgroup(spec: KernelSpec, threadgroup: tuple[int, ...] | None) -> None:
+def check_threadgroup(threadgroup: tuple[int, ...] | None) -> None:
     """Validate an explicit threadgroup against the available device thread limit.
 
     Parameters
     ----------
-    spec : KernelSpec
-        Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
-    threadgroup : tuple of int or None, optional
-        One to three positive dimensions, or None for runtime selection. Cooperative
-        kernels require their fixed group size.
+    threadgroup : tuple of int or None
+        One to three positive dimensions, or None for runtime selection.
 
     Raises
     ------
@@ -155,9 +175,8 @@ def check_threadgroup(spec: KernelSpec, threadgroup: tuple[int, ...] | None) -> 
 
     Notes
     -----
-    None or an unavailable device limit skips the check. The specification is accepted for a
-    shared validation interface; this check does not inspect its body or validate shared-
-    memory use.
+    None or an unavailable device limit skips the check. Whether a cooperative kernel
+    accepts the size is checked by ``launch_geometry``.
     """
     max_threads = device_limits().get("max_threads_per_threadgroup")
     if threadgroup and max_threads and math.prod(threadgroup) > max_threads:

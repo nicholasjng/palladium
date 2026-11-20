@@ -12,6 +12,7 @@ import sys
 
 from palladium.device import device_limits
 from palladium.emit import emit_msl_stats
+from palladium.emit.core import EmitStats
 from palladium.emit.tensorops import declared_threadgroup_width
 from palladium.launch import check_threadgroup, launch_geometry
 from palladium.trace import KernelSpec
@@ -60,13 +61,8 @@ class KernelDiagnostics:
     cooperative: bool = False
 
     def __str__(self) -> str:
-        """Format a compact launch and storage report for logs.
-
-        Returns
-        -------
-        str
-            Single-line report; unknown limits and automatic group dimensions are omitted.
-        """
+        """A one-line launch and storage report; unknown limits and automatic group
+        dimensions are omitted."""
         parts = [f"palladium kernel {self.name}: grid={self.grid}"]
         if self.threadgroup is not None:
             parts.append(f"threadgroup={self.threadgroup}")
@@ -103,10 +99,8 @@ def explain_spec(
     threadgroup : tuple of int or None, optional
         One to three positive dimensions, or None for runtime selection. Cooperative
         kernels require their fixed group size.
-    dot_general : {"auto", "default", "tensorops", "simdgroup"}, optional
-        Use cooperative TensorOps when recognized, force primitive emission, require
-        TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
-        respectively. The default is "auto".
+    dot_general, program : str, optional
+        The emission options of `CompilerParams`.
 
     Returns
     -------
@@ -130,8 +124,15 @@ def explain_spec(
     describe declarations rather than compiler-measured stack or register use.
     """
     msl, stats = emit_msl_stats(spec, dot_general=dot_general, program=program)
+    return _diagnostics(spec, msl, stats, threadgroup)
+
+
+def _diagnostics(
+    spec: KernelSpec, msl: str, stats: EmitStats, threadgroup: tuple[int, ...] | None
+) -> KernelDiagnostics:
+    """Describe a kernel that has already been emitted as `msl`."""
     grid, group = launch_geometry(spec, msl, threadgroup)
-    check_threadgroup(spec, group)
+    check_threadgroup(group)
     return KernelDiagnostics(
         name=spec.name,
         grid=grid,
@@ -145,33 +146,13 @@ def explain_spec(
 
 
 def log_compile(
-    spec: KernelSpec,
-    threadgroup: tuple[int, ...] | None = None,
-    dot_general: str = "auto",
-    program: str = "thread",
+    spec: KernelSpec, msl: str, stats: EmitStats, threadgroup: tuple[int, ...] | None = None
 ) -> None:
-    """Print kernel diagnostics when the explain environment flag is enabled.
+    """Print the diagnostics of a newly emitted kernel to stderr when ``PALLADIUM_EXPLAIN``
+    is set to anything but the empty string or "0".
 
-    Parameters
-    ----------
-    spec : KernelSpec
-        Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
-    threadgroup : tuple of int or None, optional
-        One to three positive dimensions, or None for runtime selection. Cooperative
-        kernels require their fixed group size.
-    dot_general : {"auto", "default", "tensorops", "simdgroup"}, optional
-        Use cooperative TensorOps when recognized, force primitive emission, require
-        TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
-        respectively. The default is "auto".
-
-    Notes
-    -----
-    ``PALLADIUM_EXPLAIN`` enables logging for any value except the empty string and "0".
-    This function emits source again when enabled; it does not deduplicate logs. The caller
-    invokes it on cache misses to obtain one line per specialization.
+    The caller passes the source it is about to compile, on cache misses, so each
+    specialization logs one line and is emitted once.
     """
     if os.environ.get("PALLADIUM_EXPLAIN", "") not in ("", "0"):
-        print(
-            explain_spec(spec, threadgroup, dot_general=dot_general, program=program),
-            file=sys.stderr,
-        )
+        print(_diagnostics(spec, msl, stats, threadgroup), file=sys.stderr)

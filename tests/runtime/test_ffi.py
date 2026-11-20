@@ -51,11 +51,9 @@ def test_repeated_calls_reuse_the_cached_kernel(rng):
     x2 = rng.standard_normal((4, 4), dtype=np.float32)
     y = np.ones((4, 4), dtype=np.float32)
 
-    assert len(call._cache) == 0
     r1 = float(composed(x1, y))
-    assert len(call._cache) == 1
     r2 = float(composed(x2, y))
-    assert len(call._cache) == 1  # same shape/dtype: cache hit, not a second entry
+    assert call._specialize.cache_info().misses == 1  # same shape and dtype: traced once
 
     assert r1 == pytest.approx(float(np.sum((x1 + y) ** 2)), rel=1e-4)
     assert r2 == pytest.approx(float(np.sum((x2 + y) ** 2)), rel=1e-4)
@@ -185,3 +183,23 @@ def test_nested_vmap_batches_outer_levels_sequentially(rng):
     f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((8,), jnp.float32))
     xs = rng.standard_normal((3, 5, 8)).astype(np.float32)
     np.testing.assert_array_equal(np.asarray(jax.vmap(jax.vmap(f))(xs)), xs * 3.0)
+
+
+def test_vmap_broadcasts_an_unbatched_aliased_input(rng):
+    """Check that a vmapped kernel whose aliased input is shared by the batch gets one
+    copy of it per batch element, and leaves the caller's array unchanged."""
+
+    def kernel(x_ref, w_ref, o_ref):
+        o_ref[...] = x_ref[...] * 2.0 + w_ref[...]
+
+    f = palladium.metal_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
+        input_output_aliases={0: 0},
+    )
+    x = rng.standard_normal(8, dtype=np.float32)
+    ws = rng.standard_normal((4, 8), dtype=np.float32)
+    kept = x.copy()
+    for call in (jax.vmap(f, in_axes=(None, 0)), jax.jit(jax.vmap(f, in_axes=(None, 0)))):
+        np.testing.assert_array_equal(np.asarray(call(x, ws)), x * 2.0 + ws)
+    np.testing.assert_array_equal(x, kept)

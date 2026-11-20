@@ -1,11 +1,14 @@
 """Tracing Pallas into KernelSpecs."""
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental import pallas as pl
 
+import palladium
 from palladium import trace
 
 
@@ -90,3 +93,32 @@ def test_trace_looks_through_a_jit_wrapper(rng):
     assert wrapped.grid == direct.grid
     assert wrapped.inputs == direct.inputs
     assert wrapped.outputs == direct.outputs
+
+
+def test_compiler_params_validate_and_normalize_their_options():
+    """Options fail when constructed, not at the first dispatch: math modes convert from
+    their values, and threadgroup dimensions are integers other than bool."""
+    safe: Any = "safe"  # typed as MathMode; its value converts
+    assert palladium.CompilerParams(math_mode=safe).math_mode is palladium.MathMode.SAFE
+    bogus: Any = "bogus"
+    with pytest.raises(ValueError, match="bogus"):
+        palladium.CompilerParams(math_mode=bogus)
+    assert palladium.CompilerParams(threadgroup=np.int64(4)).threadgroup_dims == (4,)
+    assert palladium.CompilerParams(threadgroup=[np.int32(4), 2]).threadgroup_dims == (4, 2)
+    invalid: tuple[Any, ...] = (True, (4, False), 2.0, "4", (0,), (1, 1, 1, 1))
+    for bad in invalid:
+        with pytest.raises(ValueError, match="threadgroup"):
+            palladium.CompilerParams(threadgroup=bad)
+
+
+@pytest.mark.parametrize("name", ["my kernel-1", "1x", "é"])
+def test_kernel_name_must_be_an_identifier(name):
+    """The name becomes the Metal function's, so tracing rejects one Metal cannot compile."""
+
+    def kernel(x_ref, o_ref):
+        o_ref[...] = x_ref[...]
+
+    x = jax.ShapeDtypeStruct((8,), jnp.float32)
+    with pytest.raises(palladium.TraceError, match="not a valid identifier"):
+        palladium.trace(pl.pallas_call(kernel, out_shape=x, name=name), x)
+    assert palladium.trace(pl.pallas_call(kernel, out_shape=x, name="scale_2"), x).name == "scale_2"

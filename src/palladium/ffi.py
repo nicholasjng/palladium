@@ -7,22 +7,28 @@ and needs no PJRT plugin.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import math
 import threading
-from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import jax
+import jax.custom_batching
 import numpy as np
 
 from palladium import _runtime
 from palladium.diagnostics import KernelDiagnostics, explain_spec, log_compile
-from palladium.emit import emit_msl
+from palladium.emit import emit_msl, emit_msl_stats
 from palladium.emit.core import CTYPES
 from palladium.errors import DispatchError
-from palladium.launch import CompilerParams, check_threadgroup, launch_geometry
+from palladium.launch import (
+    CompilerParams,
+    check_threadgroup,
+    launch_geometry,
+    lowering_options,
+)
 from palladium.trace import KernelSpec, trace
 
 __all__ = ["FfiCallable", "metal_call"]
@@ -46,23 +52,11 @@ def _register() -> None:
         _registered = True
 
 
-def check_dtypes(args: tuple) -> None:
-    """Reject unsupported input dtypes before they reach MSL emission.
+def check_dtypes(args: Sequence[Any]) -> None:
+    """Raise DispatchError for an input whose dtype has no Metal type.
 
-    Parameters
-    ----------
-    args : tuple of array-like
-        Objects exposing a ``dtype`` attribute, including shape-only examples.
-
-    Raises
-    ------
-    DispatchError
-        An argument is not float32, float16, bfloat16, int32, uint32, or bool.
-
-    Notes
-    -----
-    An empty argument tuple passes. This checks inputs only; individual primitives may
-    support fewer dtypes.
+    `args` are arrays or shape-and-dtype examples. This checks inputs only;
+    individual primitives may support fewer dtypes.
     """
     for i, a in enumerate(args):
         dtype = np.dtype(a.dtype)
@@ -124,52 +118,29 @@ class FfiCallable:
         self._params = params
         self._staged = staged
         self.interpret = interpret
-        # Bounded LRU of (spec, msl, digest) per input shape signature.
-        self._cache: OrderedDict[tuple, tuple[KernelSpec, str, str]] = OrderedDict()
-        # Serialize cache misses: concurrent first calls compile once.
+        self._specialize = functools.lru_cache(maxsize=_CACHE_SIZE)(self._trace_and_emit)
+        # lru_cache alone lets concurrent first calls each trace and emit.
         self._lock = threading.Lock()
         self._pipelined = self._build_pipelined()
 
-    @staticmethod
-    def _shapes(args) -> list[jax.ShapeDtypeStruct]:
-        return [jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args]
-
-    def _spec_and_msl(self, args: tuple[Any, ...]) -> tuple[KernelSpec, str, str]:
-        """Trace and emit for these argument shapes, cached per signature.
-
-        Returns the spec, the MSL text, and its SHA-256 digest, which native
-        caches key on instead of the source itself.
-        """
-        key = tuple((a.shape, np.dtype(a.dtype).str) for a in args)
-        # Lookup and LRU promotion under one lock: a concurrent miss can
-        # evict this entry between the two.
+    def _spec_and_msl(self, args: Sequence[Any]) -> tuple[KernelSpec, str, dict[str, Any]]:
+        """The spec, MSL and launch attributes for arguments of these shapes and
+        dtypes, traced and emitted once per signature."""
+        signature = tuple((tuple(a.shape), np.dtype(a.dtype)) for a in args)
         with self._lock:
-            entry = self._cache.get(key)
-            if entry is not None:
-                self._cache.move_to_end(key)
-        if entry is None:
-            with self._lock:
-                entry = self._cache.get(key)
-                if entry is None:
-                    check_dtypes(tuple(args))
-                    spec = trace(self._staged, *self._shapes(args))
-                    check_threadgroup(spec, self._params.threadgroup_dims)
-                    log_compile(
-                        spec,
-                        self._params.threadgroup_dims,
-                        self._params.dot_general,
-                        self._params.program,
-                    )
-                    msl = emit_msl(
-                        spec,
-                        dot_general=self._params.dot_general,
-                        program=self._params.program,
-                    )
-                    entry = (spec, msl, hashlib.sha256(msl.encode()).hexdigest())
-                    self._cache[key] = entry
-                    if len(self._cache) > _CACHE_SIZE:
-                        self._cache.popitem(last=False)
-        return entry
+            return self._specialize(signature)
+
+    def _trace_and_emit(
+        self, signature: tuple[tuple[tuple[int, ...], np.dtype], ...]
+    ) -> tuple[KernelSpec, str, dict[str, Any]]:
+        params = self._params
+        shapes = [jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in signature]
+        check_dtypes(shapes)
+        spec = trace(self._staged, *shapes)
+        check_threadgroup(params.threadgroup_dims)
+        msl, stats = emit_msl_stats(spec, dot_general=params.dot_general, program=params.program)
+        log_compile(spec, msl, stats, params.threadgroup_dims)
+        return spec, msl, launch_attributes(spec, msl, params)
 
     def explain(self, *args) -> KernelDiagnostics:
         """Report launch geometry, declared storage, and source size without Metal compilation.
@@ -206,7 +177,7 @@ class FfiCallable:
         """
         check_dtypes(args)
         return explain_spec(
-            trace(self._staged, *self._shapes(args)),
+            trace(self._staged, *(jax.ShapeDtypeStruct(a.shape, a.dtype) for a in args)),
             self._params.threadgroup_dims,
             dot_general=self._params.dot_general,
             program=self._params.program,
@@ -252,7 +223,6 @@ class FfiCallable:
         """Under jax.vmap, one FFI call over the whole batch, looped by the
         native handler; unvmapped calls dispatch once. jax.ffi's whole-batch
         methods would dispatch the per-shape grid over batched buffers."""
-        import jax.custom_batching
 
         @jax.custom_batching.custom_vmap
         def pipelined(*args):
@@ -283,16 +253,21 @@ class FfiCallable:
         """Build and invoke the ffi_call. With `axis_size`/`in_batched`
         (batched args carry the batch at axis 0, unbatched ones use stride
         0), the native handler loops over the batch."""
-        batched = in_batched if in_batched is not None else [False] * len(args)
+        batched = list(in_batched) if in_batched is not None else [False] * len(args)
         unbatched = [
             jax.ShapeDtypeStruct(a.shape[1:] if b else a.shape, a.dtype)
             for a, b in zip(args, batched, strict=True)
         ]
-        spec, msl_source, source_id = self._spec_and_msl(tuple(unbatched))
-        grid, threadgroup = launch_geometry(spec, msl_source, self._params.threadgroup_dims)
-        # MRLaunchDesc takes 3 grid dims; a (0, 0, 0) threadgroup lets the
-        # runtime choose.
-        threadgroup = threadgroup or (0, 0, 0)
+        spec, _, attributes = self._spec_and_msl(unbatched)
+        if axis_size is not None:
+            # An aliased input shares its buffer with a batched output, so an
+            # unbatched one needs a copy per batch element.
+            operands = list(args)
+            for i, _ in spec.aliases:
+                if not batched[i]:
+                    operands[i] = jax.numpy.broadcast_to(args[i], (axis_size, *args[i].shape))
+                    batched[i] = True
+            args = tuple(operands)
         in_strides = [
             np.dtype(u.dtype).itemsize * math.prod(u.shape) if b else 0
             for u, b in zip(unbatched, batched, strict=True)
@@ -314,21 +289,64 @@ class FfiCallable:
             input_output_aliases=dict(spec.aliases) or None,
         )(
             *args,
-            source_id=source_id,
-            msl_source=msl_source,
-            function_name=spec.name,
-            grid_x=int(grid[0]),
-            grid_y=int(grid[1]),
-            grid_z=int(grid[2]),
-            threadgroup_x=int(threadgroup[0]),
-            threadgroup_y=int(threadgroup[1]),
-            threadgroup_z=int(threadgroup[2]),
-            math_mode=_runtime.MATH_MODES[self._params.math_mode],
+            **attributes,
             batch_size=1 if axis_size is None else int(axis_size),
             elem_strides=np.asarray(in_strides + out_strides, dtype=np.int64),
         )
         # ffi_call returns a list for several outputs; pallas_call a tuple.
         return tuple(outs) if len(out_structs) > 1 else outs
+
+
+def launch_attributes(spec: KernelSpec, msl_source: str, params: CompilerParams) -> dict[str, Any]:
+    """The `palladium_dispatch` attributes describing one launch of `msl_source`.
+
+    The CPU FFI handler and the `metal` PJRT compiler read the same attributes,
+    plus `batch_size` and `elem_strides`, which the caller adds.
+    """
+    grid, threadgroup = launch_geometry(spec, msl_source, params.threadgroup_dims)
+    return {
+        # Native caches key on the digest instead of the source itself.
+        "source_id": hashlib.sha256(msl_source.encode()).hexdigest(),
+        "msl_source": msl_source,
+        "function_name": spec.name,
+        **{f"grid_{axis}": size for axis, size in zip("xyz", grid)},
+        # A (0, 0, 0) threadgroup lets the runtime choose.
+        **{f"threadgroup_{axis}": size for axis, size in zip("xyz", threadgroup or (0, 0, 0))},
+        "math_mode": _runtime.MATH_MODES[params.math_mode],
+    }
+
+
+def pallas_lowering(ctx, *in_nodes, interpret: Any = False, **params):
+    """Lower one `pallas_call` for the `metal` PJRT platform.
+
+    Emits the same `palladium_dispatch` custom call as `metal_call`; the
+    plugin's compiler turns it into a launch inside the program's command
+    buffers. With `interpret=True`, JAX's own rule lowers the interpreter.
+    """
+    if interpret:
+        from jax._src.interpreters import mlir  # JAX's default rule has no public name
+        from jax.experimental import pallas as pl
+
+        default = mlir._lowerings[pl.pallas_call_p].rule
+        return default(ctx, *in_nodes, interpret=interpret, **params)
+    from palladium.trace import spec_from_params
+
+    options = lowering_options(params, "metal")
+    spec = spec_from_params(params)
+    check_dtypes(ctx.avals_in)
+    check_threadgroup(options.threadgroup_dims)
+    msl_source = emit_msl(spec, dot_general=options.dot_general, program=options.program)
+    rule = jax.ffi.ffi_lowering(
+        _TARGET_NAME,
+        operand_output_aliases=dict(spec.aliases) or None,
+    )
+    return rule(
+        ctx,
+        *in_nodes,
+        **launch_attributes(spec, msl_source, options),
+        batch_size=1,
+        elem_strides=np.zeros(len(ctx.avals_in) + len(ctx.avals_out), dtype=np.int64),
+    )
 
 
 def metal_call(kernel: Callable, **pallas_kwargs) -> FfiCallable:
@@ -357,7 +375,7 @@ def metal_call(kernel: Callable, **pallas_kwargs) -> FfiCallable:
     Notes
     -----
     Tracing, dtype validation, and Metal compilation are deferred until use. This path
-    requires the native FFI library and a Metal device, but does not require jax-mps. One
+    requires the native FFI library and a Metal device, but not the PJRT plugin. One
     vmap level batches dispatches in one native call; outer levels run sequentially.
     Gradients require an explicit backward implementation via ``with_vjp``. FAST math is the
     default; use SAFE for compensated arithmetic and strict NaN or signed-zero behavior.
