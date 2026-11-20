@@ -41,16 +41,20 @@ and keep `pallas_call` with BlockSpecs for simple kernels:
 ```python
 mesh = plmtl.Mesh(grid=(m // 64, n // 64), simdgroups=4)
 
+
 @functools.partial(
     pl.kernel,
     out_type=jax.ShapeDtypeStruct((m, n), jnp.float32),
     mesh=mesh,
-    scratch_types=[plmtl.THREADGROUP((64, 20), jnp.float32),
-                   plmtl.THREADGROUP((16, 68), jnp.float32)],
+    scratch_types=[
+        plmtl.THREADGROUP((64, 20), jnp.float32),
+        plmtl.THREADGROUP((16, 68), jnp.float32),
+    ],
 )
 def matmul(a_ref, b_ref, out_ref, a_tile, b_tile):
     i, j = lax.axis_index("x"), lax.axis_index("y")
     acc = plmtl.zeros_fragments((64, 64), jnp.float32)  # fragment layout
+
     def step(kb, acc):
         plmtl.copy(a_ref.at[pl.ds(i * 64, 64), pl.ds(kb * 16, 16)], a_tile)
         plmtl.copy(b_ref.at[pl.ds(kb * 16, 16), pl.ds(j * 64, 64)], b_tile)
@@ -58,6 +62,7 @@ def matmul(a_ref, b_ref, out_ref, a_tile, b_tile):
         acc = plmtl.mma(acc, a_tile, b_tile)  # serpentine, unrolled
         plmtl.barrier()
         return acc
+
     acc = lax.fori_loop(0, k // 16, step, acc)
     out_ref[pl.ds(i * 64, 64), pl.ds(j * 64, 64)] = acc
 ```
