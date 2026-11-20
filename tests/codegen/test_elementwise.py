@@ -163,3 +163,30 @@ def test_expm1_and_log1p_keep_precision_near_zero():
     )
     want = np.expm1(x.astype(np.float64)) + np.log1p(x.astype(np.float64))
     np.testing.assert_allclose(call(x), want.astype(np.float32), rtol=1e-6)
+
+
+def test_erfc_keeps_relative_accuracy_in_the_tail(rng):
+    """1 - erf(x) would lose every digit of a small result; exact GELU reads it."""
+    x = np.linspace(-4, 6, 4 * 32, dtype=np.float32).reshape(4, 32)
+
+    def kernel(x_ref, erfc_ref, gelu_ref):
+        erfc_ref[...] = jax.scipy.special.erfc(x_ref[...])
+        gelu_ref[...] = jax.nn.gelu(x_ref[...], approximate=False)
+
+    spec = jax.ShapeDtypeStruct((4, 32), jnp.float32)
+    f = palladium.metal_call(kernel, out_shape=(spec, spec))
+    for got, want in zip(f(x), f.interpret(x), strict=True):
+        np.testing.assert_allclose(got, want, rtol=2e-5, atol=1e-30)
+
+
+def test_functions_with_custom_derivatives_are_inlined(rng):
+    """`jax.nn.softmax` and its relatives stage a `custom_jvp_call` around
+    ordinary primitives, and a `stop_gradient` inside it."""
+
+    def kernel(x_ref, o_ref):
+        x = x_ref[...]
+        o_ref[...] = jax.nn.softmax(x, axis=-1) + jax.nn.log_softmax(x, axis=-1) + jax.nn.relu(x)
+
+    x = rng.standard_normal((4, 32), dtype=np.float32)
+    f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((4, 32), jnp.float32))
+    np.testing.assert_allclose(f(x), f.interpret(x), rtol=1e-5, atol=1e-6)

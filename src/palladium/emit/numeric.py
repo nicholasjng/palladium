@@ -97,6 +97,25 @@ HELPERS: dict[str, tuple[str, str]] = {
     return x < 0.0f ? -y : y;
 }""",
     ),
+    # Numerical Recipes' erfcc: a relative error below 1.2e-7 everywhere, where
+    # 1 - erf(x) would lose every digit of a small result.
+    "erfc": (
+        "pd_erfc",
+        """inline float pd_erfc(float x) {
+    float z = fabs(x);
+    float t = 1.0f / fma(0.5f, z, 1.0f);
+    float p = fma(t, 0.17087277f, -0.82215223f);
+    p = fma(t, p, 1.48851587f);
+    p = fma(t, p, -1.13520398f);
+    p = fma(t, p, 0.27886807f);
+    p = fma(t, p, -0.18628806f);
+    p = fma(t, p, 0.09678418f);
+    p = fma(t, p, 0.37409196f);
+    p = fma(t, p, 1.00002368f);
+    float r = t * exp(fma(t, p, -z * z - 1.26551223f));
+    return x >= 0.0f ? r : 2.0f - r;
+}""",
+    ),
     "erf_inv": (
         "pd_erfinv",
         """inline float pd_erfinv(float x) {

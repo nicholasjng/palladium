@@ -139,3 +139,101 @@ def _rule_dynamic_slice(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None
         )
         dst_flat = flat_index(list(zip(idx, dst_strides, strict=True)))
         cursor.emit(f"{dst.at(dst_flat)} = {src.at(src_flat)};")
+
+
+@rule("rev")
+def _rule_rev(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """`jnp.flip`: the operand read backwards along the given dimensions."""
+    src = env.val(eqn.invars[0])
+    dst = declare(env, cursor, eqn.outvars[0])
+    reversed_dims = tuple(eqn.params["dimensions"])
+    strides = element_strides(dst.shape)
+    with cursor.loop_nest(dst.shape, "_r") as idx:
+        mirrored = [
+            f"({n - 1} - {i})" if d in reversed_dims else i
+            for d, (i, n) in enumerate(zip(idx, dst.shape, strict=True))
+        ]
+        src_flat = flat_index(list(zip(mirrored, strides, strict=True)))
+        dst_flat = flat_index(list(zip(idx, strides, strict=True)))
+        cursor.emit(f"{dst.at(dst_flat)} = {src.at(src_flat)};")
+
+
+@rule("pad")
+def _rule_pad(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """`lax.pad`: each output element is the operand's where its position maps
+    onto one, and the padding value on the border and between interior-padded
+    elements. Negative padding crops."""
+    src, value = env.val(eqn.invars[0]), env.val(eqn.invars[1])
+    dst = declare(env, cursor, eqn.outvars[0])
+    src_strides = element_strides(src.shape)
+    dst_strides = element_strides(dst.shape)
+    with cursor.loop_nest(dst.shape, "_p") as idx:
+        conditions, coords = [], []
+        for i, n, (low, _, interior) in zip(idx, src.shape, eqn.params["padding_config"]):
+            shifted, step = f"((int){i} - ({int(low)}))", int(interior) + 1
+            conditions += [f"{shifted} >= 0", f"{shifted} <= {(n - 1) * step}"]
+            if step > 1:
+                conditions.append(f"{shifted} % {step} == 0")
+            coords.append(f"({shifted} / {step})" if step > 1 else shifted)
+        src_flat = flat_index(list(zip(coords, src_strides, strict=True)))
+        dst_flat = flat_index(list(zip(idx, dst_strides, strict=True)))
+        inside = " && ".join(conditions) or "true"
+        cursor.emit(f"{dst.at(dst_flat)} = ({inside}) ? {src.at(src_flat)} : {value.at('0')};")
+
+
+@rule("argmax", "argmin")
+def _rule_argmax(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """`jnp.argmax` / `argmin` along one axis: the first index of the extremum,
+    or of the first NaN, as JAX defines them."""
+    src = env.val(eqn.invars[0])
+    (axis,) = eqn.params["axes"]
+    dst = declare(env, cursor, eqn.outvars[0])
+    floating = src.ctype in ("float", "half", "bfloat")
+    compare = ">" if eqn.primitive.name == "argmax" else "<"
+    src_strides = element_strides(src.shape)
+    dst_strides = element_strides(dst.shape)
+    with cursor.loop_nest(dst.shape, "_a") as idx:
+        best, at = cursor.fresh("best"), cursor.fresh("at")
+
+        def element(k: str) -> str:
+            coords = [*idx[:axis], k, *idx[axis:]]
+            return src.at(flat_index(list(zip(coords, src_strides, strict=True))))
+
+        cursor.emit(f"{src.ctype} {best} = {element('0')};")
+        cursor.emit(f"{dst.ctype} {at} = 0;")
+        with cursor.loop(src.shape[axis], "_k") as k:
+            candidate = cursor.fresh("v")
+            better = f"{candidate} {compare} {best}"
+            if floating:
+                better = f"({better} || (isnan({candidate}) && !isnan({best})))"
+            cursor.emit(f"{src.ctype} {candidate} = {element(k)};")
+            cursor.emit(f"if ({better}) {{ {best} = {candidate}; {at} = ({dst.ctype}){k}; }}")
+        target = (
+            dst.at(flat_index(list(zip(idx, dst_strides, strict=True)))) if dst.shape else dst.expr
+        )
+        cursor.emit(f"{target} = {at};")
+
+
+@rule("slice")
+def _rule_slice(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """`x[a:b:s]` on a value: the elements at static starts and strides."""
+    src = env.val(eqn.invars[0])
+    dst = declare(env, cursor, eqn.outvars[0])
+    starts = eqn.params["start_indices"]
+    steps = eqn.params["strides"] or (1,) * len(starts)
+    src_strides = element_strides(src.shape)
+    dst_strides = element_strides(dst.shape)
+    with cursor.loop_nest(dst.shape, "_s") as idx:
+        coords = [
+            f"({int(a)} + {i} * {int(t)})" for i, a, t in zip(idx, starts, steps, strict=True)
+        ]
+        src_flat = flat_index(list(zip(coords, src_strides, strict=True)))
+        dst_flat = flat_index(list(zip(idx, dst_strides, strict=True)))
+        cursor.emit(f"{dst.at(dst_flat)} = {src.at(src_flat)};")
+
+
+@rule("copy", "copy_p", "stop_gradient")
+def _rule_identity(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """Values are immutable once bound, so a copy is the value itself, and a
+    kernel has no gradient to stop."""
+    env.bind(eqn.outvars[0], env.val(eqn.invars[0]))
