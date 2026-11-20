@@ -7,8 +7,9 @@ that share the buffers' unified memory, and goes on with the results.
 
 `jax.pure_callback`, `jax.experimental.io_callback`, `jax.debug.callback`,
 `jax.debug.print` and `checkify` checks lower this way, as does dense linear
-algebra (Cholesky, triangular solves, LU, QR, symmetric eigendecomposition and
-SVD), which runs on LAPACK through NumPy and SciPy. A host step ends the
+algebra (Cholesky, triangular solves, LU, QR and its Householder form,
+symmetric eigendecomposition, SVD, and the Hessenberg, tridiagonal and real
+Schur forms), which runs on LAPACK through NumPy and SciPy. A host step ends the
 command buffer in flight, so a program with one does not pipeline.
 """
 
@@ -281,6 +282,50 @@ def _svd(ctx, x, *, full_matrices, compute_uv, subset_by_index, algorithm=None):
     return emit(ctx, "svd", _typed(function, ctx), [x])
 
 
+def _lapack(ctx, name: str, operands, routine: str, results, **options):
+    """A host call of one LAPACK routine per batch element. `results` picks,
+    from the routine's return values, the ones the primitive returns."""
+    import scipy.linalg
+
+    cores = (2, 1)[: len(operands)]
+
+    def one(*arrays):
+        (function,) = scipy.linalg.get_lapack_funcs((routine,), arrays[:1])
+        returned = function(*arrays, **options)
+        return [returned[k] for k in results]
+
+    return emit(ctx, name, _typed(lambda *arrays: _batched(one, cores, *arrays), ctx), operands)
+
+
+def _geqrf(ctx, a):
+    return _lapack(ctx, "geqrf", [a], "geqrf", (0, 1))
+
+
+def _householder_product(ctx, a, taus):
+    return _lapack(ctx, "householder_product", [a, taus], "orgqr", (0,))
+
+
+def _hessenberg(ctx, a):
+    return _lapack(ctx, "hessenberg", [a], "gehrd", (0, 1))
+
+
+def _tridiagonal(ctx, a, *, lower):
+    return _lapack(ctx, "tridiagonal", [a], "sytrd", (0, 1, 2, 3), lower=lower)
+
+
+def _schur(ctx, x, *, compute_schur_vectors, sort_eig_vals, select_callable):
+    import scipy.linalg
+
+    if sort_eig_vals:
+        raise NotImplementedError("schur with sorted eigenvalues is not implemented on metal")
+
+    def one(a):
+        form, vectors = scipy.linalg.schur(a, output="real", check_finite=False)
+        return (form, vectors) if compute_schur_vectors else (form,)
+
+    return emit(ctx, "schur", _typed(lambda a: _batched(one, (2,), a), ctx), [x])
+
+
 def register() -> None:
     """Register the host lowering rules for the `metal` platform."""
     rules = {
@@ -295,6 +340,11 @@ def register() -> None:
         linalg.qr_p: _qr,
         linalg.eigh_p: _eigh,
         linalg.svd_p: _svd,
+        linalg.geqrf_p: _geqrf,
+        linalg.householder_product_p: _householder_product,
+        linalg.hessenberg_p: _hessenberg,
+        linalg.tridiagonal_p: _tridiagonal,
+        linalg.schur_p: _schur,
     }
     for primitive, rule in rules.items():
         # A rule that closes over a Python function must run for every call.

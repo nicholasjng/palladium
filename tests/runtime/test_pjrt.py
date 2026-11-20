@@ -1486,6 +1486,11 @@ def test_linear_algebra_matches_cpu():
             "singular values": (lambda x: jnp.linalg.svd(x, compute_uv=False), x),
             "pinv": (jnp.linalg.pinv, x),
             "normal log density": (lambda a, x: jax.scipy.stats.multivariate_normal.logpdf(x[:, :4], jnp.zeros(4), a), a, x),
+            "householder qr": (lambda x: lax.linalg.householder_product(*jax._src.lax.linalg.geqrf(x)), x),
+            "hessenberg": (lambda g: jax.scipy.linalg.hessenberg(g, calc_q=True), x[:5]),
+            "tridiagonal": (lambda a: lax.linalg.tridiagonal(a, lower=True), a),
+            "schur": (jax.scipy.linalg.schur, x[:5]),
+            "schur batch": (lax.linalg.schur, np.stack([x[:5], x[1:], x[:5].T])),
             "cholesky gradient": (jax.grad(lambda m: jnp.linalg.cholesky(m).sum()), a),
             "eigh gradient": (jax.grad(lambda m: jnp.linalg.eigh(m)[0].sum()), a),
         }
@@ -1493,7 +1498,7 @@ def test_linear_algebra_matches_cpu():
             assert_matches_cpu(fn, *args, rtol=2e-4, err_msg=name)
         print(len(cases))
     """)
-    assert out.strip() == "22"
+    assert out.strip() == "27"
 
 
 def test_sorts_match_cpu():
