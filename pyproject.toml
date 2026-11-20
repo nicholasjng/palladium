@@ -11,7 +11,7 @@ license = "Apache-2.0"
 authors = [{ name = "Nicholas Junge", email = "nicho.junge@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = [
-    "jax>=0.11",
+    "jax>=0.12,<0.13",
 ]
 
 [project.entry-points.jax_plugins]
@@ -27,6 +27,7 @@ cmake.build-type = "Release"
 [dependency-groups]
 build = ["scikit-build-core>=1.0"]
 dev = [
+    "coverage>=7.10",
     "diffrax>=0.6",
     "hypothesis>=6.100",
     "mew-bench>=0.1.0",
@@ -34,25 +35,17 @@ dev = [
     "ruff>=0.6",
     "ty>=0.0.66",
 ]
-mps = ["jax-mps>=0.11.1"]
-# jax-mps requires jax<0.12. Without the mps group, take the newest jax;
-# sync the plugin with `uv sync --group mps --no-group latest-jax`.
-latest-jax = ["jax>=0.12", "jaxlib>=0.12"]
 
 [tool.uv]
 no-build-isolation-package = ["palladium"]
-default-groups = ["build", "dev", "latest-jax"]
-conflicts = [[{ group = "mps" }, { group = "latest-jax" }]]
-
-[tool.uv.sources]
-jax-mps = { path = "../jax-mps" }
+default-groups = ["build", "dev"]
 
 [tool.uv.extra-build-dependencies]
 palladium = ["jax"]
 
 [tool.ty.environment]
 # Tests and benchmarks import the shared workloads from examples/.
-extra-paths = ["examples", "tests"]
+extra-paths = ["benchmarks", "examples", "tests"]
 
 [tool.ty.analysis]
 # Optional dependencies of the SBI examples and the torch benchmark.
@@ -60,6 +53,7 @@ allowed-unresolved-imports = ["torch", "sbi.**", "matplotlib.**"]
 
 [tool.mew]
 benchpaths = ["benchmarks"]
+setup = "benchmarks/conf.py"
 
 [tool.pytest.ini_options]
 markers = [
@@ -67,6 +61,17 @@ markers = [
 ]
 addopts = '-m "not fuzz"'
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["src/palladium"]
+branch = true
+# The plugin tests run jax in subprocesses, since JAX_PLATFORMS is read once.
+patch = ["subprocess"]
+parallel = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
 
 [tool.ruff]
 line-length = 100
