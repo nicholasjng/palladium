@@ -122,7 +122,7 @@ asynchronously with pooled buffers: fused elementwise and index maps
 (single-result SIMD-group kernels; variadic reducers such as argmax as a
 sequential fold), floating `dot_general` through the existing Pallas GEMM
 emitter, static counted `while`, pure cond/switch, gather and scatter-add,
-and 64-bit integers for threefry RNG. Dynamic `while` remains unsupported.
+and 64-bit integers for threefry RNG. Dynamic `while` came on 2026-11-19.
 The common API cases (compile, analysis, donation, deletion in flight,
 multi-threaded dispatch) have tests. The full SBI step matches CPU over ten
 steps within normwise rtol 1e-4 per array; on 2026-11-02 the criteria moved
@@ -219,19 +219,113 @@ split K. Summed GPU time per step, each launch alone: 26.5 ms at first,
 from 46.5 to 12.8 to 5.4–7.1 ms. No launch now takes more than about
 0.25 ms; the largest are fused elementwise and packing kernels.
 
+M5 on the real model (2026-11-19, M2, 16 GB): `examples/sam2` is SAM2 in
+plain JAX (Hiera trunk, neck, prompt encoder, mask decoder, LoRA on the
+trunk's qkv projections), ported from qgis-segment's MLX port. On `metal`
+with the `sam2.1_hiera_tiny` weights at 256 px, its logits agree with MLX
+within 2.3e-6 normwise, with and without adapters, and three AdamW steps
+give MLX's losses within 4e-6. A LoRA step (rank 4, batch 1) at 1024 px
+takes 0.96 s against 3.1 s on XLA:CPU, the GPU busy 0.93 s of it, in one
+command buffer of 1,556 launches; at 256 px with batch 2, 105 ms against
+281 ms. One run each, on battery. It needed the buffer limit respected in
+reductions, and storage shared between intermediates with disjoint
+lifetimes: without it the step exhausted the GPU's memory at 1024 px.
+MLX 0.32.4 cannot train this model on the GPU (its attention kernel has no
+VJP there), so the MLX baseline is CPU only.
+
+The op gaps that kept other programs off `metal` closed on the same day:
+dynamic `while`, host callbacks, dense linear algebra, sort, cumulative
+reductions, general scatter and reducers, integer dots, grouped
+convolutions and `rng_bit_generator` (`notes/metal-pjrt-plugin.md`). Of 143
+jax functions run against XLA:CPU, 137 agree; the others need complex
+numbers, or are the `rbg` generator, whose bits may differ. diffrax solves
+on `metal` now, slowly: its nested loops wait for the GPU several times
+per step.
+
+M4, first measurement (2026-11-19, M2, 16 GB): `examples/lora` is
+Qwen2.5-0.5B-Instruct in plain JAX with mlx-lm's default LoRA (rank 8,
+scale 20, every linear layer of the last 16 blocks, Adam at 1e-5 without
+bias correction) and its loss. On `metal` in float32, its logits agree with
+mlx-lm 0.32.2 within 2.9e-6 normwise, and five training steps give mlx-lm's
+losses within 4e-6. A step on 4 sequences of 129 tokens takes 945 ms in
+float32 and, with bfloat16 weights, 812 ms on the bfloat16 GEMM (374
+tokens/s; 944 ms with the operands upcast to float32,
+`accumulate_float32`), against 2.5 s on XLA:CPU and, for mlx-lm on the same
+batches, 625 ms in float32 and 546 ms in bfloat16 (556 tokens/s, peak
+memory 2.3 GB). One run of five steps each, on battery. The step is one
+command buffer of about 3,200 launches, the GPU busy for all of it. So the
+loss curve target holds and the speed target does not yet: mlx-lm is 1.5
+times faster. Each step allocates 2.3 GB
+of new buffers when steps are queued without waiting, since each then
+starts before the one before it has returned its buffers; synchronizing
+every step removes all of them and saves 3%, so allocation is not the gap.
+
+Where the time goes (profile by launch, `PALLADIUM_PJRT_PROFILE`, same
+day): the step's products are 0.94 TFLOP, which the GEMM runs in about 410
+ms (bfloat16), at 1.3 to 1.8 TFLOPS for the 512-row products against 2.5 at
+the roofline. The gradient through the head (K = 151,936 onto 512x896)
+runs at 1.0 TFLOPS and takes 85 to 135 ms; the forward head, at 2.56, takes
+55. The other half is kernels that pack GEMM operands: 4.7 GB written per
+step at about 9 GB/s, a tenth of the copy bandwidth. One of them takes 100
+ms by itself: the 151,936x896 embedding table transposed for the head, on
+every step. Computing a product as the transpose of its mirror, where that
+reads the large operand in storage order, removed the transposed 512x4864
+copies and gained 1%, so it was not kept; why the remaining packing kernels
+are slow is open, and the profile overstates small launches. Not measured:
+peak memory on `metal`.
+
+Remaining for M4:
+- The head: a GEMM that reads a transposed operand, instead of a copy of
+  the table per step, and split K for its gradient.
+- Why packing runs at a tenth of the bandwidth; the GEMM at 512 rows.
+- Half-precision adapters and optimizer state, as far as mlx-lm has them.
+- The same comparison on the M4 Pro, on a real dataset, for more steps.
+
+M5 against MLX, forward only (2026-11-20, M2, on battery, one run of five
+calls each): MLX 0.32.4 runs the same forward on the GPU in 243 ms at 1024
+px and 30.5 ms at 256 px with batch 2; `metal` took 318 and 38.6 ms. Its
+LoRA step runs on the CPU only, in 7.4 s. By launch
+(`PALLADIUM_PJRT_PROFILE`), the three global attention blocks were about
+97 of the 311 ms: the port wrote out a 4x4096x4096 score matrix, ran the
+softmax over it in two reductions and an elementwise pass, and multiplied
+again, where MLX has one fused kernel. With `Sam2Config.fused_attention`
+those blocks run on the flash-attention kernels of
+`examples/flash_attention.py`, forward and backward: the forward takes 267
+to 271 ms with logits within 3.7e-6 of MLX, the LoRA step 895 ms instead
+of 1,046 with the same loss; 256 px does not change. Of the 261 ms left in
+the forward, the GEMMs are 100 (0.37 TFLOP), the attention kernels 52, and
+109 are reductions and elementwise kernels around them.
+
+Two changes in the plugin, same day, on AC power (which alone made every
+figure about 10% faster: MLX's forward is 217 ms there, and the port
+without either change 278): a reduction stores an operand that other nodes
+read too when computing it binds more than two buffers, and the compiler
+recognizes plain attention (`stablehlo/attention.py`). A layer norm read a
+fused residual sum of up to 30 buffers three times, in two reductions and
+the normalization. Storing it took the forward from 265 to 224 ms on
+battery; reducing each row in one thread instead of 128 added 2% on top
+and cost 30% where the operand stayed fused, so that was not kept. With
+both changes the plain port runs the forward in 197 ms at 1024 px and 29.5
+ms at 256 px, and the LoRA step in 802 ms, or 686 ms with
+`fused_attention`, which still matters for training: in a gradient the
+probabilities have other readers, so the recognizer leaves the graph as
+written. The Qwen step does not change, since its attention is causal and
+its norms read few buffers.
+
 Remaining for M5:
 - The baseline: qgis-segment's PyTorch MPS fine-tune and jax-mps, on the
-  same model and data, and the JAX port of SAM2's image encoder (Hiera) and
-  mask decoder that it needs.
-- Depthwise (grouped) convolutions, in SAM2's memory encoder; the image
-  encoder and mask decoder need none.
+  same model and data.
+- Recognizing attention with a mask, and its gradient, so training needs
+  no option either; the operands of a recognized attention are still
+  copied into the kernel's layout where a reshape or transpose hides that
+  they are stored that way.
+- The same step on the M4 Pro, and on real tiles with the torch trainer's
+  batch size.
+- Where the 0.93 s of GPU time at 1024 px goes, launch by launch.
 - Split-K for half types (float32 partials from half operands), and reading
   K chunks in place instead of copying the left operand.
 - First-step compile time, 3× CPU's for this step.
 
-Work that costs time without proving anything: a JAX port of SAM2's image
-encoder and mask decoder (SAM2 is PyTorch) for M5, and a small JAX LoRA
-training stack for M4.
 
 ## MLIR, an `applegpu` dialect, and PDLL
 
