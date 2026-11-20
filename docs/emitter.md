@@ -13,10 +13,24 @@ JAX produces the specification and where dispatch happens.
 ## 1. Choose the execution model
 
 `emit_msl` delegates to `emit_msl_stats` and returns only its source result.
-The latter validates the dot policy and may attempt the cooperative TensorOps
-compiler. A scan-containing candidate goes to attention recognition;
-otherwise it goes to matmul recognition. Under `"auto"`, an `EmitError` from
-recognition or cooperative emission causes primitive fallback.
+The latter picks one of four lowerings:
+
+- a `plmtl.kernel` on a mesh goes to the mesh-program lowering
+  ([`mesh.py`](../src/palladium/emit/mesh.py)): one threadgroup per program,
+  with dots on SIMD-group matrix fragments;
+- `program="threadgroup"` goes to the row-program lowering
+  ([`threadgroup.py`](../src/palladium/emit/threadgroup.py)): one threadgroup
+  per tile of rows, each thread owning some columns of a row;
+- a kernel with a dot may go to the cooperative TensorOps compiler, depending
+  on the dot policy. A scan-containing candidate goes to attention
+  recognition; otherwise it goes to matmul recognition. Under `"auto"`, an
+  `EmitError` from recognition or cooperative emission causes primitive
+  fallback;
+- everything else, and that fallback, is primitive emission: one Metal thread
+  per program. Sections 2 to 5 describe it.
+
+Mesh and row programs raise `EmitError` for kernels outside their vocabulary;
+they have no fallback.
 
 Primitive emission runs once with ordinary input snapshots. If declared
 thread storage reaches 512 bytes, it emits again with eligible input-load
@@ -26,28 +40,33 @@ about the Metal compiler's register allocation.
 
 ## 2. Assemble parameters and program-local Refs
 
-The primitive path binds inputs, then outputs, to successive `[[buffer(k)]]`
+Primitive emission binds inputs, then outputs, to successive `[[buffer(k)]]`
 indices. Inputs use `const device` pointers and outputs use writable `device`
 pointers. `_pid` is `thread_position_in_grid`, so each thread runs an entire
 Pallas program, including its serial loops and block operations.
 
-For a contiguous block, its origin is computed from the `BlockSpec` index map:
+Each Ref starts as a pointer to its block's origin, computed from the
+`BlockSpec` index map:
 
 ```text
 element_offset = sum(block_index[d] * full_block_extent[d] * array_stride[d])
 ```
 
-The map is itself a jaxpr, lowered by the same rule walker. Constant-only maps
-can fold to literal offsets. `BlockLayout` supplies physical extents and
-strides; `CExpr` keeps sums and products structured so zero and unit terms can
-be removed without parsing MSL text.
+The map is itself a jaxpr, lowered by the same rule walker, and a map of
+constants folds to a literal offset. `flat_index` renders such sums of
+index-times-stride terms, dropping zero terms and unit factors, for block
+origins, element addresses and Ref views alike.
 
-Strided blocks and partial edge tiles instead carry a logical-to-physical
-index template plus a bounds predicate. Invalid edge loads use dtype-specific
-Pallas padding; invalid stores are skipped. Ref indexing composes scalar
-indices and positive static slice strides with this layout. This guarding
-supports partial tiles; it does not establish safety for arbitrary user-supplied
-out-of-range indices.
+A block that spans the array's trailing dimensions is contiguous from that
+pointer. Any other block, which includes every two-dimensional tile, also
+carries a template that maps a logical element index to its offset from the
+origin. A block that reaches past the end of its array additionally carries
+a bounds predicate: invalid loads use dtype-specific Pallas padding and
+invalid stores are skipped. Blocks inside the array need no predicate and can
+be read and written in place like contiguous ones, element by element. Ref
+indexing composes scalar indices and positive static slice strides with
+these layouts. The guards support partial tiles; they do not establish
+safety for arbitrary user-supplied out-of-range indices.
 
 Scratch Refs become uninitialized per-thread declarations. They follow input
 and output Refs in the kernel body's operand order and must be written before
@@ -58,7 +77,7 @@ being read.
 | Abstraction | What it holds | Why it matters |
 |---|---|---|
 | `CVal` | Expression, logical shape, MSL type, address space, readonly status, alignment, and optional layout/lazy-expression templates | Lets rules reason about how to access a value without losing storage facts |
-| `Environment` | Var-to-CVal bindings, producer/consumer information, escaping values, and inlined-JIT output links | Enables local optimizations while checking whether other uses can observe them |
+| `Environment` | Var-to-CVal bindings, producer/consumer information, escaping values, inlined-JIT output links, and the number of bindings holding each declared variable | Enables local optimizations while checking whether other uses can observe them |
 | `Cursor` | Indented source lines, deterministic fresh names, helper functions, and declared-storage counters | Gives primitive and cooperative emitters a common way to write typed MSL |
 
 `emit_jaxpr` binds inputs, rebuilds use information for that jaxpr level, and
@@ -115,9 +134,11 @@ Several optimizations depend on observable reads and writes, not just shapes:
   consumed only as scanned inputs can be read as device views. Other uses,
   constants, or aliasing may require local snapshots.
 
-Static for loops arrive as scans. `ScanShape` identifies constants, carries,
-and scanned values from abstract-value relationships in JAX 0.11's staged
-form. Reverse scans reverse iteration while preserving stacked-output
+Static for loops arrive as scans, whose operands split into constants,
+carries, and scanned values by the scan's own input tree (`scan_operands`). A
+carry takes over its initial value's thread-local variable when no other
+binding holds that variable (`Environment.storage_users`), and gets a copy
+otherwise. Reverse scans reverse iteration while preserving stacked-output
 positions. While loops emit condition evaluation and a break inside a loop;
 conditionals emit branch chains. Each independent program can take a different
 branch or trip count.
@@ -155,10 +176,12 @@ data. Typed tensor views and operation descriptors live in
 [`tensorops/_shared.py`](../src/palladium/emit/tensorops/_shared.py);
 [`softmax.py`](../src/palladium/emit/tensorops/softmax.py) emits the row updates.
 
-Cooperative source uses `threadgroup_position_in_grid`. `launch_geometry`
-detects that marker, fixes the threadgroup to four SIMD groups, and scales the
-thread grid's first axis. Both MPS and CPU FFI use that calculation, including
-after an automatic fallback to primitive emission.
+Cooperative source, like mesh and row programs, uses
+`threadgroup_position_in_grid` and declares its group width in a
+`// palladium: threadgroup width N` line. `launch_geometry` reads that line,
+fixes the threadgroup to that width, and scales the thread grid's first axis.
+Every dispatch path uses that calculation, including after an automatic
+fallback to primitive emission.
 
 ## 7. Read the output and validate a change
 
@@ -170,15 +193,24 @@ import jax.experimental.pallas as pl
 import jax.numpy as jnp
 import palladium
 
+
 def saxpy(x, y, out):
     out[...] = 2.0 * x[...] + y[...]
 
+
 shape = jax.ShapeDtypeStruct((8,), jnp.float32)
 block = pl.BlockSpec((1,), lambda i: (i,))
-print(palladium.debug_msl(
-    saxpy, shape, shape,
-    grid=(8,), in_specs=(block, block), out_specs=block, out_shape=shape,
-))
+print(
+    palladium.debug_msl(
+        saxpy,
+        shape,
+        shape,
+        grid=(8,),
+        in_specs=(block, block),
+        out_specs=block,
+        out_shape=shape,
+    )
+)
 ```
 
 Follow the two input buffer bindings, `_pid.x`-derived offsets, scalar loads,

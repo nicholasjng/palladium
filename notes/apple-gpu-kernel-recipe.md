@@ -33,8 +33,8 @@ Where kernels land (TFLOPS, share of the 3.38 matrix peak):
 | palladium flash attention, same, `simdgroup_matrix`, 64x16 tiles | 2.10 (62%) | not measured |
 
 The vendor rows were measured with torch 2.13 and MLX 0.32.1 directly;
-`bench_vendor_matmul` measures `jnp.dot` through jax-mps instead, when the
-mps platform is installed. Attention counts 4·heads·tokens²·64 FLOPs.
+`benchmarks/bench_kernels.py` measures MLX's matmuls and attention from an
+MLX environment under the same row names as Palladium's. Attention counts 4·heads·tokens²·64 FLOPs.
 
 Targets: float32 matmul at vendor parity (≥ 2.7 TFLOPS at 4096³), float16
 matmul ≥ 3.2, attention ≥ 2.0 at float32.
@@ -95,11 +95,12 @@ serpentine product order and contiguous per-thread tile copies) reaches
 2.54 TFLOPS, past the 2.5 target and 93% of MLX. The rest of the gap is
 unexplored: MLX's vectorized tile loader, its epilogue, or compiler flags.
 
-The TensorOps lowering now emits this kernel for float32 tiled matmuls
-under `CompilerParams(dot_general="simdgroup")`
-(`src/palladium/emit/tensorops/simdgroup.py`); float16, transposed operands,
-edge tiles, K not a multiple of 16 and tiles above 8192 elements keep
-`matmul2d`. A plain Pallas `jnp.dot` through palladium, M2, 3 repetitions
+The TensorOps lowering now emits this kernel for tiled matmuls under
+`CompilerParams(dot_general="simdgroup")`
+(`src/palladium/emit/tensorops/simdgroup.py`), since 2026-11-12 also for
+float16 and bfloat16 operands widened to float32 fragments; transposed
+operands, edge tiles, K not a multiple of 16 and tiles above 8192 elements
+keep `matmul2d`. A plain Pallas `jnp.dot` through palladium, M2, 3 repetitions
 (`bench_roofline.py`):
 
 | float32, tile | `matmul2d` | `simdgroup` |

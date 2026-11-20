@@ -1,8 +1,7 @@
 # Supported JAX functionality
 
 Palladium traces one Pallas kernel and lowers it to MSL. It requires
-`jax>=0.11`; JAX 0.12.0.1 is tested, and 0.11.2 with jax-mps, which pins
-`jax<0.12`. Cases outside the subset below
+`jax>=0.12`; JAX 0.12.0.1 is tested. Cases outside the subset below
 raise an error during tracing, lowering, or compilation.
 
 ## Pallas kernels
@@ -76,15 +75,21 @@ refs (`tile[...] = x_ref[pl.ds(...), pl.ds(...)]`) are spread over the
 threadgroup's threads; `jnp.dot` of two float32 threadgroup tiles runs on
 SIMD-group matrix fragments, with output tiles a multiple of 16 in each
 dimension and K a multiple of 8, and `acc + jnp.dot(...)` accumulates in
-place; elementwise operations on a dot's result, including comparisons, run
-per fragment element, and it can be stored to a device slice. Scalars,
-`fori_loop` with scalar and fragment carries, and broadcasts of scalars are
-supported; palladium places the barriers between threadgroup writes and
-reads. Use `pl.program_id` for the mesh coordinates, since the Pallas
+place; `lax.dot_general` of `a` and `b` contracting both on their last axis
+(`a @ b.T`) reads `b` transposed. Elementwise operations on a dot's result,
+including comparisons, run per fragment element, and a result can be stored
+to a device slice or a threadgroup tile, to feed the next dot. Vectors,
+`jnp.arange` and one-dimensional slices of device arrays, combine
+elementwise with scalars and broadcast along rows or columns of a block, as
+masks and per-row statistics do. Scalars, broadcasts of scalars, and
+`fori_loop` with scalar and fragment carries are supported, with static
+bounds or bounds computed from `pl.program_id`; palladium places the
+barriers between threadgroup writes and reads. Use `pl.program_id` for the mesh coordinates, since the Pallas
 interpreter does not bind mesh axis names. A hand-written float32 matmul in
 this form ran at the speed of the emitted `simdgroup` kernel on an M2 (2.69
-TFLOPS at 4096³). Dots of device reads, other tile shapes, aliases and other
-primitives raise `EmitError`.
+TFLOPS at 4096³), and the attention backward of `examples/flash_attention.py`
+is two such kernels. Dots of device reads, other tile shapes, vectors read
+from threadgroup tiles, aliases and other primitives raise `EmitError`.
 
 On both paths, tiled matmuls on a 2D or 3D grid lower through Metal 4
 TensorOps by default (`CompilerParams(dot_general="auto")`), taking the
@@ -125,10 +130,8 @@ sizes and head dimensions must be multiples of 16 (of 8 for the `simdgroup_matri
 schedule, so SAM2's 56-wide heads need no padding), and both sequence lengths
 must divide evenly into their tiles. Short query sequences need padding and
 output cropping. Unsupported jaxpr forms and layouts raise `EmitError`.
-The mps lowering follows the same policy: cooperative kernels reach jax-mps
-with their scaled thread grid and required threadgroup, and run under `jax.jit`
-on the `mps` platform (tested on an M1 Pro with JAX 0.11.2 and the `palladium.dispatch` handler
-from the `palladium-dispatch` branch of jax-mps).
+Inside programs on the `metal` plugin, cooperative kernels launch with their
+scaled thread grid and required threadgroup like every other kernel.
 
 The backend supports float32, float16, bfloat16, int32, uint32, and bool, with
 operation-specific limits:
@@ -151,14 +154,14 @@ for numeric comparisons and measurement caveats.
 
 | Path | JIT | vmap | Gradients |
 |---|---|---|---|
-| `pl.pallas_call` on `mps` | Yes: palladium is the registered Pallas backend for the platform (`palladium.CompilerParams` for options) | JAX's own `pallas_call` batching | `palladium.with_vjp` |
+| `pl.pallas_call` on `metal` | Yes: a launch inside the program on Palladium's PJRT plugin (`palladium.CompilerParams` for options) | JAX's own `pallas_call` batching | `palladium.with_vjp` |
 | `metal_call` | Yes, through CPU FFI to Metal | One FFI call per batch; nested levels run one element at a time | `palladium.with_vjp` or `jax.custom_vjp` |
-| `plmtl.kernel` | As `metal_call` | As `metal_call` | As `metal_call` |
+| `plmtl.kernel` | As `metal_call`, from CPU programs or inside programs on `metal` | As `metal_call` | As `metal_call` |
 
-The mps lowering supports FAST math only. On other platforms a `pallas_call`
-keeps JAX's own behavior: `interpret=True` runs the Pallas interpreter.
-`metal_call` dispatches to Metal through the CPU FFI target and does not need
-jax-mps.
+Both paths support every math mode and input/output aliases. On other
+platforms a `pallas_call` keeps JAX's own behavior: `interpret=True` runs the
+Pallas interpreter. `metal_call` dispatches to Metal through the CPU FFI
+target and does not need the plugin.
 
 Unsupported primitives raise `UnsupportedPrimitiveError`; unsupported
 primitive cases raise `EmitError`. Unsupported Pallas call structure raises

@@ -1,10 +1,10 @@
-# A vertically integrated Metal compute stack for JAX (plan; M1 in progress)
+# A vertically integrated Metal compute stack for JAX (plan; M1 complete)
 
 Goal: run whole JAX training programs on Apple GPUs through a PJRT plugin
 we own, with no MLX involvement, for three workloads: ODE ensembles for
 simulation-based inference, SAM2 fine-tuning, and LLM fine-tuning. It is
 built inside palladium, on its emitter and runtime; the plugin's
-implementation record is `notes/metal-pjrt-plugin.md`. This complements the
+design and status are in `notes/metal-pjrt-plugin.md`. This complements the
 kernel facility in
 `notes/metal-kernel-facility.md`: that note is about writing kernels, this
 one about running whole programs.
@@ -102,7 +102,7 @@ is measured against an established baseline on the same machine.
 |---|---|---|---|---|
 | M0 | Baselines | Where the ceilings and competitors sit | Roofline benchmark (bandwidth; simdgroup peak in f32/f16/bf16; `matmul2d` vs `simdgroup` GEMM); the workloads on jax-mps, XLA:CPU, MLX/mlx-lm and PyTorch MPS | A results table; settles the GEMM path for family 9 |
 | M1 | Minimal plugin | `jax.jit` on our platform: zero-copy buffers, async execution, generated elementwise and reduction kernels | jax-mps on the same programs; CPU results | Matches CPU; per-call overhead clearly below jax-mps |
-| M2 | SBI end to end | The execution-model premise: whole steps on the GPU without host glue | jax-mps, XLA:CPU, diffrax | Same losses as CPU; GPU time is most of wall time; faster than jax-mps |
+| M2 | SBI end to end | The execution-model premise: whole steps on the GPU without host glue | jax-mps, XLA:CPU, diffrax on XLA:CPU | Same losses as CPU; GPU time is most of wall time; faster than jax-mps |
 | M3 | Kernels for LLM training | Kernel parity where MLX is strongest | MLX | bf16 GEMM, gather and scatter-add, attention forward and backward at MLX speed (the backward is new) |
 | M4 | LLM LoRA fine-tune | Beating MLX at its own use case | mlx-lm LoRA, same 0.5–1B model and data | Same loss curve; tokens/s at or above mlx-lm; comparable peak memory |
 | M5 | SAM2 fine-tune | Generality: convolutions, pooling, larger graphs | PyTorch MPS (qgis-segment) and jax-mps | Same mask quality; steps/s above PyTorch MPS |
@@ -116,10 +116,118 @@ first-step compile time, peak memory, and agreement with a CPU or XLA
 reference: a faster step that compiles for a minute or drifts numerically is
 not a win.
 
-M1 status (2026-11-01): the plugin runs fused elementwise and index-mapping
-programs asynchronously, with pooled buffers; reductions, `dot_general` and
-`while` come next. Steps taken, open items and the success criteria against
-jax 0.12 are in `notes/metal-pjrt-plugin.md`.
+M1 status (2026-11-02, complete): the plugin runs every operation group of the census
+asynchronously with pooled buffers: fused elementwise and index maps
+(including guarded concatenate, pad and dynamic slices), reductions
+(single-result SIMD-group kernels; variadic reducers such as argmax as a
+sequential fold), floating `dot_general` through the existing Pallas GEMM
+emitter, static counted `while`, pure cond/switch, gather and scatter-add,
+and 64-bit integers for threefry RNG. Dynamic `while` remains unsupported.
+The common API cases (compile, analysis, donation, deletion in flight,
+multi-threaded dispatch) have tests. The full SBI step matches CPU over ten
+steps within normwise rtol 1e-4 per array; on 2026-11-02 the criteria moved
+from componentwise to normwise relative error, since near-zero entries
+cannot agree componentwise and an absolute tolerance hid errors in Adam's
+second moments. Its pipelined
+throughput is still slower than CPU (2.83 ms versus 1.47 ms on the M1 Pro),
+which is M2's problem, not an M1 gate. The performance gates hold on both
+target machines: per small call 26.2 µs versus 175.7 µs for jax-mps on the M2
+and 10.2 µs versus 126.4 µs on the M4 Pro; elementwise bandwidth at 96% and
+94% of copy; first SBI step in 2.5 s and 1.6 s. The acceptance criteria against jax 0.12
+are in `notes/metal-pjrt-plugin.md`.
+
+M2 status (2026-11-02, in progress): on the M2, a pipelined SBI step takes
+0.61 ms (XLA:CPU 1.33 ms, jax-mps 18.7 ms), with the GPU busy 98% of the wall
+time, after loop replay dropped from 657 to 256 launches per step and fused
+kernels stopped recomputing values in guarded branches; on the M4 Pro it
+takes 0.225 ms with the GPU busy 99.9%. The premise check holds: with
+Palladium kernels inside `jit`, the CNF update takes 57 µs on the M2, 51 µs of
+it GPU time, against 149 µs (61 µs GPU) recorded for jax-mps with async
+dispatch. Over 5,000 training steps, Metal's losses agree with CPU's within
+CPU's own rounding sensitivity (CNF), or are closer to a float64 run than
+CPU's float32 run is (SBI; 2026-11-03). All three M2 targets hold on the M2.
+Open: CPU and jax-mps throughput on the M4 Pro. diffrax stays a CPU reference only (decided
+2026-11-03): on `metal` it needs host callbacks and dynamic `while`, and
+adaptive solvers on the GPU come from palladium's own kernels instead.
+
+M3 baseline, preliminary (2026-11-03, M2, one run of `bench_kernels.py`
+each on the `metal` plugin and on MLX 0.32.4 directly; repeat on the M4 Pro
+as `docs/benchmarking.md` describes): Palladium's flash attention forward is
+5–12% faster than MLX's fused attention at 2,048 tokens and 32 heads of 64.
+Slower: the attention backward (plain JAX through the plugin; no kernel yet)
+by 2.3–3.3×, embedding scatter-add by 2.5×, bfloat16 GEMM by 1.6–1.9×,
+float32 GEMM at 4,096³ by 1.4×, float16 GEMM by 13%. Gather and float32 GEMM
+at 1,024³ are at parity.
+
+M3 progress (2026-11-03, M2 unless noted):
+
+- The buffer pool kept stale sizes once full, so every new size allocated
+  afresh: in one process after other benchmarks, elementwise ran at 35
+  instead of 86 GB/s on the M2 (75 against 226 GB/s copy on the M4 Pro),
+  and scatter-add and the attention backward spent 3.5 and 40–80 ms per call
+  outside the GPU. It now evicts its oldest buffers.
+- Unbatched products ran with one threadgroup along x; as rank-2 GEMMs, a
+  4,096³ float32 product takes 52 instead of 99.5 ms of GPU time, the
+  roofline kernel's speed.
+- The attention backward is two plmtl kernels (FlashAttention-2), with the
+  forward storing its logsumexp. Gradient including the forward, 2,048
+  tokens of 32 heads of 64: 94.7 ms full and 49.8 ms causal, against MLX's
+  98.9 and 68.3 ms; plain JAX through the plugin took 126 and 127 ms.
+- Remaining for M3: the same comparison on the M4 Pro, the causal forward
+  there (16% behind MLX before these changes), embeddings once the pool fix
+  is measured there, and batched products (the batch axis still comes
+  first) and contractions with one-element outputs, which go through the
+  GEMM path padded to 16×16 tiles.
+
+M3 on the M2, 2026-11-12 (one run of `bench_kernels.py` each, plugin and
+MLX 0.32.4): after the pool fix, embedding scatter-add is 9% behind MLX
+(was 2.5×) and gather at parity; attention is at or ahead of MLX in every
+row (causal backward 46 against 72 ms). The half-precision GEMMs were the
+last gap: `matmul2d` ran bfloat16 at 1.5 TFLOPS on this GPU, which has no
+native bfloat arithmetic. The `simdgroup_matrix` GEMM now takes half and
+bfloat operands, keeps them narrow in threadgroup memory and widens each
+fragment to float32, as MLX's steel GEMM does, and families 7–9 use it for
+every dtype. In the plugin, against MLX: bfloat16 GEMM 1.00× at 4,096³ and
+1.01× at 1,024³ (was 1.79× and 1.50×), float16 1.04× and 1.07× (was 1.13×
+and 1.12×), float32 0.94× and 0.95×. The roofline at 64x64 tiles, 4,096³:
+bfloat16 2.60 against 1.54 TFLOPS for `matmul2d`, float16 3.25 against
+2.96. On the M4 Pro, float16 `matmul2d` already matched MLX; check there
+that the simdgroup kernel is not slower for half types.
+
+Toward M4 and M5 (2026-11-12, M2): `examples/training_steps.py`'s decoder
+block (embedding, RoPE, causal attention through plain JAX, SwiGLU,
+tied-embedding cross-entropy, AdamW) trains on `metal` and matches CPU
+within 3.4e-6 normwise in every parameter after 23 steps, at 7.6 ms per
+step against 21.3 ms on CPU. It needed `sdy.sharding_constraint` (from
+eager `jax.random.normal` on a key) passed through as an identity;
+`stablehlo.optimization_barrier` (from `jax.checkpoint`) is passed through
+too, for remat in M4. The SAM-like step stopped at `stablehlo.convolution`,
+the first M5 gap.
+
+M5 progress (2026-11-12, M2; M5 does not depend on M4, only on M3's GEMM and
+attention): the SAM-like step trains on `metal` and matches CPU over three
+steps within rtol 1e-4. Convolutions lower to patches and a GEMM, pooling and
+its gradient to inline window folds (`notes/metal-pjrt-plugin.md`, "Convolutions and pooling"). Per
+step, pipelined over 100 steps: 5.4–7.1 ms against 14.4–15.1 ms on XLA:CPU;
+first step 1.35 s against 0.45 s. Two changes made the speed. Transposed
+convolutions decompose into phases: the plain im2col of SAM's stride-4
+upsampling and its kernel gradient were 33.5M elements, 15/16 zeros, and
+the gradient's GEMM (N = 1, K = 32,768 on 16 threadgroups) alone took 12.7
+of 26.5 ms of summed GPU time. And float32 products with few output tiles
+split K. Summed GPU time per step, each launch alone: 26.5 ms at first,
+9.2 ms with phases, 5.5 ms with shared phases and split-K; the step went
+from 46.5 to 12.8 to 5.4–7.1 ms. No launch now takes more than about
+0.25 ms; the largest are fused elementwise and packing kernels.
+
+Remaining for M5:
+- The baseline: qgis-segment's PyTorch MPS fine-tune and jax-mps, on the
+  same model and data, and the JAX port of SAM2's image encoder (Hiera) and
+  mask decoder that it needs.
+- Depthwise (grouped) convolutions, in SAM2's memory encoder; the image
+  encoder and mask decoder need none.
+- Split-K for half types (float32 partials from half operands), and reading
+  K chunks in place instead of copying the left operand.
+- First-step compile time, 3× CPU's for this step.
 
 Work that costs time without proving anything: a JAX port of SAM2's image
 encoder and mask decoder (SAM2 is PyTorch) for M5, and a small JAX LoRA
