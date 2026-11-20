@@ -99,6 +99,20 @@ def test_per_row_output_and_input(metal_device, rng):
     _check(_call(kernel, 21, 640, 4, out_rows=True, row_inputs=1), x, t, reference=want)
 
 
+@pytest.mark.parametrize("columns", [96, 640])
+def test_per_row_value_leading_an_implicit_broadcast(metal_device, rng, columns):
+    """`lax.add` broadcasts a (rows, 1) operand itself: the sum varies along the
+    columns although its first operand does not."""
+
+    def kernel(x_ref, o_ref):
+        x = x_ref[...]
+        o_ref[...] = jnp.sum(jnp.max(x, axis=1, keepdims=True) + x, axis=1)
+
+    x = rng.standard_normal((12, columns)).astype(np.float32)
+    want = (x.max(axis=1, keepdims=True) + x).sum(axis=1)
+    _check(_call(kernel, 12, columns, 4, out_rows=True), x, reference=want, atol=1e-3)
+
+
 def test_inlines_jax_nn_softmax_and_where(metal_device, rng):
     """`jax.nn.softmax` stages a custom_jvp_call and `jnp.where` a jit."""
 
@@ -109,6 +123,49 @@ def test_inlines_jax_nn_softmax_and_where(metal_device, rng):
     x = rng.standard_normal((12, 160)).astype(np.float32)
     want = np.where(x > 0, _np_softmax(x), 0.0)
     _check(_call(kernel, 12, 160, 4), x, reference=want)
+
+
+def test_repeated_jit_bodies_keep_their_own_operands(metal_device, rng):
+    """Two `jnp.where` calls share one cached jit body, so one select equation."""
+
+    def kernel(x_ref, o_ref):
+        x = x_ref[...]
+        o_ref[...] = jnp.where(x > 0.0, x, 2.0 * x) + jnp.where(x < 1.0, 3.0 * x, 5.0 * x)
+
+    x = rng.standard_normal((8, 64)).astype(np.float32) * 2.0
+    want = np.where(x > 0, x, 2 * x) + np.where(x < 1, 3 * x, 5 * x)
+    _check(_call(kernel, 8, 64, 4), x, reference=want)
+
+
+@pytest.mark.parametrize("op", [jnp.max, jnp.min])
+@pytest.mark.parametrize("columns", [64, 1000])  # one SIMD group per row, the whole group
+@pytest.mark.parametrize("mode", [palladium.MathMode.SAFE, palladium.MathMode.RELAXED])
+def test_row_extrema_keep_nan_and_signed_zero(metal_device, rng, op, columns, mode):
+    """Metal's SIMD extrema ignore NaNs and leave zero ties open; the lanes' and
+    the SIMD groups' partials must combine as the elementwise extremum does."""
+
+    def kernel(x_ref, o_ref):
+        o_ref[...] = op(x_ref[...], axis=1)
+
+    x = rng.standard_normal((8, columns)).astype(np.float32)
+    x[1, 5] = x[2, columns - 3] = np.nan
+    x[3] = x[4] = -0.0
+    x[4, 7] = x[4, columns - 40] = 0.0
+    x[5] = 0.0
+    x[5, columns // 2] = -0.0
+    call = palladium.metal_call(
+        kernel,
+        grid=(2,),
+        in_specs=[pl.BlockSpec((4, columns), lambda i: (i, 0))],
+        out_specs=pl.BlockSpec((4,), lambda i: (i,)),
+        out_shape=jax.ShapeDtypeStruct((8,), jnp.float32),
+        compiler_params=palladium.CompilerParams(program="threadgroup", math_mode=mode),
+    )
+    got = np.asarray(call(x))
+    want = (np.max if op is jnp.max else np.min)(x, axis=1)
+    np.testing.assert_array_equal(got, want)
+    mixed = op is jnp.min  # a row with both zeros: -0.0 is the minimum, 0.0 the maximum
+    np.testing.assert_array_equal(np.signbit(got[3:6]), [True, mixed, mixed])
 
 
 def test_rejects_unknown_program_scope():
@@ -277,6 +334,17 @@ def test_rejects_rows_after_reductions_over_them(metal_device):
 
     with pytest.raises(EmitError, match="only when tiles divide them"):
         _tile_call(column_sums, 50, 64, 8, ("tile",))(np.zeros((50, 64), np.float32))
+
+
+def test_rejects_reshapes_that_regroup_elements(metal_device):
+    """(rows, columns) to (columns, rows) keeps two axes but not their elements."""
+
+    def kernel(x_ref, o_ref):
+        regrouped = x_ref[...].reshape(64, 4)
+        o_ref[...] = jnp.max(jnp.sum(regrouped, axis=1)).reshape(1)
+
+    with pytest.raises(EmitError, match="adding or removing unit dimensions"):
+        _tile_call(kernel, 8, 64, 4, ("scalar",))(np.zeros((8, 64), np.float32))
 
 
 def _three_point(x_ref, o_ref):

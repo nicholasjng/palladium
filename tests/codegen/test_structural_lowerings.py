@@ -128,8 +128,8 @@ def test_select_case_dtypes(metal_device, dtype):
 
 @pytest.mark.parametrize("dtype", [np.int32, np.uint32])
 def test_select_out_of_range_uses_endpoints(metal_device, dtype):
-    # This is palladium's policy; JAX leaves these indices implementation-defined.
     """Check Palladium's endpoint policy for out-of-range signed and unsigned select indices."""
+    # This is palladium's policy; JAX leaves these indices implementation-defined.
     limits = np.iinfo(dtype)
     which = np.asarray([limits.min, limits.max, 1], dtype=dtype)
     cases = [np.full((3,), i * 10, dtype=np.float32) for i in range(3)]

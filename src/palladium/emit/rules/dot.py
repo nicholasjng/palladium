@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 from jax.extend.core import JaxprEqn
 
@@ -37,7 +37,7 @@ def _rule_dot_general(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     accumulation runs in the output ctype, and mixed-precision products
     are cast to it before the multiply. The vectorized paths require
     f32 end to end. The scalar path keeps `k` innermost; an `i, k, j`
-    order measured slower.
+    order is slower.
     """
     (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = eqn.params["dimension_numbers"]
     if lhs_batch or rhs_batch:
@@ -168,74 +168,16 @@ def _emit_reduce(
     env: Environment,
     cursor: Cursor,
     eqn: JaxprEqn,
-    init: str,
-    combine: Callable[[str, str], str],
+    axes: Iterable[int],
+    operands: list[CVal],
+    inits: list[str],
+    update: Callable[[list[CVal], list[CVal]], None],
 ) -> None:
-    """Nested loops, one per kept dim, each accumulating over the reduced
-    dims via `combine` starting from `init`. `axes` may be any subset
-    of dims."""
-    axes = set(eqn.params["axes"])
-    src = env.val(eqn.invars[0])
-    rank = len(src.shape)
-    kept_dims = [d for d in range(rank) if d not in axes]
-    reduced_dims = [d for d in range(rank) if d in axes]
-
-    dst = store_or_declare(env, cursor, eqn.outvars[0], min_bytes=REGISTER_BYTES)
-    src_strides = element_strides(src.shape)
-    dst_strides = element_strides(dst.shape)
-
-    with cursor.loop_nest(tuple(src.shape[d] for d in kept_dims), "_d") as kept:
-        acc = cursor.fresh("_acc")
-        cursor.emit(f"{dst.ctype} {acc} = {init};")
-        with cursor.loop_nest(tuple(src.shape[d] for d in reduced_dims), "_d") as reduced:
-            index = dict(zip(kept_dims, kept)) | dict(zip(reduced_dims, reduced))
-            src_idx = flat_index([(index[d], src_strides[d]) for d in range(rank)])
-            value = src.at(src_idx)
-            if src.lazy is not None:
-                # A fused input is an expression: evaluate it once.
-                value = cursor.fresh("_x")
-                cursor.emit(f"{src.ctype} {value} = {src.at(src_idx)};")
-            cursor.emit(f"{acc} = {combine(acc, value)};")
-        dst_idx = flat_index(list(zip(kept, dst_strides)))
-        cursor.emit(f"{dst.at(dst_idx)} = {acc};")
-
-
-@rule("reduce_sum")
-def _rule_reduce_sum(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """`jnp.sum(x, axis=...)`; `jnp.mean` stages as reduce_sum plus a `div`."""
-    _emit_reduce(env, cursor, eqn, "0", lambda acc, x: f"{acc} + {x}")
-
-
-@rule("reduce_max", "reduce_min")
-def _rule_reduce_extremum(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """Extrema with dtype-specific comparison and accumulator identities."""
-    op = eqn.primitive.name.removeprefix("reduce_")
-    ctype = env.val(eqn.invars[0]).ctype
-    _emit_reduce(
-        env,
-        cursor,
-        eqn,
-        extremum_identity(op, ctype),
-        lambda acc, x: extremum(op, ctype, acc, x),
-    )
-
-
-@rule("reduce")
-def _rule_reduce(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """`lax.reduce` with any combiner, such as `jnp.minmax` or an argmax pair.
-
-    The loops follow `_emit_reduce`, with one scalar accumulator per operand.
-    The combiner jaxpr takes the accumulators then the current elements and
-    is inlined once per element; its results update every accumulator at
-    once, as loop carries do.
-    """
-    combiner = eqn.params["jaxpr"]
-    if combiner.constvars:
-        raise EmitError("reduce with a combiner that captures arrays is unsupported")
-    count = len(eqn.outvars)
-    operands = [env.val(v) for v in eqn.invars[:count]]
-    inits = [env.val(v) for v in eqn.invars[count:]]
-    axes = set(eqn.params["dimensions"])
+    """Nested loops, one per kept dim, each folding the reduced dims into one
+    scalar accumulator per operand, started from `inits`. `update` emits one
+    step from the accumulators and the current elements. `axes` may be any
+    subset of dims."""
+    axes = set(axes)
     shape = operands[0].shape
     rank = len(shape)
     kept_dims = [d for d in range(rank) if d not in axes]
@@ -251,7 +193,7 @@ def _rule_reduce(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         accs = []
         for dst, init in zip(dsts, inits, strict=True):
             acc = cursor.fresh("_acc")
-            cursor.emit(f"{dst.ctype} {acc} = {init.at('0')};")
+            cursor.emit(f"{dst.ctype} {acc} = {init};")
             accs.append(CVal(acc, (), dst.ctype))
         with cursor.loop_nest(tuple(shape[d] for d in reduced_dims), "_d") as reduced:
             index = dict(zip(kept_dims, kept)) | dict(zip(reduced_dims, reduced))
@@ -264,8 +206,51 @@ def _rule_reduce(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
                     value = cursor.fresh("_x")
                     cursor.emit(f"{src.ctype} {value} = {src.at(src_idx)};")
                 elements.append(CVal(value, (), src.ctype))
-            outs = emit_jaxpr(env, cursor, combiner, accs + elements)
-            copy_back_carries(cursor, outs, accs)
+            update(accs, elements)
         dst_idx = flat_index(list(zip(kept, dst_strides)))
         for dst, acc in zip(dsts, accs, strict=True):
             cursor.emit(f"{dst.at(dst_idx)} = {acc.expr};")
+
+
+@rule("reduce_sum", "reduce_max", "reduce_min")
+def _rule_reduce_named(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """`jnp.sum`, `jnp.max` and `jnp.min` over `axis`; `jnp.mean` stages as
+    reduce_sum plus a `div`. Extrema use dtype-specific comparisons and
+    accumulator identities."""
+    src = env.val(eqn.invars[0])
+    op = eqn.primitive.name.removeprefix("reduce_")
+
+    def update(accs: list[CVal], elements: list[CVal]) -> None:
+        acc, x = accs[0].expr, elements[0].expr
+        combined = f"{acc} + {x}" if op == "sum" else extremum(op, src.ctype, acc, x)
+        cursor.emit(f"{acc} = {combined};")
+
+    init = "0" if op == "sum" else extremum_identity(op, src.ctype)
+    _emit_reduce(env, cursor, eqn, eqn.params["axes"], [src], [init], update)
+
+
+@rule("reduce")
+def _rule_reduce(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """`lax.reduce` with any combiner, such as `jnp.minmax` or an argmax pair.
+
+    The combiner jaxpr takes the accumulators then the current elements and
+    is inlined once per element; its results update every accumulator at
+    once, as loop carries do.
+    """
+    combiner = eqn.params["jaxpr"]
+    if combiner.constvars:
+        raise EmitError("reduce with a combiner that captures arrays is unsupported")
+    count = len(eqn.outvars)
+
+    def update(accs: list[CVal], elements: list[CVal]) -> None:
+        copy_back_carries(cursor, emit_jaxpr(env, cursor, combiner, accs + elements), accs)
+
+    _emit_reduce(
+        env,
+        cursor,
+        eqn,
+        eqn.params["dimensions"],
+        [env.val(v) for v in eqn.invars[:count]],
+        [env.val(v).at("0") for v in eqn.invars[count:]],
+        update,
+    )

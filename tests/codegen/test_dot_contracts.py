@@ -66,12 +66,12 @@ def test_rank1_vecvec(rng):
 
 
 def test_preferred_element_type_accumulates_in_f32():
+    """Verify that half inputs are promoted before multiplication when float32 accumulation is
+    requested."""
     # a_i = b_i = 1 + 2^-10, exact in f16. The product 1 + 2^-9 + 2^-20
     # is exact in f32 but rounds to 1 + 2^-9 in f16, so a kernel that
     # multiplies in half before accumulating is off by k * 2^-20 = 2^-16,
     # past the 2^-17 tolerance below. Catches a dropped promote cast.
-    """Verify that half inputs are promoted before multiplication when float32 accumulation is
-    requested."""
 
     def kernel(a_ref, b_ref, o_ref):
         o_ref[...] = jax.lax.dot_general(

@@ -31,6 +31,21 @@ def test_integer_binary_edges(metal_device, dtype, op):
     np.testing.assert_array_equal(call(x, y), call.interpret(x, y))
 
 
+@pytest.mark.parametrize(
+    ("dtype", "op"),
+    [
+        (np.uint32, lambda x: jax.lax.div(x + np.uint32(4294967295), np.uint32(3000000000))),
+        (np.int32, lambda x: (x - np.int32(-2147483648) < 0).astype(np.int32)),
+    ],
+)
+def test_wide_integer_literals_wrap_in_fused_expressions(metal_device, dtype, op):
+    """A literal outside int's range must keep its 32-bit type: fused into its
+    consumer, the sum is never stored, so nothing else would wrap it."""
+    x = (np.arange(8) * 600000000 % 2**31).astype(dtype)
+    call = call_for(op, x)
+    np.testing.assert_array_equal(call(x), call.interpret(x))
+
+
 @pytest.mark.parametrize("scalar", [False, True])
 def test_signed_overflow_division_abs(metal_device, scalar):
     """Check int32 minimum-value absolute and division overflow for scalar and array storage."""
@@ -116,9 +131,9 @@ def test_integer_one_minus_square(metal_device, dtype):
 
 
 def test_tanh_ad_in_control_flow(metal_device):
-    # Differentiate twice, then stage through both scan and cond.
     """Compare first/second tanh derivatives staged through a loop and conditional with the
     interpreter."""
+    # Differentiate twice, then stage through both scan and cond.
     derivative = jax.grad(lambda x: jnp.tanh(x))
     second = jax.grad(derivative)
 
@@ -144,6 +159,31 @@ def test_log2_and_one_minus_square_special_values(metal_device, op):
     x = np.array([-np.inf, -2, -1, -0.0, 0.0, 1, 2, np.inf, np.nan], np.float32)
     call = call_for(op, x)
     np.testing.assert_array_equal(call(x), call.interpret(x))
+
+
+_NARROW_OPS = {
+    "exp": jax.lax.exp,
+    "sqrt": jax.lax.sqrt,
+    "abs": jax.lax.abs,
+    "floor": lambda x: jax.lax.floor(x * 4.0),
+    "logistic": jax.lax.logistic,
+    "reciprocal_square": lambda x: jax.lax.integer_pow(x, -2),
+    "round": lambda x: jax.lax.round(x * 10.0, jax.lax.RoundingMethod.TO_NEAREST_EVEN),
+    "pow": lambda x: jax.lax.pow(x, x),
+    # The float literal in the fused operand must not widen it past its type.
+    "atan2": lambda x: jax.lax.atan2(x, x + 1.0),
+}
+
+
+@pytest.mark.parametrize("dtype", [np.float16, jnp.bfloat16])
+@pytest.mark.parametrize("op", sorted(_NARROW_OPS))
+def test_narrow_floats_through_float_valued_functions(metal_device, dtype, op):
+    """Metal's math functions and float literals yield float, which bfloat does
+    not accept implicitly and which makes mixed half calls ambiguous."""
+    x = np.linspace(0.1, 0.9, 8).astype(dtype)
+    call = call_for(_NARROW_OPS[op], x)
+    got, want = np.asarray(call(x), np.float32), np.asarray(call.interpret(x), np.float32)
+    np.testing.assert_allclose(got, want, rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("dtype", [np.int32, np.uint32, np.float32])

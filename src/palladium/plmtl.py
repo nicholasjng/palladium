@@ -35,11 +35,12 @@ import collections
 import contextlib
 import dataclasses
 import enum
+import functools
 from collections.abc import Callable, Generator, Sequence
 from typing import Any
 
 import jax.numpy as jnp
-from jax._src.pallas import core as pallas_core
+from jax._src.pallas import core as pallas_core  # tracing_grid_env has no public name
 from jax.core import ShapedArray
 from jax.experimental import pallas as pl
 
@@ -58,8 +59,8 @@ class MemorySpace(enum.Enum):
     def __str__(self) -> str:
         return self.value
 
-    def __call__(self, shape: Sequence[int], dtype: Any) -> pallas_core.MemoryRef:
-        return pallas_core.MemoryRef(ShapedArray(tuple(shape), jnp.dtype(dtype)), self)
+    def __call__(self, shape: Sequence[int], dtype: Any) -> pl.MemoryRef:
+        return pl.MemoryRef(ShapedArray(tuple(shape), jnp.dtype(dtype)), self)
 
 
 THREADGROUP = MemorySpace.THREADGROUP
@@ -75,8 +76,7 @@ class Mesh:
         Threadgroups per axis, at most three axes; `pl.program_id(axis)` reads
         a program's coordinate.
     simdgroups : int, optional
-        SIMD groups per threadgroup; 4 by default, the only count supported
-        so far.
+        SIMD groups per threadgroup; 4, the default, is the only supported count.
     """
 
     grid: tuple[int, ...]
@@ -87,8 +87,8 @@ class Mesh:
         return collections.OrderedDict(zip(("x", "y", "z"), self.grid, strict=False))
 
     @property
-    def default_memory_space(self) -> pallas_core.MemorySpace:
-        return pallas_core.MemorySpace.ANY
+    def default_memory_space(self) -> pl.MemorySpace:
+        return pl.MemorySpace.ANY
 
     @property
     def core_type(self) -> str:
@@ -103,7 +103,7 @@ class Mesh:
 
     @property
     def supported_memory_spaces(self) -> Sequence[Any]:
-        return [pallas_core.MemorySpace.ANY, *MemorySpace]
+        return [pl.MemorySpace.ANY, *MemorySpace]
 
     @contextlib.contextmanager
     def tracing_context(self) -> Generator[None]:
@@ -143,15 +143,7 @@ def kernel(
         Callable on NumPy or JAX arrays, like `palladium.metal_call`; its
         `interpret` attribute runs the same kernel in the Pallas interpreter.
     """
-
-    def build(interpret: bool) -> Callable:
-        return pl.kernel(
-            body,
-            out_type=out_type,
-            mesh=mesh,
-            scratch_types=scratch_types,
-            interpret=interpret,
-            name=name,
-        )
-
-    return FfiCallable(build(False), build(True), compiler_params)
+    build = functools.partial(
+        pl.kernel, body, out_type=out_type, mesh=mesh, scratch_types=scratch_types, name=name
+    )
+    return FfiCallable(build(interpret=False), build(interpret=True), compiler_params)

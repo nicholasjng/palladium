@@ -8,7 +8,7 @@ from typing import Any
 
 from palladium import _runtime
 
-__all__ = ["device_limits", "simdgroup_width"]
+__all__ = ["device_limits", "prefers_simdgroup_matrix"]
 
 
 def device_limits() -> dict[str, Any]:
@@ -54,13 +54,11 @@ def _query_device() -> dict[str, Any]:
     }
 
 
-def simdgroup_width() -> int:
-    """Return the device SIMD-group width used to size cooperative launches.
+def prefers_simdgroup_matrix() -> bool:
+    """Whether products should use `simdgroup_matrix` rather than `matmul2d`.
 
-    Returns
-    -------
-    int
-        Reported SIMD-group width, falling back to 32 when the device or field is
-        unavailable.
+    True on Apple GPU families 7 to 9, where the `simdgroup_matrix` kernel is at
+    least as fast for every supported float type. Family 10 GPUs have matrix
+    accelerators that Metal 4's `matmul2d` uses, so they keep it.
     """
-    return int(device_limits().get("simdgroup_width", 32))
+    return device_limits().get("apple_gpu_family") in (7, 8, 9)

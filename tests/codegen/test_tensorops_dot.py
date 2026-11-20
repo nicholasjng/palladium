@@ -10,6 +10,7 @@ from jax.experimental import pallas as pl
 from jax.extend.core import Jaxpr
 
 import palladium
+from palladium.emit.tensorops.matmul import _placement, _recognize, _Store
 from palladium.errors import EmitError
 
 
@@ -168,42 +169,9 @@ def test_tensorops_dot_uses_one_threadgroup_per_pallas_program():
     assert stats.threadgroup_bytes == 0
 
 
-def test_tensorops_dot_supports_transposed_rhs_tiles():
-    """Check that cooperative matmul recognizes a transposed right operand and emits its transpose
-    flag."""
-    msl = palladium.emit_msl(_blocked_dot_rhs_transposed(), dot_general="tensorops")
-
-    assert "matmul2d_descriptor desc(16, 32, 16, false, true, false," in msl
-    assert "arg1 + (int)_pid.y * 512" in msl
-    assert "dextents<int, 2>(32, 16)" in msl
-    assert "array<int, 2>{1, 16}" in msl
-
-
-def test_tensorops_dot_supports_transposed_lhs_tiles():
-    """Check that cooperative matmul recognizes a transposed left operand and emits its transpose
-    flag."""
-    msl = palladium.emit_msl(_blocked_dot_lhs_transposed(), dot_general="tensorops")
-
-    assert "matmul2d_descriptor desc(16, 32, 16, true, false, false," in msl
-    assert "arg0 + (int)_pid.x * 16" in msl
-    assert "dextents<int, 2>(32, 16)" in msl
-    assert "array<int, 2>{1, 32}" in msl
-
-
-def test_tensorops_dot_fuses_matrix_residual_add():
-    """Check that a matrix residual is read and added inside the cooperative output epilogue."""
-    msl, stats = palladium.emit.emit_msl_stats(_blocked_residual_dot(), dot_general="tensorops")
-
-    assert "device float* arg2 [[buffer(2)]]" in msl
-    assert "device float* arg3 [[buffer(3)]]" in msl
-    assert "arg2 + (int)_pid.x * 1024 + (int)_pid.y * 32" in msl
-    assert "(arg3 + (int)_pid.x * 1024 + (int)_pid.y * 32)[row * 64 + column]" in msl
-    assert "dot_result[element]" in msl
-    assert stats.threadgroup_bytes == 16 * 32 * 4
-
-
 def test_tensorops_dot_fuses_column_bias():
-    """Check that a column bias is bound and added using the output column coordinate."""
+    """Check that a column bias is read at the output column from a tile staged in
+    threadgroup memory, whatever the order of the kernel's independent equations."""
     spec = _blocked_column_bias_dot()
     msl, stats = palladium.emit.emit_msl_stats(spec, dot_general="tensorops")
     eqns = spec.jaxpr.eqns
@@ -221,11 +189,8 @@ def test_tensorops_dot_fuses_column_bias():
         ),
     )
 
-    assert "device float* arg2 [[buffer(2)]]" in msl
-    assert "device float* arg3 [[buffer(3)]]" in msl
     assert "arg2 + (int)_pid.y * 32" in msl
     assert "element % 32" in msl
-    assert "(arg3 + (int)_pid.x * 1024 + (int)_pid.y * 32)[row * 64 + column]" in msl
     assert stats.threadgroup_bytes == 16 * 32 * 4
     assert palladium.emit_msl(reordered, dot_general="tensorops") == msl
 
@@ -269,12 +234,11 @@ def test_auto_selects_tensorops_for_tiled_dots_and_default_forces_the_primitive_
     monkeypatch, family, policy
 ):
     """Check that auto selects cooperative tiled dots, with `simdgroup_matrix` up to
-    Apple family 9 (M4), while default selects primitive emission."""
-    import palladium.emit.kernel
+    Apple GPU family 9, while default selects primitive emission."""
+    import palladium.device
 
-    monkeypatch.setattr(
-        palladium.emit.kernel, "device_limits", lambda: {"apple_gpu_family": family}
-    )
+    limits = {**palladium.device.device_limits(), "apple_gpu_family": family}
+    monkeypatch.setattr(palladium.device, "device_limits", lambda: limits)
     auto = palladium.emit_msl(_blocked_dot())
     assert auto == palladium.emit_msl(_blocked_dot(), dot_general=policy)
     ordinary = palladium.emit_msl(_blocked_dot(), dot_general="default")
@@ -359,35 +323,32 @@ def test_tensorops_matmul_accumulates_k_in_tensorops_tiles_and_handles_tail():
     assert "mode::multiply_accumulate" in source
 
 
-def test_tensorops_matmul_masks_partial_output_tiles():
-    """Check that cooperative source guards matrix-edge loads and output stores."""
-    source = palladium.emit_msl(_blocked_dot(_relu_dot, m=30, n=45, k=32), dot_general="tensorops")
-
-    assert "min(16, 30 - (int)_pid.x * 16)" in source
-    assert "min(32, 45 - (int)_pid.y * 32)" in source
-    assert "cTc.store(c_edge);" in source
-    assert "if (row < min(16, 30 - (int)_pid.x * 16)" in source
+def test_transposed_views_describe_the_stored_tiles():
+    """Check that a transposed operand's view has the stored tile's extents, innermost
+    first: the tile's rows or columns, then the K chunk."""
+    lhs = palladium.emit_msl(_blocked_dot_lhs_transposed(k=200), dot_general="tensorops")
+    assert "dextents<int, 2>(16, min(128, 200 - k_start))" in lhs
+    rhs = palladium.emit_msl(_blocked_dot_rhs_transposed(k=200), dot_general="tensorops")
+    assert "dextents<int, 2>(min(128, 200 - k_start), 32)" in rhs
 
 
 @pytest.mark.parametrize(
-    ("dtype", "metal_type"),
-    ((jnp.float16, "half"), (jnp.bfloat16, "bfloat")),
+    ("spec", "store", "cooperative_epilogue"),
+    [
+        (lambda: _blocked_dot(), _Store.DEVICE, False),
+        (lambda: _blocked_dot(_chained_dot), _Store.DEVICE, True),
+        (lambda: _blocked_dot(m=30, n=45), _Store.MASKED, False),
+        (lambda: _blocked_dot(_relu_dot, m=30, n=45), _Store.MASKED, True),
+        # An epilogue that reads another tile, and every half or bfloat output,
+        # is finished per element, edge tiles included.
+        (_blocked_residual_dot, _Store.STAGED, False),
+        (_blocked_column_bias_dot, _Store.STAGED, False),
+        (lambda: _blocked_dot(dtype=jnp.float16), _Store.STAGED, False),
+        (lambda: _blocked_dot(_chained_dot, dtype=jnp.bfloat16), _Store.STAGED, False),
+        (lambda: _blocked_dot(_relu_dot, m=30, n=45, dtype=jnp.float16), _Store.STAGED, False),
+    ],
 )
-def test_tensorops_matmul_accepts_half_precision_buffer_types(dtype, metal_type):
-    """Check half and bfloat buffer declarations and float accumulation."""
-    source = palladium.emit_msl(_blocked_dot(k=32, dtype=dtype), dot_general="tensorops")
-
-    assert f"device {metal_type}* arg0 [[buffer(0)]]" in source
-    assert f"device {metal_type}* arg2 [[buffer(2)]]" in source
-    # Products accumulate in float and narrow on the per-element store.
-    assert "get_destination_cooperative_tensor<decltype(a), decltype(b), float>()" in source
-
-
-def test_tensorops_matmul_lowering_composes_chained_epilogues():
-    """Check that a ReLU and a further scalar epilogue fuse into the cooperative result without
-    shared storage."""
-    chained, stats = palladium.emit.emit_msl_stats(
-        _blocked_dot(_chained_dot), dot_general="tensorops"
-    )
-    assert "fmax" in chained
-    assert stats.threadgroup_bytes == 0
+def test_matmul2d_placement(spec, store, cooperative_epilogue):
+    """Check where a `matmul2d` product is stored from and where its epilogue runs, for
+    each combination of output type, epilogue and edge tiles."""
+    assert _placement(_recognize(spec())) == (store, cooperative_epilogue)

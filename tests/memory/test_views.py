@@ -13,6 +13,17 @@ def copy_kernel(x, out):
     out[...] = x[...] * 2
 
 
+def test_plain_block_copy_is_exact(metal_device, rng):
+    """A load stored without arithmetic keeps every element of a two-dimensional block."""
+
+    def kernel(x, out):
+        out[...] = x[...]
+
+    call = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((16, 32), np.float32))
+    x = rng.standard_normal((16, 32), dtype=np.float32)
+    np.testing.assert_array_equal(call(x), x)
+
+
 @pytest.mark.parametrize(
     "shape,block",
     [((9, 13), (4, 8)), ((3, 5), (8, 8)), ((8, 12), (2, 3))],
@@ -107,10 +118,69 @@ def test_edge_source_guards_memory_access():
         out_shape=jax.ShapeDtypeStruct((9,), np.float32),
     )
     lines = source.splitlines()
-    loads = [line for line in lines if "arg0[" in line]
-    stores = [n for n, line in enumerate(lines) if "arg1[" in line]
+    loads = [line for line in lines if "arg0_offset[" in line]
+    stores = [n for n, line in enumerate(lines) if "arg1_offset[" in line]
     assert loads and all("< 9" in line for line in loads)
     assert stores and all("if (" in lines[n - 1] and "< 9" in lines[n - 1] for n in stores)
+
+
+def _tiled(shape, block, inputs=1):
+    spec = pl.BlockSpec(block, lambda i, j: (i, j))
+    return {
+        "grid": tuple(a // b for a, b in zip(shape, block)),
+        "in_specs": [spec] * inputs,
+        "out_specs": spec,
+        "out_shape": jax.ShapeDtypeStruct(shape, np.float32),
+    }
+
+
+def _scaled_tanh(x, y, out):
+    out[...] = jnp.tanh(x[...]) * y[...] + 1.0
+
+
+def test_interior_tiles_need_no_bounds_guards():
+    """Tiles that divide the array never leave it: no guard, no padding value,
+    and each program's origin is computed once, into a pointer."""
+    arg = jax.ShapeDtypeStruct((64, 64), np.float32)
+    source = palladium.debug_msl(_scaled_tanh, arg, arg, **_tiled((64, 64), (4, 4), 2))
+    assert "NAN" not in source and "if (" not in source and ">= 0" not in source
+    assert "arg2_offset = arg2 + " in source
+
+
+def test_large_interior_tiles_are_read_and_written_in_place():
+    """Above the register budget a tile is not copied to thread storage: its
+    loads fuse into the expression, which is stored straight to the output."""
+    arg = jax.ShapeDtypeStruct((64, 64), np.float32)
+    source = palladium.debug_msl(_scaled_tanh, arg, arg, **_tiled((64, 64), (16, 16), 2))
+    body = source[source.index("kernel void") :]
+    assert "float t" not in body
+
+
+@pytest.mark.parametrize("block", [(4, 4), (16, 16), (8, 32), (32, 8)])
+def test_interior_tiles_match_interpreter(metal_device, rng, block):
+    """Copied and fused tile accesses address the same elements."""
+    x, y = rng.standard_normal((2, 64, 64)).astype(np.float32)
+    call = palladium.metal_call(_scaled_tanh, **_tiled((64, 64), block, 2))
+    got = np.asarray(call(x, y))
+    np.testing.assert_allclose(got, np.tanh(x) * y + 1.0, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(got, call.interpret(x, y), rtol=1e-5, atol=1e-6)
+
+
+def test_fused_tiles_feed_reductions_and_aliased_outputs(metal_device, rng):
+    """A fused tile load read by a reduction, and an aliased tile, which is
+    written in place and so must be copied before the store."""
+
+    def normalize(x, out):
+        out[...] = x[...] / (jnp.sum(jnp.abs(x[...])) + 1.0)
+
+    def reverse(x, out):
+        out[...] = jnp.transpose(x[...]) * 2.0
+
+    x = rng.standard_normal((64, 64)).astype(np.float32)
+    call = palladium.metal_call(normalize, **_tiled((64, 64), (16, 16)))
+    np.testing.assert_allclose(call(x), call.interpret(x), rtol=1e-5, atol=1e-6)
+    call = palladium.metal_call(reverse, **_tiled((64, 64), (16, 16)), input_output_aliases={0: 0})
+    np.testing.assert_allclose(call(x), call.interpret(x), rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float16, jnp.bfloat16, np.int32, np.uint32])

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from jax.extend.core import JaxprEqn
 
-from palladium.emit.core import Cursor, CVal, Environment, declare, rule
+from palladium.emit.core import Cursor, Environment, declare, rule
 from palladium.errors import EmitError
 
 # Threefry-2x32-20, the algorithm `jax._src.random.threefry2x32` runs by default.
@@ -73,6 +73,7 @@ def _rule_random_fold_in(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> Non
     k1, k2 = key.at("0"), key.at("1")
     b0, b1 = _emit_threefry2x32(cursor, k1, k2, "0u", data.expr)
 
-    name = cursor.fresh()
-    cursor.emit(f"uint {name}[2] = {{{b0}, {b1}}};")
-    env.bind(eqn.outvars[0], CVal(expr=name, shape=(2,), ctype="uint"))
+    # The result is typed as a key, whose data is two words.
+    key = env.bind(eqn.outvars[0], cursor.allocate("uint", (2,)))
+    cursor.emit(f"{key.at('0')} = {b0};")
+    cursor.emit(f"{key.at('1')} = {b1};")

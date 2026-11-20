@@ -1,4 +1,4 @@
-"""`reduce_sum`/`reduce_max` -> nested loops, one per kept dim.
+"""Reductions over any subset of axes, as nested loops with one loop per kept dim.
 
 `axes` may be any subset of dims; `jnp.mean` is `reduce_sum` plus a `div`.
 `lax.reduce` with any combiner keeps one accumulator per operand.

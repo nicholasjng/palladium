@@ -1,4 +1,5 @@
-"""Emitter regressions that remain testable without a Metal device."""
+"""Storage and fusion choices that show in the emitted source, and the edge
+lowerings behind them against the interpreter."""
 
 import re
 
@@ -81,8 +82,8 @@ def test_reshape_between_scalar_and_one_element_array_stays_in_registers(kind):
     "kind",
     ["bfloat_literal", "scalar_to_array", "array_to_scalar", "zero_power", "swap"],
 )
-def test_regressions_against_interpret(metal_device, kind):
-    """Compare literal, scalar-reshape, zero-power, and scratch-swap regressions with the
+def test_edge_lowerings_match_interpreter(metal_device, kind):
+    """Compare a bfloat literal, scalar reshapes, a zero power and a used swap result with the
     interpreter."""
     kernel, arg, kwargs = _case(kind)
     call = palladium.metal_call(
@@ -99,10 +100,8 @@ def test_regressions_against_interpret(metal_device, kind):
 
 
 def test_a_jitted_helper_fuses_on_every_call():
-    # jit bodies are cached and shared by every call, Vars included, so the
-    # second walk once saw the first walk's consumers and fused nothing.
     """Check that reusing a cached JIT body preserves fusion without duplicating its intermediate
-    arrays."""
+    arrays: every call shares the body's Vars, so each walk needs its own use information."""
 
     @jax.jit
     def act(v):
@@ -135,10 +134,8 @@ def test_sum_of_squares_needs_no_block_array():
 
 
 def test_where_at_the_end_computes_into_the_output():
-    # jnp.where's select sits in an inlined jit body; its result is still
-    # stored straight to the output ref once the block is large.
     """Verify that a large terminal where writes directly to the output without a block-sized
-    temporary."""
+    temporary, although its select sits in an inlined jit body."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = jnp.where(x_ref[...] > 0.0, x_ref[...], 0.0)

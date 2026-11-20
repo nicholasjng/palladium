@@ -1,5 +1,7 @@
 """Numerical semantics of `sign` and `rem` at dtype edges (inf, NaN, signed zero, division by zero, integer limits)."""
 
+import math
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -51,11 +53,13 @@ def test_sign_and_remainder(dtype):
         (jnp.sinh, np.sinh),
         (jnp.arcsinh, np.arcsinh),
         (jnp.arctanh, np.arctanh),
+        # The large-argument formula alone is 1.5e-7 off in absolute terms: 5% at 1e-6.
+        (jax.lax.erf, np.vectorize(math.erf)),
     ],
 )
 def test_odd_functions_keep_relative_accuracy_near_zero(op, reference):
+    """Compare small-argument tanh, sinh, asinh, atanh and erf with float64 references."""
     # Metal's own versions return 0 for 1e-8 and are 1-3% off at 2e-6.
-    """Compare small-argument tanh, sinh, asinh, and atanh with float64 NumPy references."""
     x = np.array([1e-8, -2e-6, 1e-4, 5e-3, -0.02, 0.5], np.float32)
 
     def kernel(x_ref, o_ref):

@@ -1,5 +1,5 @@
-"""iota, cumulative reductions, concatenate, and dynamic_slice
-(emit/rules/structural.py), checked against the interpreter oracle."""
+"""iota, cumulative reductions, concatenate, and dynamic_slice, checked
+against the interpreter oracle."""
 
 import jax
 import jax.numpy as jnp

@@ -1,4 +1,4 @@
-"""`_rule_cond` and `_rule_while`: data-dependent branching and loops.
+"""`lax.cond`, `lax.switch` and `lax.while_loop`: data-dependent branching and loops.
 
 The gridded tests give every program instance its own branch or trip
 count; divergence across threads is native to the one-thread-per-instance

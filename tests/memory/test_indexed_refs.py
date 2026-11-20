@@ -1,4 +1,4 @@
-"""Indexed ref access (`x_ref[i, j]`) in `_rule_get`/`_rule_swap`.
+"""Indexed Ref loads and stores (`x_ref[i, j]`).
 
 Non-Slice indices squeeze that dim into a pointer offset; Slice indices keep
 the dim, with a static Python int or a dynamic Var (`pl.dslice`) as start.
