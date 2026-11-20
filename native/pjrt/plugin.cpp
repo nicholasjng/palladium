@@ -394,6 +394,26 @@ PJRT_Error* copy_buffer(const PJRT_Buffer* src, PJRT_Device* device, PJRT_Buffer
     return nullptr;
 }
 
+constexpr char kStablehloVersion[] = "stablehlo_current_version";
+int64_t stablehlo_version[3] = {-1, -1, -1};
+
+}  // namespace
+
+extern "C" {
+
+// The StableHLO version of the jaxlib that compiles: palladium._pjrt sets it
+// before jax creates the client.
+__attribute__((visibility("default"))) void palladium_pjrt_set_stablehlo_version(
+    int64_t major, int64_t minor, int64_t patch) {
+    stablehlo_version[0] = major;
+    stablehlo_version[1] = minor;
+    stablehlo_version[2] = patch;
+}
+
+}  // extern "C"
+
+namespace {
+
 PJRT_Api make_api() {
     PJRT_Api api{};
     api.struct_size = PJRT_Api_STRUCT_SIZE;
@@ -417,9 +437,23 @@ PJRT_Api make_api() {
     api.PJRT_Plugin_Initialize = [](PJRT_Plugin_Initialize_Args*) -> PJRT_Error* {
         return nullptr;
     };
+    // Without a version, jaxlib serializes programs for a StableHLO release
+    // months old, which rejects newer ops. The compiler reads programs with
+    // jaxlib's own bindings, so it reports that version here.
     api.PJRT_Plugin_Attributes = [](PJRT_Plugin_Attributes_Args* args) -> PJRT_Error* {
+        static PJRT_NamedValue attribute;
         args->attributes = nullptr;
         args->num_attributes = 0;
+        if (stablehlo_version[0] < 0) return nullptr;
+        attribute = PJRT_NamedValue{};
+        attribute.struct_size = PJRT_NamedValue_STRUCT_SIZE;
+        attribute.name = kStablehloVersion;
+        attribute.name_size = std::strlen(kStablehloVersion);
+        attribute.type = PJRT_NamedValue_kInt64List;
+        attribute.int64_array_value = stablehlo_version;
+        attribute.value_size = 3;
+        args->attributes = &attribute;
+        args->num_attributes = 1;
         return nullptr;
     };
 

@@ -1,8 +1,11 @@
 // Compilation and execution for the `metal` PJRT plugin. PJRT_Client_Compile
 // hands the StableHLO program to a compiler that palladium registers from
 // Python; it describes the program through the pp_* builder functions as
-// buffer slots and kernel launches, which Execute encodes into one command
-// buffer and commits without waiting.
+// buffer slots and steps. Execute encodes kernel launches into one command
+// buffer and commits without waiting. Host steps and branches need values the
+// GPU has yet to compute: Execute commits what it has encoded, waits, and
+// goes on in a new command buffer.
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <chrono>
@@ -34,7 +37,14 @@ struct Slot {
     std::unique_ptr<Buffer> constant;
 };
 
+// One step of a program: a kernel launch, a call into the host, or a branch.
 struct Kernel {
+    enum Kind { Launch, Host, Branch } kind = Launch;
+    // Host: the function's id; its buffers are `slots`. Branch: the steps to
+    // skip (negative: back) when the first byte of `slots[0]` is zero, or
+    // always when there is no slot.
+    int host = -1;
+    int64_t skip = 0;
     std::shared_ptr<Library> library;
     std::shared_ptr<ComputePipeline> pipeline;
     std::vector<int> slots;  // bound at buffer indices 0..n-1
@@ -64,10 +74,33 @@ struct Program {
     // Set by the compiler on failure.
     PJRT_Error_Code error_code = PJRT_Error_Code_OK;
     std::string error_message;
+
+    ~Program();
 };
 
 using Compiler = int (*)(const char* code, size_t code_size, Program* builder);
 Compiler compiler = nullptr;
+
+// Runs host function `id` on the contents of its buffers; on failure returns
+// nonzero and writes a message of at most `capacity` bytes.
+using Host = int (*)(int id, void* const* data, size_t count, char* message, size_t capacity);
+Host host = nullptr;
+
+// Host functions of destroyed programs, for palladium._pjrt to forget. A
+// program may be destroyed while the interpreter shuts down, so it does not
+// call into Python itself.
+std::mutex released_mutex;
+std::vector<int>& released() {
+    static auto* ids = new std::vector<int>;  // leaked: programs may outlive statics
+    return *ids;
+}
+
+Program::~Program() {
+    std::lock_guard lock(released_mutex);
+    for (const Kernel& k : kernels) {
+        if (k.kind == Kernel::Host) released().push_back(k.host);
+    }
+}
 
 constexpr char kName[] = "metal_program";
 constexpr char kMemoryKind[] = "device";
@@ -136,14 +169,53 @@ EXPORT int pp_kernel(Program* p, const char* msl, const char* function, int math
         const auto& [library, pipeline] = found->second;
         auto bound_offsets = offsets ? std::vector<size_t>(offsets, offsets + num_slots)
                                      : std::vector<size_t>(num_slots);
-        p->kernels.push_back({library, pipeline, {slots, slots + num_slots},
-                              std::move(bound_offsets), {grid[0], grid[1], grid[2]},
-                              {threadgroup[0], threadgroup[1], threadgroup[2]}});
+        Kernel kernel;
+        kernel.library = library;
+        kernel.pipeline = pipeline;
+        kernel.slots.assign(slots, slots + num_slots);
+        kernel.offsets = std::move(bound_offsets);
+        kernel.grid = {grid[0], grid[1], grid[2]};
+        kernel.threadgroup = {threadgroup[0], threadgroup[1], threadgroup[2]};
+        p->kernels.push_back(std::move(kernel));
         return 0;
     } catch (const MetalError& e) {
         pp_error(p, PJRT_Error_Code_INTERNAL, e.what());
         return -1;
     }
+}
+
+// A call of host function `id` on the contents of `slots`, each from its byte
+// offset, once the GPU has computed them.
+EXPORT void pp_host(Program* p, int id, const int* slots, size_t num_slots,
+                    const size_t* offsets) {
+    Kernel step;
+    step.kind = Kernel::Host;
+    step.host = id;
+    step.slots.assign(slots, slots + num_slots);
+    step.offsets.assign(offsets, offsets + num_slots);
+    p->kernels.push_back(std::move(step));
+}
+
+// Skips `skip` steps (back, when negative) if the first byte of `slot` is
+// zero; always, when `slot` is negative.
+EXPORT void pp_branch(Program* p, int slot, int64_t skip) {
+    Kernel step;
+    step.kind = Kernel::Branch;
+    step.skip = skip;
+    if (slot >= 0) step.slots.push_back(slot);
+    p->kernels.push_back(std::move(step));
+}
+
+EXPORT void palladium_pjrt_set_host(Host h) { host = h; }
+
+// Moves up to `capacity` ids of host functions whose programs are gone into
+// `ids`, and returns how many.
+EXPORT size_t palladium_pjrt_released(int* ids, size_t capacity) {
+    std::lock_guard lock(released_mutex);
+    size_t count = std::min(capacity, released().size());
+    std::copy(released().end() - count, released().end(), ids);
+    released().resize(released().size() - count);
+    return count;
 }
 
 EXPORT void pp_output(Program* p, int slot) { p->outputs.push_back(slot); }
@@ -238,6 +310,19 @@ void record_gpu(double start, double end) {
     }
 }
 
+// With PALLADIUM_PJRT_PROFILE set, every launch runs in a command buffer of
+// its own and the GPU seconds of each step of the last execution are kept,
+// for palladium_pjrt_profile. Slower: nothing overlaps.
+bool profiling() {
+    static const bool on = std::getenv("PALLADIUM_PJRT_PROFILE") != nullptr;
+    return on;
+}
+std::mutex profile_mutex;
+std::vector<double>& last_profile() {
+    static auto* seconds = new std::vector<double>;
+    return *seconds;
+}
+
 void throttle() {
     std::unique_lock lock(in_flight_mutex);
     while (!in_flight.empty() && (in_flight.front()->ready() || in_flight.size() >= kMaxInFlight)) {
@@ -249,8 +334,9 @@ void throttle() {
     }
 }
 
-// Encodes every kernel into one command buffer and returns without waiting:
-// the outputs are defined, and `completion` set, once the GPU is done.
+// Encodes the kernels into one command buffer and returns without waiting:
+// the outputs are defined, and `completion` set, once the GPU is done. A host
+// step or a conditional branch first waits for the work encoded so far.
 PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
                     PJRT_Buffer* const* args, size_t num_args, PJRT_Buffer** outputs,
                     std::shared_ptr<Completion> completion, const PJRT_ExecuteOptions* options) {
@@ -332,11 +418,64 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
         if (failure) return completion->set(PJRT_Error_Code_INTERNAL, failure);
         completion->set();
     };
+    size_t waits = 0;
     try {
-        CommandBatch batch(runtime());
+        auto batch = std::make_unique<CommandBatch>(runtime());
         bool encoded = false;
+        bool inputs_ready = false;
+        // Makes every buffer readable on the host: the work encoded so far
+        // and, the first time, the arguments other executions still compute.
+        auto synchronize = [&]() -> PJRT_Error* {
+            if (encoded) {
+                batch->wait();
+                if (auto seconds = batch->gpu_time()) {
+                    // No other execution overlaps a command buffer this one waits for.
+                    Stats& st = stats();
+                    std::lock_guard lock(st.mutex);
+                    st.gpu_sum += *seconds;
+                    st.gpu_busy_folded += *seconds;
+                }
+                batch = std::make_unique<CommandBatch>(runtime());
+                encoded = false;
+                ++waits;
+            }
+            if (!inputs_ready) {
+                for (size_t i = 0; i < num_args; ++i) {
+                    if (PJRT_Error* e = wait_ready(args[i])) return e;
+                }
+                inputs_ready = true;
+            }
+            return nullptr;
+        };
         Launch launch;  // reused: add() encodes it at once, and buffers keep their capacity
-        for (const Kernel& k : p.kernels) {
+        std::vector<void*> contents;
+        std::vector<double> profile(profiling() ? p.kernels.size() : 0);
+        for (size_t pc = 0; pc < p.kernels.size(); ++pc) {
+            const Kernel& k = p.kernels[pc];
+            if (k.kind == Kernel::Branch) {
+                bool taken = true;
+                if (!k.slots.empty()) {
+                    if (PJRT_Error* e = synchronize()) return e;
+                    taken = *static_cast<const char*>(bound[k.slots[0]]->contents()) == 0;
+                }
+                if (taken) pc += k.skip;
+                continue;
+            }
+            if (k.kind == Kernel::Host) {
+                if (PJRT_Error* e = synchronize()) return e;
+                contents.clear();
+                for (size_t j = 0; j < k.slots.size(); ++j) {
+                    char* data = static_cast<char*>(bound[k.slots[j]]->contents());
+                    contents.push_back(data ? data + k.offsets[j] : nullptr);
+                }
+                char message[4096] = "metal: no host function handler registered";
+                if (!host || host(k.host, contents.data(), contents.size(), message,
+                                  sizeof message - 1) != 0) {
+                    message[sizeof message - 1] = 0;
+                    return error(PJRT_Error_Code_INTERNAL, message);
+                }
+                continue;
+            }
             if (!k.grid.volume()) continue;
             launch.pipeline = k.pipeline.get();
             launch.buffers.clear();
@@ -346,18 +485,29 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
             launch.grid = k.grid;
             launch.threadgroup =
                 k.threadgroup.volume() ? k.threadgroup : k.pipeline->default_threadgroup(k.grid);
-            batch.add(launch);
+            batch->add(launch);
             encoded = true;
             ++launches;
+            if (profiling()) {
+                batch->wait();
+                profile[pc] += batch->gpu_time().value_or(0);
+                batch = std::make_unique<CommandBatch>(runtime());
+                encoded = false;
+                ++waits;
+            }
+        }
+        if (profiling()) {
+            std::lock_guard lock(profile_mutex);
+            last_profile() = std::move(profile);
         }
         // A host memcpy in the completion handler can lag the next command
         // buffer. GPU copies make passthrough/repeated outputs safe to chain.
         for (const auto* pass : {&snapshots, &copybacks}) {
-            batch.copy(*pass);
+            batch->copy(*pass);
             for (auto [src, dst] : *pass) encoded |= dst->size() != 0;
         }
         if (encoded) {
-            batch.commit(std::move(finish));
+            batch->commit(std::move(finish));
             committed = true;
             std::lock_guard lock(in_flight_mutex);
             in_flight.push_back(completion);
@@ -377,7 +527,7 @@ PJRT_Error* execute(std::shared_ptr<Program> program, PJRT_Device* device,
         Stats& s = stats();
         std::lock_guard lock(s.mutex);
         ++s.executions;
-        s.command_buffers += committed;
+        s.command_buffers += committed + waits;
         s.launches += launches;
         s.throttle += encode_start - throttle_start;
         s.encode += std::chrono::steady_clock::now() - encode_start;
@@ -401,6 +551,16 @@ struct PalladiumPjrtStats {
     uint64_t pool_hits, pool_misses, allocated_bytes, pool_dropped;
     double allocation_seconds;
 };
+
+// Copies the GPU seconds of each step of the last execution into `seconds`,
+// up to `capacity`, and returns the number of steps. Empty unless
+// PALLADIUM_PJRT_PROFILE is set.
+EXPORT size_t palladium_pjrt_profile(double* seconds, size_t capacity) {
+    std::lock_guard lock(profile_mutex);
+    const auto& profile = last_profile();
+    std::copy_n(profile.begin(), std::min(capacity, profile.size()), seconds);
+    return profile.size();
+}
 
 EXPORT void palladium_pjrt_stats(PalladiumPjrtStats* out, int reset) {
     Stats& s = stats();
