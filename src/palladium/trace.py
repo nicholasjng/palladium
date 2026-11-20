@@ -120,6 +120,13 @@ class KernelSpec:
     simdgroups : int or None, optional
         SIMD groups per threadgroup for a `pl.kernel` over a `plmtl.Mesh`, whose programs
         are threadgroups over whole arrays; None for a `pallas_call`.
+    sequential : tuple of int, optional
+        Grid axes whose programs run in order inside one thread, with scratch kept
+        between them, instead of as parallel threads. Empty by default.
+    prefetch : int, optional
+        How many leading inputs are the scalar operands of a
+        ``PrefetchScalarGridSpec``: whole arrays that the kernel reads and that the
+        index maps of the other operands take after the grid indices. Default 0.
 
     Notes
     -----
@@ -136,6 +143,8 @@ class KernelSpec:
     scratch: tuple[ScratchInfo, ...]
     aliases: tuple[tuple[int, int], ...] = ()
     simdgroups: int | None = None
+    sequential: tuple[int, ...] = ()
+    prefetch: int = 0
 
 
 def _block_dim(dim: Any) -> int | None:
@@ -171,6 +180,13 @@ def _block_infos(block_mappings: list[Any]) -> tuple[BlockInfo, ...]:
             )
         )
     return tuple(infos)
+
+
+def _whole_array(aval: Any, grid_rank: int) -> BlockInfo:
+    """An operand every program sees whole: one block the size of the array."""
+    shape = tuple(int(d) for d in aval.shape)
+    origin = jax.make_jaxpr(lambda *grid: (0,) * len(shape))(*(0,) * grid_rank)
+    return BlockInfo(shape, shape, np.dtype(aval.dtype), origin, shape)
 
 
 def _validate_aliases(
@@ -237,11 +253,94 @@ def _map_uses_axis(index_map: ClosedJaxpr, axis: int) -> bool:
     return seed in inner.outvars or _depends_on(inner, {seed}, list(inner.outvars))
 
 
+def _inner_ref(eqn: JaxprEqn, ref: Var) -> list[tuple[Jaxpr, Var | None]]:
+    """The bodies of a control-flow equation, each with the variable `ref` is inside it
+    (None if the body does not take it)."""
+    name, params = eqn.primitive.name, eqn.params
+    if name == "cond":
+        bodies = [(branch.jaxpr, eqn.invars[1:]) for branch in params["branches"]]
+    elif name == "while":
+        split = params["cond_nconsts"]
+        carries = eqn.invars[split + params["body_nconsts"] :]
+        bodies = [
+            (params["cond_jaxpr"].jaxpr, [*eqn.invars[:split], *carries]),
+            (params["body_jaxpr"].jaxpr, eqn.invars[split:]),
+        ]
+    elif name == "scan":
+        bodies = [(params["jaxpr"].jaxpr, eqn.invars)]
+    else:
+        bodies = [
+            (getattr(child, "jaxpr", child), eqn.invars) for child in jaxprs_in_params(params)
+        ]
+    found = []
+    for body, operands in bodies:
+        inner = [v for v, outer in zip(body.invars, operands, strict=False) if outer is ref]
+        found.append((body, inner[0] if inner else None))
+    return found
+
+
+def _first_touch(jaxpr: Jaxpr, ref: Var) -> str | None:
+    """Whether a program's first use of `ref` is a "read" or a "write"; None if it has none.
+
+    A conditional counts as a write only if every branch writes first, and a loop
+    as its body does, taking it to run at least once.
+    """
+    for eqn in jaxpr.eqns:
+        if not (effects.eqn_reads_ref(eqn, ref) or effects.eqn_writes_ref(eqn, ref)):
+            continue
+        bodies = _inner_ref(eqn, ref)
+        if not bodies:
+            # `get` reads; `addupdate` reads what it adds to; `swap` writes.
+            return "write" if eqn.primitive.name == "swap" else "read"
+        touches = [_first_touch(body, inner) for body, inner in bodies if inner is not None]
+        if "read" in touches:
+            return "read"
+        if eqn.primitive.name != "cond" and "write" in touches:
+            return "write"
+        if touches and len(touches) == len(bodies) and all(t == "write" for t in touches):
+            return "write"
+    return None
+
+
+def _sequential_axes(
+    jaxpr: Jaxpr, n_operands: int, grid: tuple[int, ...], compiler_params: Any
+) -> tuple[int, ...]:
+    """The grid axes that must run in order, because the kernel reads scratch it has
+    not written: values an earlier program along the grid left there.
+
+    Mosaic runs a grid in order with scratch kept between programs, and its kernels
+    accumulate that way: zero the scratch at the first step of an axis, add to it at
+    every step, write the output at the last. Palladium runs programs as parallel
+    threads with scratch of their own. With `dimension_semantics` the axes not
+    marked "parallel" run in order; another backend's parameters without them mean
+    Mosaic's default, every axis in order.
+    """
+    if not any(_first_touch(jaxpr, ref) == "read" for ref in jaxpr.invars[n_operands:]):
+        return ()
+    semantics = getattr(compiler_params, "dimension_semantics", None)
+    ours = getattr(compiler_params, "BACKEND", None) == "palladium"
+    if semantics is None and (compiler_params is None or ours):
+        raise TraceError(
+            "the kernel reads scratch before writing it, which only has a meaning if "
+            "programs run in order and scratch persists between them. Palladium runs "
+            "programs as parallel threads, each with scratch of its own. Write the "
+            "scratch first, or pass compiler_params=palladium.CompilerParams("
+            'dimension_semantics=...) with "arbitrary" for the grid axes to run in '
+            'order and "parallel" for the others'
+        )
+    if semantics is None:
+        return tuple(range(len(grid)))
+    if len(semantics) != len(grid):
+        raise TraceError(f"dimension_semantics {semantics} does not match the grid {grid}")
+    return tuple(axis for axis, kind in enumerate(semantics) if kind != "parallel")
+
+
 def _validate_parallel_writes(
     jaxpr: Jaxpr,
     outputs: tuple[BlockInfo, ...],
     grid: tuple[int, ...],
     n_in: int,
+    sequential: tuple[int, ...] = (),
 ) -> None:
     """Reject the provable write race: a grid axis that neither the output's
     index map nor any write index depends on. A write inside control flow
@@ -254,6 +353,8 @@ def _validate_parallel_writes(
         writes = [e for e in jaxpr.eqns if effects.eqn_writes_ref(e, o_var)]
         for axis, extent in enumerate(grid):
             if not writes or extent <= 1 or _map_uses_axis(info.index_map_jaxpr, axis):
+                continue
+            if axis in sequential:  # one thread walks this axis: no race
                 continue
             pid_vars = {
                 out
@@ -423,9 +524,7 @@ def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
             "kernel."
         )
 
-    if grid_mapping.num_index_operands:
-        raise TraceError("PrefetchScalarGridSpec is not supported")
-
+    prefetch = grid_mapping.num_index_operands
     n_in, n_out = grid_mapping.num_inputs, grid_mapping.num_outputs
     scratch_bufs = grid_mapping.scratch_avals
     mappings = list(grid_mapping.block_mappings)
@@ -434,12 +533,18 @@ def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
     if not grid:
         grid = (1,)
 
-    inputs = _block_infos(mappings[:n_in])
+    # Scalar prefetch operands lead the kernel's refs: whole arrays, at one place.
+    scalars = tuple(
+        _whole_array(v.aval.inner_aval, len(grid)) for v in kernel_jaxpr.invars[:prefetch]
+    )
+    inputs = scalars + _block_infos(mappings[:n_in])
     outputs = _block_infos(mappings[n_in : n_in + n_out])
+    n_in += prefetch
     aliases = tuple((int(i), int(j)) for i, j in params.get("input_output_aliases") or ())
     if aliases:
         _validate_aliases(kernel_jaxpr, aliases, inputs, outputs)
-    _validate_parallel_writes(kernel_jaxpr, outputs, grid, n_in)
+    sequential = _sequential_axes(kernel_jaxpr, n_in + n_out, grid, params.get("compiler_params"))
+    _validate_parallel_writes(kernel_jaxpr, outputs, grid, n_in, sequential)
 
     name = params.get("name") or "palladium_kernel"
     if not re.fullmatch(r"[A-Za-z_]\w*", name, re.ASCII):
@@ -465,6 +570,8 @@ def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
             for aval in scratch_bufs
         ),
         aliases=aliases,
+        sequential=sequential,
+        prefetch=prefetch,
     )
 
 

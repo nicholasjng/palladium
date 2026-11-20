@@ -1846,3 +1846,17 @@ def test_floating_remainder_is_exact():
         got = jax.jit(call)(a.reshape(32, 64), b.reshape(32, 64))
         np.testing.assert_array_equal(got, np.fmod(a, b).reshape(32, 64))
     """)
+
+
+def test_a_mosaic_matmul_kernel_runs_unchanged():
+    """JAX's bundled TPU matmul: a scalar-prefetch grid spec, Mosaic's compiler
+    parameters, and an accumulator in scratch along the K axis, which runs as
+    a loop inside each thread."""
+    _check("""
+        import jax, numpy as np
+        from jax.experimental.pallas.ops.tpu import matmul
+        rng = np.random.default_rng(0)
+        x, y = rng.standard_normal((2, 128, 128), np.float32)
+        got = jax.jit(lambda x, y: matmul.matmul(x, y, block_shape=(32, 32), block_k=32))(x, y)
+        np.testing.assert_allclose(got, x @ y, rtol=1e-4, atol=1e-4)
+    """)

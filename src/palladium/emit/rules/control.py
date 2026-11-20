@@ -8,7 +8,6 @@ import math
 from jax.extend.core import Jaxpr, JaxprEqn, Var
 
 from palladium.emit.core import (
-    PID,
     REGISTER_BYTES,
     Cursor,
     CVal,
@@ -29,7 +28,13 @@ def _rule_program_id(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     Pure aliasing, no storage or code. The (int) cast keeps index arithmetic signed.
     """
     axis: int = eqn.params["axis"]
-    env.bind(eqn.outvars[0], CVal(f"(int){PID[axis]}", (), "int"))
+    env.bind(eqn.outvars[0], CVal(f"(int){env.pids[axis]}", (), "int"))
+
+
+@rule("num_programs")
+def _rule_num_programs(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
+    """`pl.num_programs(axis)` -> the grid's extent along the axis, a constant."""
+    env.bind(eqn.outvars[0], CVal(str(env.grid[eqn.params["axis"]]), (), "int"))
 
 
 @rule("scan")
