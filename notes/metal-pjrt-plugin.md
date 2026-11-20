@@ -23,17 +23,40 @@ Works:
   fuse with producers and consumers without intermediate buffers.
 - Threefry on the device: key split and fold-in, random bits, and float32
   uniform and normal samples.
-- `reduce` with add, maximum, minimum, and, or bodies over arbitrary axes,
-  including empty reductions, and variadic scalar reducers (argmax and argmin
-  with first-index ties and NaN behavior).
+- `reduce` with add, multiply, maximum, minimum, and, or, xor bodies over
+  arbitrary axes, including empty reductions; any other scalar reducer body,
+  variadic ones (argmax and argmin with first-index ties and NaN behavior)
+  and 64-bit integers as a sequential fold per output.
 - Gather for JAX indexing, including batching, windows, negative indices and
-  clip/fill lowering. Scatter-add for float32, float16, bfloat16, int32 and
-  uint32 data with 32-bit indices, including duplicate indices.
-- Static counted `while`, including `lax.scan` trajectories and nested loops.
+  clip/fill lowering. Scatter with 32-bit indices: assignment on every type,
+  and add, multiply, min, max or any scalar body on types of up to 32 bits,
+  including duplicate indices.
+- Static counted `while`, including `lax.scan` trajectories and nested loops,
+  with 32- or 64-bit counters.
+- Any other `while` (`lax.while_loop` with a data-dependent condition,
+  `fori_loop` with a traced bound), nested in counted loops and conditionals:
+  the host reads the condition before each iteration.
+- Host callbacks: `jax.pure_callback`, `io_callback` (ordered or not),
+  `jax.debug.print` and `jax.debug.callback`, and `checkify` checks, also
+  inside loops.
+- Dense linear algebra on LAPACK, between launches: Cholesky, triangular
+  solves, LU, QR, `eigh` and SVD, and what JAX builds on them (`solve`, `inv`,
+  `det`, `slogdet`, `pinv`, `lstsq`, Gaussian log densities), with gradients
+  and under `vmap`.
+- `sort` along any dimension with any comparator and several operands
+  (`jnp.sort`, `argsort`, `lax.sort` by keys, `top_k`, `median`,
+  `searchsorted`, `unique` with a size, `random.permutation`), stable.
+- Cumulative reductions (`cumsum`, `cumprod`, `cummax`, `cummin`,
+  `cumlogsumexp`, forward and reverse) along axes of any length.
+- `rng_bit_generator` (the `rbg` PRNGs), as Threefry on the element index.
 - Floating `dot_general`: plain, transposed and batched products, multiple
-  batch and contraction axes, vectors and empty dimensions.
+  batch and contraction axes, vectors and empty dimensions. Integer and
+  boolean `dot_general`, as a reduction over products.
 - `convolution` (every layout, stride, padding, both dilations, window
-  reversal), `reduce_window` and `select_and_scatter`.
+  reversal, feature and batch groups), `reduce_window` with windows of any
+  length and any scalar reducer body, and `select_and_scatter`.
+- Comparisons in total order, `fma`, `exp2`, `log2`, `reduce_precision`, and
+  bitcasts between element widths.
 - Pure `stablehlo.case` (`lax.cond`, `lax.switch`), including nested
   conditionals.
 - Asynchronous execution with completion events, a buffer pool, and at most
@@ -41,26 +64,26 @@ Works:
 - Donation through `tf.aliasing_output`.
 - Palladium kernels inside `jit`: `pl.pallas_call` (any math mode, aliases)
   and `metal_call` (including under `jax.vmap`), also inside counted loops.
-- The SBI, LLM and SAM2-like steps of `examples/training_steps.py`, and the
-  CNF update of `examples/cnf_density.py`.
+- The SBI, LLM and SAM2-like steps of `examples/training_steps.py`, the
+  CNF update of `examples/cnf_density.py`, and LoRA training of SAM2
+  (`examples/sam2`, Hiera-tiny at 1024 px) and of Qwen2.5-0.5B
+  (`examples/lora`, float32 and bfloat16).
 
 Fails with UNIMPLEMENTED, naming the op (`palladium.stablehlo` raises
 `UnsupportedProgram`):
 
-- reducer bodies other than the ones above (including a single-result
-  product), and 64-bit integer reductions;
-- integer or explicitly algorithm-selected dots;
-- dynamic or unrecognized `while`;
-- non-add and variadic scatter, and scatter on other data types;
-- `reduce_window` over more than 64 elements per output;
-- `sort`, and comparisons in total order;
-- grouped convolutions (`feature_group_count` or `batch_group_count` above 1);
-- float64 arithmetic, shape-changing bitcasts, and 64-bit integer operations
-  without an explicit lowering (such as power).
+- complex numbers, and with them `fft` and `eig`;
+- reducer, scatter and comparator bodies that are not scalar elementwise
+  code, and `reduce_window` or `scatter` of several operands;
+- scatter that combines 64-bit elements, or takes 64-bit indices;
+- `select_and_scatter` reading more than 64 elements per output;
+- explicitly algorithm-selected dots;
+- a host callback with effects inside a loop condition or a reducer;
+- float64 arithmetic, and 64-bit integer operations without an explicit
+  lowering (such as power).
 
-Not supported by design yet: host callbacks (`jax.debug.print`,
-`pure_callback`), `eigh` and `svd`, the persistent compilation cache
-(executables do not serialize), more than one device.
+Not supported by design yet: the persistent compilation cache (executables
+do not serialize), more than one device.
 
 Reference inputs can be made on CPU:
 
@@ -117,16 +140,19 @@ tag>` also resolves offsets with `nm -n`.
 |---|---|
 | `native/pjrt/plugin.h` | Shared types: `Error`, `Memory` (extending the C API's function-table structs), `Completion`, `PJRT_Buffer`, the pool interface |
 | `native/pjrt/plugin.cpp` | `GetPjrtApi`: errors, events, client, device, memory, topology, buffers, the pool |
-| `native/pjrt/executable.cpp` | `PJRT_Client_Compile`, the `pp_*` builder ABI, `Execute`, executable queries, in-flight throttling, counters |
+| `native/pjrt/executable.cpp` | `PJRT_Client_Compile`, the `pp_*` builder ABI, `Execute` with its host steps and branches, executable queries, in-flight throttling, counters |
 | `native/runtime/dispatch.*` | `CommandBatch::commit(on_completed)`, the non-blocking commit Execute uses |
 | `src/palladium/_pjrt.py` | `jax_plugins` entry point (`initialize`), ctypes signatures, the compile callback, `stats()` |
-| `src/palladium/stablehlo/` | StableHLO to `Program`: graph import, terms, kernel text, scheduling |
+| `src/palladium/stablehlo/` | StableHLO to `Program`: graph import, terms, kernel text, scheduling, storage sharing |
+| `src/palladium/host.py` | Lowering rules for work on the host: Python callbacks and LAPACK |
 | `src/palladium/stablehlo/gemm.py` | Canonical batched products to the Pallas GEMM emitter |
 | `CMakeLists.txt` | `palladium_pjrt` target, the pinned downloads, the native dependency test |
 | `tests/runtime/test_pjrt.py` | End to end through jax, against the CPU backend |
 | `tests/runtime/test_pjrt_native.py` | Builds and runs `tests/native/pjrt_dependencies.cpp` |
 | `tests/codegen/test_stablehlo.py` | Generated programs, no GPU needed |
 | `examples/training_steps.py` | The SBI, LLM and SAM2-like training steps |
+| `examples/sam2/` | SAM2 in JAX with LoRA training, and its parity check against the MLX port |
+| `examples/lora/` | Qwen2.5-0.5B in JAX with mlx-lm's LoRA training, and its parity check against mlx-lm |
 | `benchmarks/bench_dispatch.py` | Per-call overhead and bandwidth, per backend |
 | `benchmarks/bench_training.py` | Pipelined training steps with GPU busy fraction, launches and host time; compile plus first call |
 | `benchmarks/bench_kernels.py` | GEMM, attention and embedding kernels against MLX |
@@ -168,8 +194,17 @@ tag>` also resolves offsets with `nm -n`.
    - `pp_kernel(msl, function, math_mode, slots, grid, threadgroup,
      offsets)`: compiles the MSL, cached per executable by source, entry
      point and math mode; an empty threadgroup lets the pipeline choose.
+   - `pp_host(id, slots, offsets)`: a call of a Python function on the
+     contents of the slots, and `pp_branch(slot, skip)`: skip steps (back,
+     when negative) if the boolean in the slot is false, or always without
+     a slot.
    - `pp_output(slot)`, `pp_alias(parameter, output)` and
      `pp_error(code, message)`.
+
+   The plugin reports jaxlib's StableHLO version as its own
+   (`stablehlo_current_version`). Without it, jaxlib serializes for a
+   release months old and rejects programs with newer ops such as `fma`,
+   which the special functions and several samplers use.
 
    `UnsupportedProgram` becomes UNIMPLEMENTED; any other exception becomes
    INTERNAL with its traceback. No exception may unwind into the plugin.
@@ -190,7 +225,21 @@ tag>` also resolves offsets with `nm -n`.
    buffer another one uses. The handler retains the program and the storage
    owners, then sets the execution's `Completion`, which, joined with the
    inputs' completions, is each output's `ready`.
-7. **Buffer reuse.** Buffers come from a pool keyed by requested size,
+7. **Host steps and branches.** A host step or a conditional branch needs
+   values the GPU has yet to compute. `Execute` commits the command buffer
+   encoded so far, waits for it (and, the first time, for the arguments
+   other executions still compute), and goes on in a new one; whatever
+   follows the last such step is committed without waiting, as always. A
+   host step calls `palladium._pjrt._host` with pointers into the buffers'
+   shared memory; NumPy views them without a copy. A program with such
+   steps therefore blocks its caller and does not pipeline.
+8. **Storage sharing.** Fresh slots that are not outputs share storage when
+   their lifetimes, from the first step binding them to the last, do not
+   overlap and their byte sizes match (`program.share_storage`). A slot
+   bound inside a host-driven loop lives for the whole loop. An execution's
+   memory is then bounded by the program's widest point: the SAM2 step at
+   1024 px exhausted a 16 GB M2 without it.
+9. **Buffer reuse.** Buffers come from a pool keyed by requested size,
    since a fresh MTLBuffer is zeroed on allocation. The pool holds up to a
    quarter of the device's recommended working set (`PALLADIUM_POOL_BYTES`
    overrides it) and evicts its oldest free buffers. Each dispatch holds
@@ -263,7 +312,7 @@ intermediates, shifts guard counts at or above the width, and divide and
 remainder handle zero and signed-min / -1 explicitly. Narrow integers
 compute in 32 bits and wrap on the way back.
 
-**Counted loops.** The compiler proves a scalar i32/ui32 counter starting
+**Counted loops.** The compiler proves a scalar integer counter starting
 at a constant, compared with LT to a constant bound and incremented by one,
 including invariant bounds and hoisted constants. It compiles the body once
 and rebinds its launches per iteration, in one command buffer with no host
@@ -278,6 +327,82 @@ carry updated only by a `dynamic_update_slice` of itself, and read nowhere
 else in the body, lives in one buffer per execution, each iteration writing
 just its update: this covers `lax.scan` outputs. A graph may replay at most
 100,000 launches.
+
+**Dynamic loops.** A `while` that is not provably counted keeps its
+condition as a program of its own. The carries start as copies in slots of
+their own, which hold the results in the end. Reading the condition costs a
+command buffer and a wait, so a body made of launches alone runs several
+iterations between two reads: an iteration is the condition, the body into a
+second bank, and copies back that a kernel gates on the condition. Once the
+condition is false the carries stop changing, so it stays false, and the
+iterations past the last change nothing. Groups of 1, 1, 2 and 4 iterations
+end in a branch out of the loop, then groups of 8 repeat: a short loop
+wastes little, and a long one waits once in eight iterations. A body with
+host steps of its own (a callback, a nested dynamic loop) cannot run
+unobserved. It is laid out twice, between the carries' slots and the second
+bank, each copy behind a read of the condition. Induction variables and
+in-place carries are optimizations of counted loops only.
+
+**Host calls.** `palladium.host` registers lowering rules for `metal` that
+emit a `palladium_host` custom call naming a Python function by index: for
+`pure_callback`, `io_callback`, `debug_callback`, `debug_print` and
+`checkify`'s check, and for `cholesky`, `triangular_solve`, `lu`, `qr`,
+`eigh` and `svd`, which run on LAPACK through NumPy and SciPy (MLX runs them
+on the CPU too). The compiler schedules the inputs into buffers, then the
+step, then reads the results as buffers. Calls with effects run in program
+order whether or not anything reads them, and a loop holding one runs for
+it; the token of an ordered effect is an empty buffer. Kernels compute every
+branch of a `case` and select, but a host call may raise, print or cost
+seconds, and a host-driven loop may never end outside its branch: a branch
+step skips each unless every `case` branch around it is the one taken.
+diffrax, which steps with a `while_loop` and reports errors from
+conditionals, solves on `metal` this way.
+
+**Sort.** A merge sort by rank, one launch per doubling of the sorted runs,
+all with one kernel: each pass binds its run width at an offset into a
+constant array and alternates between two banks of buffers. One thread per
+element binary-searches the other run of its pair with the program's own
+comparator and writes itself at its rank; elements of the left run go
+before equal ones of the right, so the sort is stable. All operands move
+together. Work is n log² n comparisons, with no data-dependent launches.
+
+**Cumulative reductions and long windows.** JAX lowers `cumsum` and its
+relatives to a `reduce_window` as long as the axis. Along more than 128
+elements it becomes three launches: the total of each block, for each block
+the total of the blocks before it, and each element folded from its block's
+start. Blocks hold about the cube root of four times the length, which
+balances the last two. The reducer must be associative and the initial
+value its identity. Any other window of more than 64 elements, or with a
+reducer body of its own, folds in a loop per output element and is stored
+once for all readers.
+
+**Scatter.** One thread per update element. An assignment stores. An
+addition of 32-bit elements is an atomic add. Any other update is a
+compare-and-exchange loop on the element's 32-bit word, with the scatter's
+own body between load and exchange; narrower elements get a word each while
+they are updated. Updates of one element apply in no particular order.
+
+**Grouped convolutions.** Each group is one product of a batch: feature
+groups split the patches' features, batch groups (the kernel gradient of a
+grouped convolution) their batch. A group contracting at most 16 elements,
+as in a depthwise 3×3, is a sum that the reading kernel unrolls, with no
+GEMM and no patch buffer.
+
+**Attention.** A floating product whose left operand is a row softmax
+(`exp(s - max s) / sum`, as `jax.nn.softmax` writes it) of a product,
+possibly times a constant, is attention if nothing else reads the scores or
+the probabilities. It runs as one Pallas kernel through the TensorOps
+recognizer: a threadgroup per tile of queries with the softmax in
+registers, each head a batch, so the queries-by-keys scores take no buffer.
+The match is by structure through the reshapes `jnp.matmul` adds; lengths
+must fill the kernel's tiles and heads be 16 to 128 wide in steps of 16,
+otherwise the graph is scheduled as written. A gradient is: there the
+probabilities have other readers.
+
+**Shared reduction operands.** A reduction stores its operand first when
+other nodes read it too and it binds more than two buffers. A normalization
+reads what it took the mean of twice more, and fused, each reader recomputed
+a residual sum of dozens of buffers.
 
 **`case`.** Guarded per-result selection: scalar and index-map producers
 stay inside each branch, while reductions, dots and counted loops are
@@ -313,12 +438,7 @@ gather without atomics: each element revisits the windows that contain it,
 recomputes each window's selection, and adds the window's source value
 where that selection is itself.
 
-**Gather and scatter.** Gather fuses source and index expressions into
-reads. Scatter initializes fresh output storage and uses atomic adds for
-f32, i32 and u32. For f16 and bf16 it uses one atomic uint word per
-element, with compare/exchange and rounding after each update, then
-unpacks; odd-sized outputs never touch a neighboring halfword outside their
-allocation.
+**Gather.** Gather fuses source and index expressions into reads.
 
 **Palladium kernels.** On `metal`, `pallas_call` lowers through
 `palladium.ffi.pallas_lowering` to the same typed-FFI custom call,
@@ -365,18 +485,39 @@ Known differences from XLA:CPU:
   says. The `x[idx]` and `x.at[idx].add` forms match CPU.
 - Float-to-narrow-integer conversion of out-of-range values is undefined on
   both backends.
+- `rng_bit_generator` draws different bits than XLA:CPU: StableHLO leaves
+  the generator to the backend. The default Threefry PRNG matches.
+- Linear algebra runs LAPACK through NumPy and SciPy, which may pick other
+  drivers than jaxlib's; results agree within rounding, and eigenvectors
+  and singular vectors up to their sign conventions.
 
 ## Remaining work
 
 - Reductions: parallel variadic reductions, coalesced tiling for column
   reductions, one thread per output for rows of 17 to about 128 elements,
   epilogue fusion.
-- Loops: dynamic conditions and other induction patterns (host condition
-  reads or GPU-driven dispatch), 64-bit loop counters, selective dispatch
-  of expensive `case` branches.
+- Loops: a dynamic loop inside a dynamic loop, and every host call in a
+  conditional branch, still cost a wait per read, where the outer loop
+  could carry the inner condition as data. A 200-step diffrax solve nests
+  such loops: 1,002 command buffers and 243 ms on an M2 with 34 ms of GPU
+  time, against 0.4 ms on CPU; a flat loop of 1,000 small iterations takes
+  31 ms. Indirect dispatch would also save the iterations run past the end.
+  Selective dispatch of expensive `case` branches made of kernels, as host
+  calls in branches already have.
+- Complex numbers and `fft`.
+- Linear algebra on the GPU: one thread per matrix for batches of small
+  Cholesky factorizations and triangular solves, which SBI's Gaussian
+  posteriors use; the host steps stop the pipeline.
+- Sort: start from short runs sorted in registers, to save the first
+  passes; a sort of a million elements is 20 launches of a million threads.
+- Storage sharing ignores slots of different sizes; the pool then drops and
+  reallocates buffers when a step's working set exceeds it (175 new buffers
+  per SAM2 step at 1024 px on a 16 GB M2).
 - Products: epilogue fusion, avoiding transposed packing, reading split-K
   chunks in place instead of copying the left operand, small and tail
   products.
+- Grouped convolutions with 17 or more elements per group go through the
+  batched GEMM, padded to 16×16 tiles.
 - Kernels: a `metal` rule for `pl.kernel`'s `mpmd_map` outside `plmtl`;
   avoiding the copy for an aliased input that is not read again.
 - Donation: in-place execution without the temporary and the copyback.
@@ -401,6 +542,12 @@ of the intervals. Busy time is a command buffer's whole residency,
 including time it waits behind a predecessor, not pure kernel time.
 Completion handlers arrive out of start order, so synchronize on the last
 outputs before reading.
+
+With `PALLADIUM_PJRT_PROFILE` set in the environment, every launch runs in
+a command buffer of its own, and `palladium._pjrt.profile()` returns the GPU
+seconds of each step of the last execution, in the order of the compiled
+program's steps. The sum exceeds the normal GPU time, by roughly 0.1 ms per
+launch on an M2, so it ranks large launches and overstates small ones.
 
 The benchmarks are mew benchmarks, run once per backend and compared with
 `mew compare` (`docs/benchmarking.md`). Do not run other GPU workloads at
