@@ -1771,3 +1771,46 @@ def test_sam2_lora_steps_match_cpu():
         for config in (plain, fused):
             assert_trees_close(run("metal", config), want, rtol=1e-4)
     """)
+
+
+def test_recognized_attention_and_normalizations_match_cpu():
+    """Plain attention on the fused kernel, in the forms the recognizer takes,
+    and normalizations whose operand is stored for its readers."""
+    _check("""
+        import jax, jax.numpy as jnp, numpy as np
+        from pjrt_tolerance import assert_matches_cpu
+        rng = np.random.default_rng(0)
+        normal = lambda *shape: rng.standard_normal(shape, np.float32)
+
+        def attention(q, k, v, scale=1.0):
+            return jax.nn.softmax((q @ jnp.swapaxes(k, -1, -2)) * scale, axis=-1) @ v
+
+        def layout(q, k, v):  # (batch, length, heads, head_dim), as models store it
+            q, k, v = (x.transpose(0, 2, 1, 3) for x in (q, k, v))
+            return attention(q * 0.125, k, v).transpose(0, 2, 1, 3)
+
+        cases = {
+            "heads": (attention, normal(2, 4, 256, 64), normal(2, 4, 256, 64), normal(2, 4, 256, 64)),
+            "scaled": (lambda q, k, v: attention(q, k, v, 0.125), *(normal(3, 256, 64) for _ in range(3))),
+            "more keys than queries": (attention, normal(2, 128, 96), normal(2, 512, 96), normal(2, 512, 96)),
+            "32-row query tiles": (attention, normal(4, 96, 32), normal(4, 688, 32), normal(4, 688, 32)),
+            "transposed layout": (layout, *(normal(1, 256, 4, 64) for _ in range(3))),
+            "large scores": (lambda q, k, v: attention(q, k, v, 50.0), *(normal(2, 256, 32) for _ in range(3))),
+            "fused operands": (lambda q, k, v: attention(jnp.tanh(q) + 1, k * 2, v - k), *(normal(2, 256, 32) for _ in range(3))),
+            "gradient": (jax.grad(lambda q, k, v: (attention(q, k, v) ** 2).sum(), (0, 1, 2)), *(normal(2, 256, 32) for _ in range(3))),
+        }
+        for name, (fn, *args) in cases.items():
+            assert_matches_cpu(fn, *args, rtol=1e-4, err_msg=name)
+
+        def layer_norm(x, w, b):
+            mean = x.mean(-1, keepdims=True)
+            var = ((x - mean) ** 2).mean(-1, keepdims=True)
+            return (x - mean) * jax.lax.rsqrt(var + 1e-6) * w + b
+
+        x = normal(64, 64, 96)
+        assert_matches_cpu(lambda x, y, w, b: layer_norm(jax.nn.gelu(x) + y, w, b), x, normal(64, 64, 96), normal(96), normal(96))
+        assert_matches_cpu(lambda x: jax.nn.log_softmax(x * 3, axis=-1), x)
+        assert_matches_cpu(lambda x: (x.max(-1), x.min(1), jnp.where(x > 2, jnp.nan, x).max(-1)), x)
+        assert_matches_cpu(lambda x: x.astype(jnp.bfloat16).sum(-1), x, rtol=1e-2)
+        assert_matches_cpu(lambda x: (x * 100).astype(jnp.int32).sum(-1), x)
+    """)
