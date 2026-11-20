@@ -70,10 +70,18 @@ def _timed(state: mew.State, call, flops: float | None = None) -> None:
     plugin_stats.report(state, state.iterations)
 
 
-def _close(actual, expected, rtol: float) -> None:
+def _close(state: mew.State, actual, expected, rtol: float) -> None:
+    """Record the normwise error of `actual` as the row's `error` counter.
+
+    On `metal` an error above `rtol` fails the row: it is a defect. MLX is
+    the baseline, so its row is timed whatever it computes: on an M5 its
+    float32 products and attention are 5e-4 to 2e-3 off the float64
+    reference, and failing them left nothing to compare with.
+    """
     actual, expected = np.asarray(actual, np.float64), np.asarray(expected, np.float64)
     error = np.abs(actual - expected).max() / np.abs(expected).max()
-    if not error <= rtol:
+    state.set_counter("error", float(error))
+    if not error <= rtol and not _MLX:
         raise AssertionError(f"normwise error {error:.2e} > {rtol:g}")
 
 
@@ -112,7 +120,9 @@ def bench_matmul(state: mew.State, dtype: str, n: int) -> None:
     rows = slice(0, 64)
     out = call()
     actual = np.asarray(out.astype(mx.float32) if backend == "mlx" else out.astype(jnp.float32))
-    _close(actual[rows], a[rows].astype(np.float64) @ b, 2e-5 if dtype == "float32" else 1e-2)
+    _close(
+        state, actual[rows], a[rows].astype(np.float64) @ b, 2e-5 if dtype == "float32" else 1e-2
+    )
     _timed(state, call, flops=2 * n**3)
 
 
@@ -202,9 +212,9 @@ def bench_attention(state: mew.State, direction: str, causal: bool) -> None:
         first = np.asarray(out if direction == "forward" else out[2])[0, :, 0]
     weights = _attention_weights(q[0, :, 0], k[0, :, 0], causal)
     if direction == "forward":
-        _close(first, weights @ v[0, :, 0], 1e-4)
+        _close(state, first, weights @ v[0, :, 0], 1e-4)
     else:  # the gradient of a sum: each key's dV row is its total weight
-        _close(first, np.broadcast_to(weights.sum(0)[:, None], first.shape), 1e-4)
+        _close(state, first, np.broadcast_to(weights.sum(0)[:, None], first.shape), 1e-4)
     # The forward pass does two products of tokens x tokens x dim per head,
     # the backward five; a causal mask halves the useful work.
     products = 2 if direction == "forward" else 5
@@ -256,5 +266,5 @@ def bench_embedding(state: mew.State, op: str) -> None:
         def call():
             return jax.block_until_ready(run(t, i, r))
 
-    _close(np.asarray(call()), expected, 1e-5)
+    _close(state, np.asarray(call()), expected, 1e-5)
     _timed(state, call)

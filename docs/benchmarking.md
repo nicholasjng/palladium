@@ -23,7 +23,11 @@ file runs once per backend and the comparison is one command.
 | `bench_sir_simulators.py` | the SIR simulator of `examples/sbi_sir.py` in NumPy and PyTorch (eager on CPU and MPS, `torch.compile`) | `uv run --with torch` |
 
 Every benchmark checks its result against NumPy or a JAX reference before
-timing, so a failure is a correctness bug, not a slow run.
+timing, so a failure is a correctness bug, not a slow run. The exception is
+MLX in `bench_kernels.py`: it is the baseline, so its rows are timed
+whatever they compute, and every row of that file reports its normwise
+error as the counter `error`. On an M5 Pro, MLX 0.32.4 was 5e-4 to 2e-3 off
+in float32 products and attention, which the check would have dropped.
 `benchmarks/conf.py` stamps each run's context with the commit (jj change
 and dirty state), `JAX_PLATFORMS`, the installed jax, jaxlib, jax-mps, mlx
 and palladium versions, the macOS version, the power source and low-power
