@@ -7,6 +7,7 @@
 
 #include <cstdlib>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -18,12 +19,12 @@
 
 namespace {
 
-// LRU of compiled (MRLibrary, MRPipeline) pairs keyed by (source digest,
-// entry point, math mode); mr_compile_library does not cache.
+// LRU of compiled pipelines keyed by (source digest, entry point, math
+// mode); mr_compile_library does not cache.
 // PALLADIUM_KERNEL_CACHE_SIZE overrides the cap, and 0 disables eviction.
 constexpr size_t kDefaultKernelCacheSize = 256;
 
-static size_t kernel_cache_capacity() {
+size_t kernel_cache_capacity() {
   const char *env = std::getenv("PALLADIUM_KERNEL_CACHE_SIZE");
   if (!env || !*env)
     return kDefaultKernelCacheSize;
@@ -34,6 +35,19 @@ static size_t kernel_cache_capacity() {
   return (size_t)v;
 }
 
+// Owning handles: every return path releases what it wrapped or created.
+struct Release {
+  void operator()(MRBuffer *b) const { mr_release_buffer(b); }
+  void operator()(MRBatch *b) const { mr_release_batch(b); }
+};
+
+// Takes ownership of a C API error message, or `fallback` if there is none.
+std::string take_error(char *err, const char *fallback) {
+  std::string message = err ? err : fallback;
+  mr_free_error_message(err);
+  return message;
+}
+
 class KernelCache {
 public:
   static KernelCache &instance() {
@@ -41,15 +55,17 @@ public:
     return cache;
   }
 
-  // Returns {nullptr, nullptr} and fills `error` on failure. `source_id`
-  // is palladium's content digest of `msl_source`, computed once at trace
-  // time, so the per-call key never copies or hashes the source itself.
-  std::pair<MRLibrary *, MRPipeline *>
-  get_or_compile(std::string_view source_id, std::string_view msl_source,
-                 std::string_view function_name, MRMathMode math_mode,
-                 std::string *error) {
+  // Returns null and fills `error` on failure. `source_id` is palladium's
+  // content digest of `msl_source`, computed once at trace time, so the
+  // per-call key never copies or hashes the source itself. The caller shares
+  // ownership, so eviction on another thread cannot free a pipeline in use.
+  std::shared_ptr<MRPipeline> get_or_compile(std::string_view source_id,
+                                             std::string_view msl_source,
+                                             std::string_view function_name,
+                                             MRMathMode math_mode,
+                                             std::string *error) {
     std::string key;
-    key.reserve(source_id.size() + function_name.size() + 2);
+    key.reserve(source_id.size() + function_name.size() + 3);
     key.append(source_id);
     key.push_back('\0');
     key.append(function_name);
@@ -71,41 +87,43 @@ public:
     MRLibrary *library = nullptr;
     if (mr_compile_library(msl_source.data(), msl_source.size(), math_mode,
                            &library, &err) != MR_OK) {
-      *error = err ? err : "mr_compile_library failed";
-      if (err)
-        mr_free_error_message(err);
-      return {nullptr, nullptr};
+      *error = take_error(err, "mr_compile_library failed");
+      return nullptr;
     }
 
     std::string fn_name(function_name);
-    MRPipeline *pipeline = nullptr;
-    if (mr_get_pipeline(library, fn_name.c_str(), &pipeline, &err) != MR_OK) {
-      *error = err ? err : "mr_get_pipeline failed";
-      if (err)
-        mr_free_error_message(err);
+    MRPipeline *raw = nullptr;
+    if (mr_get_pipeline(library, fn_name.c_str(), &raw, &err) != MR_OK) {
+      *error = take_error(err, "mr_get_pipeline failed");
       mr_release_library(library);
-      return {nullptr, nullptr};
+      return nullptr;
     }
+    // The library lives as long as its pipeline.
+    std::shared_ptr<MRPipeline> pipeline(raw, [library](MRPipeline *p) {
+      mr_release_pipeline(p);
+      mr_release_library(library);
+    });
 
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = entries_.find(key);
     if (it != entries_.end()) {
-      // Lost the compile race; release ours and use the winner's.
-      mr_release_pipeline(pipeline);
-      mr_release_library(library);
+      // Lost the compile race; ours is released on return.
       touch(it);
       return it->second->second;
     }
-    Entry entry{library, pipeline};
-    order_.push_front({key, entry});
+    order_.push_front({key, pipeline});
     entries_.emplace(std::move(key), order_.begin());
-    evict_if_needed();
-    return entry;
+    if (capacity_ != 0) {
+      while (entries_.size() > capacity_) {
+        entries_.erase(order_.back().first);
+        order_.pop_back();
+      }
+    }
+    return pipeline;
   }
 
 private:
-  using Entry = std::pair<MRLibrary *, MRPipeline *>;
-  using Node = std::pair<std::string, Entry>;
+  using Node = std::pair<std::string, std::shared_ptr<MRPipeline>>;
   using Iter = std::list<Node>::iterator;
 
   // Most-recently-used at the front. Called with mutex_ held.
@@ -113,42 +131,11 @@ private:
     order_.splice(order_.begin(), order_, it->second);
   }
 
-  // Called with mutex_ held. Safe during in-flight work: the command buffer
-  // retains the library and pipeline it uses.
-  void evict_if_needed() {
-    const size_t cap = capacity_;
-    if (cap == 0)
-      return;
-    while (entries_.size() > cap) {
-      Node &victim = order_.back();
-      mr_release_pipeline(victim.second.second);
-      mr_release_library(victim.second.first);
-      entries_.erase(victim.first);
-      order_.pop_back();
-    }
-  }
-
   std::mutex mutex_;
   const size_t capacity_ = kernel_cache_capacity();
   std::list<Node> order_;
   std::unordered_map<std::string, Iter> entries_;
 };
-
-// Returns false and fills `error` on failure; caller must not dispatch.
-bool wrap_one(xla::ffi::AnyBuffer buf, std::vector<MRBuffer *> &wrapped,
-              std::vector<size_t> &offsets, std::string *error) {
-  MRBuffer *b = nullptr;
-  char *err = nullptr;
-  if (mr_wrap_buffer(buf.untyped_data(), buf.size_bytes(), &b, &err) != MR_OK) {
-    *error = err ? err : "mr_wrap_buffer failed";
-    if (err)
-      mr_free_error_message(err);
-    return false;
-  }
-  wrapped.push_back(b);
-  offsets.push_back(0);
-  return true;
-}
 
 xla::ffi::Error PalladiumDispatch(std::string_view source_id,
                                   std::string_view msl_source,
@@ -169,42 +156,48 @@ xla::ffi::Error PalladiumDispatch(std::string_view source_id,
         "palladium_dispatch: batch_size must be >= 1");
   }
   std::string error;
-  auto [library, pipeline] = KernelCache::instance().get_or_compile(
+  std::shared_ptr<MRPipeline> pipeline = KernelCache::instance().get_or_compile(
       source_id, msl_source, function_name, (MRMathMode)math_mode, &error);
   if (!pipeline)
     return xla::ffi::Error::Internal(error);
-  (void)library; // kept alive by the cache; not needed past pipeline lookup
 
+  char *err = nullptr;
+  std::vector<std::unique_ptr<MRBuffer, Release>> owned;
   std::vector<MRBuffer *> wrapped;
-  std::vector<size_t> offsets;
+  owned.reserve(args.size() + rets.size());
   wrapped.reserve(args.size() + rets.size());
-  offsets.reserve(args.size() + rets.size());
-
+  auto wrap = [&](xla::ffi::AnyBuffer buf) {
+    MRBuffer *b = nullptr;
+    if (mr_wrap_buffer(buf.untyped_data(), buf.size_bytes(), &b, &err) != MR_OK)
+      return false;
+    owned.emplace_back(b);
+    wrapped.push_back(b);
+    return true;
+  };
   for (size_t i = 0; i < args.size(); ++i) {
     auto buf = args.get<xla::ffi::AnyBuffer>(i);
     if (!buf.has_value())
       return buf.error();
-    if (!wrap_one(*buf, wrapped, offsets, &error))
-      return xla::ffi::Error::Internal(error);
+    if (!wrap(*buf))
+      return xla::ffi::Error::Internal(take_error(err, "mr_wrap_buffer failed"));
   }
   size_t n_inputs = wrapped.size();
   for (size_t i = 0; i < rets.size(); ++i) {
     auto buf = rets.get<xla::ffi::AnyBuffer>(i);
     if (!buf.has_value())
       return buf.error();
-    if (!wrap_one(**buf, wrapped, offsets, &error))
-      return xla::ffi::Error::Internal(error);
+    if (!wrap(**buf))
+      return xla::ffi::Error::Internal(take_error(err, "mr_wrap_buffer failed"));
   }
 
   if (elem_strides.size() != wrapped.size()) {
-    for (auto *b : wrapped)
-      mr_release_buffer(b);
     return xla::ffi::Error::InvalidArgument(
         "palladium_dispatch: elem_strides must have one entry per buffer");
   }
 
+  std::vector<size_t> offsets(wrapped.size());
   MRLaunchDesc desc{};
-  desc.pipeline = pipeline;
+  desc.pipeline = pipeline.get();
   desc.buffers = wrapped.data();
   desc.buffer_offsets = offsets.data();
   desc.buffer_count = wrapped.size();
@@ -218,56 +211,32 @@ xla::ffi::Error PalladiumDispatch(std::string_view source_id,
 
   // One grid dispatch per batch element, offset element * elem_strides[i]
   // bytes into each buffer (stride 0 = shared), all in one command buffer
-  // so the ~130us fixed dispatch cost is paid once per FFI call.
+  // so the fixed cost of a command buffer is paid once per FFI call.
   // mr_batch_add copies the descriptor, so offsets is rewritten in place.
-  char *err = nullptr;
-  MRBatch *batch = nullptr;
-  auto fail = [&](const char *what) {
-    xla::ffi::Error e = xla::ffi::Error::Internal(err ? err : what);
-    if (err)
-      mr_free_error_message(err);
-    if (batch) {
-      char *werr = nullptr;
-      mr_batch_wait(batch, &werr);
-      if (werr)
-        mr_free_error_message(werr);
-      mr_release_batch(batch);
-    }
-    for (auto *b : wrapped)
-      mr_release_buffer(b);
-    return e;
-  };
-  if (mr_batch_create(&batch, &err) != MR_OK)
-    return fail("mr_batch_create failed");
+  // A batch that fails before its commit is released without running: the
+  // buffers wrap the caller's memory, which nothing may write after return.
+  MRBatch *raw_batch = nullptr;
+  if (mr_batch_create(&raw_batch, &err) != MR_OK)
+    return xla::ffi::Error::Internal(take_error(err, "mr_batch_create failed"));
+  std::unique_ptr<MRBatch, Release> batch(raw_batch);
   for (int64_t element = 0; element < batch_size; ++element) {
     for (size_t i = 0; i < wrapped.size(); ++i)
       offsets[i] = (size_t)(element * elem_strides[i]);
-    if (mr_batch_add(batch, &desc, &err) != MR_OK)
-      return fail("mr_batch_add failed");
+    if (mr_batch_add(batch.get(), &desc, &err) != MR_OK)
+      return xla::ffi::Error::Internal(take_error(err, "mr_batch_add failed"));
   }
-  if (mr_batch_commit(batch, &err) != MR_OK)
-    return fail("mr_batch_commit failed");
-  if (mr_batch_wait(batch, &err) != MR_OK)
-    return fail("mr_batch_wait failed");
-  mr_release_batch(batch);
-  batch = nullptr;
+  // Waiting commits first, and returns only once the GPU is done.
+  if (mr_batch_wait(batch.get(), &err) != MR_OK)
+    return xla::ffi::Error::Internal(take_error(err, "mr_batch_wait failed"));
 
   // Flush outputs only (no-op on the zero-copy path), once per buffer
   // after the whole batch.
   for (size_t i = n_inputs; i < wrapped.size(); ++i) {
     if (mr_buffer_flush_to(wrapped[i], &err) != MR_OK) {
-      xla::ffi::Error e =
-          xla::ffi::Error::Internal(err ? err : "mr_buffer_flush_to failed");
-      if (err)
-        mr_free_error_message(err);
-      for (auto *b : wrapped)
-        mr_release_buffer(b);
-      return e;
+      return xla::ffi::Error::Internal(
+          take_error(err, "mr_buffer_flush_to failed"));
     }
   }
-
-  for (auto *b : wrapped)
-    mr_release_buffer(b);
   return xla::ffi::Error::Success();
 }
 

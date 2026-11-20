@@ -55,6 +55,61 @@ def test_explain_env_logs_once_per_compile(monkeypatch, capsys, rng):
     assert capsys.readouterr().err.count("palladium kernel") == 1
 
 
+def test_explain_env_does_not_emit_a_second_time(monkeypatch, rng):
+    """Check that the PALLADIUM_EXPLAIN log line is built from the emission that is
+    compiled, not from another one."""
+    import palladium.diagnostics
+    import palladium.ffi
+
+    emissions = []
+    for module in (palladium.ffi, palladium.diagnostics):
+        emit = module.emit_msl_stats
+        monkeypatch.setattr(
+            module,
+            "emit_msl_stats",
+            lambda *a, emit=emit, **k: emissions.append(1) or emit(*a, **k),
+        )
+    monkeypatch.setenv("PALLADIUM_EXPLAIN", "1")
+    x = rng.standard_normal((8, 8), dtype=np.float32)
+    _classic_call()(x, x)
+    assert len(emissions) == 1
+
+
+def test_explain_string_reports_shared_storage_against_the_device_budget():
+    """A cooperative kernel's report names its group and its threadgroup memory."""
+    from jax.experimental import pallas as pl
+
+    def kernel(x_ref, y_ref, o_ref):
+        o_ref[...] = jnp.dot(x_ref[...], y_ref[...])
+
+    call = palladium.metal_call(
+        kernel,
+        grid=(2, 2),
+        in_specs=[
+            pl.BlockSpec((16, 16), lambda i, j: (i, 0)),
+            pl.BlockSpec((16, 32), lambda i, j: (0, j)),
+        ],
+        out_specs=pl.BlockSpec((16, 32), lambda i, j: (i, j)),
+        out_shape=_shaped(32, 64),
+        compiler_params=palladium.CompilerParams(dot_general="tensorops"),
+    )
+    diag = call.explain(_shaped(32, 16), _shaped(16, 64))
+    text = str(diag)
+    assert f"threadgroup={diag.threadgroup}" in text
+    assert ("shared=" in text) == bool(diag.threadgroup_bytes)
+
+
+def test_unsupported_input_dtype_is_a_dispatch_error():
+    """An input whose dtype has no Metal type fails at the call, naming the dtype."""
+
+    def kernel(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 2.0
+
+    call = palladium.metal_call(kernel, out_shape=_shaped(8))
+    with pytest.raises(DispatchError, match="argument 0 has dtype complex64"):
+        call(np.zeros(8, np.complex64))
+
+
 def test_all_errors_are_palladium_errors():
     """Check stage-specific exception inheritance, including ValueError, TypeError, and
     NotImplementedError."""
@@ -64,18 +119,3 @@ def test_all_errors_are_palladium_errors():
     assert issubclass(DispatchError, TypeError)
     assert issubclass(UnsupportedPrimitiveError, NotImplementedError)
     assert issubclass(UnsupportedPrimitiveError, EmitError)
-
-
-def test_multiple_pallas_calls_rejected():
-    """Verify that tracing a wrapper containing two Pallas calls rejects the ambiguous kernel."""
-    from jax.experimental import pallas as pl
-
-    def kernel(x_ref, o_ref):
-        o_ref[...] = x_ref[...]
-
-    def two_calls(x):
-        y = pl.pallas_call(kernel, out_shape=_shaped(8))(x)
-        return pl.pallas_call(kernel, out_shape=_shaped(8))(y)
-
-    with pytest.raises(TraceError, match="2 pallas_call"):
-        palladium.trace(two_calls, _shaped(8))

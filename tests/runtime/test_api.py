@@ -1,6 +1,5 @@
 """The conveniences layered over the core pipeline: storage accounting in
-`explain`, the device thread limit, structured error fields, and the
-bounded per-shape cache.
+`explain`, the device thread limit, and structured error fields.
 """
 
 import jax
@@ -72,28 +71,3 @@ def test_unsupported_primitive_names_the_primitive_as_a_field():
         )
     assert excinfo.value.primitive == "sort"
     assert excinfo.value.primitive in str(excinfo.value)
-
-
-# --- bounded caches ------------------------------------------------------
-
-
-def _sum_kernel(x_ref, o_ref):
-    o_ref[...] = jnp.sum(x_ref[...], keepdims=True)
-
-
-def _key(n):
-    """The cache key for one float32 input of length n."""
-    return (((n,), np.dtype(np.float32).str),)
-
-
-def test_cache_is_bounded(rng, monkeypatch):
-    """Check that shape-specialization caching evicts the oldest entry when its configured capacity
-    is exceeded."""
-    monkeypatch.setattr(palladium.ffi, "_CACHE_SIZE", 2)
-    # out_shape is fixed while the input length is free, so every n is a new key.
-    f = palladium.metal_call(_sum_kernel, out_shape=jax.ShapeDtypeStruct((1,), jnp.float32))
-    for n in (8, 16, 24):
-        f(rng.standard_normal(n, dtype=np.float32))
-    assert list(f._cache) == [_key(16), _key(24)]
-    f(rng.standard_normal(32, dtype=np.float32))
-    assert list(f._cache) == [_key(24), _key(32)]

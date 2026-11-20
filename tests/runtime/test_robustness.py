@@ -13,19 +13,9 @@ import palladium
 # --- thread safety -----------------------------------------------------------
 
 
-def test_concurrent_first_calls_emit_once_per_shape(monkeypatch, rng):
-    """Check correct concurrent first-call results and exactly one emission for each of two shape
-    specializations."""
-    import palladium.ffi as callable_module
-
-    emits = []
-    real_emit = callable_module.emit_msl
-
-    def counting_emit(*args, **kwargs):
-        emits.append(1)
-        return real_emit(*args, **kwargs)
-
-    monkeypatch.setattr(callable_module, "emit_msl", counting_emit)
+def test_concurrent_first_calls_specialize_once_per_shape(rng):
+    """Check correct concurrent first-call results and exactly one trace and emission for
+    each of two shape specializations."""
 
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2.0 + 1.0
@@ -49,8 +39,8 @@ def test_concurrent_first_calls_emit_once_per_shape(monkeypatch, rng):
         results = list(pool.map(work, range(n_threads)))
     for i, out in enumerate(results):
         np.testing.assert_allclose(out, inputs[i] * 2.0 + 1.0, rtol=1e-6)
-    assert len(emits) == 2, f"expected 2 emits, emit_msl ran {len(emits)} times"
-    assert len(call._cache) == 1 and len(call16._cache) == 1
+    assert call._specialize.cache_info().misses == 1
+    assert call16._specialize.cache_info().misses == 1
 
 
 def test_concurrent_calls_on_one_compiled_kernel(rng):
