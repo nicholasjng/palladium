@@ -26,44 +26,17 @@ _FLAT_READERS = frozenset(
 
 
 def lowers_elementwise(eqn: JaxprEqn) -> bool:
-    """Determine whether an equation uses ordinary per-element scalar emission.
-
-    Parameters
-    ----------
-    eqn : JaxprEqn
-        Staged equation to inspect or lower.
-
-    Returns
-    -------
-    bool
-        True for registered elementwise rules or a two-case boolean select; False for
-        other select forms.
-    """
+    """Whether an equation lowers per element: an elementwise rule, or a two-case boolean select."""
     if eqn.primitive.name == "select_n":
         return len(eqn.invars) == 3 and shaped(eqn.invars[0].aval).dtype == np.bool_
     return RULES.get(eqn.primitive.name) is _rule_elementwise
 
 
 def reads_by_flat_index(env: Environment, var) -> bool:
-    """Check whether all uses of a value preserve lazy flat-index evaluation.
+    """Whether every use of `var` reads it by flat index, so it can stay a lazy expression.
 
-    Parameters
-    ----------
-    env : Environment
-        Bindings and def-use information for the current jaxpr.
-    var : Var
-        Variable considered for an unmaterialized expression.
-
-    Returns
-    -------
-    bool
-        True only for a nonescaping, used variable whose consumers are elementwise or
-        supported reduction/prefix readers.
-
-    Notes
-    -----
-    Unknown, unused, and returned values fail this check. It classifies consumers; separate
-    fusion checks decide whether evaluation would be duplicated.
+    False for unused and escaping values. Whether fusion would duplicate the
+    expression is decided separately.
     """
     uses = env.consumer_eqns(var)
     return (
@@ -80,7 +53,7 @@ def _fuses_into_consumer(env: Environment, var, shape: tuple[int, ...], ops: lis
     consumer = env.sole_consumer(var)
     # An inlined jit (jnp.where wraps its select in one) shares the C scope,
     # so follow `var` to its single use inside the body.
-    while consumer is not None and consumer.primitive.name in ("jit", "pjit"):
+    while consumer is not None and consumer.primitive.name == "jit":
         if consumer.invars.count(var) != 1:
             return False
         body = consumer.params["jaxpr"].jaxpr
@@ -150,31 +123,20 @@ def _template(cursor: Cursor, eqn: JaxprEqn, opname: str, ops: list[CVal], ctype
     else:
         template = ELEMENTWISE[opname]
 
+    if ctype in ("half", "bfloat") and not template.startswith((f"{ctype}(", f"(({ctype})")):
+        # Metal's math functions return float for bfloat operands, which does
+        # not narrow implicitly, and a float literal widens the whole
+        # expression: round every result to the type the interpreter keeps.
+        template = f"{ctype}({template})"
     return template
 
 
 def scalar_expression(cursor: Cursor, eqn: JaxprEqn, operands: list[CVal]) -> str:
-    """Format one element of an elementwise equation from scalar operands.
+    """The MSL expression of one element of an elementwise equation.
 
-    Parameters
-    ----------
-    cursor : Cursor
-        Receives helper functions the expression calls.
-    eqn : JaxprEqn
-        An equation for which `lowers_elementwise` holds.
-    operands : list of CVal
-        One scalar per invar; `expr` is the operand's expression and `ctype` its
-        type.
-
-    Returns
-    -------
-    str
-        MSL expression of the output element.
-
-    Raises
-    ------
-    EmitError
-        The template does not consume exactly the given operands.
+    `operands` holds one scalar per invar. Helper functions the expression
+    calls are registered on `cursor`. Raises EmitError when the template does
+    not take exactly these operands.
     """
     out_ctype = msl_type(shaped(eqn.outvars[0].aval).dtype)
     opname = eqn.primitive.name

@@ -1,4 +1,4 @@
-"""`_rule_scan`: fori_loop becomes a C for-loop."""
+"""`lax.fori_loop` with a static trip count: a C for-loop over loop carries."""
 
 import jax
 import jax.numpy as jnp

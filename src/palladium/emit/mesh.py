@@ -8,11 +8,17 @@ and its block operations run cooperatively over the threadgroup:
 - `jnp.dot` of two threadgroup tiles runs on 8x8 SIMD-group matrix fragments,
   the SIMD groups arranged 2x2 over the output, each lane holding two
   adjacent elements of each fragment it owns (MLX's BaseMMAFrag layout).
-  `acc + jnp.dot(...)` accumulates into `acc` in place.
+  `acc + jnp.dot(...)` accumulates into `acc` in place, and `a @ b.T`
+  reads `b` transposed.
 - Elementwise operations on a dot's result apply to each lane's fragment
   elements; storing it writes each lane's elements.
+- Vectors (`iota`, one-dimensional reads of device arrays, and elementwise
+  functions of them) stay expressions of their index until they meet a
+  block: broadcast along rows or columns, each lane evaluates them at its
+  fragment coordinates, as causal masks and per-row statistics need.
 - Scalars are uniform: every thread computes them. `fori_loop` becomes a
-  loop with scalar and fragment carries.
+  loop with scalar and fragment carries, a `for` loop for static bounds and
+  a `while` loop for traced ones.
 
 Threadgroup tiles are stored with rows padded by four elements, which keeps
 the fragment reads free of bank conflicts. A barrier goes before a
@@ -22,8 +28,10 @@ read, since the last barrier.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import math
+from collections.abc import Generator, Iterable
 from contextlib import nullcontext
 
 import jax.experimental.pallas as pl
@@ -31,18 +39,16 @@ from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal, Var
 
 from palladium.emit.addressing import element_strides
 from palladium.emit.core import Cursor, CVal, literal, msl_type, shaped
-from palladium.emit.rules.control import _scan_shape
+from palladium.emit.rules.control import scan_operands
 from palladium.emit.rules.elementwise import lowers_elementwise, scalar_expression
-from palladium.emit.tensorops._shared import _kernel_source
+from palladium.emit.tensorops._shared import SIMD_WIDTH, UNROLL, _kernel_source
 from palladium.emit.tensorops.simdgroup import _MMA, emit_fragment_coordinates
+from palladium.emit.threadgroup import _NESTED, _threadgroup_params
 from palladium.errors import EmitError
 from palladium.trace import KernelSpec
 
-_SIMD_WIDTH = 32
 _WM, _WN = 2, 2  # SIMD groups along fragment rows and columns
 _PAD = 4
-_UNROLL = '_Pragma("clang loop unroll(full)")'
-_NESTED = {"jit": "jaxpr", "pjit": "jaxpr", "custom_jvp_call": "call_jaxpr"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -90,8 +96,11 @@ class _Splat:
 
 @dataclasses.dataclass(frozen=True)
 class _Dot:
+    """`a @ b`, or `a @ b.T` with `b` stored (n, k) when `transposed`."""
+
     a: _View
     b: _View
+    transposed: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -105,7 +114,24 @@ class _Fragments:
     ctype: str
 
 
-_Value = _Scalar | _Ref | _Load | _Splat | _Dot | _Fragments
+_INDEX = "$i"  # stands for the index in an _Indexed template
+
+
+@dataclasses.dataclass(frozen=True)
+class _Indexed:
+    """A value varying along `axis` of `shape` only (other extents are 1 or
+    broadcast): `template` with `_INDEX` replaced by the index along `axis`."""
+
+    template: str
+    ctype: str
+    shape: tuple[int, ...]
+    axis: int
+
+    def at(self, index: str) -> str:
+        return self.template.replace(_INDEX, f"({index})")
+
+
+_Value = _Scalar | _Ref | _Load | _Splat | _Dot | _Fragments | _Indexed
 
 
 def lower_mesh_program(spec: KernelSpec, kernel_name: str | None = None) -> tuple[str, int]:
@@ -132,26 +158,16 @@ def lower_mesh_program(spec: KernelSpec, kernel_name: str | None = None) -> tupl
         mesh programs do not lower: dot operands outside threadgroup memory, tiles
         that do not divide into fragments, loops over scanned inputs, or primitives
         other than reads, writes, elementwise operations, broadcasts of scalars,
-        dots and loops.
+        dots, vectors and loops.
     """
     if spec.aliases:
         raise EmitError("mesh programs do not support input_output_aliases yet")
     if any(info.space != "threadgroup" for info in spec.scratch):
         raise EmitError("mesh programs take plmtl.THREADGROUP scratch only")
-    threads = (spec.simdgroups or 0) * _SIMD_WIDTH
+    threads = (spec.simdgroups or 0) * SIMD_WIDTH
     cursor = Cursor()
     cursor.require("simdgroup_mma", _MMA)
     infos = (*spec.inputs, *spec.outputs)
-    params = tuple(
-        f"{'const ' if index < len(spec.inputs) else ''}device {msl_type(info.dtype)}* "
-        f"arg{index} [[buffer({index})]]"
-        for index, info in enumerate(infos)
-    ) + (
-        "uint3 _pid [[threadgroup_position_in_grid]]",
-        "uint _sg [[simdgroup_index_in_threadgroup]]",
-        "uint _lane [[thread_index_in_simdgroup]]",
-        "uint _tid [[thread_index_in_threadgroup]]",
-    )
     scope: dict[Var, _Value] = {}
     for index, (var, info) in enumerate(zip(spec.jaxpr.invars, infos, strict=False)):
         shape = tuple(info.array_shape)
@@ -169,21 +185,8 @@ def lower_mesh_program(spec: KernelSpec, kernel_name: str | None = None) -> tupl
     emit_fragment_coordinates(cursor, "_lane")
     cursor.emit(f"const short _sm = 8 * (_sg / {_WN}) + _fm, _sn = 8 * (_sg % {_WN}) + _fn;")
     _Lowering(cursor, threads).walk(spec.jaxpr.eqns, scope, spec.jaxpr.outvars)
-    source = _kernel_source(kernel_name or spec.name, params, cursor, threads)
+    source = _kernel_source(kernel_name or spec.name, _threadgroup_params(spec), cursor, threads)
     return source, cursor.threadgroup_bytes
-
-
-def _last_uses(eqns, outvars) -> dict[Var, int]:
-    """The index of each variable's last use; block outputs count as used after all."""
-    last: dict[Var, int] = {}
-    for index, eqn in enumerate(eqns):
-        for atom in eqn.invars:
-            if isinstance(atom, Var):
-                last[atom] = index
-    for atom in outvars:
-        if isinstance(atom, Var):
-            last[atom] = len(eqns)
-    return last
 
 
 class _Lowering:
@@ -194,16 +197,26 @@ class _Lowering:
         self.threads = threads
         self.written: set[str] = set()  # threadgroup tiles written since the last barrier
         self.read: set[str] = set()  # and read since it
+        # Fragments a nested body must not overwrite: an enclosing scope, or
+        # the next iteration, still reads them.
+        self.pinned: frozenset[str] = frozenset()
 
     def walk(self, eqns, scope: dict[Var, _Value], outvars) -> None:
-        last_use = _last_uses(eqns, outvars)
+        # The index of each variable's last use; the block's outputs outlive it.
+        last_use: dict[Var, int] = {
+            atom: index
+            for index, eqn in enumerate(eqns)
+            for atom in eqn.invars
+            if isinstance(atom, Var)
+        }
+        last_use.update((atom, len(eqns)) for atom in outvars if isinstance(atom, Var))
         for index, eqn in enumerate(eqns):
             name = eqn.primitive.name
             if not eqn.outvars:
                 raise EmitError(f"mesh programs do not support primitive {name!r}")
             out = eqn.outvars[0]
             if name in _NESTED:
-                self._inline(eqn, scope)
+                self._inline(eqn, scope, last_use, index)
             elif name == "program_id":
                 scope[out] = _Scalar(f"int(_pid.{'xyz'[eqn.params['axis']]})", "int")
             elif name == "get":
@@ -213,13 +226,16 @@ class _Lowering:
             elif name == "dot_general":
                 scope[out] = self._dot(eqn, scope)
             elif name == "broadcast_in_dim":
-                operand = self._value(eqn.invars[0], scope)
-                if not isinstance(operand, _Scalar):
-                    raise EmitError("mesh programs broadcast scalars only")
-                shape = tuple(int(d) for d in shaped(out.aval).shape)
-                scope[out] = _Splat(operand.expr, operand.ctype, shape)
+                scope[out] = self._broadcast(eqn, scope)
+            elif name == "iota":
+                if len(eqn.params["shape"]) != 1:
+                    raise EmitError("mesh programs take one-dimensional iota only")
+                ctype = msl_type(eqn.params["dtype"])
+                scope[out] = _Indexed(f"{ctype}({_INDEX})", ctype, tuple(eqn.params["shape"]), 0)
             elif name == "scan":
                 self._scan(eqn, scope, last_use, index)
+            elif name == "while":
+                self._while(eqn, scope, last_use, index)
             elif lowers_elementwise(eqn):
                 scope[out] = self._elementwise(eqn, scope, last_use, index)
             else:
@@ -234,15 +250,62 @@ class _Lowering:
         except KeyError as error:
             raise EmitError(f"mesh program value {atom} is not defined") from error
 
-    def _inline(self, eqn: JaxprEqn, scope) -> None:
+    def _vector(self, value: _Value) -> _Value:
+        """A one-dimensional read of a device array as an _Indexed value."""
+        if not (isinstance(value, _Load) and len(value.view.shape) == 1):
+            return value
+        view = value.view
+        if view.ref.space != "device":
+            raise EmitError("mesh programs read vectors from device arrays only")
+        element = f"{self._pointer(view)}[{_INDEX} * {view.strides[0]}]"
+        return _Indexed(element, view.ref.ctype, view.shape, 0)
+
+    def _broadcast(self, eqn: JaxprEqn, scope) -> _Value:
+        operand = self._vector(self._value(eqn.invars[0], scope))
+        shape = tuple(int(d) for d in shaped(eqn.outvars[0].aval).shape)
+        if isinstance(operand, (_Scalar, _Splat)):
+            return _Splat(operand.expr, operand.ctype, shape)
+        if isinstance(operand, _Indexed):
+            axis = eqn.params["broadcast_dimensions"][operand.axis]
+            return _Indexed(operand.template, operand.ctype, shape, axis)
+        raise EmitError("mesh programs broadcast scalars and vectors only")
+
+    def _inline(self, eqn: JaxprEqn, scope, last_use, index) -> None:
         nested = eqn.params[_NESTED[eqn.primitive.name]]
         jaxpr = getattr(nested, "jaxpr", nested)
         if getattr(nested, "consts", ()) or jaxpr.constvars:
             raise EmitError("mesh programs cannot inline a nested jaxpr with constants")
         inner = {v: self._value(a, scope) for v, a in zip(jaxpr.invars, eqn.invars, strict=True)}
-        self.walk(jaxpr.eqns, inner, jaxpr.outvars)
+        live = {
+            value.name
+            for atom, value in zip(eqn.invars, inner.values(), strict=True)
+            if isinstance(value, _Fragments)
+            and not self._dead_after(atom, value, scope, last_use, index)
+        }
+        with self._pinning(live):
+            self.walk(jaxpr.eqns, inner, jaxpr.outvars)
         for outvar, result in zip(eqn.outvars, jaxpr.outvars, strict=True):
             scope[outvar] = self._value(result, inner)
+
+    def _dead_after(self, atom, value: _Fragments, scope, last_use, index) -> bool:
+        """Whether equation `index` may overwrite `value`: nothing that outlives
+        the equation holds these fragments, under `atom` or any other name."""
+        if not isinstance(atom, Var) or value.name in self.pinned:
+            return False
+        return all(
+            last_use.get(var, -1) <= index
+            for var, other in scope.items()
+            if isinstance(other, _Fragments) and other.name == value.name
+        )
+
+    @contextlib.contextmanager
+    def _pinning(self, names: Iterable[str]) -> Generator[None]:
+        outer = self.pinned
+        self.pinned = outer | frozenset(names)
+        try:
+            yield
+        finally:
+            self.pinned = outer
 
     # Barriers.
 
@@ -275,15 +338,18 @@ class _Lowering:
                     reads.add(ref.expr)
                 elif name == "swap":
                     writes.add(ref.expr)
-            nested = None
+            nested, atoms = None, eqn.invars
             if name == "scan":
                 nested = getattr(eqn.params["jaxpr"], "jaxpr", eqn.params["jaxpr"])
+            elif name == "while":
+                nested = eqn.params["body_jaxpr"].jaxpr
+                atoms = eqn.invars[eqn.params["cond_nconsts"] :]
             elif name in _NESTED:
                 nested = getattr(eqn.params[_NESTED[name]], "jaxpr", eqn.params[_NESTED[name]])
             if nested is not None:
                 inner = {
                     v: env.get(a)
-                    for v, a in zip(nested.invars, eqn.invars, strict=False)
+                    for v, a in zip(nested.invars, atoms, strict=False)
                     if isinstance(a, Var)
                 }
                 r, w = self._threadgroup_effects(nested, inner)
@@ -364,6 +430,8 @@ class _Lowering:
         """Every thread copies its share, four elements at a time where rows allow."""
         if dst.shape != src.shape or len(dst.shape) != 2:
             raise EmitError("mesh programs copy equal two-dimensional blocks")
+        if dst.strides[1] != 1 or src.strides[1] != 1:
+            raise EmitError("mesh programs copy blocks with contiguous rows")
         self._reading(src.ref)
         self._writing(dst.ref)
         rows, columns = dst.shape
@@ -382,7 +450,7 @@ class _Lowering:
             return f"*({space} {vector}*)({element})"
 
         cursor = self.cursor
-        with cursor.block(f"{_UNROLL} for (short _c = 0; _c < {copies}; ++_c)"):
+        with cursor.block(f"{UNROLL} for (short _c = 0; _c < {copies}; ++_c)"):
             cursor.emit(f"const uint _e = _tid + _c * {self.threads};")
             guard = cursor.block(f"if (_e < {units})") if units % self.threads else nullcontext()
             with guard:
@@ -408,7 +476,7 @@ class _Lowering:
 
     def _each_element(self, fragments: _Fragments):
         fm, fn = self._fragment_counts(fragments.shape)
-        u = _UNROLL
+        u = UNROLL
         return (
             self.cursor.block(f"{u} for (short i = 0; i < {fm}; ++i)"),
             self.cursor.block(f"{u} for (short j = 0; j < {fn}; ++j)"),
@@ -422,11 +490,15 @@ class _Lowering:
             self.cursor.emit(f"{target.name}[i][j][c] = {self._element(value)};")
 
     def _element(self, value: object) -> str:
+        """`value` at fragment element [i][j][c] of the enclosing loops."""
         if isinstance(value, _Fragments):
             return f"{value.name}[i][j][c]"
         if isinstance(value, (_Scalar, _Splat)):
             return value.expr
-        raise EmitError("mesh programs combine fragments with fragments and scalars only")
+        if isinstance(value, _Indexed) and len(value.shape) == 2:
+            row, column = f"_sm + i * {8 * _WM}", f"_sn + j * {8 * _WN} + c"
+            return value.at(row if value.axis == 0 else column)
+        raise EmitError("mesh programs combine blocks with blocks, vectors and scalars only")
 
     def _fragments(self, value: object, shape: tuple[int, ...]) -> _Fragments:
         """`value` as fragments of `shape`, computed if not already."""
@@ -437,7 +509,7 @@ class _Lowering:
             self._assign(fragments, _Scalar("0.0f", "float"))
             self._mma(fragments, value)
             return fragments
-        if isinstance(value, _Splat):
+        if isinstance(value, (_Splat, _Indexed)):
             fragments = self._new_fragments(shape, value.ctype)
             self._assign(fragments, value)
             return fragments
@@ -450,14 +522,16 @@ class _Lowering:
         if a.view.ref.space != "threadgroup" or b.view.ref.space != "threadgroup":
             raise EmitError("stage dot operands in plmtl.THREADGROUP scratch first")
         (contract, batch) = eqn.params["dimension_numbers"]
-        if tuple(contract[0]) != (1,) or tuple(contract[1]) != (0,) or batch != ((), ()):
-            raise EmitError("mesh programs lower (m, k) @ (k, n) dots only")
+        dims = (tuple(contract[0]), tuple(contract[1]))
+        if dims not in (((1,), (0,)), ((1,), (1,))) or tuple(map(tuple, batch)) != ((), ()):
+            raise EmitError("mesh programs lower (m, k) @ (k, n) and (m, k) @ (n, k).T dots only")
+        transposed = dims[1] == (1,)
         if a.view.ref.ctype != "float" or b.view.ref.ctype != "float":
             raise EmitError("mesh program dots take float32 tiles so far")
         if a.view.shape[1] % 8 or a.view.strides[1] != 1 or b.view.strides[1] != 1:
             raise EmitError("mesh program dots need contiguous rows and k divisible by 8")
-        self._fragment_counts((a.view.shape[0], b.view.shape[1]))
-        return _Dot(a.view, b.view)
+        self._fragment_counts((a.view.shape[0], b.view.shape[0 if transposed else 1]))
+        return _Dot(a.view, b.view, transposed)
 
     def _mma(self, target: _Fragments, dot: _Dot) -> None:
         """target += a @ b, each SIMD group multiplying its fragments in serpentine order."""
@@ -465,22 +539,27 @@ class _Lowering:
         self._reading(dot.b.ref)
         fm, fn = self._fragment_counts(target.shape)
         lda, ldb = dot.a.strides[0], dot.b.strides[0]
-        cursor, u = self.cursor, _UNROLL
+        cursor, u = self.cursor, UNROLL
         a_ptr, b_ptr = cursor.fresh("_as"), cursor.fresh("_bs")
         cursor.emit(
             f"const threadgroup float* {a_ptr} = {self._pointer(dot.a)} + _sm * {lda} + _fn;"
         )
-        cursor.emit(
-            f"const threadgroup float* {b_ptr} = {self._pointer(dot.b)} + _fm * {ldb} + _sn;"
-        )
+        # The lane's B elements are rows kk + _fm, columns _sn + 16 j + {0, 1};
+        # transposed, those are columns kk + _fm of rows _sn + 16 j + {0, 1}.
+        b_start = f"_sn * {ldb} + _fm" if dot.transposed else f"_fm * {ldb} + _sn"
+        cursor.emit(f"const threadgroup float* {b_ptr} = {self._pointer(dot.b)} + {b_start};")
         with cursor.block(f"{u} for (short kk = 0; kk < {dot.a.shape[1]}; kk += 8)"):
             cursor.emit(f"simdgroup_frag _a[{fm}], _b[{fn}];")
             with cursor.block(f"{u} for (short i = 0; i < {fm}; ++i)"):
                 row = f"i * {8 * _WM * lda} + kk"
                 cursor.emit(f"_a[i] = simdgroup_frag({a_ptr}[{row}], {a_ptr}[{row} + 1]);")
             with cursor.block(f"{u} for (short j = 0; j < {fn}; ++j)"):
-                column = f"kk * {ldb} + j * {8 * _WN}"
-                cursor.emit(f"_b[j] = simdgroup_frag({b_ptr}[{column}], {b_ptr}[{column} + 1]);")
+                if dot.transposed:
+                    first, second = f"j * {8 * _WN * ldb} + kk", f"j * {8 * _WN * ldb} + {ldb} + kk"
+                else:
+                    first = f"kk * {ldb} + j * {8 * _WN}"
+                    second = f"{first} + 1"
+                cursor.emit(f"_b[j] = simdgroup_frag({b_ptr}[{first}], {b_ptr}[{second}]);")
             with (
                 cursor.block(f"{u} for (short i = 0; i < {fm}; ++i)"),
                 cursor.block(f"{u} for (short j = 0; j < {fn}; ++j)"),
@@ -489,9 +568,11 @@ class _Lowering:
                 cursor.emit(f"simdgroup_mma({target.name}[i][n], _a[i], _b[n]);")
 
     def _store(self, view: _View, fragments: _Fragments) -> None:
+        if view.strides[1] != 1:
+            raise EmitError("mesh programs store blocks with contiguous rows")
         self._writing(view.ref)
         fm, fn = self._fragment_counts(fragments.shape)
-        cursor, u = self.cursor, _UNROLL
+        cursor, u = self.cursor, UNROLL
         pointer = self._pointer(view)
         with (
             cursor.block(f"{u} for (short i = 0; i < {fm}; ++i)"),
@@ -507,7 +588,7 @@ class _Lowering:
     # Elementwise and loops.
 
     def _elementwise(self, eqn: JaxprEqn, scope, last_use, index) -> _Value:
-        operands = [self._value(atom, scope) for atom in eqn.invars]
+        operands = [self._vector(self._value(atom, scope)) for atom in eqn.invars]
         ctype = msl_type(shaped(eqn.outvars[0].aval).dtype)
         shape = tuple(int(d) for d in shaped(eqn.outvars[0].aval).shape)
         if not shape:
@@ -525,7 +606,7 @@ class _Lowering:
         if eqn.primitive.name == "add" and len(dots) == 1 and len(accs) == 1:
             # acc + dot: accumulate in place when acc is not needed afterwards.
             ((acc_atom, target),) = accs
-            if not (isinstance(acc_atom, Var) and last_use.get(acc_atom) == index):
+            if not self._dead_after(acc_atom, target, scope, last_use, index):
                 acc, target = target, self._new_fragments(shape, ctype)
                 self._assign(target, acc)
             self._mma(target, dots[0])
@@ -537,6 +618,23 @@ class _Lowering:
                 self.cursor, eqn, [CVal(op.expr, (), op.ctype) for op in uniform]
             )
             return _Splat(expression, ctype, shape)
+        axes = {op.axis for op in values if isinstance(op, _Indexed)}
+        vectors = [op for op in values if isinstance(op, (_Scalar, _Splat, _Indexed))]
+        if len(axes) == 1 and len(vectors) == len(values):
+            # A vector stays an expression of its index: evaluated where it meets a block.
+            template = scalar_expression(
+                self.cursor,
+                eqn,
+                [
+                    CVal(op.template, (), op.ctype)
+                    if isinstance(op, _Indexed)
+                    else CVal(op.expr, (), op.ctype)
+                    for op in vectors
+                ],
+            )
+            return _Indexed(template, ctype, shape, axes.pop())
+        if len(shape) != 2:
+            raise EmitError("mesh programs combine vectors along one axis only")
         result = self._new_fragments(shape, ctype)
         a, b, c = self._each_element(result)
         with a, b, c:
@@ -550,8 +648,7 @@ class _Lowering:
 
     def _scan(self, eqn: JaxprEqn, scope, last_use, index) -> None:
         params = eqn.params
-        shape = _scan_shape(eqn)
-        consts, carries = shape.num_consts, shape.num_carry
+        consts, carries = (len(group) for group in scan_operands(eqn)[:2])
         body = params["jaxpr"]
         if isinstance(body, ClosedJaxpr):
             if body.consts:
@@ -561,12 +658,32 @@ class _Lowering:
             raise EmitError("mesh programs lower loops without scanned inputs or outputs")
         if params["reverse"]:
             raise EmitError("mesh programs lower forward loops only")
+        header = f"for (int _it = 0; _it < {params['length']}; ++_it)"
+        self._loop(header, body, eqn.invars[:consts], eqn, scope, last_use, index)
+
+    def _while(self, eqn: JaxprEqn, scope, last_use, index) -> None:
+        """A loop testing a uniform scalar condition before each iteration."""
+        params = eqn.params
+        cond, body = params["cond_jaxpr"], params["body_jaxpr"]
+        if cond.consts or body.consts:
+            raise EmitError("mesh programs cannot lower a loop body with constants")
+        nc, nb = params["cond_nconsts"], params["body_nconsts"]
+        test = (cond.jaxpr, eqn.invars[:nc])
+        consts = eqn.invars[nc : nc + nb]
+        self._loop("while (true)", body.jaxpr, consts, eqn, scope, last_use, index, test)
+
+    def _loop(self, header, body: Jaxpr, consts, eqn, scope, last_use, index, test=None) -> None:
+        """Lower `body` under `header` with the carries of `eqn`, which follow
+        `consts` among its operands; `test` is a condition jaxpr and its
+        constants, evaluated on the carries before each iteration."""
+        inits = eqn.invars[len(eqn.invars) - len(eqn.outvars) :]
         inner: dict[Var, _Value] = {
-            v: self._value(a, scope)
-            for v, a in zip(body.invars[:consts], eqn.invars[:consts], strict=True)
+            v: self._value(a, scope) for v, a in zip(body.invars, consts, strict=False)
         }
+        # Every iteration reads the constants, so none may be updated in place.
+        invariant = {value.name for value in inner.values() if isinstance(value, _Fragments)}
         state: list[_Scalar | _Fragments] = []
-        for v, atom in zip(body.invars[consts:], eqn.invars[consts:], strict=True):
+        for v, atom in zip(body.invars[len(consts) :], inits, strict=True):
             init = self._value(atom, scope)
             carry: _Scalar | _Fragments
             if isinstance(init, _Scalar):
@@ -575,12 +692,12 @@ class _Lowering:
                 carry = _Scalar(name, init.ctype)
             else:
                 shape = tuple(int(d) for d in shaped(v.aval).shape)
-                reusable = (
+                if (
                     isinstance(init, _Fragments)
-                    and isinstance(atom, Var)
-                    and last_use.get(atom) == index
-                )
-                if reusable:
+                    and init.name not in invariant
+                    and all(init.name != getattr(taken, "name", None) for taken in state)
+                    and self._dead_after(atom, init, scope, last_use, index)
+                ):
                     carry = init
                 else:
                     carry = self._new_fragments(shape, msl_type(shaped(v.aval).dtype))
@@ -591,14 +708,28 @@ class _Lowering:
             state.append(carry)
         reads, writes = self._threadgroup_effects(body, inner)
         cursor = self.cursor
-        with cursor.block(f"for (int _it = 0; _it < {params['length']}; ++_it)"):
+        with cursor.block(header), self._pinning(invariant):
             if reads & writes:  # the previous iteration's reads and writes are pending
                 self.read |= reads
                 self.written |= writes
+            if test is not None:
+                jaxpr, test_consts = test
+                env = {v: self._value(a, scope) for v, a in zip(jaxpr.invars, test_consts)}
+                env.update(zip(jaxpr.invars[len(test_consts) :], state, strict=True))
+                # The body reads the carries after the condition did.
+                with self._pinning(v.name for v in env.values() if isinstance(v, _Fragments)):
+                    self.walk(jaxpr.eqns, env, jaxpr.outvars)
+                flag = self._value(jaxpr.outvars[0], env)
+                if not isinstance(flag, _Scalar):
+                    raise EmitError("mesh program loop conditions are scalars")
+                cursor.emit(f"if (!({flag.expr})) break;")
             self.walk(body.eqns, inner, body.outvars)
             results = [self._value(atom, inner) for atom in body.outvars]
-            # Scalars update in two phases: a carry may read another's old value.
+            # Carries update together: one may take another's old value. Scalars
+            # go through locals; fragments are ordered so that a carry is
+            # overwritten after its readers, and a cycle saves one carry first.
             updates = []
+            moves: list[tuple[_Fragments, _Fragments]] = []
             for carry, result in zip(state, results, strict=True):
                 if isinstance(carry, _Scalar):
                     if not isinstance(result, _Scalar):
@@ -607,7 +738,18 @@ class _Lowering:
                     cursor.emit(f"const {carry.ctype} {local} = {result.expr};")
                     updates.append((carry.expr, local))
                 elif not (isinstance(result, _Fragments) and result.name == carry.name):
-                    self._assign(carry, self._fragments(result, carry.shape))
+                    moves.append((carry, self._fragments(result, carry.shape)))
+            while moves:
+                sources = {value.name for _, value in moves}
+                move = next((m for m in moves if m[0].name not in sources), None)
+                if move is None:
+                    carry = moves[0][0]
+                    saved = self._new_fragments(carry.shape, carry.ctype)
+                    self._assign(saved, carry)
+                    moves = [(c, saved if v.name == carry.name else v) for c, v in moves]
+                    continue
+                self._assign(*move)
+                moves.remove(move)
             for name, local in updates:
                 cursor.emit(f"{name} = {local};")
         for outvar, carry in zip(eqn.outvars, state, strict=True):

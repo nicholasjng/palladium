@@ -7,65 +7,19 @@ import string
 
 from palladium.errors import EmitError
 
-MAX_PRIMITIVE_ARITY = 6
-PRIMITIVE_INVARS = string.ascii_lowercase[:MAX_PRIMITIVE_ARITY]
+PRIMITIVE_INVARS = "abcdef"  # template field names, in operand order
 
 
 @functools.cache
 def template_fields(template: str) -> frozenset[str]:
-    """Collect the named replacement fields used by a scalar-expression template.
-
-    Parameters
-    ----------
-    template : str
-        Python format template containing operand names such as {a} and {b}.
-
-    Returns
-    -------
-    frozenset of str
-        Unique nonempty replacement-field names; empty for a literal expression.
-
-    Raises
-    ------
-    ValueError
-        The format string contains malformed braces.
-
-    Notes
-    -----
-    Results are cached by the complete template. Repeated fields count once.
-    """
+    """The operand names a scalar-expression template uses, such as {a} and {b}."""
     return frozenset(f for _, f, _, _ in string.Formatter().parse(template) if f)
 
 
 def unwrapped(expr: str) -> str:
-    """Remove one redundant outer pair of parentheses from an expression.
-
-    Parameters
-    ----------
-    expr : str
-        Emitter-generated MSL expression with balanced parentheses.
-
-    Returns
-    -------
-    str
-        Inner text if the first parenthesis closes at the end; otherwise the original
-        text.
-
-    Notes
-    -----
-    Only one outer pair is removed. This scans parentheses and does not parse MSL strings or
-    comments.
-    """
-    if not (expr.startswith("(") and expr.endswith(")")):
-        return expr
-    depth = 0
-    for i, ch in enumerate(expr):
-        depth += ch == "("
-        depth -= ch == ")"
-        if depth == 0 and i < len(expr) - 1:
-            # The leading paren closes early: shapes like (a) * (b).
-            return expr
-    return expr[1:-1]
+    """Remove one redundant outer pair of parentheses, if the expression has one."""
+    # A leading paren that closes early is a shape like (a) * (b).
+    return expr[1:-1] if expr.startswith("(") and _closes_last(expr, 0) else expr
 
 
 _CALLEE = re.compile(r"[A-Za-z_][\w:<>]*\(")
@@ -84,23 +38,11 @@ def _closes_last(expr: str, start: int) -> bool:
 
 
 def enclosed(expr: str) -> str:
-    """Parenthesize a scalar expression when needed to bind it as one operand.
+    """Parenthesize a scalar expression unless it already binds as one operand.
 
-    Parameters
-    ----------
-    expr : str
-        Emitter-generated MSL scalar expression.
-
-    Returns
-    -------
-    str
-        Original text for a recognized operand, call, or complete bracketed group;
-        otherwise parenthesized text.
-
-    Notes
-    -----
-    Recognition is intentionally small and conservative. This is not a general MSL parser;
-    extra parentheses are preferable to changing precedence.
+    Operands, calls and fully parenthesized groups are recognized; anything
+    else gets parentheses, since an extra pair is better than a changed
+    precedence. This is not an MSL parser.
     """
     if _OPERAND.fullmatch(expr) or (expr.startswith("(") and _closes_last(expr, 0)):
         return expr
@@ -112,7 +54,8 @@ def enclosed(expr: str) -> str:
 
 # MSL has no erf, erfinv, expm1, or log1p; these are float32 helpers emitted
 # once per kernel on first use. erf: Abramowitz and Stegun 7.1.26 (abs error
-# 1.5e-7). erfinv: Giles, "Approximating the erfinv function" (2010), the
+# 1.5e-7), and below |x| = 0.5, where that error is no longer small against
+# the result, six terms of the Maclaurin series (relative error 3e-8). erfinv: Giles, "Approximating the erfinv function" (2010), the
 # single-precision branch. expm1 and log1p switch to short series below
 # |x| = 0.25, where the builtin exp and log would cancel.
 HELPERS: dict[str, tuple[str, str]] = {
@@ -120,6 +63,15 @@ HELPERS: dict[str, tuple[str, str]] = {
         "pd_erf",
         """inline float pd_erf(float x) {
     float a = fabs(x);
+    if (a < 0.5f) {
+        float t = x * x;
+        float p = fma(t, -1.0f / 1320.0f, 1.0f / 216.0f);
+        p = fma(t, p, -1.0f / 42.0f);
+        p = fma(t, p, 0.1f);
+        p = fma(t, p, -1.0f / 3.0f);
+        p = fma(t, p, 1.0f);
+        return 1.1283791671f * x * p;
+    }
     float t = 1.0f / fma(0.3275911f, a, 1.0f);
     float poly = fma(fma(fma(fma(1.061405429f, t, -1.453152027f), t, 1.421413741f), t,
                          -0.284496736f), t, 0.254829592f) * t;
@@ -192,7 +144,7 @@ HELPERS: dict[str, tuple[str, str]] = {
 
 # Metal's tanh, sinh, asinh, and atanh lose relative accuracy below
 # |x| ~ 1e-3 in every math mode (tanh(1e-8) returns 0), and their precise::
-# forms are 2.4x slower. Below 0.01, two series terms are exact to ~1e-9.
+# forms cost more than twice as much. Below 0.01, two series terms are exact to ~1e-9.
 _SMALL_ARGUMENT = {
     "tanh": ("pd_tanh", "1.0f / -3.0f"),
     "sinh": ("pd_sinh", "1.0f / 6.0f"),
@@ -257,30 +209,11 @@ ELEMENTWISE: dict[str, str] = {
 
 
 def extremum(op: str, ctype: str, a: str, b: str) -> str:
-    """Render a dtype-aware scalar minimum or maximum.
+    """A dtype-aware scalar minimum or maximum of `a` and `b`; `op` is "min" or "max".
 
-    Parameters
-    ----------
-    op : {"min", "max"}
-        Extremum to compute.
-    ctype : str
-        MSL scalar type name, such as "float", "half", "bfloat", "int", "uint", or
-        "bool".
-    a : str
-        Left MSL operand.
-    b : str
-        Right MSL operand.
-
-    Returns
-    -------
-    str
-        Boolean logic, integer comparison, or floating extremum with explicit NaN and
-        signed-zero handling.
-
-    Notes
-    -----
-    Integer extrema stay in integer arithmetic. Floating edge semantics require a
-    compilation math mode that preserves them; FAST may optimize them away.
+    Booleans use logic and integers stay in integer arithmetic. Floats
+    propagate NaN and order -0.0 below 0.0, which Metal's own extrema leave
+    open; FAST math may optimize those cases away.
     """
     if ctype == "bool":
         return f"({a} {'&&' if op == 'min' else '||'} {b})"
@@ -297,26 +230,9 @@ def extremum(op: str, ctype: str, a: str, b: str) -> str:
 
 
 def extremum_identity(op: str, ctype: str) -> str:
-    """Return the dtype-specific identity for a minimum or maximum reduction.
+    """The identity of a minimum or maximum reduction over `ctype`.
 
-    Parameters
-    ----------
-    op : {"min", "max"}
-        Reduction operation.
-    ctype : str
-        MSL scalar type name, such as "float", "half", "bfloat", "int", "uint", or
-        "bool".
-
-    Returns
-    -------
-    str
-        Typed extremal constant, infinity, or boolean identity suitable for initializing
-        an accumulator.
-
-    Notes
-    -----
-    Integer identities avoid conversion through float and therefore preserve values above
-    the float32 exact-integer range.
+    Integer identities are integer literals, exact above float32's integer range.
     """
     if ctype == "int":
         return "2147483647" if op == "min" else "(-2147483647 - 1)"
@@ -328,31 +244,11 @@ def extremum_identity(op: str, ctype: str) -> str:
 
 
 def typed_expression(op: str, ctype: str) -> str | None:
-    """Select a dtype-specific expression template for a scalar primitive.
+    """The dtype-specific template of a scalar primitive, or None to use `ELEMENTWISE`.
 
-    Parameters
-    ----------
-    op : str
-        JAX primitive name.
-    ctype : str
-        MSL scalar type name, such as "float", "half", "bfloat", "int", "uint", or
-        "bool".
-
-    Returns
-    -------
-    str or None
-        Template using operand fields, or None when the generic table should be
-        consulted.
-
-    Raises
-    ------
-    EmitError
-        A typed primitive is requested with an incompatible scalar type.
-
-    Notes
-    -----
-    Typed cases preserve integer wraparound, division by zero, shift boundaries, and narrow
-    floating intermediates. The returned template still needs operand substitution.
+    Typed templates keep integer wraparound, division by zero, shift counts
+    past the width, and narrow floating intermediates as jax defines them.
+    Raises EmitError for a primitive that does not support `ctype`.
     """
     if op in ("min", "max"):
         return extremum(op, ctype, "{a}", "{b}")
@@ -386,32 +282,9 @@ def typed_expression(op: str, ctype: str) -> str | None:
 
 
 def helper_template(cursor, op: str, ctype: str) -> str:
-    """Register a numeric helper and return its typed call template.
+    """Register the helper function of `op` and return a call template for operand {a}.
 
-    Parameters
-    ----------
-    cursor : Cursor
-        Destination for generated MSL statements and storage accounting.
-    op : str
-        Primitive name in HELPERS.
-    ctype : str
-        MSL scalar type name, such as "float", "half", "bfloat", "int", "uint", or
-        "bool".
-
-    Returns
-    -------
-    str
-        Call template with {a} as the operand and a result cast to ctype.
-
-    Raises
-    ------
-    KeyError
-        The primitive has no helper definition.
-
-    Notes
-    -----
-    Helpers operate in float32, then narrow the result if needed. Each helper is emitted
-    once per cursor.
+    Helpers compute in float32; the call narrows the result to `ctype`.
     """
     function, source = HELPERS[op]
     cursor.require(function, source)
@@ -419,35 +292,10 @@ def helper_template(cursor, op: str, ctype: str) -> str:
 
 
 def format_scalar(op: str, ctype: str, operands: tuple[str, ...], cursor=None) -> str:
-    """Format a scalar primitive from dtype-specific or generic MSL templates.
+    """The MSL expression of scalar primitive `op` on `operands`, in primitive order.
 
-    Parameters
-    ----------
-    op : str
-        JAX primitive name.
-    ctype : str
-        MSL scalar type name, such as "float", "half", "bfloat", "int", "uint", or
-        "bool".
-    operands : tuple of str
-        MSL scalar operands in primitive order.
-    cursor : Cursor or None, optional
-        Required for primitives implemented by emitted helper functions.
-
-    Returns
-    -------
-    str
-        Complete MSL scalar expression.
-
-    Raises
-    ------
-    EmitError
-        The primitive or dtype is unsupported, or operand arity does not match the
-        template.
-
-    Notes
-    -----
-    Helper-only primitives cannot be formatted without a cursor. Templates use up to six
-    named operands; variadic selects are handled separately by their lowering rule.
+    Primitives lowered through helper functions need `cursor` to emit them.
+    Raises EmitError for an unknown primitive or the wrong number of operands.
     """
     if op in HELPERS and cursor is not None:
         template = helper_template(cursor, op, ctype)

@@ -6,13 +6,14 @@ KernelSpec. `grid_mapping`/`block_mapping` fields are version-sensitive.
 from __future__ import annotations
 
 import dataclasses
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import jax
 import jax.experimental.pallas as pl
 import numpy as np
-from jax._src.pallas import core as pallas_core
+from jax._src.pallas import core as pallas_core  # get_grid_mapping has no public name
 from jax.extend.core import (
     ClosedJaxpr,
     Jaxpr,
@@ -124,7 +125,7 @@ class KernelSpec:
     -----
     Prefer ``trace`` to constructing this record directly: the dataclass itself does not
     validate layouts, aliases, or write safety. Alias validation requires identical layouts
-    and input reads before output writes; the mps dispatch path rejects aliases.
+    and input reads before output writes.
     """
 
     name: str
@@ -306,14 +307,15 @@ def trace(pallas_fn: Callable, *example_args) -> KernelSpec:
     ------
     TraceError
         No call or multiple calls are found, or the kernel uses scalar prefetch,
-        unsupported block dimensions, foreign effects, invalid aliases, or provably
-        colliding writes.
+        unsupported block dimensions, foreign effects, invalid aliases, provably
+        colliding writes, or a name that is not an identifier.
 
     Notes
     -----
     Only JIT wrappers are searched for calls; arbitrary nested control-flow wrappers are not
     traversed. Write checks reject obvious collisions but do not prove index-map
-    injectivity. This adapter depends on JAX 0.11 Pallas internals.
+    injectivity. This adapter reads private Pallas metadata, which changes between JAX
+    releases.
     """
     closed = jax.make_jaxpr(pallas_fn)(*example_args)
     eqns = _pallas_call_eqns(closed.jaxpr)
@@ -344,19 +346,19 @@ def _mesh_spec(eqn: JaxprEqn) -> KernelSpec:
     (mesh,) = params["meshes"]
     (jaxpr,) = params["jaxprs"]
     if mesh.simdgroups != 4:
-        raise TraceError("plmtl meshes support 4 SIMD groups per threadgroup so far")
+        raise TraceError("plmtl meshes require 4 SIMD groups per threadgroup")
     if not 1 <= len(mesh.grid) <= 3:
         raise TraceError("plmtl meshes have one to three grid axes")
     out_avals = params["out_avals"]
     n_in, n_out = len(eqn.invars), len(out_avals)
     refs = [v.aval.inner_aval for v in jaxpr.invars[: n_in + n_out]]
     scratch = [v.aval for v in jaxpr.invars[n_in + n_out :]]
-    any_space = pallas_core.MemorySpace.ANY
-    grid_spec = pallas_core.GridSpec(
+    any_space = pl.MemorySpace.ANY
+    grid_spec = pl.GridSpec(
         grid=tuple(mesh.grid),
         in_specs=tuple(pl.BlockSpec(memory_space=any_space) for _ in range(n_in)),
         out_specs=tuple(pl.BlockSpec(memory_space=any_space) for _ in range(n_out)),
-        scratch_shapes=tuple(pallas_core.MemoryRef(a.inner_aval, a.memory_space) for a in scratch),
+        scratch_shapes=tuple(pl.MemoryRef(a.inner_aval, a.memory_space) for a in scratch),
     )
     _, grid_mapping = pallas_core.get_grid_mapping(
         grid_spec,
@@ -385,7 +387,7 @@ def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
     Parameters
     ----------
     pallas_params : mapping of str to object
-        JAX 0.11 ``pallas_call`` parameters, including ``jaxpr`` and ``grid_mapping``.
+        Parameters of a staged ``pallas_call``, including ``jaxpr`` and ``grid_mapping``.
 
     Returns
     -------
@@ -395,18 +397,18 @@ def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
     Raises
     ------
     TraceError
-        Unsupported effects, prefetch, block dimensions, aliases, or obvious parallel
-        write collisions are detected.
+        Unsupported effects, prefetch, block dimensions, aliases, obvious parallel
+        write collisions, or a kernel name that is not an identifier are detected.
     KeyError
         Required JAX equation parameters are absent.
 
     Notes
     -----
-    This is the common adapter for offline tracing and mps lowering. It consumes JAX
+    This is the common adapter for offline tracing and the `metal` lowering. It consumes JAX
     internal metadata rather than user-facing Pallas keyword arguments; it does not perform
     MSL primitive validation.
     """
-    params = dict(pallas_params)
+    params = pallas_params
     grid_mapping = params["grid_mapping"]
 
     kernel_jaxpr = params["jaxpr"]
@@ -439,8 +441,15 @@ def spec_from_params(pallas_params: Mapping[str, Any]) -> KernelSpec:
         _validate_aliases(kernel_jaxpr, aliases, inputs, outputs)
     _validate_parallel_writes(kernel_jaxpr, outputs, grid, n_in)
 
+    name = params.get("name") or "palladium_kernel"
+    if not re.fullmatch(r"[A-Za-z_]\w*", name, re.ASCII):
+        raise TraceError(
+            f"kernel name {name!r} is not a valid identifier: it names the Metal function, "
+            "so use letters, digits and underscores, not starting with a digit"
+        )
+
     return KernelSpec(
-        name=params.get("name") or "palladium_kernel",
+        name=name,
         jaxpr=kernel_jaxpr,
         grid=grid,
         inputs=inputs,

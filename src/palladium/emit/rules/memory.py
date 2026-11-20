@@ -23,7 +23,8 @@ def _rule_get(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     of copying, since nothing writes through a `const device` ref. A
     full-block load binds the view only when each element is read once:
     by a store, a fused elementwise consumer, or a scan taking it as xs.
-    A block reused inside a loop keeps the copy.
+    A block reused inside a loop keeps the copy, and so does a block that
+    reaches past its array, whose reads are guarded.
     """
     indexer_args = eqn.params["tree"].unflatten(eqn.invars[1:])
     src = env.val(eqn.invars[0])
@@ -31,13 +32,19 @@ def _rule_get(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     if indexer_args:
         (indexer,) = indexer_args
         src = ref_view(env, src, indexer)
+    # A block addressed through an index map has no pointer to hand out: it
+    # stays a view only for consumers that read it element by element.
+    mapped = src.index_map is not None
     viewable = (
         src.readonly
-        and src.index_map is None
+        and src.valid is None
         and src.space == "device"
         and src.shape
         and math.prod(src.shape) == math.prod(out_shape)
-        and (bool(indexer_args) or (bool(out_shape) and _read_once(env, eqn.outvars[0], out_shape)))
+        and (
+            (bool(indexer_args) and not mapped)
+            or (bool(out_shape) and _read_once(env, eqn.outvars[0], out_shape, mapped))
+        )
     )
     if viewable:
         env.bind(eqn.outvars[0], dataclasses.replace(src, shape=out_shape))
@@ -46,9 +53,12 @@ def _rule_get(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     cursor.copy(dst, src, dst.size)
 
 
-def _read_once(env: Environment, var, shape: tuple[int, ...]) -> bool:
-    """Allow a readonly device view for scan-only xs or eligible single-use fused loads."""
-    if _consumed_only_as_scan_xs(env, var):
+def _read_once(env: Environment, var, shape: tuple[int, ...], mapped: bool) -> bool:
+    """Allow a readonly device view for scan-only xs or eligible single-use fused loads.
+
+    Scans slice their xs by pointer, which a `mapped` block does not have.
+    """
+    if not mapped and _consumed_only_as_scan_xs(env, var):
         return True
     if not env.fuse_loads:
         return False

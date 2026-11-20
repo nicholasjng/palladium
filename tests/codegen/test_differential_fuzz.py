@@ -11,6 +11,10 @@ pass-through/permuted outputs) and asserts the Metal result matches
 - Generated ops are numerically tamed by construction (exp only as
   exp(-|x|), division by |b|+1, loop bodies wrapped in tanh, inputs in
   [-2, 2]) so failures mean wrong code, not overflow.
+- Row programs (`program="threadgroup"`) and mesh programs (`plmtl.kernel`)
+  have lowerings of their own, so each gets its own generator: expression
+  trees with per-row statistics and column scans in both row layouts, and
+  loops over fragment carries with in-place accumulation and permutations.
 - GPU-bound and slow, so opt-in: `uv run pytest -m fuzz`. Scale with
   PALLADIUM_FUZZ_EXAMPLES (default 100 per test).
 """
@@ -27,6 +31,7 @@ from hypothesis.extra.numpy import arrays
 from jax.experimental import pallas as pl
 
 import palladium
+from palladium import plmtl
 
 pytestmark = pytest.mark.fuzz
 
@@ -415,3 +420,167 @@ def test_fuzz_while(case):
         compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE),
     )
     _assert_matches_oracle(f, args)
+
+
+_ROW_STATS = {
+    "mean": lambda v: jnp.mean(v, axis=1, keepdims=True),
+    "max": lambda v: jnp.max(v, axis=1, keepdims=True),
+    "min": lambda v: jnp.min(v, axis=1, keepdims=True),
+}
+_ROW_FINISH = {
+    "store": lambda v: v,
+    "cumsum": lambda v: jnp.cumsum(v, axis=1),
+    "cummax": lambda v: jax.lax.cummax(v, axis=1),
+    "reverse_cumsum": lambda v: jax.lax.cumsum(v, axis=1, reverse=True),
+}
+
+
+@st.composite
+def row_cases(draw):
+    """Row programs: per-row statistics of expression trees, an expression over
+    the blocks and the statistics, and a store or a scan along the columns."""
+    n_inputs = draw(st.integers(1, 2))
+    # 40 and 96 columns give each row one SIMD group, 300 the whole group;
+    # 7 rows leave a partial last tile.
+    columns = draw(st.sampled_from([40, 96, 300]))
+    rows, tile = draw(st.sampled_from([(4, 1), (4, 2), (7, 3), (8, 4)]))
+    stable = range(n_inputs)  # statistics are computed, so not compared
+    stats = draw(
+        st.lists(
+            st.tuples(st.sampled_from(sorted(_ROW_STATS)), trees(n_inputs)), min_size=0, max_size=2
+        )
+    )
+    tree = draw(trees(n_inputs + len(stats), compare_refs=stable))
+    # Two selects of one signature share a cached jit body, so its equations.
+    blend = draw(st.none() | st.tuples(trees(n_inputs, compare_refs=stable), st.floats(0.0, 1.0)))
+    finish = draw(st.sampled_from(sorted(_ROW_FINISH)))
+    args = draw(
+        st.tuples(
+            *[
+                arrays(np.float32, (rows, columns), elements=st.floats(-2.0, 2.0, width=32))
+                for _ in range(n_inputs)
+            ]
+        )
+    )
+    return columns, tile, stats, tree, blend, finish, args
+
+
+def make_row_kernel(stats, tree, blend, finish):
+    def kernel(*refs):
+        *ins, out = refs
+        vals = [r[...] for r in ins]
+        for reducer, stat_tree in stats:
+            # Bounded, so sums over a row in another order stay within tolerance.
+            vals.append(_ROW_STATS[reducer](jnp.tanh(eval_tree(stat_tree, vals) + 0.0 * vals[0])))
+        res = jnp.tanh(eval_tree(tree, vals) + 0.0 * vals[0])
+        if blend is not None:
+            other = jnp.tanh(eval_tree(blend[0], vals) + 0.0 * vals[0])
+            low = jnp.where(vals[0] < -blend[1], other, res)
+            res = jnp.where(vals[0] > blend[1], res, other) + low
+        out[...] = _ROW_FINISH[finish](res)
+
+    return kernel
+
+
+@settings(max_examples=MAX_EXAMPLES, deadline=None)
+@given(row_cases())
+def test_fuzz_row_programs(case):
+    """Compare generated row programs with the interpreter in both row layouts."""
+    columns, tile, stats, tree, blend, finish, args = case
+    rows = args[0].shape[0]
+    spec = pl.BlockSpec((tile, columns), lambda i: (i, 0))
+    f = palladium.metal_call(
+        make_row_kernel(stats, tree, blend, finish),
+        grid=(pl.cdiv(rows, tile),),
+        in_specs=[spec] * len(args),
+        out_specs=spec,
+        out_shape=jax.ShapeDtypeStruct((rows, columns), jnp.float32),
+        compiler_params=palladium.CompilerParams(
+            program="threadgroup", math_mode=palladium.MathMode.SAFE
+        ),
+    )
+    _assert_matches_oracle(f, args)
+
+
+_MESH_TILE, _MESH_K = 32, 16
+
+
+@st.composite
+def mesh_cases(draw):
+    """Mesh programs: a loop over fragment carries. A carry starts from one of
+    the loop's constants (two products and zeros) and becomes another carry,
+    an expression tree, or a carry or constant plus a new product."""
+    n_carry = draw(st.integers(1, 3))
+    n_vals = n_carry + 2  # the carries, then the two constant products
+    starts = draw(st.tuples(*[st.integers(0, 2) for _ in range(n_carry)]))
+    plans = draw(
+        st.tuples(
+            *[
+                st.one_of(
+                    st.integers(0, n_carry - 1),
+                    st.integers(0, n_vals - 1).map(lambda i: ("accumulate", i)),
+                    # Every value is computed, so comparisons take literals only.
+                    trees(n_vals, compare_refs=range(0)),
+                )
+                for _ in range(n_carry)
+            ]
+        )
+    )
+    steps = draw(st.integers(1, 3))
+    args = draw(
+        st.tuples(
+            *[
+                arrays(np.float32, shape, elements=st.floats(-0.5, 0.5, width=32))
+                for shape in ((_MESH_TILE, _MESH_K), (_MESH_K, _MESH_TILE))
+            ]
+        )
+    )
+    return starts, plans, steps, args
+
+
+def make_mesh_kernel(starts, plans, steps):
+    def kernel(a_ref, b_ref, o_ref, a_tile, b_tile):
+        a_tile[...] = a_ref[...]
+        b_tile[...] = b_ref[...]
+
+        def product():
+            return jnp.dot(a_tile[...], b_tile[...])
+
+        consts = [jnp.tanh(product()), jnp.tanh(product() * 0.5)]
+        choices = [*consts, jnp.zeros((_MESH_TILE, _MESH_TILE), jnp.float32)]
+
+        def body(_, carry):
+            vals = list(carry) + consts
+            new = []
+            for plan in plans:
+                if isinstance(plan, int):
+                    new.append(carry[plan])
+                elif isinstance(plan, tuple):
+                    new.append(jnp.tanh(vals[plan[1]] + product()))
+                else:
+                    new.append(jnp.tanh(eval_tree(plan, vals) + 0.0 * carry[0]))
+            return tuple(new)
+
+        final = jax.lax.fori_loop(0, steps, body, tuple(choices[i] for i in starts))
+        o_ref[...] = sum((i + 1.0) * value for i, value in enumerate(final))
+
+    return kernel
+
+
+@settings(max_examples=MAX_EXAMPLES, deadline=None)
+@given(mesh_cases())
+def test_fuzz_mesh_programs(case):
+    """Compare generated loops over fragment carries with the interpreter."""
+    starts, plans, steps, args = case
+    f = plmtl.kernel(
+        make_mesh_kernel(starts, plans, steps),
+        jax.ShapeDtypeStruct((_MESH_TILE, _MESH_TILE), jnp.float32),
+        mesh=plmtl.Mesh((1,)),
+        scratch_types=[
+            plmtl.THREADGROUP((_MESH_TILE, _MESH_K), jnp.float32),
+            plmtl.THREADGROUP((_MESH_K, _MESH_TILE), jnp.float32),
+        ],
+    )
+    # The products differ between Metal and CPU by rounding, which the trees
+    # amplify more than they do libm differences.
+    np.testing.assert_allclose(f(*args), np.asarray(f.interpret(*args)), rtol=1e-3, atol=1e-3)

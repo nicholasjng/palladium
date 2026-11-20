@@ -44,6 +44,22 @@ def test_stacked_ys_without_xs(rng):
     _run_and_compare(kernel, _shaped(8), y0)
 
 
+def test_single_step_scan_with_one_element_ys(rng):
+    """A one-step scan stacking a scalar keeps its ys in a plain scalar variable,
+    which has no slots to address; the xs are one row of one element as well."""
+
+    def kernel(x_ref, w_ref, o_ref):
+        def step(carry, w):
+            return carry + w, jnp.sum(carry) * w[0]
+
+        carry, ys = jax.lax.scan(step, x_ref[...], w_ref[...])
+        o_ref[...] = carry + jnp.sum(ys)
+
+    x = rng.standard_normal(8).astype(np.float32)
+    w = rng.standard_normal((1, 1)).astype(np.float32)
+    _run_and_compare(kernel, _shaped(8), x, w)
+
+
 def test_dense_output_scan_streams_to_the_ref(rng):
     """Check direct streaming of stacked scan outputs without a local trajectory array, plus oracle
     agreement."""

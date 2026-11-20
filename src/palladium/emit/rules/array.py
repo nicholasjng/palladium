@@ -16,7 +16,9 @@ from palladium.emit.rules.elementwise import _rule_elementwise, reads_by_flat_in
 from palladium.errors import EmitError
 
 # A variable name or a numeric literal.
-_CHEAP_SCALAR = re.compile(r"[A-Za-z_]\w*|-?[\d.]+(e[-+]?\d+)?f?|bfloat\(-?[\d.]+(e[-+]?\d+)?f\)")
+_CHEAP_SCALAR = re.compile(
+    r"[A-Za-z_]\w*|-?[\d.]+(e[-+]?\d+)?[fu]?|bfloat\(-?[\d.]+(e[-+]?\d+)?f\)"
+)
 
 
 @rule("reshape")

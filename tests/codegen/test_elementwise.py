@@ -1,4 +1,4 @@
-"""The ELEMENTWISE table and `_rule_elementwise`.
+"""Elementwise primitives: scalar templates, broadcasting and helper functions.
 
 Tolerances are float32-honest: kernels compile with MathMode.FAST, so
 transcendentals need not be bit-identical to the CPU oracle.

@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import math
-import re
 
-from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var
+from jax.extend.core import Jaxpr, JaxprEqn, Var
 
 from palladium.emit.core import (
     PID,
@@ -50,28 +49,15 @@ def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     length: int = eqn.params["length"]
     body: Jaxpr = eqn.params["jaxpr"]
     reverse: bool = eqn.params.get("reverse", False)
-    shape = _scan_shape(eqn)
-    num_carry = shape.num_carry
+    consts, inits, xs = scan_operands(eqn)
+    num_carry = len(inits)
 
-    const_vals = [env.val(v) for v in eqn.invars[: shape.num_consts]]
-    xs_vals = [env.val(v) for v in eqn.invars[shape.first_xs :]]
+    const_vals = [env.val(v) for v in consts]
+    xs_vals = [env.val(v) for v in xs]
     if any(xs.transposed for xs in xs_vals):
         raise EmitError("scanning a lazily transposed xs is unsupported")
 
-    carries = []
-    for invar, outvar in zip(
-        eqn.invars[shape.num_consts : shape.first_xs],
-        eqn.outvars[:num_carry],
-        strict=True,
-    ):
-        init = env.val(invar)
-        if _adoptable(env, invar, init):
-            # The initial value is dead after the scan: update it in place.
-            dst = env.bind(outvar, init)
-        else:
-            dst = declare(env, cursor, outvar)
-            cursor.copy(dst, init, dst.size)
-        carries.append(dst)
+    carries = _bind_carries(env, cursor, inits, eqn.outvars[:num_carry])
 
     ys_targets = []
     for outvar in eqn.outvars[num_carry:]:
@@ -85,9 +71,13 @@ def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
     # xs/ys keep their stacked positions under reverse, so the same
     # idx-based addressing serves both directions.
     with cursor.loop(length, "_s", reverse=reverse) as idx:
+        # This iteration's xs are views into the stacked values, which are
+        # immutable, so no copy is needed.
         x_slices = [
-            _xs_slice(xs, bv, idx)
-            for xs, bv in zip(xs_vals, body.invars[shape.first_xs :], strict=True)
+            xs.slot(idx, shaped(bv.aval).shape)
+            if shaped(bv.aval).shape
+            else CVal(xs.at(idx), (), xs.ctype, storage=xs.storage)
+            for xs, bv in zip(xs_vals, body.invars[len(consts) + num_carry :], strict=True)
         ]
         outs = emit_jaxpr(env, cursor, body, const_vals + carries + x_slices)
         for target, y in zip(ys_targets, outs[num_carry:], strict=True):
@@ -95,121 +85,37 @@ def _rule_scan(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         copy_back_carries(cursor, outs[:num_carry], carries)
 
 
-def _adoptable(env: Environment, var, value: CVal) -> bool:
-    """Whether a scan carry may take over `value`'s storage: thread-local
-    variables read by nothing but this scan and aliased by no other binding."""
-    if (
-        not isinstance(var, Var)
-        or env.sole_consumer(var) is None
-        or value.space != "thread"
-        or value.readonly
-        or value.lazy is not None
-        or value.index_map is not None
-        or value.transposed
-        or not value.expr.isidentifier()
-    ):
-        return False
-    name = re.compile(rf"\b{value.expr}\b")
-    return sum(bool(name.search(bound.expr)) for bound in env.bindings.values()) == 1
+def _bind_carries(env: Environment, cursor: Cursor, inits, outvars) -> list[CVal]:
+    """Mutable loop variables bound on `outvars`, started from `inits`."""
+    carries = []
+    for invar, outvar in zip(inits, outvars, strict=True):
+        init = env.val(invar)
+        if (
+            isinstance(invar, Var)
+            and env.sole_consumer(invar) is not None
+            and init.expr == init.storage  # the whole variable, not a view of it
+            and init.space == "thread"
+            and not init.transposed
+            and env.storage_users[init.storage] == 1
+        ):
+            # A thread-local variable that nothing but this loop reads, under
+            # any name: the carry updates it in place.
+            dst = env.bind(outvar, init)
+        else:
+            dst = declare(env, cursor, outvar)
+            cursor.copy(dst, init, dst.size)
+        carries.append(dst)
+    return carries
 
 
-@dataclasses.dataclass(frozen=True)
-class ScanShape:
-    """Record the constant and carry split of a staged scan equation.
+def scan_operands(eqn: JaxprEqn) -> tuple[list, list, list]:
+    """A scan's operands as (consts, initial carries, xs).
 
-    Attributes
-    ----------
-    num_consts : int
-        Leading invariant inputs to the scan body.
-    num_carry : int
-        Mutable loop-carry inputs following constants.
-
-    Notes
-    -----
-    Scanned xs follow constants and carries. Outputs contain carries followed by stacked ys;
-    the record does not itself validate the equation.
+    The split is the scan's own: `ft_in` is the tree jax packs the three
+    groups into, and reads them back from.
     """
-
-    num_consts: int
-    num_carry: int
-
-    @property
-    def first_xs(self) -> int:
-        """Return the first scanned-input position in the scan operand list.
-
-        Returns
-        -------
-        int
-            Number of constant and carry inputs combined; also the end position when no xs
-            are present.
-        """
-        return self.num_consts + self.num_carry
-
-
-def _scan_shape(eqn: JaxprEqn) -> ScanShape:
-    """Structurally classify scan operands into (consts, carries, xs) and
-    outputs into (carries, ys).
-
-    Derived from avals, not params: jax 0.11's scan params carry no
-    num_carry/num_consts. A carry keeps its aval across eqn and body,
-    a const likewise, while xs/ys gain a leading `length` dim; carries
-    lead the outvars and trail-align against the body's x slices, so the
-    counts fall out of pairwise aval comparison.
-    """
-    body, length = eqn.params["jaxpr"], eqn.params["length"]
-
-    def sig(atom: Var | Literal) -> tuple[tuple[int, ...], str]:
-        # Consts may be Refs, whose aval is not a ShapedArray but still
-        # exposes .shape/.dtype.
-        aval = atom.aval
-        shape = tuple(int(d) for d in getattr(aval, "shape", ()))
-        return shape, str(getattr(aval, "dtype", ""))
-
-    def stacked(outer: Var | Literal, inner: Var | Literal) -> bool:
-        (o_shape, o_dtype), (i_shape, i_dtype) = sig(outer), sig(inner)
-        return o_dtype == i_dtype and o_shape == (length, *i_shape)
-
-    if len(body.outvars) != len(eqn.outvars) or len(body.invars) != len(eqn.invars):
-        raise EmitError("unrecognized scan structure: eqn/body arity mismatch")
-
-    num_carry = 0
-    while num_carry < len(eqn.outvars) and sig(eqn.outvars[num_carry]) == sig(
-        body.outvars[num_carry]
-    ):
-        num_carry += 1
-    for ov, bv in zip(eqn.outvars[num_carry:], body.outvars[num_carry:], strict=True):
-        if not stacked(ov, bv):
-            raise EmitError(
-                "unrecognized scan structure: outputs after the carries must all be stacked ys"
-            )
-
-    num_xs = 0
-    while num_xs < len(eqn.invars) - num_carry and stacked(
-        eqn.invars[len(eqn.invars) - 1 - num_xs],
-        body.invars[len(body.invars) - 1 - num_xs],
-    ):
-        num_xs += 1
-    num_consts = len(eqn.invars) - num_carry - num_xs
-    for iv, bv in zip(
-        eqn.invars[num_consts : num_consts + num_carry],
-        body.invars[num_consts : num_consts + num_carry],
-        strict=True,
-    ):
-        if sig(iv) != sig(bv):
-            raise EmitError(
-                "unrecognized scan structure: carry avals disagree between eqn and body"
-            )
-    return ScanShape(num_consts, num_carry)
-
-
-def _xs_slice(xs: CVal, body_invar: Var, idx: str) -> CVal:
-    """This iteration's x: a view into the stacked xs value, which is
-    immutable, so no copy is needed."""
-    aval = shaped(body_invar.aval)
-    shape = tuple(int(d) for d in aval.shape)
-    if not shape:
-        return CVal(expr=xs.at(idx), shape=(), ctype=xs.ctype)
-    return xs.slot(idx, shape)
+    consts, carries, xs = eqn.params["ft_in"].update(eqn.invars).unpack()
+    return list(consts), list(carries), list(xs)
 
 
 def _consumed_only_as_scan_xs(env: Environment, var: Var) -> bool:
@@ -223,12 +129,8 @@ def _consumed_only_as_scan_xs(env: Environment, var: Var) -> bool:
     for eqn in env.consumer_eqns(var):
         if eqn.primitive.name != "scan":
             return False
-        try:
-            shape = _scan_shape(eqn)
-        except EmitError:
-            # Keep the copy; the scan rule raises the real diagnostic.
-            return False
-        if any(iv is var for iv in eqn.invars[: shape.first_xs]):
+        consts, inits, _ = scan_operands(eqn)
+        if any(iv is var for iv in (*consts, *inits)):
             return False
     return True
 
@@ -240,64 +142,39 @@ def _nbytes(var: Var) -> int:
 
 
 def store_or_declare(env: Environment, cursor: Cursor, var: Var, *, min_bytes: int = 0) -> CVal:
-    """Reuse a safe output Ref or allocate thread-local result storage.
+    """Bind `var` to storage for a result that is written element by element.
 
-    Parameters
-    ----------
-    env : Environment
-        Bindings and def-use information for the current jaxpr.
-    cursor : Cursor
-        Destination for generated MSL statements and storage accounting.
-    var : Var
-        Result variable to bind.
-    min_bytes : int, optional
-        Minimum result size for attempting a direct store, default zero.
-
-    Returns
-    -------
-    CVal
-        Bound writable destination, either an eligible device Ref or fresh local
-        storage.
-
-    Notes
-    -----
-    Aliased, indexed, readonly, multiply used, and layout-incompatible targets fall back to
-    local storage. The final store can skip a redundant self-copy.
+    That is the output Ref the result is stored to, when `store_target` allows
+    it and the result has at least `min_bytes`, which skips the later copy;
+    otherwise fresh thread-local storage.
     """
-    target = store_target(env, var) if _nbytes(var) >= min_bytes else None
+    # Every rule that stores through this writes element by element, so a
+    # block addressed through an index map is as good a target as a pointer.
+    target = store_target(env, var, mapped=True) if _nbytes(var) >= min_bytes else None
     if target is None:
         return declare(env, cursor, var)
     shape = tuple(int(d) for d in shaped(var.aval).shape)
     return env.bind(var, dataclasses.replace(target, shape=shape or (1,)))
 
 
-def store_target(env: Environment, outvar: Var) -> CVal | None:
-    """Find an output Ref into which a result may be computed directly.
+def store_target(env: Environment, outvar: Var, *, mapped: bool = False) -> CVal | None:
+    """The output Ref a result may be computed into directly, or None.
 
-    Parameters
-    ----------
-    env : Environment
-        Bindings and def-use information for the current jaxpr.
-    outvar : Var
-        Result feeding a full-block output swap, possibly through an inlined JIT result.
-
-    Returns
-    -------
-    CVal or None
-        Compatible writable device Ref, or None when early writes could be observed or
-        the layout is unsuitable.
-
-    Notes
-    -----
-    The target must have one full-block store and no other uses, and must not share storage
-    with an aliased Ref. Small results escaping an inlined JIT body retain local storage to
-    avoid slower device writes.
+    The result must feed one full-block store of a Ref that has no other use
+    and shares no buffer with another Ref, so that the early write cannot be
+    observed; layout and type must match, and a Ref reaching past its array is
+    never a target. A Ref addressed through an index map has no pointer and
+    qualifies only with `mapped`, for callers that write one element at a time.
+    A result leaving an inlined jit body keeps local storage while it fits in
+    registers, where writing a Ref inside a loop that reads device memory is
+    slower.
     """
     outer = env.jit_outputs.get(outvar)
     if outer is not None and env.consumers.get(outvar) == [None]:
-        # Writing a ref inside a loop that also reads device memory measured
-        # slower while the thread-local copy still fits in registers.
-        return store_target(env, outer) if _nbytes(outvar) >= REGISTER_BYTES else None
+        # See the docstring: local storage wins while it fits in registers.
+        if _nbytes(outvar) < REGISTER_BYTES:
+            return None
+        return store_target(env, outer, mapped=mapped)
     swap = env.sole_consumer(outvar)
     if (
         swap is None
@@ -319,7 +196,8 @@ def store_target(env: Environment, outvar: Var) -> CVal | None:
         or ref.space != "device"
         or ref.readonly
         or ref.transposed
-        or ref.index_map is not None
+        or ref.valid is not None
+        or (ref.index_map is not None and not mapped)
     ):
         return None
     aval = shaped(outvar.aval)
@@ -404,16 +282,7 @@ def _rule_while(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
 
     cond_consts = [env.val(v) for v in eqn.invars[:cond_nconsts]]
     body_consts = [env.val(v) for v in eqn.invars[cond_nconsts : cond_nconsts + body_nconsts]]
-    carries = []
-    for invar, outvar in zip(eqn.invars[cond_nconsts + body_nconsts :], eqn.outvars, strict=True):
-        init = env.val(invar)
-        if _adoptable(env, invar, init):
-            # The initial value is dead after the scan: update it in place.
-            dst = env.bind(outvar, init)
-        else:
-            dst = declare(env, cursor, outvar)
-            cursor.copy(dst, init, dst.size)
-        carries.append(dst)
+    carries = _bind_carries(env, cursor, eqn.invars[cond_nconsts + body_nconsts :], eqn.outvars)
 
     with cursor.block("while (true)"):
         (pred,) = emit_jaxpr(env, cursor, cond_jaxpr.jaxpr, cond_consts + carries)

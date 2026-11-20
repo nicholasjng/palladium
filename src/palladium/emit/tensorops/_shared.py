@@ -7,12 +7,14 @@ import re
 
 from jax.extend.core import Jaxpr, JaxprEqn, Literal, Var, subjaxprs
 
-from palladium.device import simdgroup_width
-from palladium.emit.core import Cursor, CVal
+from palladium.emit.core import Cursor
 from palladium.errors import EmitError
 from palladium.trace import BlockInfo, KernelSpec
 
 SIMDGROUPS = 4
+# Threads per SIMD group on every Apple GPU; the fragment layouts assume it.
+SIMD_WIDTH = 32
+UNROLL = '_Pragma("clang loop unroll(full)")'
 
 
 def _kernel_source(
@@ -24,7 +26,7 @@ def _kernel_source(
     threads, by default four SIMD groups.
     """
     parameter_text = ",\n    ".join(parameters)
-    width = width or SIMDGROUPS * simdgroup_width()
+    width = width or SIMDGROUPS * SIMD_WIDTH
     return "\n".join(
         (
             "#include <metal_stdlib>",
@@ -48,45 +50,26 @@ def _shape(atom: Var | Literal) -> tuple[int, ...]:
     return tuple(int(size) for size in getattr(atom.aval, "shape", ()))
 
 
-@dataclasses.dataclass(frozen=True)
-class _TensorHandle:
-    """MPP tensor expression emitted from a typed backing-buffer view."""
+def _tensor(
+    cursor: Cursor,
+    name: str,
+    element: str,
+    pointer: str,
+    extents: tuple[str | int, ...],
+    strides: tuple[str | int, ...],
+) -> str:
+    """Declare the MPP tensor `name` over `pointer` and return the name.
 
-    expr: str
-    shape: tuple[int, ...]
-    ctype: str
-    space: str
-
-
-@dataclasses.dataclass(frozen=True)
-class _TensorView:
-    """Typed MPP tensor view over an emitter value and explicit strides."""
-
-    storage: CVal
-    shape: tuple[int, ...]
-    extents: tuple[str | int, ...]
-    strides: tuple[str | int, ...]
-
-    def __post_init__(self) -> None:
-        if len(self.extents) != len(self.strides) or len(self.shape) != len(self.extents):
-            raise ValueError("TensorOps shape, extents, and strides must have the same rank")
-        if self.storage.space not in ("device", "threadgroup"):
-            raise ValueError("TensorOps storage must be device or threadgroup memory")
-
-    def emit(self, cursor: Cursor, name: str) -> _TensorHandle:
-        """Declare an MPP tensor handle over this typed storage view."""
-        rank = len(self.extents)
-        extents = ", ".join(map(str, self.extents))
-        strides = ", ".join(map(str, self.strides))
-        cursor.emit(
-            f"auto {name} = tensor<{self.storage.space} {self.storage.ctype}, "
-            f"dextents<int, {rank}>, tensor_inline>("
-        )
-        cursor.indent += 1
-        cursor.emit(f"{self.storage.expr}, dextents<int, {rank}>({extents}),")
-        cursor.emit(f"array<int, {rank}>{{{strides}}});")
-        cursor.indent -= 1
-        return _TensorHandle(name, self.shape, self.storage.ctype, self.storage.space)
+    `element` is the address space and type, such as "device float"; extents and
+    strides are in elements, innermost dimension first.
+    """
+    rank = len(extents)
+    cursor.emit(f"auto {name} = tensor<{element}, dextents<int, {rank}>, tensor_inline>(")
+    cursor.indent += 1
+    cursor.emit(f"{pointer}, dextents<int, {rank}>({', '.join(map(str, extents))}),")
+    cursor.emit(f"array<int, {rank}>{{{', '.join(map(str, strides))}}});")
+    cursor.indent -= 1
+    return name
 
 
 @dataclasses.dataclass(frozen=True)
@@ -162,26 +145,21 @@ class _TensorOpsMatmul:
             f"{self.name};"
         )
 
-    def emit_run(
-        self, cursor: Cursor, lhs: _TensorHandle, rhs: _TensorHandle, out: _TensorHandle
-    ) -> None:
-        """Emit the operation call for typed tensor handles."""
-        cursor.emit(f"{self.name}.run({lhs.expr}, {rhs.expr}, {out.expr});")
-
     def emit_cooperative_destination(
         self,
         cursor: Cursor,
-        lhs: _TensorHandle,
-        rhs: _TensorHandle,
+        lhs: str,
+        rhs: str,
         name: str = "cTc",
         element_type: str = "float",
-    ) -> _TensorHandle:
-        """Create the MPP-owned destination layout used for fused epilogues."""
+    ) -> str:
+        """Declare `name`, the MPP-owned destination of this product for operands
+        typed like the tensors `lhs` and `rhs`, used for fused epilogues."""
         cursor.emit(
             f"auto {name} = {self.name}.get_destination_cooperative_tensor<"
-            f"decltype({lhs.expr}), decltype({rhs.expr}), {element_type}>();"
+            f"decltype({lhs}), decltype({rhs}), {element_type}>();"
         )
-        return _TensorHandle(name, (self.m, self.n), element_type, "thread")
+        return name
 
 
 def _index_map_is(info: BlockInfo, axes: tuple[int | None, ...]) -> bool:
@@ -200,6 +178,16 @@ def _index_map_is(info: BlockInfo, axes: tuple[int | None, ...]) -> bool:
     return True
 
 
+def _producers(jaxpr: Jaxpr) -> dict[Var, JaxprEqn]:
+    """The equation defining each variable of `jaxpr`'s top level."""
+    return {variable: eqn for eqn in jaxpr.eqns for variable in eqn.outvars}
+
+
+def _unsqueezed(block_shape: tuple[int | None, ...]) -> tuple[int, ...]:
+    """A block shape with each squeezed dimension as its one element."""
+    return tuple(1 if size is None else int(size) for size in block_shape)
+
+
 def _contains(jaxpr: Jaxpr, primitive: str) -> bool:
     """Whether a jaxpr stages `primitive`, including in nested control flow."""
     return any(eqn.primitive.name == primitive for eqn in jaxpr.eqns) or any(
@@ -211,46 +199,18 @@ _WIDTH_MARKER = re.compile(r"// palladium: threadgroup width (\d+)")
 
 
 def declared_threadgroup_width(msl_source: str) -> int | None:
-    """Read the group width a cooperative kernel declares.
-
-    Parameters
-    ----------
-    msl_source : str
-        Emitted source; every kernel running one threadgroup per Pallas program
-        contains the line ``// palladium: threadgroup width N``.
-
-    Returns
-    -------
-    int or None
-        The declared thread count, or None for one thread per program.
-    """
+    """The thread count a cooperative kernel declares in its
+    ``// palladium: threadgroup width N`` line, or None for a kernel that runs one
+    thread per program."""
     match = _WIDTH_MARKER.search(msl_source)
     return int(match.group(1)) if match else None
 
 
 def uses_tensorops(spec: KernelSpec, dot_general: str) -> bool:
-    """Decide whether the requested dot policy should attempt cooperative recognition.
+    """Whether the dot policy should attempt cooperative recognition.
 
-    Parameters
-    ----------
-    spec : KernelSpec
-        Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
-    dot_general : {"auto", "default", "tensorops", "simdgroup"}, optional
-        Use cooperative TensorOps when recognized, force primitive emission, require
-        TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
-        respectively. The default is "auto".
-
-    Returns
-    -------
-    bool
-        True for a kernel containing a dot when policy is "tensorops" or "simdgroup",
-        or "auto" on a 2D or 3D grid.
-
-    Notes
-    -----
-    This is a selection heuristic rather than a support guarantee; recognition may still
-    reject the kernel. A kernel without dots returns False even for "tensorops". Policy
-    validation belongs to the outer emitter.
+    True for a kernel containing a dot under "tensorops" or "simdgroup", or under
+    "auto" on a 2D or 3D grid. Recognition may still reject the kernel.
     """
     if not _contains(spec.jaxpr, "dot_general"):
         return False

@@ -41,22 +41,41 @@ from palladium.emit.addressing import block_offset
 from palladium.emit.core import Cursor, CVal, Environment, msl_type, shaped
 from palladium.emit.numeric import extremum, extremum_identity
 from palladium.emit.rules.elementwise import lowers_elementwise, scalar_expression
-from palladium.emit.tensorops._shared import SIMDGROUPS, _index_map_is, _kernel_source
+from palladium.emit.tensorops._shared import (
+    SIMD_WIDTH,
+    SIMDGROUPS,
+    UNROLL,
+    _index_map_is,
+    _kernel_source,
+)
 from palladium.errors import EmitError
 from palladium.trace import BlockInfo, KernelSpec
 
 ROW, COLUMN = "row", "column"
-_SIMD_WIDTH = 32
 _NARROW_COLUMNS = 256  # at most this many columns: one SIMD group per row
 _COLUMNS_PER_THREAD = 4
 _MAX_THREADS = 1024
 _MAX_CACHED = 16  # per-thread block elements kept in registers
-_UNROLL = '_Pragma("clang loop unroll(full)")'
 _REDUCTIONS = {"reduce_sum": "simd_sum", "reduce_max": "simd_max", "reduce_min": "simd_min"}
 _SCANS = ("cumsum", "cumprod", "cummax", "cummin")
 # Primitives whose nested jaxpr is inlined: `jnp.where` stages `jit`,
 # `jax.nn.softmax` stages `custom_jvp_call`.
-_NESTED = {"jit": "jaxpr", "pjit": "jaxpr", "custom_jvp_call": "call_jaxpr"}
+_NESTED = {"jit": "jaxpr", "custom_jvp_call": "call_jaxpr"}
+
+
+def _threadgroup_params(spec: KernelSpec) -> tuple[str, ...]:
+    """Kernel parameters of a program run by one threadgroup: the input then
+    output buffers, and the thread's position in its group."""
+    return tuple(
+        f"{'const ' if index < len(spec.inputs) else ''}device {msl_type(info.dtype)}* "
+        f"arg{index} [[buffer({index})]]"
+        for index, info in enumerate((*spec.inputs, *spec.outputs))
+    ) + (
+        "uint3 _pid [[threadgroup_position_in_grid]]",
+        "uint _sg [[simdgroup_index_in_threadgroup]]",
+        "uint _lane [[thread_index_in_simdgroup]]",
+        "uint _tid [[thread_index_in_threadgroup]]",
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,25 +173,15 @@ def lower_row_program(spec: KernelSpec, kernel_name: str | None = None) -> tuple
         raise EmitError("row programs need one program per row tile")
 
     if columns <= _NARROW_COLUMNS:
-        layout = _Layout(_SIMD_WIDTH, SIMDGROUPS * _SIMD_WIDTH, -(-columns // _SIMD_WIDTH))
+        layout = _Layout(SIMD_WIDTH, SIMDGROUPS * SIMD_WIDTH, -(-columns // SIMD_WIDTH))
     else:
         threads = -(-columns // _COLUMNS_PER_THREAD)
-        per_row = min(_MAX_THREADS, -(-threads // _SIMD_WIDTH) * _SIMD_WIDTH)
+        per_row = min(_MAX_THREADS, -(-threads // SIMD_WIDTH) * SIMD_WIDTH)
         layout = _Layout(per_row, per_row, -(-columns // per_row))
     cursor = Cursor()
     env = Environment()
-    params = tuple(
-        f"{'const ' if index < len(spec.inputs) else ''}device {msl_type(info.dtype)}* "
-        f"arg{index} [[buffer({index})]]"
-        for index, info in enumerate(infos)
-    ) + (
-        "uint3 _pid [[threadgroup_position_in_grid]]",
-        "uint _sg [[simdgroup_index_in_threadgroup]]",
-        "uint _lane [[thread_index_in_simdgroup]]",
-        "uint _tid [[thread_index_in_threadgroup]]",
-    )
     if layout.whole_group:  # SIMD-group partials of reductions and scans, as bits
-        size = _SIMD_WIDTH * (min(layout.slots, _MAX_CACHED) + 1)
+        size = SIMD_WIDTH * (min(layout.slots, _MAX_CACHED) + 1)
         cursor.allocate("uint", (size,), name="_partials", space="threadgroup")
     refs: dict[Var, tuple[str, str, BlockInfo]] = {}
     for index, (ref, info) in enumerate(zip(spec.jaxpr.invars, infos, strict=True)):
@@ -220,7 +229,9 @@ def lower_row_program(spec: KernelSpec, kernel_name: str | None = None) -> tuple
     with cursor.block(header):
         body.walk(spec.jaxpr.eqns, {})
     body.finish()
-    source = _kernel_source(kernel_name or spec.name, params, cursor, layout.width)
+    source = _kernel_source(
+        kernel_name or spec.name, _threadgroup_params(spec), cursor, layout.width
+    )
     return source, cursor.threadgroup_bytes
 
 
@@ -293,13 +304,13 @@ class _RowBody:
             return
         # Each SIMD group saw every fourth row: combine into SIMD group 0.
         for index, (acc, ctype, combine, slots) in enumerate(self.accumulators):
-            size = SIMDGROUPS * slots * _SIMD_WIDTH if slots else SIMDGROUPS
+            size = SIMDGROUPS * slots * SIMD_WIDTH if slots else SIMDGROUPS
             scratch = f"_rows{index}"
             self._declare(f"threadgroup uint {scratch}[{size}];")
             cursor.account("uint", size, "threadgroup")
             if slots:
                 with cursor.block(f"for (short _k = 0; _k < {slots}; ++_k)"):
-                    slot = f"(_sg * {slots} + _k) * {_SIMD_WIDTH} + _lane"
+                    slot = f"(_sg * {slots} + _k) * {SIMD_WIDTH} + _lane"
                     cursor.emit(f"{scratch}[{slot}] = {_to_bits(f'{acc}[_k]', ctype)};")
             else:
                 with cursor.block("if (_lane == 0)"):
@@ -311,7 +322,7 @@ class _RowBody:
                 with cursor.block(f"for (uint g = 1; g < {SIMDGROUPS}; ++g)"):
                     if slots:
                         with cursor.block(f"for (short _k = 0; _k < {slots}; ++_k)"):
-                            slot = f"(g * {slots} + _k) * {_SIMD_WIDTH} + _lane"
+                            slot = f"(g * {slots} + _k) * {SIMD_WIDTH} + _lane"
                             other = self._local(ctype, _from_bits(f"{scratch}[{slot}]", ctype))
                             cursor.emit(f"{acc}[_k] = {combine(f'{acc}[_k]', other)};")
                     else:
@@ -460,19 +471,39 @@ class _RowBody:
         with self._pass(operand.extent) as (column, slot):
             element = self._local(ctype, self._lane_expr(operand, column, slot, {}))
             self.cursor.emit(f"{acc} = {combine(acc, element)};")
-        simd = _REDUCTIONS[op]
-        self.cursor.emit(f"{acc} = {simd}({acc});")
+        self._simd_reduce(acc, ctype, op)
         if self.layout.whole_group:
             # Combine the SIMD groups' partials; every group reads them all.
-            groups = self.layout.width // _SIMD_WIDTH
+            groups = self.layout.width // SIMD_WIDTH
             with self.cursor.block("if (_lane == 0)"):
                 self.cursor.emit(f"_partials[_sg] = {_to_bits(acc, ctype)};")
             self.cursor.barrier()
             partial = _from_bits("_partials[_lane]", ctype)
-            self.cursor.emit(f"{acc} = {simd}(_lane < {groups} ? {partial} : {identity});")
+            self.cursor.emit(f"{acc} = _lane < {groups} ? {partial} : {identity};")
+            self._simd_reduce(acc, ctype, op)
             self.cursor.barrier()
         # The accumulator is scoped to the row loop when declared in it.
         return _Value(kept, ctype, expr=acc, per_row=self.in_loop)
+
+    def _simd_reduce(self, acc: str, ctype: str, op: str) -> None:
+        """Reduce `acc` over the lanes of the SIMD group, in place.
+
+        Metal's SIMD extrema ignore NaNs and leave ties between zeros open,
+        where `extremum` propagates NaN and orders -0.0 below 0.0.
+        """
+        cursor, simd = self.cursor, _REDUCTIONS[op]
+        if op == "reduce_sum" or ctype not in ("float", "half", "bfloat"):
+            cursor.emit(f"{acc} = {simd}({acc});")
+            return
+        nan, zero = cursor.fresh("_nan"), cursor.fresh("_zero")
+        # The zero that wins a tie, if any lane holds it: 0.0 for max, -0.0 for min.
+        negative = "" if op == "reduce_min" else "!"
+        winner, other = ("-0.0f", "0.0f") if op == "reduce_min" else ("0.0f", "-0.0f")
+        cursor.emit(f"const bool {nan} = simd_any(isnan(float({acc})));")
+        cursor.emit(f"const bool {zero} = simd_any({acc} == 0 && {negative}signbit(float({acc})));")
+        cursor.emit(f"{acc} = {simd}({acc});")
+        ties = f"{ctype}({zero} ? {winner} : {other})"
+        cursor.emit(f"{acc} = {nan} ? {ctype}(NAN) : ({acc} == 0 ? {ties} : {acc});")
 
     def _reduce_rows(self, eqn, operand, kept, ctype, identity, combine) -> _Value:
         """Accumulate over the row loop; the result exists after it, per tile."""
@@ -531,21 +562,21 @@ class _RowBody:
         # A reverse scan runs from the last lane down; lane `total_lane` ends
         # up holding the SIMD group's whole chunk.
         shuffle, toward, total_lane, end_lane = (
-            ("simd_shuffle_down", f"_lane + d < {_SIMD_WIDTH}", "0", f"{_SIMD_WIDTH - 1}")
+            ("simd_shuffle_down", f"_lane + d < {SIMD_WIDTH}", "0", f"{SIMD_WIDTH - 1}")
             if reverse
-            else ("simd_shuffle_up", "_lane >= d", f"{_SIMD_WIDTH - 1}", "0")
+            else ("simd_shuffle_up", "_lane >= d", f"{SIMD_WIDTH - 1}", "0")
         )
         cursor = self.cursor
 
         def scan_lanes(value: str) -> None:
-            with cursor.block(f"{_UNROLL} for (ushort d = 1; d < {_SIMD_WIDTH}; d <<= 1)"):
+            with cursor.block(f"{UNROLL} for (ushort d = 1; d < {SIMD_WIDTH}; d <<= 1)"):
                 cursor.emit(f"const {ctype} other = {shuffle}({value}, d);")
                 with cursor.block(f"if ({toward})"):
                     cursor.emit(f"{value} = {combine('other', value)};")
 
         result, carry = cursor.fresh("_scan"), cursor.fresh("_carry")
         cursor.emit(f"{ctype} {result}[{layout.slots}];")
-        with cursor.block(f"{_UNROLL} for (short _k = 0; _k < {layout.slots}; ++_k)"):
+        with cursor.block(f"{UNROLL} for (short _k = 0; _k < {layout.slots}; ++_k)"):
             cursor.emit(f"const uint _c = {layout.thread} + _k * {layout.per_row};")
             element = self._lane_expr(operand, "_c", "_k", {})
             value = cursor.fresh("_v")
@@ -554,27 +585,27 @@ class _RowBody:
             cursor.emit(f"{result}[_k] = {value};")
             if layout.whole_group:
                 with cursor.block(f"if (_lane == {total_lane})"):
-                    slot = f"_k * {_SIMD_WIDTH} + _sg"
+                    slot = f"_k * {SIMD_WIDTH} + _sg"
                     cursor.emit(f"_partials[{slot}] = {_to_bits(value, ctype)};")
         if layout.whole_group:
             # The first SIMD group turns each chunk's SIMD-group totals into
             # exclusive prefixes, and records the chunk's total after them.
-            groups = layout.width // _SIMD_WIDTH
+            groups = layout.width // SIMD_WIDTH
             cursor.barrier()
             with (
                 cursor.block("if (_sg == 0)"),
-                cursor.block(f"{_UNROLL} for (short _k = 0; _k < {layout.slots}; ++_k)"),
+                cursor.block(f"{UNROLL} for (short _k = 0; _k < {layout.slots}; ++_k)"),
             ):
-                partial = _from_bits(f"_partials[_k * {_SIMD_WIDTH} + _lane]", ctype)
+                partial = _from_bits(f"_partials[_k * {SIMD_WIDTH} + _lane]", ctype)
                 cursor.emit(f"{ctype} _p = _lane < {groups} ? {partial} : {identity};")
                 scan_lanes("_p")
                 cursor.emit(f"{ctype} _before = {shuffle}(_p, 1);")
                 with cursor.block(f"if (_lane == {end_lane})"):
                     cursor.emit(f"_before = {identity};")
                 before = _to_bits("_before", ctype)
-                cursor.emit(f"_partials[_k * {_SIMD_WIDTH} + _lane] = {before};")
+                cursor.emit(f"_partials[_k * {SIMD_WIDTH} + _lane] = {before};")
                 with cursor.block(f"if (_lane == {total_lane})"):
-                    total_slot = f"{layout.slots * _SIMD_WIDTH} + _k"
+                    total_slot = f"{layout.slots * SIMD_WIDTH} + _k"
                     cursor.emit(f"_partials[{total_slot}] = {_to_bits('_p', ctype)};")
             cursor.barrier()
         cursor.emit(f"{ctype} {carry} = {identity};")
@@ -583,10 +614,10 @@ class _RowBody:
             if reverse
             else f"for (short _k = 0; _k < {layout.slots}; ++_k)"
         )
-        with cursor.block(f"{_UNROLL} {slots}"):
+        with cursor.block(f"{UNROLL} {slots}"):
             if layout.whole_group:
-                before = _from_bits(f"_partials[_k * {_SIMD_WIDTH} + _sg]", ctype)
-                total = _from_bits(f"_partials[{layout.slots * _SIMD_WIDTH} + _k]", ctype)
+                before = _from_bits(f"_partials[_k * {SIMD_WIDTH} + _sg]", ctype)
+                total = _from_bits(f"_partials[{layout.slots * SIMD_WIDTH} + _k]", ctype)
                 value = combine(before, f"{result}[_k]")
             else:
                 total = f"simd_broadcast({result}[_k], {total_lane})"
@@ -628,10 +659,11 @@ class _RowBody:
                 else:
                     raise EmitError("row programs cannot tell which axis this broadcast adds")
         else:  # reshape, squeeze, expand_dims keep the non-unit axes in order
-            labelled = [a for a in operand.axes if a is not None]
-            axes = [None if extent == 1 else labelled.pop(0) for extent in out_shape]
-            if labelled:
+            in_shape = tuple(int(d) for d in shaped(eqn.invars[0].aval).shape)
+            if [d for d in in_shape if d != 1] != [d for d in out_shape if d != 1]:
                 raise EmitError("row programs reshape only by adding or removing unit dimensions")
+            labelled = iter(a for a in operand.axes if a is not None)
+            axes = [None if extent == 1 else next(labelled, None) for extent in out_shape]
         named = [a for a in axes if a]
         if len(set(named)) != len(named):
             raise EmitError("row programs cannot repeat an axis")
@@ -694,9 +726,12 @@ class _RowBody:
         operands = tuple(self._value(atom, scope) for atom in eqn.invars)
         ctype = msl_type(shaped(eqn.outvars[0].aval).dtype)
         shape = tuple(int(d) for d in shaped(eqn.outvars[0].aval).shape)
-        axes = next(
-            (op.axes for op in operands if len(op.axes) == len(shape)), (None,) * len(shape)
-        )
+        # Operands broadcast their unit dimensions, so each dimension takes
+        # its axis from whichever operand has one there.
+        ranked = [op.axes for op in operands if len(op.axes) == len(shape)]
+        axes: tuple[str | None, ...] = (None,) * len(shape)
+        if ranked:
+            axes = tuple(next((a for a in along if a), None) for along in zip(*ranked))
         per_row = any(op.per_row for op in operands)
         if any(op.by_column for op in operands):
             return _Value(
@@ -721,7 +756,7 @@ class _RowBody:
         `extent`; yields the column and the thread's slot for it."""
         layout = self.layout
         slots = -(-extent // layout.per_row)
-        with self.cursor.block(f"{_UNROLL} for (short _k = 0; _k < {slots}; ++_k)"):
+        with self.cursor.block(f"{UNROLL} for (short _k = 0; _k < {slots}; ++_k)"):
             self.cursor.emit(f"const uint _c = {layout.thread} + _k * {layout.per_row};")
             if extent % layout.per_row:
                 with self.cursor.block(f"if (_c < {extent})"):
@@ -759,7 +794,9 @@ class _RowBody:
             return value.read.replace("$c", f"({column})")
         if value.eqn is None:
             raise EmitError("row programs cannot shift a scan or a row reduction along the columns")
-        key = (id(value.eqn), column, slot)
+        # Keyed by the value, not its equation: a cached jit body (`jnp.where`)
+        # is one set of equations shared by every call to it.
+        key = (id(value), column, slot)
         if key not in memo:
             scalars = [
                 CVal(self._lane_expr(op, column, slot, memo), (), op.ctype) for op in value.operands

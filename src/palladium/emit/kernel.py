@@ -5,14 +5,13 @@ from __future__ import annotations
 
 import math
 
-from palladium.device import device_limits
+from palladium.device import prefers_simdgroup_matrix
 from palladium.emit import rules as _rules  # noqa: F401 - registers the rules
 from palladium.emit.addressing import (
-    BlockLayout,
-    block_offset,
-    constant_offset,
+    block_strides,
     element_strides,
     flat_index,
+    full_block_shape,
 )
 from palladium.emit.core import (
     PID,
@@ -41,52 +40,13 @@ def emit_msl_stats(
     dot_general: str = "auto",
     program: str = "thread",
 ) -> tuple[str, EmitStats]:
-    """Generate a complete Metal kernel and estimate its declared storage.
+    """`emit_msl` with the storage the kernel declares; arguments and errors are the same.
 
-    Parameters
-    ----------
-    spec : KernelSpec
-        Traced Pallas kernel, including operand layouts, scratch buffers, and grid.
-    kernel_name : str or None, optional
-        MSL function name override; None uses ``spec.name``. The name must be a valid
-        MSL identifier.
-    dot_general : {"auto", "default", "tensorops", "simdgroup"}, optional
-        Use cooperative TensorOps when recognized, force primitive emission, require
-        TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
-        respectively. The default is "auto", which also prefers `simdgroup_matrix`
-        on M1 to M4 GPUs (Apple families 7 to 9), where it is faster than
-        `matmul2d`.
-    program : {"thread", "threadgroup"}, optional
-        "thread" (default) runs each Pallas program as one Metal thread, or
-        one threadgroup when a dot lowers cooperatively. "threadgroup" runs
-        each program as one threadgroup of rows (`emit/threadgroup.py`);
-        kernels it cannot lower raise EmitError.
-
-    Returns
-    -------
-    source : str
-        Self-contained MSL, with input then output buffers and the required program-
-        position builtin.
-    stats : EmitStats
-        Declared thread-local and threadgroup storage, without compiler liveness
-        analysis.
-
-    Raises
-    ------
-    EmitError
-        The kernel uses unsupported shapes, addressing, effects, or primitive
-        parameters.
-    UnsupportedPrimitiveError
-        A staged primitive has no registered lowering rule.
-    ValueError
-        The dot policy is unknown.
-
-    Notes
-    -----
-    Primitive emission rejects grids above rank three and captured arrays. At 512 or more
-    declared thread-local bytes it re-emits with eligible input loads fused into their
-    consumers. Cooperative emission reports shared storage and zero declared thread-local
-    bytes; register use inside MPP operations is not included.
+    The one-thread-per-program emitter re-emits with eligible input loads
+    fused into their consumers once its thread-local storage reaches
+    `REGISTER_BYTES`. Cooperative lowerings report threadgroup storage and no
+    thread-local bytes. The counts cover declarations only: not compiler
+    temporaries, liveness, or register use inside MPP operations.
     """
     if dot_general not in DOT_GENERAL_POLICIES:
         raise ValueError("dot_general must be 'auto', 'default', 'tensorops', or 'simdgroup'")
@@ -99,10 +59,8 @@ def emit_msl_stats(
         source, threadgroup_bytes = lower_row_program(spec, kernel_name)
         return source, EmitStats(thread_bytes=0, threadgroup_bytes=threadgroup_bytes)
     if dot_general != "default" and uses_tensorops(spec, dot_general):
-        # Measured on an M2 and an M4 Pro. Family 10 GPUs have matrix
-        # accelerators, which matmul2d can use, so they keep it.
         prefer_simdgroup = dot_general == "simdgroup" or (
-            dot_general == "auto" and device_limits().get("apple_gpu_family") in (7, 8, 9)
+            dot_general == "auto" and prefers_simdgroup_matrix()
         )
         try:
             source, threadgroup_bytes = compile_kernel(
@@ -125,7 +83,7 @@ def emit_msl_stats(
 def _assemble(
     spec: KernelSpec, kernel_name: str | None, *, fuse_loads: bool
 ) -> tuple[str, EmitStats]:
-    """Assemble primitive MSL and storage totals, optionally fusing eligible immutable input loads."""
+    """One-thread-per-program MSL and its declared storage; `fuse_loads` reads eligible input blocks in place."""
     name = kernel_name or spec.name
     if len(spec.grid) > 3:
         raise EmitError(f"grid {spec.grid} has rank > 3; Metal grids are 3D")
@@ -133,11 +91,6 @@ def _assemble(
     operands = list(spec.inputs) + list(spec.outputs)
     n_in = len(spec.inputs)
     params = []
-    for k, info in enumerate(operands):
-        qual = "device" if k >= n_in else "const device"
-        ctype = msl_type(info.dtype)
-        params.append(f"{qual} {ctype}* arg{k} [[buffer({k})]]")
-    params.append("uint3 _pid [[thread_position_in_grid]]")
 
     env = Environment(
         no_stream_refs=frozenset(
@@ -154,45 +107,50 @@ def _assemble(
     for k, info in enumerate(operands):
         qual = "device" if k >= n_in else "const device"
         ctype = msl_type(info.dtype)
-        layout = BlockLayout.from_info(info)
-        full = layout.shape
+        params.append(f"{qual} {ctype}* arg{k} [[buffer({k})]]")
+        full = full_block_shape(info)
+        steps = block_strides(info)
         strided = any(b != a for b, a in zip(full[1:], info.array_shape[1:]))
         edge = any(a % b for a, b in zip(info.array_shape, full))
-        if strided or edge:
-            dims = info.full_block_shape
-            pids = [
-                CVal(f"(int){PID[d]}", (), "int")
-                for d in range(len(info.index_map_jaxpr.jaxpr.invars))
-            ]
-            origins = emit_jaxpr(env, cursor, info.index_map_jaxpr.jaxpr, pids)
-            logical_strides = iter(element_strides(info.block_shape))
-            coords = []
-            for dim, size, origin in zip(dims, full, origins, strict=True):
-                local = "0" if dim is None else f"(($i / {next(logical_strides)}) % {size})"
-                coords.append(f"(int({origin.expr}) * {size} + int({local}))")
-            address = flat_index(list(zip(coords, element_strides(info.array_shape))))
-            valid = " && ".join(
-                f"({c} >= 0 && {c} < {a})" for c, a in zip(coords, info.array_shape)
-            )
-            ref_vals.append(
-                CVal(
-                    f"arg{k}",
-                    info.block_shape or (1,),
-                    ctype,
-                    space="device",
-                    readonly=k < n_in and k not in aliased_inputs,
-                    index_map=address,
-                    valid=valid,
-                )
-            )
-            continue
-        constant = constant_offset(info)
-        offset = constant if constant is not None else block_offset(env, cursor, spec, info)
+        pids = [
+            CVal(f"(int){PID[d]}", (), "int") for d in range(len(info.index_map_jaxpr.jaxpr.invars))
+        ]
+        origins = emit_jaxpr(env, cursor, info.index_map_jaxpr.jaxpr, pids)
+        # The provable multiple of every block origin: the offset itself when
+        # the index map is constant, the common divisor of the steps otherwise.
+        if all(origin.expr.lstrip("-").isdigit() for origin in origins):
+            align = sum(int(origin.expr) * step for origin, step in zip(origins, steps))
+            offset = str(align)
+        else:
+            align = math.gcd(*steps)
+            offset = flat_index(zip((origin.expr for origin in origins), steps, strict=True))
         if offset == "0":
             ptr = f"arg{k}"
         else:
             ptr = f"arg{k}_offset"
             cursor.emit(f"{qual} {ctype}* {ptr} = arg{k} + {offset};")
+        index_map = valid = None
+        if strided or edge:
+            # The block's rows are not adjacent in the array, or it reaches
+            # past the array: address elements by their block coordinates.
+            logical_strides = iter(element_strides(info.block_shape))
+            local = [
+                "0" if dim is None else f"(($i / {next(logical_strides)}) % {size})"
+                for dim, size in zip(info.full_block_shape, full, strict=True)
+            ]
+            index_map = flat_index(zip(local, element_strides(info.array_shape)))
+        if edge:
+            # Only a block past the array's end has elements to skip.
+            valid = " && ".join(
+                f"({c} >= 0 && {c} < {a})"
+                for c, a in zip(
+                    (
+                        f"(int({origin.expr}) * {size} + int({index}))"
+                        for origin, size, index in zip(origins, full, local, strict=True)
+                    ),
+                    info.array_shape,
+                )
+            )
 
         # Scalar refs (shape ()) are addressed as one-element arrays.
         ref_vals.append(
@@ -202,7 +160,9 @@ def _assemble(
                 ctype=ctype,
                 space="device",
                 readonly=k < n_in and k not in aliased_inputs,
-                align=layout.alignment() if constant is None else int(constant),
+                align=align,
+                index_map=index_map,
+                valid=valid,
             )
         )
 
@@ -231,6 +191,7 @@ def _assemble(
         )
     emit_jaxpr(env, cursor, spec.jaxpr, ref_vals)
 
+    params.append("uint3 _pid [[thread_position_in_grid]]")
     head = f"kernel void {name}(\n    " + ",\n    ".join(params) + ")\n{"
     source = "\n".join(
         [
@@ -268,7 +229,7 @@ def emit_msl(
         MSL identifier.
     dot_general : {"auto", "default", "tensorops", "simdgroup"}, optional
         Use cooperative TensorOps when recognized, force primitive emission, require
-        TensorOps, or require them with `simdgroup_matrix` float32 matmuls,
+        TensorOps, or require them with `simdgroup_matrix` matmuls,
         respectively. The default is "auto", which also prefers `simdgroup_matrix`
         on M1 to M4 GPUs (Apple families 7 to 9), where it is faster than
         `matmul2d`.

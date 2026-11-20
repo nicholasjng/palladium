@@ -1,14 +1,13 @@
-"""A float32 tiled matmul built from `simdgroup_matrix`, after MLX's steel GEMM.
+"""A tiled matmul built from float32 `simdgroup_matrix`, after MLX's steel GEMM.
 
-On M1/M2-class GPUs, Metal 4's `matmul2d` reaches about 2.1 TFLOPS for
-float32 at 4096³, while this kernel reaches about 2.5 (see
-`notes/apple-gpu-kernel-recipe.md`). Each Pallas program is one threadgroup
-of 2x2 SIMD groups. Per K step of 16, all threads copy contiguous runs of the
-operand tiles into padded threadgroup rows; each lane then reads its own two
-elements of every 8x8 fragment, SIMD groups interleave across the output
-tile, and products run in serpentine order into per-lane float32
-accumulators. Every fragment loop is fully unrolled: otherwise the
-accumulator arrays live in stack memory and the kernel runs about 40x slower.
+Each Pallas program is one threadgroup of 2x2 SIMD groups. Per K step of 16,
+all threads copy contiguous runs of the operand tiles into padded threadgroup
+rows; each lane then reads its own two elements of every 8x8 fragment, SIMD
+groups interleave across the output tile, and products run in serpentine order
+into per-lane float32 accumulators. Half and bfloat operands stay in their type
+in threadgroup memory and widen to float as each lane reads its fragment
+elements, as MLX does. Every fragment loop is fully unrolled: otherwise the
+accumulator arrays live in stack memory instead of registers.
 """
 
 from __future__ import annotations
@@ -16,16 +15,14 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Generator
 
-from palladium.emit.core import Cursor
+from palladium.emit.core import CTYPE_BYTES, Cursor
 
-from ._shared import SIMDGROUPS
+from ._shared import SIMD_WIDTH, SIMDGROUPS, UNROLL
 
 K_TILE = 16
-_WM, _WN = 2, 2
-_PAD = 4  # 16 bytes of float32, as MLX pads threadgroup rows
-_UNROLL = '_Pragma("clang loop unroll(full)")'
-# Accumulator elements per tile above which registers spill (128x128
-# measured slower than 128x64 on an M2).
+_WM, _WN = 2, 2  # SIMD groups along M and N: the SIMDGROUPS of one threadgroup
+_PAD_BYTES = 16  # as MLX pads threadgroup rows
+# Accumulator elements per tile above which registers spill.
 _MAX_TILE_ELEMENTS = 128 * 64
 
 _MMA = """typedef vec<float, 2> simdgroup_frag;
@@ -49,29 +46,14 @@ PARAMETERS = (
 
 
 def supports(tm: int, tn: int, k: int) -> bool:
-    """Whether the kernel can compute a `tm x tn` output tile over `k`.
+    """Whether the kernel can compute a `tm x tn` output tile over a contraction of `k`.
 
-    Parameters
-    ----------
-    tm, tn : int
-        Output tile rows and columns.
-    k : int
-        Contraction length.
-
-    Returns
-    -------
-    bool
-        True for 2x2 SIMD groups, `tm` in 16, 32, 64 or 128, `tn` a multiple of
-        16, at most 8192 tile elements, and `k` a multiple of 16.
-
-    Notes
-    -----
-    The `tm` choices make each thread's share of an A tile copy divide the
-    16-element row; larger tiles spill the accumulators.
+    `tm` must be 16, 32, 64 or 128, so that each thread's share of an A tile copy
+    divides the 16-element row; `tn` and `k` multiples of 16; and the tile small
+    enough for its accumulators to stay in registers.
     """
     return (
-        SIMDGROUPS == _WM * _WN
-        and tm in (16, 32, 64, 128)
+        tm in (16, 32, 64, 128)
         and tn % 16 == 0
         and tm * tn <= _MAX_TILE_ELEMENTS
         and k > 0
@@ -89,7 +71,9 @@ def emit_fragment_coordinates(cursor: Cursor, lane: str) -> None:
     cursor.emit(f"const short _fn = (_qid & 2) * 2 + ({lane} % 2) * 2;")
 
 
-def emit_main_loop(cursor: Cursor, *, a: str, b: str, k: int, n: int, tm: int, tn: int) -> None:
+def emit_main_loop(
+    cursor: Cursor, *, a: str, b: str, k: int, n: int, tm: int, tn: int, ctype: str = "float"
+) -> None:
     """Emit the accumulation of one output tile into per-lane fragments.
 
     Parameters
@@ -104,6 +88,9 @@ def emit_main_loop(cursor: Cursor, *, a: str, b: str, k: int, n: int, tm: int, t
         Contraction length and the row stride of B.
     tm, tn : int
         Output tile rows and columns; `supports(tm, tn, k)` must hold.
+    ctype : str, optional
+        Operand element type: "float", "half" or "bfloat". Products and
+        accumulators are float32 for every type.
 
     Notes
     -----
@@ -112,23 +99,24 @@ def emit_main_loop(cursor: Cursor, *, a: str, b: str, k: int, n: int, tm: int, t
     Requires the parameters in `PARAMETERS`.
     """
     cursor.require("simdgroup_mma", _MMA)
-    threads = SIMDGROUPS * 32
+    threads = SIMDGROUPS * SIMD_WIDTH
     frags_m, frags_n = tm // (8 * _WM), tn // (8 * _WN)
-    lda, ldb = K_TILE + _PAD, tn + _PAD
+    pad = _PAD_BYTES // CTYPE_BYTES[ctype]
+    lda, ldb = K_TILE + pad, tn + pad
     a_reads, b_reads = tm * K_TILE // threads, K_TILE * tn // threads
     a_cols, b_cols = K_TILE // a_reads, tn // b_reads
     a_rows, b_rows = threads // a_cols, threads // b_cols
-    a_tile = cursor.allocate("float", (tm * lda,), name="_As", space="threadgroup")
-    b_tile = cursor.allocate("float", (K_TILE * ldb,), name="_Bs", space="threadgroup")
-    u = _UNROLL
+    a_tile = cursor.allocate(ctype, (tm * lda,), name="_As", space="threadgroup")
+    b_tile = cursor.allocate(ctype, (K_TILE * ldb,), name="_Bs", space="threadgroup")
+    u = UNROLL
 
     cursor.emit("// Each thread copies contiguous runs of both operand tiles per K step.")
     cursor.emit(f"const short _a_i = _tid / {a_cols}, _a_j = {a_reads} * (_tid % {a_cols});")
     cursor.emit(f"const short _b_i = _tid / {b_cols}, _b_j = {b_reads} * (_tid % {b_cols});")
-    cursor.emit(f"device const float* _a_src = {a} + _a_i * {k} + _a_j;")
-    cursor.emit(f"device const float* _b_src = {b} + _b_i * {n} + _b_j;")
-    cursor.emit(f"threadgroup float* _a_dst = {a_tile.expr} + _a_i * {lda} + _a_j;")
-    cursor.emit(f"threadgroup float* _b_dst = {b_tile.expr} + _b_i * {ldb} + _b_j;")
+    cursor.emit(f"device const {ctype}* _a_src = {a} + _a_i * {k} + _a_j;")
+    cursor.emit(f"device const {ctype}* _b_src = {b} + _b_i * {n} + _b_j;")
+    cursor.emit(f"threadgroup {ctype}* _a_dst = {a_tile.expr} + _a_i * {lda} + _a_j;")
+    cursor.emit(f"threadgroup {ctype}* _b_dst = {b_tile.expr} + _b_i * {ldb} + _b_j;")
     emit_fragment_coordinates(cursor, "_lane")
     cursor.emit(f"const short _sm = 8 * (_sg / {_WN}) + _fm, _sn = 8 * (_sg % {_WN}) + _fn;")
     cursor.emit(f"simdgroup_frag _acc[{frags_m}][{frags_n}];")
@@ -153,18 +141,20 @@ def emit_main_loop(cursor: Cursor, *, a: str, b: str, k: int, n: int, tm: int, t
         cursor.barrier()
         cursor.emit(f"_a_src += {K_TILE};")
         cursor.emit(f"_b_src += {K_TILE * n};")
-        cursor.emit(f"const threadgroup float* _as = {a_tile.expr} + _sm * {lda} + _fn;")
-        cursor.emit(f"const threadgroup float* _bs = {b_tile.expr} + _fm * {ldb} + _sn;")
+        cursor.emit(f"const threadgroup {ctype}* _as = {a_tile.expr} + _sm * {lda} + _fn;")
+        cursor.emit(f"const threadgroup {ctype}* _bs = {b_tile.expr} + _fm * {ldb} + _sn;")
         with cursor.block(f"{u} for (short kk = 0; kk < {K_TILE}; kk += 8)"):
             cursor.emit(f"simdgroup_frag _a[{frags_m}], _b[{frags_n}];")
             cursor.emit("simdgroup_barrier(mem_flags::mem_none);")
             with cursor.block(f"{u} for (short i = 0; i < {frags_m}; ++i)"):
                 row = f"i * {8 * _WM * lda} + kk"
-                cursor.emit(f"_a[i] = simdgroup_frag(_as[{row}], _as[{row} + 1]);")
+                cursor.emit(f"_a[i] = simdgroup_frag(float(_as[{row}]), float(_as[{row} + 1]));")
             cursor.emit("simdgroup_barrier(mem_flags::mem_none);")
             with cursor.block(f"{u} for (short j = 0; j < {frags_n}; ++j)"):
                 column = f"kk * {ldb} + j * {8 * _WN}"
-                cursor.emit(f"_b[j] = simdgroup_frag(_bs[{column}], _bs[{column} + 1]);")
+                cursor.emit(
+                    f"_b[j] = simdgroup_frag(float(_bs[{column}]), float(_bs[{column} + 1]));"
+                )
             cursor.emit("simdgroup_barrier(mem_flags::mem_none);")
             cursor.emit("// Serpentine order keeps one operand fragment live between products.")
             with (
@@ -192,7 +182,7 @@ def accumulator_elements(cursor: Cursor, tm: int, tn: int) -> Generator[tuple[st
         The float32 element and its row and column in the output tile, valid
         inside the `with` body.
     """
-    u = _UNROLL
+    u = UNROLL
     with (
         cursor.block(f"{u} for (short i = 0; i < {tm // (8 * _WM)}; ++i)"),
         cursor.block(f"{u} for (short j = 0; j < {tn // (8 * _WN)}; ++j)"),
