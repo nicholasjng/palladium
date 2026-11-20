@@ -1,7 +1,7 @@
 """Measure the Apple GPU roofline and where Pallas matmuls and attention land on it.
 
-Run with ``uv run mew run --random-interleaving benchmarks/bench_roofline.py``;
-add ``JAX_PLATFORMS=mps,cpu`` with jax-mps installed for the vendor rows.
+Run with ``uv run mew run --random-interleaving benchmarks/bench_roofline.py``.
+MLX's kernels for the same products are in ``bench_kernels.py``.
 
 - ``bench_copy_bandwidth``: device memory bandwidth, one read and one write
   of 256 MiB.
@@ -9,15 +9,16 @@ add ``JAX_PLATFORMS=mps,cpu`` with jax-mps installed for the vendor rows.
   operands. Every product reads another accumulator, so the compiler cannot
   hoist it out of the loop.
 - ``bench_pallas_matmul``: a plain tiled ``jnp.dot`` Pallas kernel through the
-  TensorOps lowering (``matmul2d``), and for float32 also through
-  ``dot_general="simdgroup"``, checked against NumPy before timing.
+  TensorOps lowering (``matmul2d``) and through ``dot_general="simdgroup"``,
+  checked against NumPy before timing.
 - ``bench_plmtl_matmul``: the same float32 matmul written by hand in Pallas
   on a ``plmtl.Mesh``, staging tiles in threadgroup memory over the K loop.
-- ``bench_vendor_matmul``: ``jnp.dot`` on the mps platform, which jax-mps
-  runs on MLX's kernels. Wall time per call, so it includes dispatch.
+- ``bench_pallas_elementwise``: ``tanh(x) * y + 1`` over 2048², one thread per
+  block, in square tiles, wide tiles and whole rows, as ``gbps`` over two
+  reads and one write, to compare with the copy bandwidth.
 - ``bench_pallas_attention``: the example flash attention at 4096 tokens and
   32 heads of 64, float32, through ``matmul2d`` and ``simdgroup_matrix``, each
-  at its fastest tiling on an M2, checked on one head against NumPy. FLOPs
+  at a fixed tiling, checked on one head against NumPy. FLOPs
   count 4·heads·tokens²·64, halved for the causal mask.
 
 Kernel rows report GPU time from the command buffer. Each row sets a
@@ -26,24 +27,19 @@ Kernel rows report GPU time from the command buffer. Each row sets a
 
 from __future__ import annotations
 
-import os
 import statistics
-import sys
-import time
 
 import jax
 import jax.numpy as jnp
 import mew
 import numpy as np
+from flash_attention import attention_kernel, attention_specs, reference_attention
 from jax.experimental import pallas as pl
 
 from palladium import _runtime
 from palladium.emit.tensorops import declared_threadgroup_width
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "examples"))
-from flash_attention import attention_kernel, attention_specs, reference_attention
-
-DTYPES = ("float32", "float16")
+DTYPES = ("float32", "float16", "bfloat16")
 SIZES = (2048, 4096)
 TILES = ((32, 32), (64, 32), (64, 64), (128, 64))
 MATMUL_CASES = [
@@ -51,8 +47,7 @@ MATMUL_CASES = [
     for size in SIZES
     for dtype in DTYPES
     for tm, tn in TILES
-    # The simdgroup kernel covers float32 only; float16 keeps matmul2d.
-    for policy in (("tensorops", "simdgroup") if dtype == "float32" else ("tensorops",))
+    for policy in ("tensorops", "simdgroup")
 ]
 MATMUL_IDS = [
     f"{c['policy']}-{c['dtype']}-n{c['size']}-tm{c['tile_m']}-tn{c['tile_n']}" for c in MATMUL_CASES
@@ -65,8 +60,6 @@ PLMTL_CASES = [
 PLMTL_IDS = [
     f"float32-n{c['size']}-tm{c['tile_m']}-tn{c['tile_n']}-tk{c['tile_k']}" for c in PLMTL_CASES
 ]
-VENDOR_CASES = [{"size": size, "dtype": dtype} for size in SIZES for dtype in DTYPES]
-VENDOR_IDS = [f"{c['dtype']}-n{c['size']}" for c in VENDOR_CASES]
 
 ATTENTION_SHAPE = (1, 4096, 32, 64)
 ATTENTION_CASES = [
@@ -125,14 +118,14 @@ kernel void copy4(device const float4* a [[buffer(0)]], device float4* b [[buffe
     unit="ms",
 )
 def bench_simdgroup_matrix_peak(state: mew.State, dtype: str) -> None:
-    ctype = {"float32": "float", "float16": "half"}[dtype]
+    ctype = {"float32": "float", "float16": "half", "bfloat16": "bfloat"}[dtype]
     source = f"""
 #include <metal_stdlib>
 using namespace metal;
 kernel void peak(device const {ctype}* x [[buffer(0)]], device {ctype}* out [[buffer(1)]],
                  uint sg [[simdgroup_index_in_threadgroup]],
                  uint tg [[threadgroup_position_in_grid]]) {{
-    simdgroup_matrix<{ctype}, 8, 8> a, b, c0(0.001), c1(0.002), c2(0.003), c3(0.004);
+    simdgroup_matrix<{ctype}, 8, 8> a, b, c0({ctype}(0.001)), c1({ctype}(0.002)), c2({ctype}(0.003)), c3({ctype}(0.004));
     simdgroup_load(a, x, 8);
     simdgroup_load(b, x + 64, 8);
     for (int i = 0; i < {_ITERATIONS}; ++i) {{
@@ -194,10 +187,11 @@ def bench_pallas_matmul(
     output = np.empty((size, size), dtype)
     buffers = [x, y, output]
     threadgroup = declared_threadgroup_width(source)
+    assert threadgroup is not None, "cooperative kernels declare their threadgroup width"
     grid = ((size // tile_m) * threadgroup, size // tile_n, 1)
     _runtime.run(kernel, buffers, grid, threadgroup)
     corner = x[:64].astype(np.float32) @ y[:, :64].astype(np.float32)
-    tolerance = 1e-5 if dtype == "float32" else 1e-3
+    tolerance = {"float32": 1e-5, "float16": 1e-3, "bfloat16": 8e-3}[dtype]  # about one ulp
     np.testing.assert_allclose(
         output[:64, :64].astype(np.float32) / np.abs(corner).max(),
         corner / np.abs(corner).max(),
@@ -246,6 +240,7 @@ def bench_plmtl_matmul(state: mew.State, size: int, tile_m: int, tile_n: int, ti
     output = np.empty((size, size), np.float32)
     buffers = [x, y, output]
     threadgroup = declared_threadgroup_width(source)
+    assert threadgroup is not None, "cooperative kernels declare their threadgroup width"
     grid = ((size // tile_m) * threadgroup, size // tile_n, 1)
     _runtime.run(kernel, buffers, grid, threadgroup)
     corner = x[:64] @ y[:, :64]
@@ -261,24 +256,51 @@ def bench_plmtl_matmul(state: mew.State, size: int, tile_m: int, tile_n: int, ti
     )
 
 
-@mew.parametrize(VENDOR_CASES, ids=VENDOR_IDS, tags="roofline", use_manual_time=True, unit="ms")
-def bench_vendor_matmul(state: mew.State, size: int, dtype: str) -> None:
-    try:
-        device = jax.devices("mps")[0]
-    except RuntimeError:
-        state.skip_with_error("no mps platform: install jax-mps and set JAX_PLATFORMS=mps,cpu")
-        return
-    with jax.default_device(device):
-        x = jax.random.normal(jax.random.key(0), (size, size), dtype)
-        y = jax.random.normal(jax.random.key(1), (size, size), dtype)
-        matmul = jax.jit(jnp.dot)
+ELEMENTWISE_SIZE = 2048
+ELEMENTWISE_BLOCKS = ((16, 16), (8, 64), (1, ELEMENTWISE_SIZE))
 
-        def run() -> float:
-            start = time.perf_counter()
-            jax.block_until_ready(matmul(x, y))
-            return time.perf_counter() - start
 
-        _run_timed(state, run, work=2 * size**3, counter="tflops", scale=1e12)
+def _elementwise_kernel(x_ref, y_ref, o_ref):
+    o_ref[...] = jnp.tanh(x_ref[...]) * y_ref[...] + 1.0
+
+
+@mew.parametrize(
+    [{"rows": rows, "columns": columns} for rows, columns in ELEMENTWISE_BLOCKS],
+    ids=[f"block{rows}x{columns}" for rows, columns in ELEMENTWISE_BLOCKS],
+    tags="roofline",
+    use_manual_time=True,
+    unit="ms",
+)
+def bench_pallas_elementwise(state: mew.State, rows: int, columns: int) -> None:
+    import palladium
+
+    size = ELEMENTWISE_SIZE
+    rng = np.random.default_rng(0)
+    x, y = (rng.standard_normal((size, size)).astype(np.float32) for _ in range(2))
+    shape = jax.ShapeDtypeStruct((size, size), jnp.float32)
+    block = pl.BlockSpec((rows, columns), lambda i, j: (i, j))
+    grid = (size // rows, size // columns)
+    source = palladium.debug_msl(
+        _elementwise_kernel,
+        shape,
+        shape,
+        grid=grid,
+        in_specs=(block, block),
+        out_specs=block,
+        out_shape=shape,
+    )
+    kernel = _runtime.Kernel(source, "palladium_kernel")
+    output = np.empty((size, size), np.float32)
+    buffers = [x, y, output]
+    _runtime.run(kernel, buffers, grid)
+    np.testing.assert_allclose(output, np.tanh(x) * y + 1.0, rtol=2e-5, atol=2e-6)
+    _run_timed(
+        state,
+        lambda: _runtime.run(kernel, buffers, grid),
+        work=3 * x.nbytes,
+        counter="gbps",
+        scale=1e9,
+    )
 
 
 @mew.parametrize(
@@ -309,6 +331,7 @@ def bench_pallas_attention(
     output = np.empty(ATTENTION_SHAPE, np.float32)
     buffers = [q, k, v, output]
     threadgroup = declared_threadgroup_width(source)
+    assert threadgroup is not None, "cooperative kernels declare their threadgroup width"
     launch = (batch * threadgroup, heads, tokens // tile_q)
     _runtime.run(kernel, buffers, launch, threadgroup)
     head = (slice(None), slice(None), slice(0, 1))

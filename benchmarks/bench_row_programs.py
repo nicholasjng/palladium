@@ -83,6 +83,7 @@ def bench_row_program(state: mew.State, kernel: str, rows: int, columns: int) ->
     output = np.empty((rows, columns), np.float32)
     buffers = [*args, output]
     threads = declared_threadgroup_width(source)
+    assert threads is not None, "cooperative kernels declare their threadgroup width"
     grid = ((rows // TILE) * threads, 1, 1)
 
     def run() -> float:
