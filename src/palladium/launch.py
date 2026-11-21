@@ -63,6 +63,10 @@ class CompilerParams(pl.CompilerParams):
     math_mode : MathMode or str, optional
         FAST by default; RELAXED and SAFE are available on both entry points. A
         mode's value, such as "safe", is converted.
+    dimension_semantics : tuple of str or None, optional
+        "parallel" or "arbitrary" per grid axis, as Mosaic's parameter of that name.
+        Only read for a kernel that keeps values in scratch between programs: the
+        axes not marked "parallel" then run in order inside one thread.
     BACKEND : str
         Pallas backend identifier, "palladium"; leave this at its default.
 
@@ -84,6 +88,7 @@ class CompilerParams(pl.CompilerParams):
     program: str = "thread"
     threadgroup: SupportsIndex | Sequence[SupportsIndex] | None = None
     math_mode: MathMode = MathMode.FAST
+    dimension_semantics: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.dot_general not in DOT_GENERAL_POLICIES:
@@ -104,20 +109,17 @@ class CompilerParams(pl.CompilerParams):
 def lowering_options(params: Mapping[str, Any], platform: str) -> CompilerParams:
     """A `pallas_call`'s Palladium options, or the defaults, when lowering for `platform`.
 
-    Raises
-    ------
-    TypeError
-        The call carries another backend's compiler parameters.
+    Another backend's parameters, such as Mosaic's, give the defaults: a kernel
+    written for it should lower here unchanged, and what its options tune does not
+    exist on Metal. Their `dimension_semantics` are read from the call itself, by
+    `trace.spec_from_params`.
     """
-    options = params.get("compiler_params")
-    if options is None:
-        return CompilerParams()
-    if not isinstance(options, CompilerParams):
-        raise TypeError(
-            f"pallas_call on {platform} lowers through Palladium, which takes "
-            f"palladium.CompilerParams, not {type(options).__name__}"
-        )
-    return options
+    return adopt_params(params.get("compiler_params"))
+
+
+def adopt_params(options: Any) -> CompilerParams:
+    """`options` if they are Palladium's, else the defaults."""
+    return options if isinstance(options, CompilerParams) else CompilerParams()
 
 
 def normalize_threadgroup(
@@ -226,7 +228,8 @@ def launch_geometry(
     Geometry follows the emitted source after any TensorOps fallback; callers must
     supply a grid of at most three dimensions.
     """
-    grid = _pad3(spec.grid)
+    # Axes that run in order are loops inside the kernel, not threads.
+    grid = _pad3(tuple(n for axis, n in enumerate(spec.grid) if axis not in spec.sequential))
     group = None if threadgroup is None else _pad3(threadgroup)
     width = declared_threadgroup_width(msl_source)
     if width is not None:

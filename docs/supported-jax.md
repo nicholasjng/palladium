@@ -8,11 +8,12 @@ raise an error during tracing, lowering, or compilation.
 
 | Feature | Supported behavior |
 |---|---|
-| Kernel entry | One `pallas_call`, or one `pl.kernel` on a `plmtl.Mesh`, per traced callable; multiple calls and `PrefetchScalarGridSpec` are rejected |
-| Grid | Rank 1–3, or gridless for one program instance |
+| Kernel entry | One `pallas_call`, or one `pl.kernel` on a `plmtl.Mesh`, per traced callable; multiple calls are rejected. A `PrefetchScalarGridSpec`'s scalar operands are whole arrays the kernel reads and its index maps take |
+| Grid | Up to three parallel axes, or gridless for one program instance. Axes that run in order (below) do not count |
+| Compiler parameters | `palladium.CompilerParams`. Another backend's, such as Mosaic's, are accepted and give the defaults, so a kernel written for it lowers unchanged; only their `dimension_semantics` are read |
 | Blocks | Contiguous or strided `BlockSpec` tiles, squeezed axes, partial edge tiles; `pl.Element`, `pl.Indirect`, and `pl.BoundedSlice` are unsupported |
 | Ref indexing | Full refs, scalar indices, `pl.dslice`, positive static slice strides |
-| Scratch | Per-instance `pl.MemorySpace` scratch |
+| Scratch | Per-instance `pl.MemorySpace` scratch, written before it is read. A kernel that reads scratch first relies on programs running in order with scratch kept between them, as on Mosaic: it needs `dimension_semantics`, and the axes not marked `"parallel"` then run as loops inside one thread. Without them it is rejected |
 | Captures | Python scalar constants; captured arrays are unsupported, so pass them as operands |
 | Outputs | Multiple outputs and Pallas input/output aliases, subject to backend limitations |
 
@@ -25,14 +26,21 @@ read snapshots are preserved across later writes.
 
 - **Elementwise:** add/subtract/multiply/divide, power, abs/negation,
   exp/exp2/expm1/log/log2/log1p, sqrt/rsqrt, sin/cos/tan and their inverses,
-  sinh/cosh/tanh and their inverses, atan2, erf/erf_inv, logistic, square,
-  floor/ceil/round, is_finite, sign/remainder/clamp, min/max, comparisons,
-  casts, bitcasts, logical and bitwise operations, shifts, and broadcasting.
-  erf, erf_inv, expm1, and log1p are float32 helper functions emitted with
-  the kernel; the rest map onto MSL builtins.
+  sinh/cosh/tanh and their inverses, atan2, erf/erfc/erf_inv, logistic,
+  square, floor/ceil/round, is_finite, sign/remainder/clamp, min/max,
+  comparisons, casts, bitcasts, logical and bitwise operations, shifts, and
+  broadcasting. erf, erfc, erf_inv, expm1, log1p and the floating remainder
+  are float32 helper functions emitted with the kernel; the rest map onto
+  MSL builtins. The remainder is exact, which Metal's `fmod` is not.
 - **Array structure:** reshape, permuted reshape, transpose, selection via
-  `select_n`, `broadcasted_iota`/`arange`, `concatenate`, and `dynamic_slice`
-  (start indices clamped as JAX defines).
+  `select_n`, `broadcasted_iota`/`arange`, `concatenate`, static slices,
+  `dynamic_slice` (start indices clamped as JAX defines), `pad` (interior
+  and negative widths included) and `flip`.
+- **Index of an extremum:** `argmax` and `argmin` along one axis, with the
+  first index on ties and NaN as the extremum (under SAFE math).
+- **Inlined calls:** `jit`, and functions with a custom derivative rule such
+  as `jax.nn.softmax`, `log_softmax` and `relu`; `stop_gradient` is the
+  identity.
 - **Cumulative:** `cumsum`, `cumprod`, `cummax`, `cummin` along one axis,
   forward or reverse.
 - **Reductions:** sum, min, and max over supported axis subsets, and
@@ -133,8 +141,8 @@ output cropping. Unsupported jaxpr forms and layouts raise `EmitError`.
 Inside programs on the `metal` plugin, cooperative kernels launch with their
 scaled thread grid and required threadgroup like every other kernel.
 
-The backend supports float32, float16, bfloat16, int32, uint32, and bool, with
-operation-specific limits:
+The backend supports float32, float16, bfloat16, int32, uint32, bool, and
+the 8- and 16-bit integers, with operation-specific limits:
 
 | Type | Supported operations |
 |---|---|
@@ -143,6 +151,7 @@ operation-specific limits:
 | bfloat16 | Load/store, elementwise, reductions, and cooperative TensorOps matmul |
 | int32, uint32 | Load/store, arithmetic, bitwise operations, shifts, and reductions |
 | bool | Load/store, logic, and selection |
+| int8, uint8, int16, uint16 | Load/store, conversion, comparison, selection, bitwise operations, and wrapping add, subtract, multiply and negate; other rules reject them, so convert to 32 bits first |
 
 float64 and int64 are rejected. `preferred_element_type` controls
 dot accumulation through the output dtype. Under SAFE math, floating extrema

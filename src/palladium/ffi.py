@@ -25,6 +25,7 @@ from palladium.emit.core import CTYPES
 from palladium.errors import DispatchError
 from palladium.launch import (
     CompilerParams,
+    adopt_params,
     check_threadgroup,
     launch_geometry,
     lowering_options,
@@ -109,13 +110,7 @@ class FfiCallable:
     """
 
     def __init__(self, staged: Callable, interpret: Callable, params: CompilerParams | None):
-        if params is None:
-            params = CompilerParams()
-        elif not isinstance(params, CompilerParams):
-            raise TypeError(
-                f"metal_call takes palladium.CompilerParams, not {type(params).__name__}"
-            )
-        self._params = params
+        self._params = adopt_params(params)
         self._staged = staged
         self.interpret = interpret
         self._specialize = functools.lru_cache(maxsize=_CACHE_SIZE)(self._trace_and_emit)

@@ -1165,23 +1165,30 @@ def test_pooling_and_its_gradient_match_cpu():
 
 
 def test_sam_training_step_matches_cpu_over_three_steps():
+    """Each of three steps, taken on both backends from the CPU's state.
+
+    The states are not left to run apart: max-pooling picks a winner, so two
+    trajectories a few 1e-6 apart can disagree on one and then differ by
+    1e-3 in a gradient, with either backend stepping correctly. From one
+    state the backends agree to rounding at every step. Drift over long runs
+    is what examples/pjrt_long_run.py measures, against the CPU's own spread.
+    """
     _check("""
         import jax, numpy as np
         from training_steps import workload
         from pjrt_tolerance import assert_trees_close
-        cpu = jax.devices('cpu')[0]
+        cpu, metal = jax.devices('cpu')[0], jax.devices('metal')[0]
         with jax.default_device(cpu):
             fn, params, opt, images, masks = workload('sam')
             images = jax.random.uniform(jax.random.key(1), images.shape)
             masks = (jax.random.uniform(jax.random.key(2), masks.shape) > 0.5).astype(np.float32)
-        state = {d: jax.device_put((params, opt, images, masks), jax.devices(d)[0]) for d in ('metal', 'cpu')}
         run = jax.jit(fn)
+        state = (params, opt, images, masks)
         for _ in range(3):
-            losses = {}
-            for d, (p, o, x, m) in state.items():
-                (p, o), losses[d] = run(p, o, x, m)
-                state[d] = (p, o, x, m)
-            assert_trees_close((state['metal'][:2], losses['metal']), (state['cpu'][:2], losses['cpu']), rtol=1e-4)
+            (p, o), loss = run(*state)
+            got = run(*jax.device_put(state, metal))
+            assert_trees_close(got, ((p, o), loss), rtol=1e-4)
+            state = (p, o, images, masks)
     """)
 
 
@@ -1486,6 +1493,11 @@ def test_linear_algebra_matches_cpu():
             "singular values": (lambda x: jnp.linalg.svd(x, compute_uv=False), x),
             "pinv": (jnp.linalg.pinv, x),
             "normal log density": (lambda a, x: jax.scipy.stats.multivariate_normal.logpdf(x[:, :4], jnp.zeros(4), a), a, x),
+            "householder qr": (lambda x: lax.linalg.householder_product(*jax._src.lax.linalg.geqrf(x)), x),
+            "hessenberg": (lambda g: jax.scipy.linalg.hessenberg(g, calc_q=True), x[:5]),
+            "tridiagonal": (lambda a: lax.linalg.tridiagonal(a, lower=True), a),
+            "schur": (jax.scipy.linalg.schur, x[:5]),
+            "schur batch": (lax.linalg.schur, np.stack([x[:5], x[1:], x[:5].T])),
             "cholesky gradient": (jax.grad(lambda m: jnp.linalg.cholesky(m).sum()), a),
             "eigh gradient": (jax.grad(lambda m: jnp.linalg.eigh(m)[0].sum()), a),
         }
@@ -1493,7 +1505,7 @@ def test_linear_algebra_matches_cpu():
             assert_matches_cpu(fn, *args, rtol=2e-4, err_msg=name)
         print(len(cases))
     """)
-    assert out.strip() == "22"
+    assert out.strip() == "27"
 
 
 def test_sorts_match_cpu():
@@ -1813,4 +1825,50 @@ def test_recognized_attention_and_normalizations_match_cpu():
         assert_matches_cpu(lambda x: (x.max(-1), x.min(1), jnp.where(x > 2, jnp.nan, x).max(-1)), x)
         assert_matches_cpu(lambda x: x.astype(jnp.bfloat16).sum(-1), x, rtol=1e-2)
         assert_matches_cpu(lambda x: (x * 100).astype(jnp.int32).sum(-1), x)
+    """)
+
+
+def test_floating_remainder_is_exact():
+    """Metal's fmod rounds the quotient: fmod(x, x) can return x, and a large
+    quotient loses every digit. The remainder is exact, as on the CPU, also
+    in a Pallas kernel."""
+    _check("""
+        import jax, jax.numpy as jnp, ml_dtypes, numpy as np
+        from jax import lax
+        from jax.experimental import pallas as pl
+        from pjrt_tolerance import assert_matches_cpu
+        rng = np.random.default_rng(0)
+        a = (rng.standard_normal(2048) * 10.0 ** rng.integers(-6, 12, 2048)).astype(np.float32)
+        b = (rng.standard_normal(2048) * 10.0 ** rng.integers(-6, 6, 2048)).astype(np.float32)
+        a[:6] = [7.5, -7.5, 1e10, 5.0, -0.0, np.inf]
+        b[:6] = [2.5, 2.5, 3.0, 0.1, 1.0, 2.0]
+        assert_matches_cpu(lax.rem, a, b, exact=True)
+        assert_matches_cpu(lambda a: lax.rem(a, a), a, exact=True)
+        assert_matches_cpu(jnp.mod, a, b, exact=True)
+        assert_matches_cpu(lambda a, b: lax.rem(a, jnp.zeros_like(b)), a, b, exact=True)
+        for dtype in (np.float16, ml_dtypes.bfloat16):
+            assert_matches_cpu(lax.rem, a.astype(dtype), (jnp.abs(b) + 1).astype(dtype), exact=True)
+
+        def kernel(a_ref, b_ref, out_ref):
+            out_ref[...] = lax.rem(a_ref[...], b_ref[...])
+
+        block = pl.BlockSpec((16, 64), lambda i: (i, 0))
+        call = pl.pallas_call(kernel, grid=(2,), in_specs=[block, block], out_specs=block,
+                              out_shape=jax.ShapeDtypeStruct((32, 64), jnp.float32))
+        got = jax.jit(call)(a.reshape(32, 64), b.reshape(32, 64))
+        np.testing.assert_array_equal(got, np.fmod(a, b).reshape(32, 64))
+    """)
+
+
+def test_a_mosaic_matmul_kernel_runs_unchanged():
+    """JAX's bundled TPU matmul: a scalar-prefetch grid spec, Mosaic's compiler
+    parameters, and an accumulator in scratch along the K axis, which runs as
+    a loop inside each thread."""
+    _check("""
+        import jax, numpy as np
+        from jax.experimental.pallas.ops.tpu import matmul
+        rng = np.random.default_rng(0)
+        x, y = rng.standard_normal((2, 128, 128), np.float32)
+        got = jax.jit(lambda x, y: matmul.matmul(x, y, block_shape=(32, 32), block_k=32))(x, y)
+        np.testing.assert_allclose(got, x @ y, rtol=1e-4, atol=1e-4)
     """)

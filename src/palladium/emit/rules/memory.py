@@ -94,10 +94,11 @@ def _rule_swap(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
         env.bind(outvar, dst_ref)
 
 
-@rule("jit")
+@rule("jit", "custom_jvp_call")
 def _inline_jit(env: Environment, cursor: Cursor, eqn: JaxprEqn) -> None:
-    """Inline a jit-wrapped call by walking its body jaxpr."""
-    inner: Jaxpr = eqn.params["jaxpr"]
+    """Inline a jit-wrapped call, or a function with a custom derivative rule
+    such as `jax.nn.softmax`, by walking its body jaxpr."""
+    inner: Jaxpr = eqn.params["jaxpr" if eqn.primitive.name == "jit" else "call_jaxpr"]
     body = inner.jaxpr
     if inner.consts:
         raise EmitError("jit with consts is unsupported")

@@ -58,6 +58,24 @@ def enclosed(expr: str) -> str:
 # the result, six terms of the Maclaurin series (relative error 3e-8). erfinv: Giles, "Approximating the erfinv function" (2010), the
 # single-precision branch. expm1 and log1p switch to short series below
 # |x| = 0.25, where the builtin exp and log would cancel.
+# The exact floating remainder with the sign of x, as C's fmod and XLA's rem.
+# Metal defines fmod as x - y * trunc(x / y), which rounds the quotient:
+# fmod(x, x) can return x, and a large quotient loses every digit. Each step
+# here subtracts the largest y * 2^k not above the remainder, which is exact.
+FMOD = (
+    "pd_fmod",
+    """inline float pd_fmod(float x, float y) {
+    float r = fabs(x), ay = fabs(y);
+    if (isnan(x) || isnan(y) || isinf(x) || ay == 0.0f) return NAN;
+    if (isinf(y)) return x;
+    for (int k = 0; k < 300 && r >= ay; ++k) {
+        float t = ldexp(ay, ilogb(r) - ilogb(ay));
+        r -= t > r ? 0.5f * t : t;
+    }
+    return copysign(r, x);
+}""",
+)
+
 HELPERS: dict[str, tuple[str, str]] = {
     "erf": (
         "pd_erf",
@@ -77,6 +95,25 @@ HELPERS: dict[str, tuple[str, str]] = {
                          -0.284496736f), t, 0.254829592f) * t;
     float y = 1.0f - poly * exp(-a * a);
     return x < 0.0f ? -y : y;
+}""",
+    ),
+    # Numerical Recipes' erfcc: a relative error below 1.2e-7 everywhere, where
+    # 1 - erf(x) would lose every digit of a small result.
+    "erfc": (
+        "pd_erfc",
+        """inline float pd_erfc(float x) {
+    float z = fabs(x);
+    float t = 1.0f / fma(0.5f, z, 1.0f);
+    float p = fma(t, 0.17087277f, -0.82215223f);
+    p = fma(t, p, 1.48851587f);
+    p = fma(t, p, -1.13520398f);
+    p = fma(t, p, 0.27886807f);
+    p = fma(t, p, -0.18628806f);
+    p = fma(t, p, 0.09678418f);
+    p = fma(t, p, 0.37409196f);
+    p = fma(t, p, 1.00002368f);
+    float r = t * exp(fma(t, p, -z * z - 1.26551223f));
+    return x >= 0.0f ? r : 2.0f - r;
 }""",
     ),
     "erf_inv": (

@@ -38,7 +38,51 @@ CTYPES: dict[np.dtype, str] = {
     np.dtype(np.int32): "int",
     np.dtype(np.uint32): "uint",
     np.dtype(np.bool_): "bool",
+    np.dtype(np.int8): "char",
+    np.dtype(np.uint8): "uchar",
+    np.dtype(np.int16): "short",
+    np.dtype(np.uint16): "ushort",
 }
+
+# 8- and 16-bit integers load, store, convert, compare, select and do wrapping
+# arithmetic: MSL computes them in 32 bits and the store narrows. The other
+# rules have 32-bit and floating forms only (division by zero, shift counts,
+# extrema, dots), so they reject narrow operands instead of guessing.
+NARROW = frozenset(np.dtype(t) for t in (np.int8, np.uint8, np.int16, np.uint16))
+NARROW_RULES = frozenset(
+    [
+        "get",
+        "swap",
+        "convert_element_type",
+        "add",
+        "sub",
+        "mul",
+        "neg",
+        "eq",
+        "ne",
+        "lt",
+        "le",
+        "gt",
+        "ge",
+        "and",
+        "or",
+        "xor",
+        "not",
+        "select_n",
+        "broadcast_in_dim",
+        "reshape",
+        "squeeze",
+        "transpose",
+        "concatenate",
+        "dynamic_slice",
+        "jit",
+        "cond",
+        "scan",
+        "while",
+        "program_id",
+        "num_programs",
+    ]
+)
 
 
 def msl_type(dtype: DTypeLike) -> str:
@@ -404,6 +448,9 @@ class Environment:
         self.jit_outputs: dict[Var, Var] = {}
         # How many bound variables hold each declared storage, whole or in part.
         self.storage_users: collections.Counter[str | None] = collections.Counter()
+        # The program's coordinate along each grid axis, and the grid's extents.
+        self.pids: tuple[str, ...] = PID
+        self.grid: tuple[int, ...] = ()
 
     def val(self, atom: Atom) -> CVal:
         """The value bound to a variable, or a literal as a typed scalar constant."""
@@ -532,6 +579,14 @@ def emit_jaxpr(env: Environment, cursor: Cursor, jaxpr: Jaxpr, in_vals: list[CVa
     for eqn in jaxpr.eqns:
         name = eqn.primitive.name
         impl = RULES.get(name)
+        if name not in NARROW_RULES and any(
+            getattr(getattr(v, "aval", None), "dtype", None) in NARROW
+            for v in (*eqn.invars, *eqn.outvars)
+        ):
+            raise EmitError(
+                f"{name} has no rule for 8- and 16-bit integers; convert its operands to "
+                "int32, uint32 or a floating type first"
+            )
         if impl is None:
             raise UnsupportedPrimitiveError(f"no MSL rule for primitive '{name}'", primitive=name)
         impl(env, cursor, eqn)

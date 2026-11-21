@@ -98,3 +98,39 @@ def test_systematic_resampling_building_blocks(rng):
     f = palladium.metal_call(kernel, out_shape=jax.ShapeDtypeStruct((16,), jnp.int32))
     args = (w, np.array([0.37], np.float32))
     np.testing.assert_array_equal(f(*args), np.asarray(f.interpret(*args)))
+
+
+def test_flip_pad_and_static_slices(rng):
+    """Reversal along each axis, constant padding with interior and negative
+    widths, and strided static slices."""
+
+    def kernel(x_ref, o_ref):
+        x = x_ref[...]
+        flipped = jnp.flip(x, axis=1) + jnp.flip(x, (0, 1))
+        padded = jax.lax.pad(x, 0.5, ((1, -1, 0), (-3, 2, 1)))[:, :10]
+        o_ref[...] = flipped + padded + jnp.pad(x[::2, 1::3], ((0, 3), (2, 5)), constant_values=7.0)
+
+    x = rng.standard_normal((6, 10), dtype=np.float32)
+    _check(kernel, (x,), jax.ShapeDtypeStruct((6, 10), jnp.float32))
+
+
+@pytest.mark.parametrize("op", [jnp.argmax, jnp.argmin])
+def test_argmax_and_argmin_take_the_first_extremum_or_nan(rng, op):
+    """Ties resolve to the first index, and a NaN counts as the extremum."""
+
+    def kernel(x_ref, rows_ref, columns_ref, all_ref):
+        x = x_ref[...]
+        rows_ref[...] = op(x, axis=1).astype(jnp.int32)
+        columns_ref[...] = op(x, axis=0).astype(jnp.int32)
+        all_ref[...] = op(jnp.round(x)).astype(jnp.int32)
+
+    x = rng.standard_normal((6, 10), dtype=np.float32)
+    x[1, :] = 2.0  # a row of ties
+    x[2, 4] = x[2, 7] = np.nan
+    f = palladium.metal_call(
+        kernel,
+        out_shape=tuple(jax.ShapeDtypeStruct(s, jnp.int32) for s in ((6,), (10,), ())),
+        compiler_params=palladium.CompilerParams(math_mode=palladium.MathMode.SAFE),
+    )
+    for got, want in zip(f(x), f.interpret(x), strict=True):
+        np.testing.assert_array_equal(got, want)

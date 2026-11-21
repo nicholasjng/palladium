@@ -58,7 +58,10 @@ def emit_msl_stats(
     if program == "threadgroup":
         source, threadgroup_bytes = lower_row_program(spec, kernel_name)
         return source, EmitStats(thread_bytes=0, threadgroup_bytes=threadgroup_bytes)
-    if dot_general != "default" and uses_tensorops(spec, dot_general):
+    # The cooperative lowerings give each program a threadgroup, which a
+    # program that follows another along a sequential axis cannot have.
+    plain = not spec.sequential and not spec.prefetch
+    if dot_general != "default" and plain and uses_tensorops(spec, dot_general):
         prefer_simdgroup = dot_general == "simdgroup" or (
             dot_general == "auto" and prefers_simdgroup_matrix()
         )
@@ -85,7 +88,8 @@ def _assemble(
 ) -> tuple[str, EmitStats]:
     """One-thread-per-program MSL and its declared storage; `fuse_loads` reads eligible input blocks in place."""
     name = kernel_name or spec.name
-    if len(spec.grid) > 3:
+    parallel = [axis for axis in range(len(spec.grid)) if axis not in spec.sequential]
+    if len(parallel) > 3:
         raise EmitError(f"grid {spec.grid} has rank > 3; Metal grids are 3D")
 
     operands = list(spec.inputs) + list(spec.outputs)
@@ -98,7 +102,29 @@ def _assemble(
         ),
         fuse_loads=fuse_loads,
     )
+    # A thread's position gives the parallel axes; the others are loops in it.
+    env.pids = tuple(
+        f"_seq{axis}" if axis in spec.sequential else PID[parallel.index(axis)]
+        for axis in range(len(spec.grid))
+    )
+    env.grid = spec.grid
     cursor = Cursor()
+    # Scratch is declared before the loops over the sequential axes, so it
+    # keeps its values from one program to the next along them.
+    scratch_vals: list[CVal] = []
+    for k, info in enumerate(spec.scratch):
+        ctype = msl_type(info.dtype)
+        shape = info.shape
+        size = math.prod(info.shape)
+        cursor.account(ctype, size, "thread")
+        scratch_op = f"{ctype} scratch{k}"
+        scratch_op += f"[{size}];" if shape else ";"
+        cursor.emit(scratch_op)
+        scratch_vals.append(
+            CVal(expr=f"scratch{k}", shape=shape, ctype=ctype, readonly=False, align=0)
+        )
+    for axis in spec.sequential:
+        cursor.emit(f"for (uint _seq{axis} = 0; _seq{axis} < {spec.grid[axis]}; ++_seq{axis}) {{")
     ref_vals: list[CVal] = []
     # Aliased inputs share their buffer with an output; dropping readonly
     # forces gets to copy instead of binding a view that would observe
@@ -112,9 +138,11 @@ def _assemble(
         steps = block_strides(info)
         strided = any(b != a for b, a in zip(full[1:], info.array_shape[1:]))
         edge = any(a % b for a, b in zip(info.array_shape, full))
-        pids = [
-            CVal(f"(int){PID[d]}", (), "int") for d in range(len(info.index_map_jaxpr.jaxpr.invars))
-        ]
+        # An index map takes the grid coordinates, then the prefetched scalar
+        # operands, which lead the kernel's refs and so are bound by now.
+        coordinates = min(len(spec.grid), len(info.index_map_jaxpr.jaxpr.invars))
+        pids = [CVal(f"(int){env.pids[d]}", (), "int") for d in range(coordinates)]
+        pids += ref_vals[: len(info.index_map_jaxpr.jaxpr.invars) - coordinates]
         origins = emit_jaxpr(env, cursor, info.index_map_jaxpr.jaxpr, pids)
         # The provable multiple of every block origin: the offset itself when
         # the index map is constant, the common divisor of the steps otherwise.
@@ -166,23 +194,7 @@ def _assemble(
             )
         )
 
-    for k, info in enumerate(spec.scratch):
-        ctype = msl_type(info.dtype)
-        shape = info.shape
-        size = math.prod(info.shape)
-        cursor.account(ctype, size, "thread")
-        scratch_op = f"{ctype} scratch{k}"
-        scratch_op += f"[{size}];" if shape else ";"
-        cursor.emit(scratch_op)
-        ref_vals.append(
-            CVal(
-                expr=f"scratch{k}",
-                shape=shape,
-                ctype=ctype,
-                readonly=False,
-                align=0,
-            )
-        )
+    ref_vals += scratch_vals
 
     n_refs = len(operands) + len(spec.scratch)
     if len(spec.jaxpr.invars) != n_refs:
@@ -190,6 +202,8 @@ def _assemble(
             f"kernel has {len(spec.jaxpr.invars)} refs but spec carries {n_refs} operands"
         )
     emit_jaxpr(env, cursor, spec.jaxpr, ref_vals)
+    for _ in spec.sequential:
+        cursor.emit("}")
 
     params.append("uint3 _pid [[thread_position_in_grid]]")
     head = f"kernel void {name}(\n    " + ",\n    ".join(params) + ")\n{"

@@ -9,7 +9,7 @@ from collections.abc import Callable, Collection, Sequence
 
 import numpy as np
 
-from palladium.emit.numeric import extremum_identity, format_scalar
+from palladium.emit.numeric import FMOD, extremum_identity, format_scalar
 from palladium.errors import EmitError
 from palladium.stablehlo.graph import (
     WINDOW_LIMIT,
@@ -531,6 +531,8 @@ class Kernel:
             kind = "float" if operand_ctype in ("float", "half", "bfloat") else operand_ctype
             if kind not in EXTRA[node.name]:
                 raise UnsupportedProgram(f"metal: stablehlo.{node.name} on {operand_ctype}")
+            if node.name == "remainder" and kind == "float":
+                self.require(*FMOD)
             expr = EXTRA[node.name][kind].format(**dict(zip("abc", values, strict=False)))
             # Templates that compute in float narrow explicitly: bfloat has no
             # implicit conversion from float.

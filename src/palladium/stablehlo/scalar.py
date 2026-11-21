@@ -123,7 +123,7 @@ EXTRA = {
         "uint": "uint({a} > 0u)",
     },
     "remainder": {
-        "float": "fmod({a}, {b})",
+        "float": "pd_fmod(float({a}), float({b}))",  # needs numeric.FMOD
         "int": "({b} == 0 ? {a} : ({b} == -1 ? 0 : {a} % {b}))",
         "uint": "({b} == 0u ? {a} : {a} % {b})",
     },
